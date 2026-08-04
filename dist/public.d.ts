@@ -1210,7 +1210,6 @@ export declare function remove(ref: DatabaseReference): Promise<void>;
  * callback to handle success and failure.
  */
 export declare function runTransaction(ref: DatabaseReference, transactionUpdate: (currentData: any) => unknown, options?: TransactionOptions): Promise<TransactionResult>;
-/* Excluded from this release type: _serverCacheSeedStats */
 /**
  * @license
  * Copyright 2020 Google LLC

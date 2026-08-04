@@ -947,6 +947,82 @@ const KEY_INDEX = new KeyIndex();
 
 /**
  * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let MAX_NODE$2;
+function setMaxNode$1(val) {
+    MAX_NODE$2 = val;
+}
+/**
+ * The hash text of a leaf value: `<typeof>:<serialized value>`. Numbers
+ * serialize as IEEE-754 hex; everything else via String(). This is the one
+ * definition of the leaf grammar shared by Node.hash() (v2 = false) and the
+ * compound-hash range serialization (v2 = true, where strings are
+ * JSON-quoted so ranges are unambiguous to reparse — Android calls this the
+ * "V2" hash representation).
+ */
+function leafHashValueText(value, v2) {
+    const type = typeof value;
+    let text = type + ':';
+    if (type === 'number') {
+        text += doubleToIEEE754String(value);
+    }
+    else if (v2 && type === 'string') {
+        text += hashQuotedString(value);
+    }
+    else {
+        text += String(value);
+    }
+    return text;
+}
+/**
+ * JSON-style quoting with only backslash and double quote escaped (the V2
+ * hash grammar's string form).
+ */
+function hashQuotedString(value) {
+    let escaped = value;
+    if (escaped.indexOf('\\') !== -1) {
+        escaped = escaped.replace(/\\/g, '\\\\');
+    }
+    if (escaped.indexOf('"') !== -1) {
+        escaped = escaped.replace(/"/g, '\\"');
+    }
+    return '"' + escaped + '"';
+}
+const priorityHashText = function (priority) {
+    return leafHashValueText(priority, /* v2= */ false);
+};
+/**
+ * Validates that a priority snapshot Node is valid.
+ */
+const validatePriorityNode = function (priorityNode) {
+    if (priorityNode.isLeafNode()) {
+        const val = priorityNode.val();
+        util.assert(typeof val === 'string' ||
+            typeof val === 'number' ||
+            (typeof val === 'object' && util.contains(val, '.sv')), 'Priority must be a string or number.');
+    }
+    else {
+        util.assert(priorityNode === MAX_NODE$2 || priorityNode.isEmpty(), 'priority of unexpected type.');
+    }
+    // Don't call getPriority() on MAX_NODE to avoid hitting assertion.
+    util.assert(priorityNode === MAX_NODE$2 || priorityNode.getPriority().isEmpty(), "Priority nodes can't have a priority of their own.");
+};
+
+/**
+ * @license
  * Copyright 2026 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1011,21 +1087,10 @@ function compoundHashFromNode(node, splitStrategy) {
     }
     const strategy = splitStrategy || simpleSizeSplitStrategy(node);
     const builder = new CompoundHashBuilder(strategy);
-    processNode(node, builder);
+    const walker = new CompoundHashWalker(node, builder);
+    walker.drainUntil(Infinity);
     builder.finishHashing();
     return new CompoundHash(builder.posts, builder.hashes);
-}
-function processNode(node, builder) {
-    if (node.isLeafNode()) {
-        builder.processLeaf(node);
-    }
-    else {
-        forEachChildWithPriority(node, (key, child) => {
-            builder.startChild(key);
-            processNode(child, builder);
-            builder.endChild();
-        });
-    }
 }
 /**
  * Iterates children in key order with the node's priority interleaved as a
@@ -1048,6 +1113,63 @@ function forEachChildWithPriority(node, action) {
         }
         action(key, child);
     });
+}
+/**
+ * The one definition of the compound-hash traversal, driven as an explicit
+ * frame stack — a `child` frame runs builder.startChild, pushes its subtree,
+ * and a matching `end` frame runs builder.endChild — so the builder sees the
+ * exact call sequence a recursive walk would produce. The synchronous
+ * computation drains it in one go; the async one drains it in bounded
+ * slices. Either way the resulting hash is identical by construction.
+ */
+class CompoundHashWalker {
+    constructor(node, builder_) {
+        this.builder_ = builder_;
+        this.stack_ = [{ kind: 'node', node }];
+    }
+    /**
+     * Processes frames until the walk completes or `deadline` (an epoch-ms
+     * timestamp) passes — always at least one frame, so every slice makes
+     * progress no matter how small its budget. Returns true when the walk is
+     * complete.
+     */
+    drainUntil(deadline) {
+        while (this.stack_.length > 0) {
+            this.processFrame_(this.stack_.pop());
+            if (Date.now() >= deadline) {
+                break;
+            }
+        }
+        return this.stack_.length === 0;
+    }
+    processFrame_(frame) {
+        if (frame.kind === 'end') {
+            this.builder_.endChild();
+            return;
+        }
+        const current = frame.kind === 'node' ? frame.node : frame.child;
+        if (frame.kind === 'child') {
+            this.builder_.startChild(frame.key);
+            this.stack_.push({ kind: 'end' });
+        }
+        if (current.isLeafNode()) {
+            this.builder_.processLeaf(current);
+            // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
+            // child frame) already sits on the stack.
+            return;
+        }
+        const children = [];
+        forEachChildWithPriority(current, (key, child) => {
+            children.push([key, child]);
+        });
+        for (let i = children.length - 1; i >= 0; i--) {
+            this.stack_.push({
+                kind: 'child',
+                key: children[i][0],
+                child: children[i][1]
+            });
+        }
+    }
 }
 class CompoundHashBuilder {
     constructor(splitStrategy_) {
@@ -1083,7 +1205,7 @@ class CompoundHashBuilder {
         if (this.needsComma_) {
             this.currentHash_ += ',';
         }
-        this.currentHash_ += quoted(key) + ':(';
+        this.currentHash_ += hashQuotedString(key) + ':(';
         if (this.currentDepth_ === this.currentPath_.length) {
             this.currentPath_.push(key);
         }
@@ -1113,7 +1235,7 @@ class CompoundHashBuilder {
         if (this.currentHash_ === null) {
             let hash = '(';
             for (let i = 0; i < this.currentDepth_; i++) {
-                hash += quoted(this.currentPath_[i]) + ':(';
+                hash += hashQuotedString(this.currentPath_[i]) + ':(';
             }
             this.currentHash_ = hash;
             this.needsComma_ = false;
@@ -1133,42 +1255,21 @@ class CompoundHashBuilder {
     }
 }
 /**
- * The compound-hash representation of a leaf value. Unlike the text hashed by
- * Node.hash(), strings and keys are JSON-quoted so range serializations are
- * unambiguous to reparse (Android calls this the "V2" hash representation).
+ * The compound-hash representation of a leaf: the V2 grammar (strings and
+ * keys JSON-quoted so range serializations are unambiguous to reparse; see
+ * leafHashValueText), with the priority prefixed exactly as in Node.hash().
  */
 function leafHashRepresentation(node) {
     let representation = '';
-    if (!node.getPriority().isEmpty()) {
+    const priority = node.getPriority();
+    if (!priority.isEmpty()) {
         representation +=
-            'priority:' + leafHashRepresentation(node.getPriority()) + ':';
+            'priority:' +
+                leafHashValueText(priority.val(), true) +
+                ':';
     }
-    const value = node.val();
-    const type = typeof value;
-    representation += type + ':';
-    if (type === 'number') {
-        representation += doubleToIEEE754String(value);
-    }
-    else if (type === 'string') {
-        representation += quoted(value);
-    }
-    else {
-        representation += String(value);
-    }
+    representation += leafHashValueText(node.val(), true);
     return representation;
-}
-/**
- * JSON-style quoting with only backslash and double quote escaped.
- */
-function quoted(value) {
-    let escaped = value;
-    if (escaped.indexOf('\\') !== -1) {
-        escaped = escaped.replace(/\\/g, '\\\\');
-    }
-    if (escaped.indexOf('"') !== -1) {
-        escaped = escaped.replace(/"/g, '\\"');
-    }
-    return '"' + escaped + '"';
 }
 /**
  * Estimates the serialized size of a node in bytes — a cheap approximation
@@ -1211,14 +1312,22 @@ function estimateSerializedNodeSize(node) {
     }
 }
 /**
- * Computes a compound hash in bounded slices of main-thread time, yielding to
- * the event loop between slices, so hashing a large tree for persistence
- * never blocks the UI the way a monolithic walk would.
- *
- * The recursive walk of compoundHashFromNode is driven as an explicit frame
- * stack — a `child` frame runs builder.startChild, pushes its subtree, and a
- * matching `end` frame runs builder.endChild — so the builder sees the exact
- * call sequence the recursion produces and the resulting hash is identical.
+ * Schedules the next slice of a background computation: idle time where the
+ * platform offers it, a macrotask otherwise.
+ */
+function scheduleSlice(fn) {
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(() => fn(), { timeout: 200 });
+    }
+    else {
+        setTimeout(fn, 0);
+    }
+}
+/**
+ * Computes a compound hash in bounded slices of main-thread time, yielding
+ * to the event loop between slices, so hashing a large tree for persistence
+ * never blocks the UI the way a monolithic walk would. Same traversal as
+ * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
  */
 function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
     if (node.isEmpty()) {
@@ -1226,49 +1335,60 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
     }
     const strategy = splitStrategy || simpleSizeSplitStrategy(node);
     const builder = new CompoundHashBuilder(strategy);
-    // Popped last-in-first-out; children are pushed in reverse key order so
-    // they pop in key order.
-    const stack = [{ kind: 'node', node }];
-    const processFrame = (frame) => {
-        if (frame.kind === 'end') {
-            builder.endChild();
-            return;
-        }
-        const current = frame.kind === 'node' ? frame.node : frame.child;
-        if (frame.kind === 'child') {
-            builder.startChild(frame.key);
-            stack.push({ kind: 'end' });
-        }
-        if (current.isLeafNode()) {
-            builder.processLeaf(current);
-            // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
-            // child frame) already sits on the stack.
-            return;
-        }
-        const children = [];
-        forEachChildWithPriority(current, (key, child) => {
-            children.push([key, child]);
-        });
-        for (let i = children.length - 1; i >= 0; i--) {
-            stack.push({ kind: 'child', key: children[i][0], child: children[i][1] });
-        }
-    };
+    const walker = new CompoundHashWalker(node, builder);
     return new Promise((resolve, reject) => {
-        const schedule = typeof requestIdleCallback === 'function'
-            ? (fn) => requestIdleCallback(() => fn(), { timeout: 200 })
-            : (fn) => setTimeout(fn, 0);
         const step = () => {
             try {
-                const deadline = Date.now() + sliceMs;
-                while (stack.length > 0 && Date.now() < deadline) {
-                    processFrame(stack.pop());
-                }
-                if (stack.length > 0) {
-                    schedule(step);
+                if (!walker.drainUntil(Date.now() + sliceMs)) {
+                    scheduleSlice(step);
                     return;
                 }
                 builder.finishHashing();
                 resolve(new CompoundHash(builder.posts, builder.hashes));
+            }
+            catch (e) {
+                reject(e);
+            }
+        };
+        step();
+    });
+}
+/**
+ * Computes node.hash() — the canonical listen hash — in bounded slices.
+ * Node hashes cache per node (lazyHash_) and nodes are immutable, so the
+ * walk primes every subtree's hash bottom-up across slices; the final
+ * root hash() then assembles from cached children in one cheap pass, and
+ * unchanged subtrees stay primed for the next flush.
+ */
+function hashFromNodeAsync(node, sliceMs = 12) {
+    const stack = [{ node, childrenPrimed: false }];
+    const processFrame = (frame) => {
+        if (frame.childrenPrimed || frame.node.isLeafNode()) {
+            frame.node.hash();
+            return;
+        }
+        stack.push({ node: frame.node, childrenPrimed: true });
+        frame.node.forEachChild(KEY_INDEX, (_key, child) => {
+            stack.push({ node: child, childrenPrimed: false });
+        });
+    };
+    return new Promise((resolve, reject) => {
+        const step = () => {
+            try {
+                const deadline = Date.now() + sliceMs;
+                // At least one frame per slice: progress is guaranteed even with a
+                // zero budget.
+                while (stack.length > 0) {
+                    processFrame(stack.pop());
+                    if (Date.now() >= deadline) {
+                        break;
+                    }
+                }
+                if (stack.length > 0) {
+                    scheduleSlice(step);
+                    return;
+                }
+                resolve(node.hash());
             }
             catch (e) {
                 reject(e);
@@ -2210,51 +2330,6 @@ function NAME_COMPARATOR(left, right) {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-let MAX_NODE$2;
-function setMaxNode$1(val) {
-    MAX_NODE$2 = val;
-}
-const priorityHashText = function (priority) {
-    if (typeof priority === 'number') {
-        return 'number:' + doubleToIEEE754String(priority);
-    }
-    else {
-        return 'string:' + priority;
-    }
-};
-/**
- * Validates that a priority snapshot Node is valid.
- */
-const validatePriorityNode = function (priorityNode) {
-    if (priorityNode.isLeafNode()) {
-        const val = priorityNode.val();
-        util.assert(typeof val === 'string' ||
-            typeof val === 'number' ||
-            (typeof val === 'object' && util.contains(val, '.sv')), 'Priority must be a string or number.');
-    }
-    else {
-        util.assert(priorityNode === MAX_NODE$2 || priorityNode.isEmpty(), 'priority of unexpected type.');
-    }
-    // Don't call getPriority() on MAX_NODE to avoid hitting assertion.
-    util.assert(priorityNode === MAX_NODE$2 || priorityNode.getPriority().isEmpty(), "Priority nodes can't have a priority of their own.");
-};
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 let __childrenNodeConstructor;
 /**
  * LeafNode is a class for storing leaf nodes in a DataSnapshot.  It
@@ -2380,17 +2455,17 @@ class LeafNode {
                         priorityHashText(this.priorityNode_.val()) +
                         ':';
             }
-            const type = typeof this.value_;
-            toHash += type + ':';
-            if (type === 'number') {
-                toHash += doubleToIEEE754String(this.value_);
-            }
-            else {
-                toHash += this.value_;
-            }
+            toHash += leafHashValueText(this.value_, 
+            /* v2= */ false);
             this.lazyHash_ = sha1(toHash);
         }
         return this.lazyHash_;
+    }
+    /** @inheritDoc */
+    stampLazyHash(hash) {
+        if (this.lazyHash_ === null) {
+            this.lazyHash_ = hash;
+        }
     }
     /**
      * Returns the value of the leaf node.
@@ -2974,6 +3049,12 @@ class ChildrenNode {
         return this.lazyHash_;
     }
     /** @inheritDoc */
+    stampLazyHash(hash) {
+        if (this.lazyHash_ === null) {
+            this.lazyHash_ = hash;
+        }
+    }
+    /** @inheritDoc */
     getPredecessorChildName(childName, childNode, index) {
         const idx = this.resolveIndex_(index);
         if (idx) {
@@ -3303,51 +3384,36 @@ setNodeFromJSON(nodeFromJSON);
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-const seeds = new Map();
-function normalizeSeedPath(path) {
-    const trimmed = String(path).replace(/^\/+|\/+$/g, '');
-    return trimmed === '' ? '/' : '/' + trimmed;
-}
 /**
- * Registers cached JSON as the initial server cache for `path`. Must be
- * called before the listener for that exact path attaches — the seed is
- * consumed (once) at listener registration, and only by a default (complete,
- * unfiltered) query: a filtered query's listen hash is computed over the
- * filtered subset, which raw cached JSON is not.
- *
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined clears nothing and seeds
- * nothing (an empty tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
+ * The seeds registered for one Repo, keyed by canonical path string
+ * (Path.toString() — the same canonicalization the consumer uses, so a seed
+ * for 'a//b/' and a listen at '/a/b' cannot drift apart).
  */
-function seedServerCache(path, json, hash, compoundHash) {
-    if (json === null || json === undefined) {
-        return;
+class ServerCacheSeedStore {
+    constructor() {
+        this.seeds_ = new Map();
     }
-    seeds.set(normalizeSeedPath(path), { json, hash, compoundHash });
-}
-/**
- * Removes all registered seeds.
- * @internal
- */
-function clearServerCacheSeeds() {
-    seeds.clear();
-}
-/**
- * Consumes (at most once) the seed registered for exactly `pathString`.
- * Returns undefined when no seed matches.
- */
-function takeServerCacheSeed(pathString) {
-    const key = normalizeSeedPath(pathString);
-    const seed = seeds.get(key);
-    if (seed !== undefined) {
-        seeds.delete(key);
+    set(path, json, hash, compoundHash) {
+        if (json === null || json === undefined) {
+            return;
+        }
+        this.seeds_.set(new Path(path).toString(), { json, hash, compoundHash });
     }
-    return seed;
+    /**
+     * Consumes (at most once) the seed registered for exactly `pathString`.
+     * Returns undefined when no seed matches.
+     */
+    take(pathString) {
+        const key = new Path(pathString).toString();
+        const seed = this.seeds_.get(key);
+        if (seed !== undefined) {
+            this.seeds_.delete(key);
+        }
+        return seed;
+    }
+    clear() {
+        this.seeds_.clear();
+    }
 }
 /**
  * Builds the node for a seed, stamping the precomputed canonical hash into
@@ -3364,11 +3430,7 @@ function buildSeedNode(seed) {
         return node;
     }
     if (typeof seed.hash === 'string' && seed.hash.length > 0) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const stampable = node;
-        if (stampable.lazyHash_ === null) {
-            stampable.lazyHash_ = seed.hash;
-        }
+        node.stampLazyHash(seed.hash);
     }
     const compoundHash = seed.compoundHash;
     if (compoundHash &&
@@ -3422,13 +3484,8 @@ const serverCacheSeedStats = {
     hashMatches: 0,
     rangeMergesReceived: 0,
     seededPaths: [],
-    bytesReceived: 0,
-    dataPushesByPath: {}
+    bytesReceived: 0
 };
-/** Normalizes a wire path for the per-path push counters. */
-function normalizeStatsPath(path) {
-    return normalizeSeedPath(path);
-}
 
 /**
  * @license
@@ -4101,24 +4158,28 @@ EmulatorTokenProvider.OWNER = 'owner';
  * costs range-merge deltas; a cold root costs exactly today's full download.
  *
  * What is persisted, per top-level listened ROOT (a complete, unfiltered
- * listen):
- *   - the last server-confirmed tree, as exported JSON (val(true) — priorities
- *     preserved), written through debounced on server overwrites / merges /
- *     range merges / listen-completes;
- *   - the tree's canonical listen hash and compound hash, recomputed AFTER
- *     each write-through in idle-time slices (compoundHashFromNodeAsync) and
- *     stored alongside, so the next startup seeds in O(1) with no tree walk.
+ * listen), as TWO records under adjacent keys:
+ *   - the data record: the last server-confirmed tree as exported JSON
+ *     (val(true) — priorities preserved), written through debounced on
+ *     server overwrites / merges / range merges / listen-completes;
+ *   - the hash record: the tree's canonical listen hash and compound hash,
+ *     recomputed AFTER each write-through in idle-time slices and stored
+ *     separately, so a flush serializes the tree exactly once and the hash
+ *     lands as a small follow-up write.
  *
- * Coupling stored hashes to stored trees: every write-through bumps a
- * per-root `revision`; the async recompute carries the revision it hashed
- * and its result is discarded when a newer write-through superseded it. A
- * record whose hashes are missing (recompute pending at shutdown) restores
- * WITHOUT hashes — the data still paints, the listen just goes out
- * hashless, exactly a cold load for that root.
+ * Coupling stored hashes to stored trees: every write-through stamps the
+ * data record with a manager-wide monotonic `revision`; the async recompute
+ * carries the revision it hashed and its result is discarded when a newer
+ * write-through superseded it. On restore the hash record is joined only
+ * when its revision matches the data record's — a mismatch (recompute
+ * pending at shutdown) restores WITHOUT hashes: the data still paints, the
+ * listen just goes out hashless, exactly a cold load for that root.
  *
  * Storage: one IndexedDB database ('firebase-database-persistence'), one
- * object store, keyed "<repo prefix>|<path>". All storage failures degrade
- * to cold loads; nothing here may ever break the live connection.
+ * object store, keyed "<repo prefix>|<path>" (data) and
+ * "<repo prefix>|<path>#hash" (hashes; '#' cannot appear in a path segment).
+ * All storage failures degrade to cold loads; nothing here may ever break
+ * the live connection.
  */
 const STORE = 'firebase-server-cache';
 /**
@@ -4152,13 +4213,14 @@ const persistenceStats = {
     evictions: 0,
     storageFailures: 0
 };
+const HASH_KEY_SUFFIX = '#hash';
 /**
  * One PersistenceManager per Repo. `prefix` namespaces records so multiple
  * databases/apps sharing the page don't collide. `idbFactory` exists for
  * tests (Node has no IndexedDB); production uses the global.
  */
 class PersistenceManager {
-    constructor(prefix_, idbFactory_ = typeof indexedDB !== 'undefined'
+    constructor(prefix_, idbFactory_ = util.isIndexedDBAvailable()
         ? indexedDB
         : null) {
         this.prefix_ = prefix_;
@@ -4169,9 +4231,13 @@ class PersistenceManager {
          */
         this.trackedRoots_ = new Set();
         /**
-         * Latest server tree per root; revision couples hashes to trees.
+         * Latest server tree per root. Revisions come from a single manager-wide
+         * counter, so no revision is ever reissued — an in-flight hash recompute
+         * can never collide with a tree that arrived after its root was evicted
+         * and re-tracked.
          */
         this.latest_ = new Map();
+        this.revisionCounter_ = 0;
         this.writeTimers_ = new Map();
         this.disposed_ = false;
     }
@@ -4252,8 +4318,9 @@ class PersistenceManager {
     }
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
-     * cursor walk. Best-effort: any failure leaves the records for the next
-     * session's sweep.
+     * cursor walk. Both record kinds carry `updatedAt`, so data and hash
+     * records expire together. Best-effort: any failure leaves the records
+     * for the next session's sweep.
      */
     sweepExpired_(db) {
         const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
@@ -4313,60 +4380,84 @@ class PersistenceManager {
     key_(pathString) {
         return this.prefix_ + '|' + pathString;
     }
-    idbGet_(pathString) {
+    /**
+     * Runs `body` against the object store in a transaction of the given mode
+     * and resolves with what `body` chose to deliver (via its `done` callback)
+     * once the transaction completes. Every failure path — no database, a
+     * throwing store call, an aborted transaction — resolves `fallback` and
+     * counts one storageFailure (except when IndexedDB is absent altogether,
+     * which is a supported cold-load configuration, not a failure).
+     */
+    withStore_(mode, fallback, body) {
         return this.open_().then(db => new Promise(resolve => {
             if (!db) {
-                resolve(null);
+                resolve(fallback);
                 return;
             }
             try {
-                const tx = db.transaction(STORE, 'readonly');
-                const req = tx.objectStore(STORE).get(this.key_(pathString));
-                req.onsuccess = () => resolve(req.result ?? null);
-                req.onerror = () => resolve(null);
-            }
-            catch (e) {
-                resolve(null);
-            }
-        }));
-    }
-    idbPut_(pathString, record) {
-        return this.open_().then(db => new Promise(resolve => {
-            if (!db) {
-                resolve();
-                return;
-            }
-            try {
-                const tx = db.transaction(STORE, 'readwrite');
-                tx.objectStore(STORE).put(record, this.key_(pathString));
-                tx.oncomplete = () => resolve();
+                const tx = db.transaction(STORE, mode);
+                let value = fallback;
+                body(tx.objectStore(STORE), v => {
+                    value = v;
+                });
+                tx.oncomplete = () => resolve(value);
                 tx.onabort = tx.onerror = () => {
                     persistenceStats.storageFailures++;
-                    resolve();
+                    resolve(fallback);
                 };
             }
             catch (e) {
                 persistenceStats.storageFailures++;
-                resolve();
+                resolve(fallback);
             }
         }));
     }
-    idbDelete_(pathString) {
-        return this.open_().then(db => new Promise(resolve => {
-            if (!db) {
-                resolve();
-                return;
+    /**
+     * Reads a root's data record and joins its hash record when the revisions
+     * match, in one readonly transaction. Expired records resolve null (and
+     * are deleted best-effort).
+     */
+    readRecord_(pathString) {
+        return this.withStore_('readonly', null, (store, done) => {
+            const dataReq = store.get(this.key_(pathString));
+            const hashReq = store.get(this.key_(pathString) + HASH_KEY_SUFFIX);
+            dataReq.onsuccess = () => {
+                const record = dataReq.result;
+                if (!record) {
+                    done(null);
+                    return;
+                }
+                const hashes = hashReq.result;
+                if (hashes && hashes.revision === record.revision) {
+                    done({
+                        json: record.json,
+                        hash: hashes.hash,
+                        compoundHash: hashes.compoundHash,
+                        updatedAt: record.updatedAt,
+                        revision: record.revision
+                    });
+                }
+                else {
+                    done(record);
+                }
+            };
+        }).then(record => {
+            if (!record) {
+                return null;
             }
-            try {
-                const tx = db.transaction(STORE, 'readwrite');
-                tx.objectStore(STORE).delete(this.key_(pathString));
-                tx.oncomplete = () => resolve();
-                tx.onabort = tx.onerror = () => resolve();
+            if (Date.now() - record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+                persistenceStats.evictions++;
+                void this.deleteRecord_(pathString);
+                return null;
             }
-            catch (e) {
-                resolve();
-            }
-        }));
+            return record;
+        });
+    }
+    deleteRecord_(pathString) {
+        return this.withStore_('readwrite', undefined, store => {
+            store.delete(this.key_(pathString));
+            store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
+        });
     }
     /**
      * Restores the persisted record for a root. Resolves null on miss, expiry,
@@ -4376,19 +4467,7 @@ class PersistenceManager {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
-        const read = this.idbGet_(pathString).then(record => {
-            if (!record) {
-                return null;
-            }
-            if (Date.now() - record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
-                persistenceStats.evictions++;
-                void this.idbDelete_(pathString);
-                return null;
-            }
-            return record;
-        });
-        const timeout = new Promise(resolve => setTimeout(() => resolve(null), PERSISTENCE_RESTORE_TIMEOUT_MS));
-        return Promise.race([read, timeout]).then(record => {
+        return this.raceRestoreTimeout_(this.readRecord_(pathString)).then(record => {
             if (record) {
                 persistenceStats.restoredRoots.push(pathString);
             }
@@ -4396,6 +4475,69 @@ class PersistenceManager {
                 persistenceStats.restoreMisses.push(pathString);
             }
             return record;
+        });
+    }
+    /**
+     * The boot-peek read (see getPersistedValue): resolves the record of the
+     * DEEPEST persisted ancestor of `pathString` (or of the path itself),
+     * fetching the whole ancestor chain in one readonly transaction. Expired
+     * ancestors are skipped (and deleted best-effort). Does not touch the
+     * restore counters — a peek is not a listen restore.
+     */
+    restoreNearest(pathString) {
+        if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        // Deepest first: the path itself, then each ancestor up to the root.
+        const candidates = [];
+        let path = new Path(pathString);
+        while (path !== null) {
+            candidates.push(path.toString());
+            path = pathParent(path);
+        }
+        const read = this.withStore_('readonly', [], (store, done) => {
+            const results = new Array(candidates.length);
+            let remaining = candidates.length;
+            candidates.forEach((candidate, i) => {
+                const req = store.get(this.key_(candidate));
+                req.onsuccess = () => {
+                    results[i] = req.result;
+                    if (--remaining === 0) {
+                        done(results);
+                    }
+                };
+            });
+        }).then(results => {
+            const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+            for (let i = 0; i < results.length; i++) {
+                const record = results[i];
+                if (!record) {
+                    continue;
+                }
+                if (record.updatedAt < cutoff) {
+                    persistenceStats.evictions++;
+                    void this.deleteRecord_(candidates[i]);
+                    continue;
+                }
+                return { root: candidates[i], record };
+            }
+            return null;
+        });
+        return this.raceRestoreTimeout_(read);
+    }
+    /**
+     * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
+     * soon as the read settles first (the common case — otherwise every
+     * restore would pin its Repo in memory for the full budget).
+     */
+    raceRestoreTimeout_(read) {
+        let timer;
+        const timeout = new Promise(resolve => {
+            timer = setTimeout(() => resolve(null), PERSISTENCE_RESTORE_TIMEOUT_MS);
+        });
+        return Promise.race([read, timeout]).then(result => {
+            clearTimeout(timer);
+            return result;
         });
     }
     /**
@@ -4411,16 +4553,14 @@ class PersistenceManager {
         if (!this.trackedRoots_.has(pathString)) {
             return;
         }
-        const prev = this.latest_.get(pathString);
-        const revision = (prev ? prev.revision : 0) + 1;
-        this.latest_.set(pathString, { node, revision });
+        this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
         const existing = this.writeTimers_.get(pathString);
         if (existing) {
             clearTimeout(existing);
         }
         this.writeTimers_.set(pathString, setTimeout(() => {
             this.writeTimers_.delete(pathString);
-            this.flush_(pathString);
+            void this.flush_(pathString);
         }, PERSISTENCE_WRITE_DEBOUNCE_MS));
     }
     /**
@@ -4436,7 +4576,7 @@ class PersistenceManager {
             this.writeTimers_.delete(pathString);
         }
         persistenceStats.evictions++;
-        void this.idbDelete_(pathString);
+        void this.deleteRecord_(pathString);
     }
     dispose() {
         this.disposed_ = true;
@@ -4464,14 +4604,21 @@ class PersistenceManager {
         }
         const { node, revision } = entry;
         persistenceStats.writeThroughs++;
-        // Data first, hashless: a crash before the hash recompute leaves a
-        // restorable tree that seeds without a hash instead of nothing.
+        // The tree is serialized and written exactly once, hashless — a crash
+        // before the recompute leaves a restorable tree that seeds without a
+        // hash instead of nothing. The hashes follow as a small separate record.
         const record = {
             json: node.val(true),
             updatedAt: Date.now(),
             revision
         };
-        return this.idbPut_(pathString, record).then(() => compoundHashFromNodeAsync(node).then(compoundHash => {
+        const put = this.withStore_('readwrite', undefined, store => {
+            store.put(record, this.key_(pathString));
+        });
+        return put.then(() => Promise.all([
+            hashFromNodeAsync(node),
+            compoundHashFromNodeAsync(node)
+        ]).then(([hash, compoundHash]) => {
             const current = this.latest_.get(pathString);
             if (!current || current.revision !== revision || this.disposed_) {
                 // A newer server update superseded this tree while it hashed; its
@@ -4481,15 +4628,17 @@ class PersistenceManager {
                 return;
             }
             persistenceStats.hashRecomputes++;
-            return this.idbPut_(pathString, {
-                json: record.json,
-                hash: node.hash(),
+            const hashRecord = {
+                hash,
                 compoundHash: {
                     hashes: compoundHash.hashes,
                     posts: compoundHash.posts
                 },
                 updatedAt: record.updatedAt,
                 revision
+            };
+            return this.withStore_('readwrite', undefined, store => {
+                store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
             });
         }));
     }
@@ -6020,6 +6169,13 @@ class PersistentConnection extends ServerActions {
         this.log_ = logWrapper('p:' + this.id + ':');
         this.interruptReasons_ = {};
         this.listens = new Map();
+        /**
+         * Data pushes received per ACTIVE listen path (see hashMatches in
+         * serverCacheSeedStats): entries live only while a listen exists at the
+         * path — created on the first push, dropped in removeListen_ — so the map
+         * is bounded by the number of active listens.
+         */
+        this.dataPushes_ = new Map();
         this.outstandingPuts_ = [];
         this.outstandingGets_ = [];
         this.outstandingPutCount_ = 0;
@@ -6150,8 +6306,7 @@ class PersistentConnection extends ServerActions {
             serverCacheSeedStats.listensSentWithHash++;
         }
         const hadHash = req['h'] !== '';
-        const pushesBefore = serverCacheSeedStats.dataPushesByPath[normalizeStatsPath(pathString)] ||
-            0;
+        const pushesBefore = this.dataPushes_.get(pathString) || 0;
         this.sendRequest(action, req, (message) => {
             const payload = message[ /*data*/'d'];
             const status = message[ /*status*/'s'];
@@ -6160,7 +6315,7 @@ class PersistentConnection extends ServerActions {
                 // An 'ok' with no data pushed for this path since the listen went
                 // out means the server accepted our hash as current.
                 if (hadHash &&
-                    (serverCacheSeedStats.dataPushesByPath[normalizeStatsPath(pathString)] || 0) === pushesBefore) {
+                    (this.dataPushes_.get(pathString) || 0) === pushesBefore) {
                     serverCacheSeedStats.hashMatches++;
                 }
             }
@@ -6444,9 +6599,10 @@ class PersistentConnection extends ServerActions {
         if ((action === 'd' || action === 'm' || action === 'rm') &&
             body &&
             body['p'] !== undefined) {
-            const statsPath = normalizeStatsPath(body['p']);
-            serverCacheSeedStats.dataPushesByPath[statsPath] =
-                (serverCacheSeedStats.dataPushesByPath[statsPath] || 0) + 1;
+            const pushPath = new Path(body['p']).toString();
+            if (this.listens.has(pushPath)) {
+                this.dataPushes_.set(pushPath, (this.dataPushes_.get(pushPath) || 0) + 1);
+            }
         }
         if (action === 'd') {
             this.onDataUpdate_(body[ /*path*/'p'], body[ /*data*/'d'], 
@@ -6706,6 +6862,7 @@ class PersistentConnection extends ServerActions {
             map.delete(queryId);
             if (map.size === 0) {
                 this.listens.delete(normalizedPathString);
+                this.dataPushes_.delete(normalizedPathString);
             }
         }
         else {
@@ -10701,7 +10858,11 @@ function syncTreeGetCompleteServerCache(syncTree, path) {
     if (!view) {
         return null;
     }
-    return viewGetServerCache(view) || null;
+    // The CERTIFIED cache only (fully server-initialized) — never a seeded or
+    // child-assembled partial tree: this feeds the persistence write-through,
+    // and persisting uncertified data would surface it as server truth on the
+    // next boot.
+    return viewGetCompleteServerCache(view, newEmptyPath());
 }
 /**
  * Applies server range merges against the complete (default) view at the
@@ -10721,11 +10882,7 @@ function syncTreeApplyServerRangeMerges(syncTree, path, merges) {
         // No complete view for this update: it was removed, ignore
         return [];
     }
-    let serverNode = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-    for (const merge of merges) {
-        serverNode = merge.applyTo(serverNode);
-    }
-    return syncTreeApplyServerOverwrite(syncTree, path, serverNode);
+    return syncTreeApplyServerOverwrite(syncTree, path, applyRangeMergesToView(view, merges));
 }
 /**
  * Applies tagged-query server range merges against the query's view.
@@ -10747,11 +10904,19 @@ function syncTreeApplyTaggedRangeMerges(syncTree, path, merges, tag) {
     if (!view) {
         return [];
     }
+    return syncTreeApplyTaggedQueryOverwrite(syncTree, r.path, applyRangeMergesToView(view, merges), tag);
+}
+/**
+ * Folds server range merges over a view's raw server cache — the tree the
+ * listen's hashes were computed from, certified or not — producing the tree
+ * the overwrite paths then promote.
+ */
+function applyRangeMergesToView(view, merges) {
     let serverNode = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
     for (const merge of merges) {
         serverNode = merge.applyTo(serverNode);
     }
-    return syncTreeApplyTaggedQueryOverwrite(syncTree, r.path, serverNode, tag);
+    return serverNode;
 }
 /**
  * Remove event callback(s).
@@ -10915,7 +11080,7 @@ function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSe
         // until the server certifies it (see ServerCacheSeed).
         serverCache = null;
         if (query._queryParams.loadsAllData()) {
-            const seed = takeServerCacheSeed(path.toString());
+            const seed = syncTree.listenProvider_.takeServerCacheSeed?.(path.toString());
             if (seed !== undefined) {
                 try {
                     serverCache = buildSeedNode(seed);
@@ -12013,6 +12178,11 @@ class Repo {
          */
         this.persistence_ = null;
         /**
+         * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
+         * by serverSyncTree_ via its listen provider.
+         */
+        this.serverCacheSeeds_ = new ServerCacheSeedStore();
+        /**
          * Listens held back while their persisted root restores, keyed by path.
          * stopListening flips the token so a listen whose last registration was
          * removed mid-restore is never sent (see repoStartServerListen).
@@ -12103,7 +12273,8 @@ function repoStart(repo, appId, authOverride) {
         },
         stopListening: (query, tag) => {
             repoStopServerListen(repo, query, tag);
-        }
+        },
+        takeServerCacheSeed: pathString => repo.serverCacheSeeds_.take(pathString)
     });
 }
 /**
@@ -12230,7 +12401,12 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             return;
         }
         repo.pendingSeedRestores_.delete(pathString);
-        if (record !== null) {
+        // If the server certified this path while the restore was in flight (an
+        // overlapping listen, a get()), the live data wins — applying the stored
+        // tree now would clobber fresher server state with stale bytes.
+        const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+            null;
+        if (record !== null && !alreadyCertified) {
             try {
                 const node = buildSeedNode(record);
                 if (!node.isEmpty()) {
@@ -15111,30 +15287,19 @@ function getPersistedValue(db, pathString) {
         return Promise.resolve(null);
     }
     // Records are stored per listened ROOT; a peek at a subpath restores the
-    // deepest stored ancestor (walking up from the full path) and drills into
-    // its JSON along the remaining segments.
+    // deepest stored ancestor (one IndexedDB read over the whole chain) and
+    // drills into its tree along the remaining segments. Going through the
+    // node model — not the raw stored JSON — matters: records hold EXPORT
+    // format (val(true)), and a raw walk would surface '.value'/'.priority'
+    // wrappers instead of the values snapshot.val() semantics promise.
     const path = new Path(pathString);
-    const attempt = (candidate) => persistence.restore(candidate.toString()).then(record => {
-        if (record !== null) {
-            // candidate is an ancestor of (or equal to) path by construction.
-            let cursor = newRelativePath(candidate, path);
-            let value = record.json;
-            while (!pathIsEmpty(cursor)) {
-                if (value === null || typeof value !== 'object') {
-                    return null;
-                }
-                value = value[pathGetFront(cursor)];
-                cursor = pathPopFront(cursor);
-            }
-            return value === undefined ? null : value;
-        }
-        const parent = pathParent(candidate);
-        if (parent === null) {
+    return persistence.restoreNearest(path.toString()).then(result => {
+        if (result === null) {
             return null;
         }
-        return attempt(parent);
+        const relativePath = newRelativePath(new Path(result.root), path);
+        return nodeFromJSON(result.record.json).getChild(relativePath).val();
     });
-    return attempt(path);
 }
 /**
  * Enables client-side persistence of the server cache for this Database
@@ -15166,6 +15331,40 @@ function setPersistenceEnabled(db, enabled) {
             repo.persistence_ = null;
         }
     }
+}
+/**
+ * Registers cached JSON as the initial server cache for `path` on this
+ * Database instance. Must be called before the listener for that exact path
+ * attaches — the seed is consumed (once) at listener registration, and only
+ * by a default (complete, unfiltered) query: a filtered query's listen hash
+ * is computed over the filtered subset, which raw cached JSON is not. See
+ * core/ServerCacheSeed.ts.
+ *
+ * @param db - The instance whose next listen at `path` should be seeded.
+ * @param path - Absolute database path the JSON was cached for.
+ * @param json - The cached value. null/undefined seeds nothing (an empty
+ * tree's hash is what an unseeded listen sends anyway).
+ * @param hash - Optional precomputed canonical hash of `json` (the exact
+ * value computeCanonicalHash returns for it).
+ * @param compoundHash - Optional precomputed compound hash of `json` (the
+ * exact value computeCompoundHash returns for it).
+ * @internal
+ */
+function seedServerCache(db, path, json, hash, compoundHash) {
+    db = util.getModularInstance(db);
+    db._checkNotDeleted('seedServerCache');
+    // _repoInternal: seeding is boot-time configuration and must not start
+    // the instance.
+    db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
+}
+/**
+ * Removes all seeds registered on this Database instance.
+ * @internal
+ */
+function clearServerCacheSeeds(db) {
+    db = util.getModularInstance(db);
+    db._checkNotDeleted('clearServerCacheSeeds');
+    db._repoInternal.serverCacheSeeds_.clear();
 }
 /**
  * Resolves when the default complete listen at `pathString` has received its

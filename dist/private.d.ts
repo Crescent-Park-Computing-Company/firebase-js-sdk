@@ -845,6 +845,11 @@ export declare interface ListenOptions {
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
+    /**
+     * Consumes the server-cache seed registered for `pathString`, if any (see
+     * ServerCacheSeedStore). Absent for providers without seeding (.info).
+     */
+    takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 
 /**
@@ -1131,6 +1136,13 @@ declare interface Node_2 {
      * @returns hash representing the node contents.
      */
     hash(): string;
+    /**
+     * Installs a precomputed value for hash() — used by server-cache seeding
+     * to stamp a hash computed off the main thread (see ServerCacheSeed). No
+     * effect once a hash has been computed or stamped: nodes are immutable,
+     * so the first hash is the only hash.
+     */
+    stampLazyHash(hash: string): void;
     /**
      * @param other - Another node
      * @returns -1 for less than, 0 for equal, 1 for greater than other
@@ -1850,9 +1862,13 @@ declare class PersistenceManager {
      */
     private trackedRoots_;
     /**
-     * Latest server tree per root; revision couples hashes to trees.
+     * Latest server tree per root. Revisions come from a single manager-wide
+     * counter, so no revision is ever reissued — an in-flight hash recompute
+     * can never collide with a tree that arrived after its root was evicted
+     * and re-tracked.
      */
     private latest_;
+    private revisionCounter_;
     private writeTimers_;
     private disposed_;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null);
@@ -1874,20 +1890,51 @@ declare class PersistenceManager {
     private open_;
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
-     * cursor walk. Best-effort: any failure leaves the records for the next
-     * session's sweep.
+     * cursor walk. Both record kinds carry `updatedAt`, so data and hash
+     * records expire together. Best-effort: any failure leaves the records
+     * for the next session's sweep.
      */
     private sweepExpired_;
     private openAtVersion_;
     private key_;
-    private idbGet_;
-    private idbPut_;
-    private idbDelete_;
+    /**
+     * Runs `body` against the object store in a transaction of the given mode
+     * and resolves with what `body` chose to deliver (via its `done` callback)
+     * once the transaction completes. Every failure path — no database, a
+     * throwing store call, an aborted transaction — resolves `fallback` and
+     * counts one storageFailure (except when IndexedDB is absent altogether,
+     * which is a supported cold-load configuration, not a failure).
+     */
+    private withStore_;
+    /**
+     * Reads a root's data record and joins its hash record when the revisions
+     * match, in one readonly transaction. Expired records resolve null (and
+     * are deleted best-effort).
+     */
+    private readRecord_;
+    private deleteRecord_;
     /**
      * Restores the persisted record for a root. Resolves null on miss, expiry,
      * storage failure, or timeout — the caller then attaches unseeded.
      */
     restore(pathString: string): Promise<PersistedRecord | null>;
+    /**
+     * The boot-peek read (see getPersistedValue): resolves the record of the
+     * DEEPEST persisted ancestor of `pathString` (or of the path itself),
+     * fetching the whole ancestor chain in one readonly transaction. Expired
+     * ancestors are skipped (and deleted best-effort). Does not touch the
+     * restore counters — a peek is not a listen restore.
+     */
+    restoreNearest(pathString: string): Promise<{
+        root: string;
+        record: PersistedRecord;
+    } | null>;
+    /**
+     * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
+     * soon as the read settles first (the common case — otherwise every
+     * restore would pin its Repo in memory for the full budget).
+     */
+    private raceRestoreTimeout_;
     /**
      * Write-through: the server confirmed `node` as the state of the tracked
      * root `path`. Debounced per root; hashes recompute afterwards in idle
@@ -1929,6 +1976,13 @@ declare class PersistentConnection extends ServerActions {
     private log_;
     private interruptReasons_;
     private readonly listens;
+    /**
+     * Data pushes received per ACTIVE listen path (see hashMatches in
+     * serverCacheSeedStats): entries live only while a listen exists at the
+     * path — created on the first push, dropped in removeListen_ — so the map
+     * is bounded by the number of active listens.
+     */
+    private dataPushes_;
     private outstandingPuts_;
     private outstandingGets_;
     private outstandingPutCount_;
@@ -2270,6 +2324,11 @@ declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
+     * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
+     * by serverSyncTree_ via its listen provider.
+     */
+    serverCacheSeeds_: ServerCacheSeedStore;
+    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
@@ -2410,7 +2469,29 @@ declare abstract class ServerActions {
     }): void;
 }
 
+declare interface ServerCacheSeed {
+    json: unknown;
+    hash?: string;
+    compoundHash?: SeedCompoundHash;
+}
+
 /* Excluded from this release type: _serverCacheSeedStats */
+
+/**
+ * The seeds registered for one Repo, keyed by canonical path string
+ * (Path.toString() — the same canonicalization the consumer uses, so a seed
+ * for 'a//b/' and a listen at '/a/b' cannot drift apart).
+ */
+declare class ServerCacheSeedStore {
+    private seeds_;
+    set(path: string, json: unknown, hash?: string, compoundHash?: SeedCompoundHash): void;
+    /**
+     * Consumes (at most once) the seed registered for exactly `pathString`.
+     * Returns undefined when no seed matches.
+     */
+    take(pathString: string): ServerCacheSeed | undefined;
+    clear(): void;
+}
 
 /**
  * @license
