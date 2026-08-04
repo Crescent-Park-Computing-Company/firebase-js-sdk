@@ -1000,21 +1000,6 @@ export declare function orderByPriority(): QueryConstraint;
  */
 export declare function orderByValue(): QueryConstraint;
 /**
- * How long after the last server update a root's write-through runs. The
- * flush serializes the whole root (val(true) + the structured clone into
- * IndexedDB), so it is deliberately coarse for very large roots.
- */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
-export declare const _persistenceStats: {
-    restoredRoots: string[];
-    restoreMisses: string[];
-    writeThroughs: number;
-    hashRecomputes: number;
-    staleHashDiscards: number;
-    evictions: number;
-    storageFailures: number;
-};
-/**
  * Generates a new child location using a unique key and returns its
  * `Reference`.
  *
@@ -1278,7 +1263,7 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+/* Excluded from this release type: _setPersistenceEnabled */
 /**
  * Sets a priority for the data at this Database location.
  *

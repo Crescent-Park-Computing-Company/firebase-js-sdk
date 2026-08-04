@@ -118,7 +118,9 @@ declare class ChildChangeAccumulator {
     getChanges(): Change[];
 }
 
-/** Removes all registered seeds. * @internal
+/**
+ * Removes all registered seeds.
+ * @internal
  */
 export declare function _clearServerCacheSeeds(): void;
 
@@ -609,19 +611,6 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  */
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
 
-/**
- * Enables client-side persistence of the server cache for this Database
- * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
- * and restored on the next startup, where they paint immediately and
- * revalidate with the server via the hash protocol — an unchanged tree costs
- * a handshake, a changed one costs range-merge deltas.
- *
- * Must be called before the first listener attaches (matching the mobile
- * SDKs' setPersistenceEnabled contract); listens attached earlier simply
- * bypass persistence. No-ops where IndexedDB is unavailable.
- *
- * @internal
- */
 /**
  * Reads the persisted server cache for `path` WITHOUT attaching a listener —
  * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
@@ -1890,6 +1879,7 @@ declare interface PersistedRecord {
  * How long after the last server update a root's write-through runs. The
  * flush serializes the whole root (val(true) + the structured clone into
  * IndexedDB), so it is deliberately coarse for very large roots.
+ * @internal
  */
 export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 
@@ -1952,6 +1942,10 @@ declare class PersistenceManager {
     private flush_;
 }
 
+/**
+ * Counters for observing persistence effectiveness.
+ * @internal
+ */
 export declare const _persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
@@ -2658,6 +2652,19 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @internal
+ */
 export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 /**

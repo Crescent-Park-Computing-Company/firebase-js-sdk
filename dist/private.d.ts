@@ -1834,12 +1834,7 @@ declare interface PersistedRecord {
     revision: number;
 }
 
-/**
- * How long after the last server update a root's write-through runs. The
- * flush serializes the whole root (val(true) + the structured clone into
- * IndexedDB), so it is deliberately coarse for very large roots.
- */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
+/* Excluded from this release type: _PERSISTENCE_WRITE_DEBOUNCE_MS */
 
 /**
  * One PersistenceManager per Repo. `prefix` namespaces records so multiple
@@ -1900,15 +1895,7 @@ declare class PersistenceManager {
     private flush_;
 }
 
-export declare const _persistenceStats: {
-    restoredRoots: string[];
-    restoreMisses: string[];
-    writeThroughs: number;
-    hashRecomputes: number;
-    staleHashDiscards: number;
-    evictions: number;
-    storageFailures: number;
-};
+/* Excluded from this release type: _persistenceStats */
 
 /**
  * Firebase connection.  Abstracts wire protocol and handles reconnecting.
@@ -2450,7 +2437,7 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+/* Excluded from this release type: _setPersistenceEnabled */
 
 /**
  * Sets a priority for the data at this Database location.

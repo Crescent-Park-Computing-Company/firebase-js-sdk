@@ -1410,6 +1410,7 @@ const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
  * How long after the last server update a root's write-through runs. The
  * flush serializes the whole root (val(true) + the structured clone into
  * IndexedDB), so it is deliberately coarse for very large roots.
+ * @internal
  */
 const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 /**
@@ -1418,6 +1419,10 @@ const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * and only when IndexedDB is pathologically slow.
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
+/**
+ * Counters for observing persistence effectiveness.
+ * @internal
+ */
 const persistenceStats = {
     restoredRoots: [],
     restoreMisses: [],
@@ -3907,7 +3912,9 @@ function seedServerCache(path, json, hash, compoundHash) {
     }
     seeds.set(normalizeSeedPath(path), { json, hash, compoundHash });
 }
-/** Removes all registered seeds. * @internal
+/**
+ * Removes all registered seeds.
+ * @internal
  */
 function clearServerCacheSeeds() {
     seeds.clear();
@@ -12011,60 +12018,7 @@ function repoStart(repo, appId, authOverride) {
     repoUpdateInfo(repo, 'connected', false);
     repo.serverSyncTree_ = new SyncTree({
         startListening: (query, tag, currentHashFn, onComplete) => {
-            const sendListen = () => {
-                repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-                    const events = onComplete(status, data);
-                    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-                    // 'ok' certifies the (possibly restored) server cache as current —
-                    // the listen-complete counts as a server update for persistence. Any
-                    // other status (permission_denied, listen revoked) evicts the stored
-                    // copy: a cached tree must not outlive the access that produced it.
-                    if (tag == null && repo.persistence_ !== null) {
-                        if (status === 'ok') {
-                            repoPersistAfterServerUpdate(repo, query._path);
-                        }
-                        else {
-                            repo.persistence_.evict(query._path);
-                        }
-                    }
-                });
-            };
-            // Persistence: a complete default listen on a persisted-eligible root
-            // holds its outbound listen until the stored tree restores (bounded
-            // inside restore()), applies it as server data — raising cached events
-            // immediately, mobile-persistence semantics — and then listens with
-            // the restored tree's hashes. Roots the app never persisted resolve
-            // null instantly and attach exactly as before.
-            const persistence = repo.persistence_;
-            // tag is null OR undefined for a default (non-query) listen depending on
-            // the caller; loose null covers both.
-            if (persistence !== null &&
-                tag == null &&
-                query._queryParams.loadsAllData()) {
-                const pathString = query._path.toString();
-                persistence.track(pathString);
-                void persistence.restore(pathString).then(record => {
-                    if (record !== null) {
-                        try {
-                            const node = buildSeedNode({
-                                json: record.json,
-                                hash: record.hash,
-                                compoundHash: record.compoundHash
-                            });
-                            if (!node.isEmpty()) {
-                                const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, node);
-                                eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-                            }
-                        }
-                        catch (e) {
-                            // A malformed record must never break the listen.
-                        }
-                    }
-                    sendListen();
-                });
-                return [];
-            }
-            sendListen();
+            repoStartServerListen(repo, query, tag, currentHashFn, onComplete);
             // No synchronous events for network-backed sync trees
             return [];
         },
@@ -12128,6 +12082,60 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
     if (tag == null) {
         repoPersistAfterServerUpdate(repo, path);
     }
+}
+/**
+ * Sends a listen for the server sync tree, restoring the persisted server
+ * cache first where applicable: a complete default listen on a persisted
+ * root is held until the stored tree restores (bounded inside restore()),
+ * the restored tree is applied as server data — raising cached events
+ * immediately, mobile-persistence semantics — and the listen then goes out
+ * carrying the restored tree's hashes. Roots that were never persisted
+ * resolve null instantly and attach exactly as before.
+ */
+function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
+    const sendListen = () => {
+        repo.server_.listen(query, currentHashFn, tag, (status, data) => {
+            const events = onComplete(status, data);
+            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+            // A listen 'ok' certifies the (possibly restored) server cache as
+            // current; any other status (permission_denied, listen revoked) evicts
+            // the stored copy — a cached tree must not outlive the access that
+            // produced it. tag is null or undefined for a default listen depending
+            // on the caller; loose null covers both.
+            if (tag == null && repo.persistence_ !== null) {
+                if (status === 'ok') {
+                    repoPersistAfterServerUpdate(repo, query._path);
+                }
+                else {
+                    repo.persistence_.evict(query._path);
+                }
+            }
+        });
+    };
+    const persistence = repo.persistence_;
+    if (persistence === null ||
+        tag != null ||
+        !query._queryParams.loadsAllData()) {
+        sendListen();
+        return;
+    }
+    const pathString = query._path.toString();
+    persistence.track(pathString);
+    void persistence.restore(pathString).then(record => {
+        if (record !== null) {
+            try {
+                const node = buildSeedNode(record);
+                if (!node.isEmpty()) {
+                    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, node);
+                    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+                }
+            }
+            catch (e) {
+                // A malformed record must never break the listen.
+            }
+        }
+        sendListen();
+    });
 }
 /**
  * Persistence write-through: after the server updated `path` (overwrite,
@@ -14927,19 +14935,6 @@ function goOffline(db) {
     repoInterrupt(db._repo);
 }
 /**
- * Enables client-side persistence of the server cache for this Database
- * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
- * and restored on the next startup, where they paint immediately and
- * revalidate with the server via the hash protocol — an unchanged tree costs
- * a handshake, a changed one costs range-merge deltas.
- *
- * Must be called before the first listener attaches (matching the mobile
- * SDKs' setPersistenceEnabled contract); listens attached earlier simply
- * bypass persistence. No-ops where IndexedDB is unavailable.
- *
- * @internal
- */
-/**
  * Reads the persisted server cache for `path` WITHOUT attaching a listener —
  * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
@@ -14982,6 +14977,19 @@ function getPersistedValue(db, pathString) {
     });
     return attempt(path);
 }
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @internal
+ */
 function setPersistenceEnabled(db, enabled) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
