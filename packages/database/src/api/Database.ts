@@ -49,15 +49,14 @@ import {
   repoWhenListenComplete
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
+import { SeedCompoundHash } from '../core/ServerCacheSeed';
+import { nodeFromJSON } from '../core/snap/nodeFromJSON';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import {
   newEmptyPath,
   newRelativePath,
   Path,
-  pathGetFront,
-  pathIsEmpty,
-  pathParent,
-  pathPopFront
+  pathIsEmpty
 } from '../core/util/Path';
 import {
   warn,
@@ -465,31 +464,19 @@ export function getPersistedValue(
     return Promise.resolve(null);
   }
   // Records are stored per listened ROOT; a peek at a subpath restores the
-  // deepest stored ancestor (walking up from the full path) and drills into
-  // its JSON along the remaining segments.
+  // deepest stored ancestor (one IndexedDB read over the whole chain) and
+  // drills into its tree along the remaining segments. Going through the
+  // node model — not the raw stored JSON — matters: records hold EXPORT
+  // format (val(true)), and a raw walk would surface '.value'/'.priority'
+  // wrappers instead of the values snapshot.val() semantics promise.
   const path = new Path(pathString);
-  const attempt = (candidate: Path): Promise<unknown | null> =>
-    persistence.restore(candidate.toString()).then(record => {
-      if (record !== null) {
-        // candidate is an ancestor of (or equal to) path by construction.
-        let cursor = newRelativePath(candidate, path);
-        let value: unknown = record.json;
-        while (!pathIsEmpty(cursor)) {
-          if (value === null || typeof value !== 'object') {
-            return null;
-          }
-          value = (value as Record<string, unknown>)[pathGetFront(cursor)!];
-          cursor = pathPopFront(cursor);
-        }
-        return value === undefined ? null : value;
-      }
-      const parent = pathParent(candidate);
-      if (parent === null) {
-        return null;
-      }
-      return attempt(parent);
-    });
-  return attempt(path);
+  return persistence.restoreNearest(path.toString()).then(result => {
+    if (result === null) {
+      return null;
+    }
+    const relativePath = newRelativePath(new Path(result.root), path);
+    return nodeFromJSON(result.record.json).getChild(relativePath).val();
+  });
 }
 
 /**
@@ -521,6 +508,48 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
       repo.persistence_ = null;
     }
   }
+}
+
+/**
+ * Registers cached JSON as the initial server cache for `path` on this
+ * Database instance. Must be called before the listener for that exact path
+ * attaches — the seed is consumed (once) at listener registration, and only
+ * by a default (complete, unfiltered) query: a filtered query's listen hash
+ * is computed over the filtered subset, which raw cached JSON is not. See
+ * core/ServerCacheSeed.ts.
+ *
+ * @param db - The instance whose next listen at `path` should be seeded.
+ * @param path - Absolute database path the JSON was cached for.
+ * @param json - The cached value. null/undefined seeds nothing (an empty
+ * tree's hash is what an unseeded listen sends anyway).
+ * @param hash - Optional precomputed canonical hash of `json` (the exact
+ * value computeCanonicalHash returns for it).
+ * @param compoundHash - Optional precomputed compound hash of `json` (the
+ * exact value computeCompoundHash returns for it).
+ * @internal
+ */
+export function seedServerCache(
+  db: Database,
+  path: string,
+  json: unknown,
+  hash?: string,
+  compoundHash?: SeedCompoundHash
+): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('seedServerCache');
+  // _repoInternal: seeding is boot-time configuration and must not start
+  // the instance.
+  db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
+}
+
+/**
+ * Removes all seeds registered on this Database instance.
+ * @internal
+ */
+export function clearServerCacheSeeds(db: Database): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('clearServerCacheSeeds');
+  db._repoInternal.serverCacheSeeds_.clear();
 }
 
 /**

@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 
 import { getPersistedValue } from '../src/api/Database';
+import { QueryImpl } from '../src/api/Reference_impl';
 import {
   PersistenceManager,
   PersistedRecord,
@@ -34,9 +35,15 @@ import {
   computeCompoundHash
 } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
-import { SyncTree } from '../src/core/SyncTree';
+import {
+  SyncTree,
+  syncTreeAddEventRegistration,
+  syncTreeApplyServerOverwrite,
+  syncTreeGetCompleteServerCache
+} from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
 import { EventQueue } from '../src/core/view/EventQueue';
+import { QueryParams } from '../src/core/view/QueryParams';
 
 /**
  * A minimal in-memory IDBFactory covering exactly the calls the manager
@@ -128,7 +135,10 @@ function makeFakeIndexedDB(options: { startWithoutStore?: boolean } = {}): {
         throw new Error('NotFoundError: object store not found');
       }
       const t = { ...tx };
-      async(() => t.oncomplete && t.oncomplete());
+      // Requests complete on microtasks; the transaction completes on a
+      // macrotask — after every request issued against it, as in real
+      // IndexedDB.
+      setTimeout(() => t.oncomplete && t.oncomplete(), 0);
       return t;
     }
   });
@@ -170,7 +180,16 @@ function makeFakeIndexedDB(options: { startWithoutStore?: boolean } = {}): {
 }
 
 function flushAsync(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, 0));
+  // Several macrotask turns: the manager's transactions complete on
+  // macrotasks (see the fake above), and one operation may chain multiple
+  // transactions (open -> read -> delete; data put -> hash put).
+  let chain = Promise.resolve();
+  for (let i = 0; i < 8; i++) {
+    chain = chain.then(
+      () => new Promise<void>(resolve => setTimeout(resolve, 0))
+    );
+  }
+  return chain;
 }
 
 describe('PersistenceManager', () => {
@@ -474,6 +493,73 @@ describe('repoStartServerListen / repoStopServerListen', () => {
   });
 });
 
+describe('stale restore vs live server data', () => {
+  it('a restore that loses the race does not clobber certified data', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    const path = new Path('users/alice');
+    // A record from the last session…
+    data.set('test-repo|/users/alice', {
+      json: { stale: true },
+      updatedAt: Date.now(),
+      revision: 1
+    });
+
+    const calls: string[] = [];
+    const syncTree = new SyncTree({
+      startListening: () => [],
+      stopListening: () => {}
+    });
+    const repo = {
+      pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
+      listenCompletions_: new Map<
+        string,
+        { complete: boolean; waiters: Array<() => void> }
+      >(),
+      persistence_: manager,
+      eventQueue_: new EventQueue(),
+      serverSyncTree_: syncTree,
+      server_: {
+        listen: () => calls.push('listen'),
+        unlisten: () => calls.push('unlisten')
+      }
+    } as unknown as Repo;
+    const query = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    const registration = {
+      respondsTo: () => true,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createEvent: () => null as any,
+      getEventRunner: () => () => {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
+      hasAnyCallback: () => true
+    };
+    syncTreeAddEventRegistration(syncTree, query, registration);
+
+    repoStartServerListen(
+      repo,
+      query,
+      null,
+      (() => '') as never,
+      (() => []) as never
+    );
+    // …but the server certifies fresher data while the restore is in flight.
+    syncTreeApplyServerOverwrite(syncTree, path, nodeFromJSON({ live: true }));
+    await flushAsync();
+
+    const cache = syncTreeGetCompleteServerCache(syncTree, path);
+    expect(cache).to.not.equal(null);
+    expect(cache!.val(true)).to.deep.equal({ live: true });
+  });
+});
+
 describe('getPersistedValue', () => {
   function makeDatabaseWithPersistence(): {
     db: unknown;
@@ -512,5 +598,23 @@ describe('getPersistedValue', () => {
       await getPersistedValue(db as never, '/users/alice/missing/deep')
     ).to.equal(null);
     expect(await getPersistedValue(db as never, '/users/bob')).to.equal(null);
+  });
+
+  it('unwraps export-format records to snapshot.val() semantics', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('prio/root');
+    manager.track(root.toString());
+    // A prioritized leaf persists as {'.value': ..., '.priority': ...}
+    // (export format); the peek must return the plain value.
+    const node = nodeFromJSON({ a: { '.value': 42, '.priority': 7 }, b: 'x' });
+    manager.serverCacheUpdated(root, node);
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    expect(await getPersistedValue(db as never, '/prio/root/a')).to.equal(42);
+    expect(await getPersistedValue(db as never, '/prio/root')).to.deep.equal({
+      a: 42,
+      b: 'x'
+    });
   });
 });

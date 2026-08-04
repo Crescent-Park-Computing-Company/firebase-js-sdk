@@ -33,8 +33,8 @@ import {
   buildSeedNode,
   getNodeCompoundHash,
   ListenHashFn,
-  serverCacheSeedStats,
-  takeServerCacheSeed
+  ServerCacheSeed,
+  serverCacheSeedStats
 } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
@@ -65,7 +65,12 @@ import { each, errorForServerCode } from './util/util';
 import { CacheNode } from './view/CacheNode';
 import { Event } from './view/Event';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
-import { View, viewGetCompleteNode, viewGetServerCache } from './view/View';
+import {
+  View,
+  viewGetCompleteNode,
+  viewGetCompleteServerCache,
+  viewGetServerCache
+} from './view/View';
 import {
   newWriteTree,
   WriteTree,
@@ -105,6 +110,12 @@ export interface ListenProvider {
   ): Event[];
 
   stopListening(a: QueryContext, b: number | null): void;
+
+  /**
+   * Consumes the server-cache seed registered for `pathString`, if any (see
+   * ServerCacheSeedStore). Absent for providers without seeding (.info).
+   */
+  takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 
 /**
@@ -339,7 +350,11 @@ export function syncTreeGetCompleteServerCache(
   if (!view) {
     return null;
   }
-  return viewGetServerCache(view) || null;
+  // The CERTIFIED cache only (fully server-initialized) — never a seeded or
+  // child-assembled partial tree: this feeds the persistence write-through,
+  // and persisting uncertified data would surface it as server truth on the
+  // next boot.
+  return viewGetCompleteServerCache(view, newEmptyPath());
 }
 
 /**
@@ -364,11 +379,11 @@ export function syncTreeApplyServerRangeMerges(
     // No complete view for this update: it was removed, ignore
     return [];
   }
-  let serverNode = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-  for (const merge of merges) {
-    serverNode = merge.applyTo(serverNode);
-  }
-  return syncTreeApplyServerOverwrite(syncTree, path, serverNode);
+  return syncTreeApplyServerOverwrite(
+    syncTree,
+    path,
+    applyRangeMergesToView(view, merges)
+  );
 }
 
 /**
@@ -396,11 +411,25 @@ export function syncTreeApplyTaggedRangeMerges(
   if (!view) {
     return [];
   }
+  return syncTreeApplyTaggedQueryOverwrite(
+    syncTree,
+    r.path,
+    applyRangeMergesToView(view, merges),
+    tag
+  );
+}
+
+/**
+ * Folds server range merges over a view's raw server cache — the tree the
+ * listen's hashes were computed from, certified or not — producing the tree
+ * the overwrite paths then promote.
+ */
+function applyRangeMergesToView(view: View, merges: RangeMerge[]): Node {
   let serverNode = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
   for (const merge of merges) {
     serverNode = merge.applyTo(serverNode);
   }
-  return syncTreeApplyTaggedQueryOverwrite(syncTree, r.path, serverNode, tag);
+  return serverNode;
 }
 
 /**
@@ -629,7 +658,9 @@ export function syncTreeAddEventRegistration(
     // until the server certifies it (see ServerCacheSeed).
     serverCache = null;
     if (query._queryParams.loadsAllData()) {
-      const seed = takeServerCacheSeed(path.toString());
+      const seed = syncTree.listenProvider_.takeServerCacheSeed?.(
+        path.toString()
+      );
       if (seed !== undefined) {
         try {
           serverCache = buildSeedNode(seed);

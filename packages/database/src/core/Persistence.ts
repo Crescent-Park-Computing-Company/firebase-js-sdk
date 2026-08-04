@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
-import { compoundHashFromNodeAsync } from './CompoundHash';
+import { isIndexedDBAvailable } from '@firebase/util';
+
+import { compoundHashFromNodeAsync, hashFromNodeAsync } from './CompoundHash';
 import { SeedCompoundHash } from './ServerCacheSeed';
 import { Node } from './snap/Node';
-import { Path } from './util/Path';
+import { Path, pathParent } from './util/Path';
 
 /**
  * Client-side persistence of the server cache, in the spirit of the mobile
@@ -37,24 +39,28 @@ import { Path } from './util/Path';
  * costs range-merge deltas; a cold root costs exactly today's full download.
  *
  * What is persisted, per top-level listened ROOT (a complete, unfiltered
- * listen):
- *   - the last server-confirmed tree, as exported JSON (val(true) — priorities
- *     preserved), written through debounced on server overwrites / merges /
- *     range merges / listen-completes;
- *   - the tree's canonical listen hash and compound hash, recomputed AFTER
- *     each write-through in idle-time slices (compoundHashFromNodeAsync) and
- *     stored alongside, so the next startup seeds in O(1) with no tree walk.
+ * listen), as TWO records under adjacent keys:
+ *   - the data record: the last server-confirmed tree as exported JSON
+ *     (val(true) — priorities preserved), written through debounced on
+ *     server overwrites / merges / range merges / listen-completes;
+ *   - the hash record: the tree's canonical listen hash and compound hash,
+ *     recomputed AFTER each write-through in idle-time slices and stored
+ *     separately, so a flush serializes the tree exactly once and the hash
+ *     lands as a small follow-up write.
  *
- * Coupling stored hashes to stored trees: every write-through bumps a
- * per-root `revision`; the async recompute carries the revision it hashed
- * and its result is discarded when a newer write-through superseded it. A
- * record whose hashes are missing (recompute pending at shutdown) restores
- * WITHOUT hashes — the data still paints, the listen just goes out
- * hashless, exactly a cold load for that root.
+ * Coupling stored hashes to stored trees: every write-through stamps the
+ * data record with a manager-wide monotonic `revision`; the async recompute
+ * carries the revision it hashed and its result is discarded when a newer
+ * write-through superseded it. On restore the hash record is joined only
+ * when its revision matches the data record's — a mismatch (recompute
+ * pending at shutdown) restores WITHOUT hashes: the data still paints, the
+ * listen just goes out hashless, exactly a cold load for that root.
  *
  * Storage: one IndexedDB database ('firebase-database-persistence'), one
- * object store, keyed "<repo prefix>|<path>". All storage failures degrade
- * to cold loads; nothing here may ever break the live connection.
+ * object store, keyed "<repo prefix>|<path>" (data) and
+ * "<repo prefix>|<path>#hash" (hashes; '#' cannot appear in a path segment).
+ * All storage failures degrade to cold loads; nothing here may ever break
+ * the live connection.
  */
 
 const STORE = 'firebase-server-cache';
@@ -88,6 +94,14 @@ export interface PersistedRecord {
   revision: number;
 }
 
+/** The hash follow-up record stored next to a data record. */
+interface PersistedHashRecord {
+  hash: string;
+  compoundHash: SeedCompoundHash;
+  updatedAt: number;
+  revision: number;
+}
+
 /**
  * Counters for observing persistence effectiveness.
  * @internal
@@ -110,6 +124,8 @@ export const persistenceStats: {
   storageFailures: 0
 };
 
+const HASH_KEY_SUFFIX = '#hash';
+
 /**
  * One PersistenceManager per Repo. `prefix` namespaces records so multiple
  * databases/apps sharing the page don't collide. `idbFactory` exists for
@@ -122,15 +138,19 @@ export class PersistenceManager {
    */
   private trackedRoots_ = new Set<string>();
   /**
-   * Latest server tree per root; revision couples hashes to trees.
+   * Latest server tree per root. Revisions come from a single manager-wide
+   * counter, so no revision is ever reissued — an in-flight hash recompute
+   * can never collide with a tree that arrived after its root was evicted
+   * and re-tracked.
    */
   private latest_ = new Map<string, { node: Node; revision: number }>();
+  private revisionCounter_ = 0;
   private writeTimers_ = new Map<string, ReturnType<typeof setTimeout>>();
   private disposed_ = false;
 
   constructor(
     private prefix_: string,
-    private idbFactory_: IDBFactory | null = typeof indexedDB !== 'undefined'
+    private idbFactory_: IDBFactory | null = isIndexedDBAvailable()
       ? indexedDB
       : null
   ) {}
@@ -218,8 +238,9 @@ export class PersistenceManager {
 
   /**
    * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
-   * cursor walk. Best-effort: any failure leaves the records for the next
-   * session's sweep.
+   * cursor walk. Both record kinds carry `updatedAt`, so data and hash
+   * records expire together. Best-effort: any failure leaves the records
+   * for the next session's sweep.
    */
   private sweepExpired_(db: IDBDatabase): void {
     const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
@@ -233,7 +254,7 @@ export class PersistenceManager {
           return;
         }
         const key = cursor.key;
-        const record = cursor.value as PersistedRecord | undefined;
+        const record = cursor.value as { updatedAt?: unknown } | undefined;
         if (
           typeof key === 'string' &&
           key.startsWith(prefix) &&
@@ -285,69 +306,95 @@ export class PersistenceManager {
     return this.prefix_ + '|' + pathString;
   }
 
-  private idbGet_(pathString: string): Promise<PersistedRecord | null> {
+  /**
+   * Runs `body` against the object store in a transaction of the given mode
+   * and resolves with what `body` chose to deliver (via its `done` callback)
+   * once the transaction completes. Every failure path — no database, a
+   * throwing store call, an aborted transaction — resolves `fallback` and
+   * counts one storageFailure (except when IndexedDB is absent altogether,
+   * which is a supported cold-load configuration, not a failure).
+   */
+  private withStore_<T>(
+    mode: IDBTransactionMode,
+    fallback: T,
+    body: (store: IDBObjectStore, done: (value: T) => void) => void
+  ): Promise<T> {
     return this.open_().then(
       db =>
-        new Promise<PersistedRecord | null>(resolve => {
+        new Promise<T>(resolve => {
           if (!db) {
-            resolve(null);
+            resolve(fallback);
             return;
           }
           try {
-            const tx = db.transaction(STORE, 'readonly');
-            const req = tx.objectStore(STORE).get(this.key_(pathString));
-            req.onsuccess = () =>
-              resolve((req.result as PersistedRecord) ?? null);
-            req.onerror = () => resolve(null);
-          } catch (e) {
-            resolve(null);
-          }
-        })
-    );
-  }
-
-  private idbPut_(pathString: string, record: PersistedRecord): Promise<void> {
-    return this.open_().then(
-      db =>
-        new Promise<void>(resolve => {
-          if (!db) {
-            resolve();
-            return;
-          }
-          try {
-            const tx = db.transaction(STORE, 'readwrite');
-            tx.objectStore(STORE).put(record, this.key_(pathString));
-            tx.oncomplete = () => resolve();
+            const tx = db.transaction(STORE, mode);
+            let value = fallback;
+            body(tx.objectStore(STORE), v => {
+              value = v;
+            });
+            tx.oncomplete = () => resolve(value);
             tx.onabort = tx.onerror = () => {
               persistenceStats.storageFailures++;
-              resolve();
+              resolve(fallback);
             };
           } catch (e) {
             persistenceStats.storageFailures++;
-            resolve();
+            resolve(fallback);
           }
         })
     );
   }
 
-  private idbDelete_(pathString: string): Promise<void> {
-    return this.open_().then(
-      db =>
-        new Promise<void>(resolve => {
-          if (!db) {
-            resolve();
+  /**
+   * Reads a root's data record and joins its hash record when the revisions
+   * match, in one readonly transaction. Expired records resolve null (and
+   * are deleted best-effort).
+   */
+  private readRecord_(pathString: string): Promise<PersistedRecord | null> {
+    return this.withStore_<PersistedRecord | null>(
+      'readonly',
+      null,
+      (store, done) => {
+        const dataReq = store.get(this.key_(pathString));
+        const hashReq = store.get(this.key_(pathString) + HASH_KEY_SUFFIX);
+        dataReq.onsuccess = () => {
+          const record = dataReq.result as PersistedRecord | undefined;
+          if (!record) {
+            done(null);
             return;
           }
-          try {
-            const tx = db.transaction(STORE, 'readwrite');
-            tx.objectStore(STORE).delete(this.key_(pathString));
-            tx.oncomplete = () => resolve();
-            tx.onabort = tx.onerror = () => resolve();
-          } catch (e) {
-            resolve();
+          const hashes = hashReq.result as PersistedHashRecord | undefined;
+          if (hashes && hashes.revision === record.revision) {
+            done({
+              json: record.json,
+              hash: hashes.hash,
+              compoundHash: hashes.compoundHash,
+              updatedAt: record.updatedAt,
+              revision: record.revision
+            });
+          } else {
+            done(record);
           }
-        })
-    );
+        };
+      }
+    ).then(record => {
+      if (!record) {
+        return null;
+      }
+      if (Date.now() - record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+        persistenceStats.evictions++;
+        void this.deleteRecord_(pathString);
+        return null;
+      }
+      return record;
+    });
+  }
+
+  private deleteRecord_(pathString: string): Promise<void> {
+    return this.withStore_<void>('readwrite', undefined, store => {
+      store.delete(this.key_(pathString));
+      store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
+    });
   }
 
   /**
@@ -358,27 +405,88 @@ export class PersistenceManager {
     if (this.disposed_) {
       return Promise.resolve(null);
     }
-    const read = this.idbGet_(pathString).then(record => {
-      if (!record) {
-        return null;
+    return this.raceRestoreTimeout_(this.readRecord_(pathString)).then(
+      record => {
+        if (record) {
+          persistenceStats.restoredRoots.push(pathString);
+        } else {
+          persistenceStats.restoreMisses.push(pathString);
+        }
+        return record;
       }
-      if (Date.now() - record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
-        persistenceStats.evictions++;
-        void this.idbDelete_(pathString);
-        return null;
-      }
-      return record;
-    });
-    const timeout = new Promise<null>(resolve =>
-      setTimeout(() => resolve(null), PERSISTENCE_RESTORE_TIMEOUT_MS)
     );
-    return Promise.race([read, timeout]).then(record => {
-      if (record) {
-        persistenceStats.restoredRoots.push(pathString);
-      } else {
-        persistenceStats.restoreMisses.push(pathString);
+  }
+
+  /**
+   * The boot-peek read (see getPersistedValue): resolves the record of the
+   * DEEPEST persisted ancestor of `pathString` (or of the path itself),
+   * fetching the whole ancestor chain in one readonly transaction. Expired
+   * ancestors are skipped (and deleted best-effort). Does not touch the
+   * restore counters — a peek is not a listen restore.
+   */
+  restoreNearest(
+    pathString: string
+  ): Promise<{ root: string; record: PersistedRecord } | null> {
+    if (this.disposed_) {
+      return Promise.resolve(null);
+    }
+    // Deepest first: the path itself, then each ancestor up to the root.
+    const candidates: string[] = [];
+    let path: Path | null = new Path(pathString);
+    while (path !== null) {
+      candidates.push(path.toString());
+      path = pathParent(path);
+    }
+    const read = this.withStore_<Array<PersistedRecord | undefined>>(
+      'readonly',
+      [],
+      (store, done) => {
+        const results: Array<PersistedRecord | undefined> = new Array(
+          candidates.length
+        );
+        let remaining = candidates.length;
+        candidates.forEach((candidate, i) => {
+          const req = store.get(this.key_(candidate));
+          req.onsuccess = () => {
+            results[i] = req.result as PersistedRecord | undefined;
+            if (--remaining === 0) {
+              done(results);
+            }
+          };
+        });
       }
-      return record;
+    ).then(results => {
+      const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+      for (let i = 0; i < results.length; i++) {
+        const record = results[i];
+        if (!record) {
+          continue;
+        }
+        if (record.updatedAt < cutoff) {
+          persistenceStats.evictions++;
+          void this.deleteRecord_(candidates[i]);
+          continue;
+        }
+        return { root: candidates[i], record };
+      }
+      return null;
+    });
+    return this.raceRestoreTimeout_(read);
+  }
+
+  /**
+   * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
+   * soon as the read settles first (the common case — otherwise every
+   * restore would pin its Repo in memory for the full budget).
+   */
+  private raceRestoreTimeout_<T>(read: Promise<T | null>): Promise<T | null> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<null>(resolve => {
+      timer = setTimeout(() => resolve(null), PERSISTENCE_RESTORE_TIMEOUT_MS);
+    });
+    return Promise.race([read, timeout]).then(result => {
+      clearTimeout(timer);
+      return result;
     });
   }
 
@@ -395,9 +503,7 @@ export class PersistenceManager {
     if (!this.trackedRoots_.has(pathString)) {
       return;
     }
-    const prev = this.latest_.get(pathString);
-    const revision = (prev ? prev.revision : 0) + 1;
-    this.latest_.set(pathString, { node, revision });
+    this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
     const existing = this.writeTimers_.get(pathString);
     if (existing) {
       clearTimeout(existing);
@@ -406,7 +512,7 @@ export class PersistenceManager {
       pathString,
       setTimeout(() => {
         this.writeTimers_.delete(pathString);
-        this.flush_(pathString);
+        void this.flush_(pathString);
       }, PERSISTENCE_WRITE_DEBOUNCE_MS)
     );
   }
@@ -424,7 +530,7 @@ export class PersistenceManager {
       this.writeTimers_.delete(pathString);
     }
     persistenceStats.evictions++;
-    void this.idbDelete_(pathString);
+    void this.deleteRecord_(pathString);
   }
 
   dispose(): void {
@@ -455,15 +561,22 @@ export class PersistenceManager {
     }
     const { node, revision } = entry;
     persistenceStats.writeThroughs++;
-    // Data first, hashless: a crash before the hash recompute leaves a
-    // restorable tree that seeds without a hash instead of nothing.
+    // The tree is serialized and written exactly once, hashless — a crash
+    // before the recompute leaves a restorable tree that seeds without a
+    // hash instead of nothing. The hashes follow as a small separate record.
     const record: PersistedRecord = {
       json: node.val(true),
       updatedAt: Date.now(),
       revision
     };
-    return this.idbPut_(pathString, record).then(() =>
-      compoundHashFromNodeAsync(node).then(compoundHash => {
+    const put = this.withStore_<void>('readwrite', undefined, store => {
+      store.put(record, this.key_(pathString));
+    });
+    return put.then(() =>
+      Promise.all([
+        hashFromNodeAsync(node),
+        compoundHashFromNodeAsync(node)
+      ]).then(([hash, compoundHash]) => {
         const current = this.latest_.get(pathString);
         if (!current || current.revision !== revision || this.disposed_) {
           // A newer server update superseded this tree while it hashed; its
@@ -473,15 +586,17 @@ export class PersistenceManager {
           return;
         }
         persistenceStats.hashRecomputes++;
-        return this.idbPut_(pathString, {
-          json: record.json,
-          hash: node.hash(),
+        const hashRecord: PersistedHashRecord = {
+          hash,
           compoundHash: {
             hashes: compoundHash.hashes,
             posts: compoundHash.posts
           },
           updatedAt: record.updatedAt,
           revision
+        };
+        return this.withStore_<void>('readwrite', undefined, store => {
+          store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
         });
       })
     );

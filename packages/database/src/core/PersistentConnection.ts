@@ -35,11 +35,7 @@ import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import {
-  ListenHashFn,
-  normalizeStatsPath,
-  serverCacheSeedStats
-} from './ServerCacheSeed';
+import { ListenHashFn, serverCacheSeedStats } from './ServerCacheSeed';
 import { OnlineMonitor } from './util/OnlineMonitor';
 import { Path } from './util/Path';
 import { error, log, logWrapper, warn, ObjectToUniqueKey } from './util/util';
@@ -101,6 +97,13 @@ export class PersistentConnection extends ServerActions {
     /* path */ string,
     Map</* queryId */ string, ListenSpec>
   > = new Map();
+  /**
+   * Data pushes received per ACTIVE listen path (see hashMatches in
+   * serverCacheSeedStats): entries live only while a listen exists at the
+   * path — created on the first push, dropped in removeListen_ — so the map
+   * is bounded by the number of active listens.
+   */
+  private dataPushes_: Map<string, number> = new Map();
   private outstandingPuts_: OutstandingPut[] = [];
   private outstandingGets_: OutstandingGet[] = [];
   private outstandingPutCount_ = 0;
@@ -311,9 +314,7 @@ export class PersistentConnection extends ServerActions {
       serverCacheSeedStats.listensSentWithHash++;
     }
     const hadHash = req['h'] !== '';
-    const pushesBefore =
-      serverCacheSeedStats.dataPushesByPath[normalizeStatsPath(pathString)] ||
-      0;
+    const pushesBefore = this.dataPushes_.get(pathString) || 0;
 
     this.sendRequest(action, req, (message: { [k: string]: unknown }) => {
       const payload: unknown = message[/*data*/ 'd'];
@@ -325,9 +326,7 @@ export class PersistentConnection extends ServerActions {
         // out means the server accepted our hash as current.
         if (
           hadHash &&
-          (serverCacheSeedStats.dataPushesByPath[
-            normalizeStatsPath(pathString)
-          ] || 0) === pushesBefore
+          (this.dataPushes_.get(pathString) || 0) === pushesBefore
         ) {
           serverCacheSeedStats.hashMatches++;
         }
@@ -705,9 +704,13 @@ export class PersistentConnection extends ServerActions {
       body &&
       body['p'] !== undefined
     ) {
-      const statsPath = normalizeStatsPath(body['p'] as string);
-      serverCacheSeedStats.dataPushesByPath[statsPath] =
-        (serverCacheSeedStats.dataPushesByPath[statsPath] || 0) + 1;
+      const pushPath = new Path(body['p'] as string).toString();
+      if (this.listens.has(pushPath)) {
+        this.dataPushes_.set(
+          pushPath,
+          (this.dataPushes_.get(pushPath) || 0) + 1
+        );
+      }
     }
     if (action === 'd') {
       this.onDataUpdate_(
@@ -1033,6 +1036,7 @@ export class PersistentConnection extends ServerActions {
       map.delete(queryId);
       if (map.size === 0) {
         this.listens.delete(normalizedPathString);
+        this.dataPushes_.delete(normalizedPathString);
       }
     } else {
       // all listens for this path has already been removed

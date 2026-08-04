@@ -18,6 +18,7 @@
 import { compoundHashFromNode } from './CompoundHash';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
+import { Path } from './util/Path';
 
 /**
  * Server-cache seeding: apps that persist a copy of their data (e.g. in
@@ -38,6 +39,10 @@ import { nodeFromJSON } from './snap/nodeFromJSON';
  * full overwrite) promotes it to complete, server-certified state. Wrong or
  * stale seeded data therefore costs at most a missed hash — it is never
  * surfaced to the app as current data.
+ *
+ * Seeds are scoped to one Database instance (one Repo): each Repo owns a
+ * ServerCacheSeedStore, and its SyncTree consumes from that store only —
+ * two instances listening to the same path never steal each other's seeds.
  *
  * The optional precomputed hashes exist so callers can compute them off the
  * main thread (e.g. in a worker, via computeCanonicalHash /
@@ -66,68 +71,48 @@ export interface ListenHashFn {
   compoundHash?: () => SeedCompoundHash | undefined;
 }
 
-interface ServerCacheSeed {
+export interface ServerCacheSeed {
   json: unknown;
   hash?: string;
   compoundHash?: SeedCompoundHash;
 }
 
-const seeds = new Map<string, ServerCacheSeed>();
-
-function normalizeSeedPath(path: string): string {
-  const trimmed = String(path).replace(/^\/+|\/+$/g, '');
-  return trimmed === '' ? '/' : '/' + trimmed;
-}
-
 /**
- * Registers cached JSON as the initial server cache for `path`. Must be
- * called before the listener for that exact path attaches — the seed is
- * consumed (once) at listener registration, and only by a default (complete,
- * unfiltered) query: a filtered query's listen hash is computed over the
- * filtered subset, which raw cached JSON is not.
- *
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined clears nothing and seeds
- * nothing (an empty tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
+ * The seeds registered for one Repo, keyed by canonical path string
+ * (Path.toString() — the same canonicalization the consumer uses, so a seed
+ * for 'a//b/' and a listen at '/a/b' cannot drift apart).
  */
-export function seedServerCache(
-  path: string,
-  json: unknown,
-  hash?: string,
-  compoundHash?: SeedCompoundHash
-): void {
-  if (json === null || json === undefined) {
-    return;
+export class ServerCacheSeedStore {
+  private seeds_ = new Map<string, ServerCacheSeed>();
+
+  set(
+    path: string,
+    json: unknown,
+    hash?: string,
+    compoundHash?: SeedCompoundHash
+  ): void {
+    if (json === null || json === undefined) {
+      return;
+    }
+    this.seeds_.set(new Path(path).toString(), { json, hash, compoundHash });
   }
-  seeds.set(normalizeSeedPath(path), { json, hash, compoundHash });
-}
 
-/**
- * Removes all registered seeds.
- * @internal
- */
-export function clearServerCacheSeeds(): void {
-  seeds.clear();
-}
-
-/**
- * Consumes (at most once) the seed registered for exactly `pathString`.
- * Returns undefined when no seed matches.
- */
-export function takeServerCacheSeed(
-  pathString: string
-): ServerCacheSeed | undefined {
-  const key = normalizeSeedPath(pathString);
-  const seed = seeds.get(key);
-  if (seed !== undefined) {
-    seeds.delete(key);
+  /**
+   * Consumes (at most once) the seed registered for exactly `pathString`.
+   * Returns undefined when no seed matches.
+   */
+  take(pathString: string): ServerCacheSeed | undefined {
+    const key = new Path(pathString).toString();
+    const seed = this.seeds_.get(key);
+    if (seed !== undefined) {
+      this.seeds_.delete(key);
+    }
+    return seed;
   }
-  return seed;
+
+  clear(): void {
+    this.seeds_.clear();
+  }
 }
 
 /**
@@ -145,11 +130,7 @@ export function buildSeedNode(seed: ServerCacheSeed): Node {
     return node;
   }
   if (typeof seed.hash === 'string' && seed.hash.length > 0) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stampable = node as any;
-    if (stampable.lazyHash_ === null) {
-      stampable.lazyHash_ = seed.hash;
-    }
+    node.stampLazyHash(seed.hash);
   }
   const compoundHash = seed.compoundHash;
   if (
@@ -170,10 +151,7 @@ export function buildSeedNode(seed: ServerCacheSeed): Node {
  */
 const nodeCompoundHashes = new WeakMap<object, SeedCompoundHash>();
 
-export function setNodeCompoundHash(
-  node: Node,
-  compoundHash: SeedCompoundHash
-): void {
+function setNodeCompoundHash(node: Node, compoundHash: SeedCompoundHash): void {
   nodeCompoundHashes.set(node, compoundHash);
 }
 
@@ -215,7 +193,6 @@ export const serverCacheSeedStats: {
   rangeMergesReceived: number;
   seededPaths: string[];
   bytesReceived: number;
-  dataPushesByPath: Record<string, number>;
 } = {
   listensSentWithHash: 0,
   listensSentWithCompoundHash: 0,
@@ -223,11 +200,5 @@ export const serverCacheSeedStats: {
   hashMatches: 0,
   rangeMergesReceived: 0,
   seededPaths: [],
-  bytesReceived: 0,
-  dataPushesByPath: {}
+  bytesReceived: 0
 };
-
-/** Normalizes a wire path for the per-path push counters. */
-export function normalizeStatsPath(path: string): string {
-  return normalizeSeedPath(path);
-}

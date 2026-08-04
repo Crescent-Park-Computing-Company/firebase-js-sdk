@@ -21,20 +21,19 @@ import { QueryImpl } from '../src/api/Reference_impl';
 import { PersistentConnection } from '../src/core/PersistentConnection';
 import { RepoInfo } from '../src/core/RepoInfo';
 import {
-  clearServerCacheSeeds,
   computeCanonicalHash,
   computeCompoundHash,
   buildSeedNode,
   ListenHashFn,
-  seedServerCache,
-  takeServerCacheSeed
+  ServerCacheSeedStore
 } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { RangeMerge } from '../src/core/snap/RangeMerge';
 import {
   SyncTree,
   syncTreeAddEventRegistration,
-  syncTreeApplyServerRangeMerges
+  syncTreeApplyServerRangeMerges,
+  syncTreeGetCompleteServerCache
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
 import { Event } from '../src/core/view/Event';
@@ -50,8 +49,13 @@ interface CapturedListen {
   onComplete: (status: string) => Event[];
 }
 
-function makeSyncTree(): { syncTree: SyncTree; listens: CapturedListen[] } {
+function makeSyncTree(): {
+  syncTree: SyncTree;
+  listens: CapturedListen[];
+  seeds: ServerCacheSeedStore;
+} {
   const listens: CapturedListen[] = [];
+  const seeds = new ServerCacheSeedStore();
   const syncTree = new SyncTree({
     startListening: (query, tag, hashFn, onComplete) => {
       listens.push({
@@ -61,9 +65,10 @@ function makeSyncTree(): { syncTree: SyncTree; listens: CapturedListen[] } {
       });
       return [];
     },
-    stopListening: () => {}
+    stopListening: () => {},
+    takeServerCacheSeed: pathString => seeds.take(pathString)
   });
-  return { syncTree, listens };
+  return { syncTree, listens, seeds };
 }
 
 interface CapturedChange {
@@ -100,10 +105,6 @@ function changesOf(events: Event[]): CapturedChange[] {
 }
 
 describe('Server cache seeding', () => {
-  beforeEach(() => {
-    clearServerCacheSeeds();
-  });
-
   it('an unseeded listen sends the empty hash and no compound hash', () => {
     const { syncTree, listens } = makeSyncTree();
     syncTreeAddEventRegistration(
@@ -119,9 +120,8 @@ describe('Server cache seeding', () => {
   it('a seeded listen carries the stamped hash without recomputing it', () => {
     const json = { a: 'x', b: { c: 1 } };
     const hash = computeCanonicalHash(json);
-    seedServerCache('seeded/path', json, hash);
-
-    const { syncTree, listens } = makeSyncTree();
+    const { syncTree, listens, seeds } = makeSyncTree();
+    seeds.set('seeded/path', json, hash);
     syncTreeAddEventRegistration(
       syncTree,
       defaultQueryAt('seeded/path'),
@@ -134,14 +134,8 @@ describe('Server cache seeding', () => {
   it('a seeded listen exposes the stamped compound hash', () => {
     const json = { a: 'x', b: { c: 1 } };
     const compoundHash = computeCompoundHash(json);
-    seedServerCache(
-      'seeded/ch',
-      json,
-      computeCanonicalHash(json),
-      compoundHash
-    );
-
-    const { syncTree, listens } = makeSyncTree();
+    const { syncTree, listens, seeds } = makeSyncTree();
+    seeds.set('seeded/ch', json, computeCanonicalHash(json), compoundHash);
     syncTreeAddEventRegistration(
       syncTree,
       defaultQueryAt('seeded/ch'),
@@ -156,9 +150,8 @@ describe('Server cache seeding', () => {
   });
 
   it('a seed raises no value event until the server confirms', () => {
-    seedServerCache('quiet/path', { a: 1 }, computeCanonicalHash({ a: 1 }));
-
-    const { syncTree } = makeSyncTree();
+    const { syncTree, seeds } = makeSyncTree();
+    seeds.set('quiet/path', { a: 1 }, computeCanonicalHash({ a: 1 }));
     const initial = syncTreeAddEventRegistration(
       syncTree,
       defaultQueryAt('quiet/path'),
@@ -173,9 +166,8 @@ describe('Server cache seeding', () => {
   });
 
   it('listen-complete promotes the seed to a server-certified value event', () => {
-    seedServerCache('confirmed/path', { a: 1 }, computeCanonicalHash({ a: 1 }));
-
-    const { syncTree, listens } = makeSyncTree();
+    const { syncTree, listens, seeds } = makeSyncTree();
+    seeds.set('confirmed/path', { a: 1 }, computeCanonicalHash({ a: 1 }));
     syncTreeAddEventRegistration(
       syncTree,
       defaultQueryAt('confirmed/path'),
@@ -191,15 +183,38 @@ describe('Server cache seeding', () => {
   });
 
   it('a seed is consumed at most once and only for its exact path', () => {
-    seedServerCache('once/path', { a: 1 });
-    expect(takeServerCacheSeed('other/path')).to.equal(undefined);
-    expect(takeServerCacheSeed('/once/path')).to.not.equal(undefined);
-    expect(takeServerCacheSeed('/once/path')).to.equal(undefined);
+    const seeds = new ServerCacheSeedStore();
+    seeds.set('once/path', { a: 1 });
+    expect(seeds.take('other/path')).to.equal(undefined);
+    expect(seeds.take('/once/path')).to.not.equal(undefined);
+    expect(seeds.take('/once/path')).to.equal(undefined);
+  });
+
+  it('seeds are scoped to their store — one instance cannot steal another', () => {
+    const first = makeSyncTree();
+    const second = makeSyncTree();
+    first.seeds.set('shared/path', { a: 1 }, computeCanonicalHash({ a: 1 }));
+
+    // The second instance listens to the same path first: no theft.
+    syncTreeAddEventRegistration(
+      second.syncTree,
+      defaultQueryAt('shared/path'),
+      makeEventRegistration()
+    );
+    expect(second.listens[0].hashFn()).to.equal('');
+
+    // The first instance still holds its seed.
+    syncTreeAddEventRegistration(
+      first.syncTree,
+      defaultQueryAt('shared/path'),
+      makeEventRegistration()
+    );
+    expect(first.listens[0].hashFn()).to.equal(computeCanonicalHash({ a: 1 }));
   });
 
   it('a filtered query does not consume the seed', () => {
-    seedServerCache('filtered/path', { a: 1 });
-    const { syncTree } = makeSyncTree();
+    const { syncTree, seeds } = makeSyncTree();
+    seeds.set('filtered/path', { a: 1 });
     const params = new QueryParams();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (params as any).limitSet_ = true;
@@ -214,7 +229,30 @@ describe('Server cache seeding', () => {
     );
     syncTreeAddEventRegistration(syncTree, query, makeEventRegistration());
     // The seed must still be there for a later default listen.
-    expect(takeServerCacheSeed('filtered/path')).to.not.equal(undefined);
+    expect(seeds.take('filtered/path')).to.not.equal(undefined);
+  });
+
+  it('a seeded (uncertified) cache is not reported as complete server cache', () => {
+    const { syncTree, listens, seeds } = makeSyncTree();
+    seeds.set('seeded/gate', { a: 1 }, computeCanonicalHash({ a: 1 }));
+    syncTreeAddEventRegistration(
+      syncTree,
+      defaultQueryAt('seeded/gate'),
+      makeEventRegistration()
+    );
+    // Uncertified: the persistence write-through must see nothing here, or
+    // seeded bytes would be re-persisted as server truth.
+    expect(
+      syncTreeGetCompleteServerCache(syncTree, new Path('seeded/gate'))
+    ).to.equal(null);
+    // Server certifies -> now it is complete.
+    listens[0].onComplete('ok');
+    const cache = syncTreeGetCompleteServerCache(
+      syncTree,
+      new Path('seeded/gate')
+    );
+    expect(cache).to.not.equal(null);
+    expect(cache!.val(true)).to.deep.equal({ a: 1 });
   });
 
   it('an empty seed does not poison the shared empty-node singleton', () => {
@@ -232,14 +270,13 @@ describe('Server cache seeding', () => {
       foo: { a: { 'deep-a-1': 1, 'deep-a-2': 2 }, b: 'b', c: 'c', d: 'd' },
       quu: 'quu-value'
     };
-    seedServerCache(
+    const { syncTree, seeds } = makeSyncTree();
+    seeds.set(
       'rm/path',
       cached,
       computeCanonicalHash(cached),
       computeCompoundHash(cached)
     );
-
-    const { syncTree } = makeSyncTree();
     syncTreeAddEventRegistration(
       syncTree,
       defaultQueryAt('rm/path'),

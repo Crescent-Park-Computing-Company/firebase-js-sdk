@@ -20,8 +20,10 @@ import { expect } from 'chai';
 import {
   CompoundHash,
   compoundHashFromNode,
+  compoundHashFromNodeAsync,
   CompoundHashSplitState,
-  estimateSerializedNodeSize
+  estimateSerializedNodeSize,
+  hashFromNodeAsync
 } from '../src/core/CompoundHash';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { sha1 } from '../src/core/util/util';
@@ -193,5 +195,35 @@ describe('CompoundHash', () => {
     expect(estimateSerializedNodeSize(nodeFromJSON({ key: 'abc' }))).to.equal(
       1 + 3 + 4 + 5
     );
+  });
+
+  it('async compound hash matches the synchronous one', async () => {
+    const shapes: unknown[] = [
+      { a: 1 },
+      { a: { b: { c: 'deep', '.priority': 'p' } }, d: true },
+      Object.fromEntries(Array.from({ length: 800 }, (_, i) => [String(i), i]))
+    ];
+    for (const json of shapes) {
+      const node = nodeFromJSON(json);
+      // A tiny slice forces multiple scheduling rounds on the larger trees.
+      const asyncHash = await compoundHashFromNodeAsync(node, undefined, 1);
+      const syncHash = compoundHashFromNode(node);
+      expect(asyncHash.hashes).to.deep.equal(syncHash.hashes);
+      expect(asyncHash.posts).to.deep.equal(syncHash.posts);
+    }
+  });
+
+  it('async simple hash matches node.hash()', async () => {
+    const shapes: unknown[] = [
+      'leaf',
+      { a: 1, b: { c: 'x', '.priority': 2 } },
+      Object.fromEntries(Array.from({ length: 800 }, (_, i) => [String(i), i]))
+    ];
+    for (const json of shapes) {
+      // Fresh nodes for each side so the async walk cannot ride on hashes
+      // the sync walk already cached.
+      const asyncResult = await hashFromNodeAsync(nodeFromJSON(json), 1);
+      expect(asyncResult).to.equal(nodeFromJSON(json).hash());
+    }
   });
 });

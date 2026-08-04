@@ -18,7 +18,8 @@
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
 import { LeafNode } from './snap/LeafNode';
 import { Node } from './snap/Node';
-import { doubleToIEEE754String, nameCompare, sha1 } from './util/util';
+import { hashQuotedString, leafHashValueText } from './snap/snap';
+import { nameCompare, sha1 } from './util/util';
 
 /**
  * A compound hash of a node: the node's tree serialized in key order, cut
@@ -99,21 +100,10 @@ export function compoundHashFromNode(
   }
   const strategy = splitStrategy || simpleSizeSplitStrategy(node);
   const builder = new CompoundHashBuilder(strategy);
-  processNode(node, builder);
+  const walker = new CompoundHashWalker(node, builder);
+  walker.drainUntil(Infinity);
   builder.finishHashing();
   return new CompoundHash(builder.posts, builder.hashes);
-}
-
-function processNode(node: Node, builder: CompoundHashBuilder): void {
-  if (node.isLeafNode()) {
-    builder.processLeaf(node as LeafNode);
-  } else {
-    forEachChildWithPriority(node, (key, child) => {
-      builder.startChild(key);
-      processNode(child, builder);
-      builder.endChild();
-    });
-  }
 }
 
 /**
@@ -141,6 +131,74 @@ function forEachChildWithPriority(
     action(key, child);
   });
 }
+
+/**
+ * The one definition of the compound-hash traversal, driven as an explicit
+ * frame stack — a `child` frame runs builder.startChild, pushes its subtree,
+ * and a matching `end` frame runs builder.endChild — so the builder sees the
+ * exact call sequence a recursive walk would produce. The synchronous
+ * computation drains it in one go; the async one drains it in bounded
+ * slices. Either way the resulting hash is identical by construction.
+ */
+class CompoundHashWalker {
+  // Popped last-in-first-out; children are pushed in reverse key order so
+  // they pop in key order.
+  private stack_: CompoundHashFrame[];
+
+  constructor(node: Node, private builder_: CompoundHashBuilder) {
+    this.stack_ = [{ kind: 'node', node }];
+  }
+
+  /**
+   * Processes frames until the walk completes or `deadline` (an epoch-ms
+   * timestamp) passes — always at least one frame, so every slice makes
+   * progress no matter how small its budget. Returns true when the walk is
+   * complete.
+   */
+  drainUntil(deadline: number): boolean {
+    while (this.stack_.length > 0) {
+      this.processFrame_(this.stack_.pop()!);
+      if (Date.now() >= deadline) {
+        break;
+      }
+    }
+    return this.stack_.length === 0;
+  }
+
+  private processFrame_(frame: CompoundHashFrame): void {
+    if (frame.kind === 'end') {
+      this.builder_.endChild();
+      return;
+    }
+    const current = frame.kind === 'node' ? frame.node : frame.child;
+    if (frame.kind === 'child') {
+      this.builder_.startChild(frame.key);
+      this.stack_.push({ kind: 'end' });
+    }
+    if (current.isLeafNode()) {
+      this.builder_.processLeaf(current as LeafNode);
+      // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
+      // child frame) already sits on the stack.
+      return;
+    }
+    const children: Array<[string, Node]> = [];
+    forEachChildWithPriority(current, (key, child) => {
+      children.push([key, child]);
+    });
+    for (let i = children.length - 1; i >= 0; i--) {
+      this.stack_.push({
+        kind: 'child',
+        key: children[i][0],
+        child: children[i][1]
+      });
+    }
+  }
+}
+
+type CompoundHashFrame =
+  | { kind: 'node'; node: Node }
+  | { kind: 'child'; key: string; child: Node }
+  | { kind: 'end' };
 
 class CompoundHashBuilder {
   posts: string[] = [];
@@ -180,7 +238,7 @@ class CompoundHashBuilder {
     if (this.needsComma_) {
       this.currentHash_ += ',';
     }
-    this.currentHash_ += quoted(key) + ':(';
+    this.currentHash_ += hashQuotedString(key) + ':(';
     if (this.currentDepth_ === this.currentPath_.length) {
       this.currentPath_.push(key);
     } else {
@@ -212,7 +270,7 @@ class CompoundHashBuilder {
     if (this.currentHash_ === null) {
       let hash = '(';
       for (let i = 0; i < this.currentDepth_; i++) {
-        hash += quoted(this.currentPath_[i]) + ':(';
+        hash += hashQuotedString(this.currentPath_[i]) + ':(';
       }
       this.currentHash_ = hash;
       this.needsComma_ = false;
@@ -234,41 +292,24 @@ class CompoundHashBuilder {
 }
 
 /**
- * The compound-hash representation of a leaf value. Unlike the text hashed by
- * Node.hash(), strings and keys are JSON-quoted so range serializations are
- * unambiguous to reparse (Android calls this the "V2" hash representation).
+ * The compound-hash representation of a leaf: the V2 grammar (strings and
+ * keys JSON-quoted so range serializations are unambiguous to reparse; see
+ * leafHashValueText), with the priority prefixed exactly as in Node.hash().
  */
-export function leafHashRepresentation(node: Node): string {
+function leafHashRepresentation(node: LeafNode): string {
   let representation = '';
-  if (!node.getPriority().isEmpty()) {
+  const priority = node.getPriority();
+  if (!priority.isEmpty()) {
     representation +=
-      'priority:' + leafHashRepresentation(node.getPriority()) + ':';
+      'priority:' +
+      leafHashValueText(priority.val() as string | number, true) +
+      ':';
   }
-  const value = node.val();
-  const type = typeof value;
-  representation += type + ':';
-  if (type === 'number') {
-    representation += doubleToIEEE754String(value as number);
-  } else if (type === 'string') {
-    representation += quoted(value as string);
-  } else {
-    representation += String(value);
-  }
+  representation += leafHashValueText(
+    node.val() as string | number | boolean,
+    true
+  );
   return representation;
-}
-
-/**
- * JSON-style quoting with only backslash and double quote escaped.
- */
-function quoted(value: string): string {
-  let escaped = value;
-  if (escaped.indexOf('\\') !== -1) {
-    escaped = escaped.replace(/\\/g, '\\\\');
-  }
-  if (escaped.indexOf('"') !== -1) {
-    escaped = escaped.replace(/"/g, '\\"');
-  }
-  return '"' + escaped + '"';
 }
 
 /**
@@ -309,14 +350,22 @@ export function estimateSerializedNodeSize(node: Node): number {
 }
 
 /**
- * Computes a compound hash in bounded slices of main-thread time, yielding to
- * the event loop between slices, so hashing a large tree for persistence
- * never blocks the UI the way a monolithic walk would.
- *
- * The recursive walk of compoundHashFromNode is driven as an explicit frame
- * stack — a `child` frame runs builder.startChild, pushes its subtree, and a
- * matching `end` frame runs builder.endChild — so the builder sees the exact
- * call sequence the recursion produces and the resulting hash is identical.
+ * Schedules the next slice of a background computation: idle time where the
+ * platform offers it, a macrotask otherwise.
+ */
+function scheduleSlice(fn: () => void): void {
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => fn(), { timeout: 200 });
+  } else {
+    setTimeout(fn, 0);
+  }
+}
+
+/**
+ * Computes a compound hash in bounded slices of main-thread time, yielding
+ * to the event loop between slices, so hashing a large tree for persistence
+ * never blocks the UI the way a monolithic walk would. Same traversal as
+ * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
  */
 export function compoundHashFromNodeAsync(
   node: Node,
@@ -328,57 +377,64 @@ export function compoundHashFromNodeAsync(
   }
   const strategy = splitStrategy || simpleSizeSplitStrategy(node);
   const builder = new CompoundHashBuilder(strategy);
-
-  type Frame =
-    | { kind: 'node'; node: Node }
-    | { kind: 'child'; key: string; child: Node }
-    | { kind: 'end' };
-  // Popped last-in-first-out; children are pushed in reverse key order so
-  // they pop in key order.
-  const stack: Frame[] = [{ kind: 'node', node }];
-
-  const processFrame = (frame: Frame): void => {
-    if (frame.kind === 'end') {
-      builder.endChild();
-      return;
-    }
-    const current = frame.kind === 'node' ? frame.node : frame.child;
-    if (frame.kind === 'child') {
-      builder.startChild(frame.key);
-      stack.push({ kind: 'end' });
-    }
-    if (current.isLeafNode()) {
-      builder.processLeaf(current as LeafNode);
-      // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
-      // child frame) already sits on the stack.
-      return;
-    }
-    const children: Array<[string, Node]> = [];
-    forEachChildWithPriority(current, (key, child) => {
-      children.push([key, child]);
-    });
-    for (let i = children.length - 1; i >= 0; i--) {
-      stack.push({ kind: 'child', key: children[i][0], child: children[i][1] });
-    }
-  };
-
+  const walker = new CompoundHashWalker(node, builder);
   return new Promise((resolve, reject) => {
-    const schedule =
-      typeof requestIdleCallback === 'function'
-        ? (fn: () => void) => requestIdleCallback(() => fn(), { timeout: 200 })
-        : (fn: () => void) => setTimeout(fn, 0);
     const step = (): void => {
       try {
-        const deadline = Date.now() + sliceMs;
-        while (stack.length > 0 && Date.now() < deadline) {
-          processFrame(stack.pop()!);
-        }
-        if (stack.length > 0) {
-          schedule(step);
+        if (!walker.drainUntil(Date.now() + sliceMs)) {
+          scheduleSlice(step);
           return;
         }
         builder.finishHashing();
         resolve(new CompoundHash(builder.posts, builder.hashes));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    step();
+  });
+}
+
+/**
+ * Computes node.hash() — the canonical listen hash — in bounded slices.
+ * Node hashes cache per node (lazyHash_) and nodes are immutable, so the
+ * walk primes every subtree's hash bottom-up across slices; the final
+ * root hash() then assembles from cached children in one cheap pass, and
+ * unchanged subtrees stay primed for the next flush.
+ */
+export function hashFromNodeAsync(node: Node, sliceMs = 12): Promise<string> {
+  interface HashFrame {
+    node: Node;
+    childrenPrimed: boolean;
+  }
+  const stack: HashFrame[] = [{ node, childrenPrimed: false }];
+  const processFrame = (frame: HashFrame): void => {
+    if (frame.childrenPrimed || frame.node.isLeafNode()) {
+      frame.node.hash();
+      return;
+    }
+    stack.push({ node: frame.node, childrenPrimed: true });
+    frame.node.forEachChild(KEY_INDEX, (_key, child) => {
+      stack.push({ node: child, childrenPrimed: false });
+    });
+  };
+  return new Promise((resolve, reject) => {
+    const step = (): void => {
+      try {
+        const deadline = Date.now() + sliceMs;
+        // At least one frame per slice: progress is guaranteed even with a
+        // zero budget.
+        while (stack.length > 0) {
+          processFrame(stack.pop()!);
+          if (Date.now() >= deadline) {
+            break;
+          }
+        }
+        if (stack.length > 0) {
+          scheduleSlice(step);
+          return;
+        }
+        resolve(node.hash());
       } catch (e) {
         reject(e);
       }

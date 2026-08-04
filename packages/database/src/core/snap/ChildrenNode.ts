@@ -255,6 +255,13 @@ export class ChildrenNode implements Node {
   }
 
   /** @inheritDoc */
+  stampLazyHash(hash: string): void {
+    if (this.lazyHash_ === null) {
+      this.lazyHash_ = hash;
+    }
+  }
+
+  /** @inheritDoc */
   getPredecessorChildName(
     childName: string,
     childNode: Node,

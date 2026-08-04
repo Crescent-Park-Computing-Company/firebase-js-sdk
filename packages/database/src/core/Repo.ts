@@ -33,7 +33,11 @@ import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import { buildSeedNode, ListenHashFn } from './ServerCacheSeed';
+import {
+  buildSeedNode,
+  ListenHashFn,
+  ServerCacheSeedStore
+} from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
@@ -201,6 +205,12 @@ export class Repo {
   persistence_: PersistenceManager | null = null;
 
   /**
+   * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
+   * by serverSyncTree_ via its listen provider.
+   */
+  serverCacheSeeds_ = new ServerCacheSeedStore();
+
+  /**
    * Listens held back while their persisted root restores, keyed by path.
    * stopListening flips the token so a listen whose last registration was
    * removed mid-restore is never sent (see repoStartServerListen).
@@ -355,7 +365,8 @@ export function repoStart(
     },
     stopListening: (query, tag) => {
       repoStopServerListen(repo, query, tag);
-    }
+    },
+    takeServerCacheSeed: pathString => repo.serverCacheSeeds_.take(pathString)
   });
 }
 
@@ -518,7 +529,13 @@ export function repoStartServerListen(
       return;
     }
     repo.pendingSeedRestores_.delete(pathString);
-    if (record !== null) {
+    // If the server certified this path while the restore was in flight (an
+    // overlapping listen, a get()), the live data wins — applying the stored
+    // tree now would clobber fresher server state with stale bytes.
+    const alreadyCertified =
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+      null;
+    if (record !== null && !alreadyCertified) {
       try {
         const node = buildSeedNode(record);
         if (!node.isEmpty()) {
