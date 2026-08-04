@@ -1397,7 +1397,6 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
  * to cold loads; nothing here may ever break the live connection.
  */
 const STORE = 'firebase-server-cache';
-const DB_VERSION = 1;
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -1471,13 +1470,39 @@ class PersistenceManager {
         if (this.db_) {
             return this.db_;
         }
-        this.db_ = new Promise(resolve => {
+        this.db_ = this.openAtVersion_(undefined).then(db => {
+            if (db === null) {
+                return null;
+            }
+            if (db.objectStoreNames.contains(STORE)) {
+                return db;
+            }
+            // The database exists but lacks the store — e.g. it was created by a
+            // versionless open from other tooling. Object stores can only be added
+            // in a version-change transaction, so reopen one version up.
+            const nextVersion = db.version + 1;
+            db.close();
+            return this.openAtVersion_(nextVersion).then(upgraded => {
+                if (upgraded !== null && !upgraded.objectStoreNames.contains(STORE)) {
+                    persistenceStats.storageFailures++;
+                    upgraded.close();
+                    return null;
+                }
+                return upgraded;
+            });
+        });
+        return this.db_;
+    }
+    openAtVersion_(version) {
+        return new Promise(resolve => {
             if (!this.idbFactory_) {
                 resolve(null);
                 return;
             }
             try {
-                const req = this.idbFactory_.open('firebase-database-persistence', DB_VERSION);
+                const req = version === undefined
+                    ? this.idbFactory_.open('firebase-database-persistence')
+                    : this.idbFactory_.open('firebase-database-persistence', version);
                 req.onupgradeneeded = () => {
                     const db = req.result;
                     if (!db.objectStoreNames.contains(STORE)) {
@@ -1496,7 +1521,6 @@ class PersistenceManager {
                 resolve(null);
             }
         });
-        return this.db_;
     }
     key_(pathString) {
         return this.prefix_ + '|' + pathString;

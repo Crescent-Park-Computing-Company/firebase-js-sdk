@@ -1871,6 +1871,7 @@ declare class PersistenceManager {
      */
     trackedRootFor(pathString: string): string | null;
     private open_;
+    private openAtVersion_;
     private key_;
     private idbGet_;
     private idbPut_;
