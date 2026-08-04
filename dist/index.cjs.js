@@ -1463,6 +1463,26 @@ class PersistenceManager {
         this.trackedRoots_.add(pathString);
     }
     /**
+     * The root's last listen stopped: flush any pending write-through so
+     * IndexedDB holds the final tree for the next session, then release the
+     * in-memory copy — only live listens need it.
+     */
+    untrack(pathString) {
+        if (!this.trackedRoots_.has(pathString)) {
+            return;
+        }
+        this.trackedRoots_.delete(pathString);
+        // Release the tree only after the flush settles: flush_'s hash recompute
+        // re-reads latest_ to couple hashes to trees, so deleting synchronously
+        // would store the final record hashless. Skip the delete if the root was
+        // re-tracked meanwhile — the new listen owns the entry now.
+        void this.flushNow(pathString).then(() => {
+            if (!this.trackedRoots_.has(pathString)) {
+                this.latest_.delete(pathString);
+            }
+        });
+    }
+    /**
      * The nearest tracked root at-or-above `pathString`, or null.
      */
     trackedRootFor(pathString) {
@@ -1500,7 +1520,46 @@ class PersistenceManager {
                 return upgraded;
             });
         });
+        // One sweep per manager, off the first open: restore() only expires the
+        // exact keys it is asked for, so without this, roots that are never
+        // listened to again would sit in IndexedDB forever.
+        void this.db_.then(db => {
+            if (db !== null) {
+                this.sweepExpired_(db);
+            }
+        });
         return this.db_;
+    }
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
+     * cursor walk. Best-effort: any failure leaves the records for the next
+     * session's sweep.
+     */
+    sweepExpired_(db) {
+        const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+        const prefix = this.key_('');
+        try {
+            const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
+            const req = store.openCursor();
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) {
+                    return;
+                }
+                const key = cursor.key;
+                const record = cursor.value;
+                if (typeof key === 'string' &&
+                    key.startsWith(prefix) &&
+                    (typeof record?.updatedAt !== 'number' || record.updatedAt < cutoff)) {
+                    persistenceStats.evictions++;
+                    cursor.delete();
+                }
+                cursor.continue();
+            };
+        }
+        catch (e) {
+            // Sweeping is opportunistic; never let it surface.
+        }
     }
     openAtVersion_(version) {
         return new Promise(resolve => {
@@ -11945,6 +12004,18 @@ class Repo {
          * enabled it before this Repo's first listen.
          */
         this.persistence_ = null;
+        /**
+         * Listens held back while their persisted root restores, keyed by path.
+         * stopListening flips the token so a listen whose last registration was
+         * removed mid-restore is never sent (see repoStartServerListen).
+         */
+        this.pendingSeedRestores_ = new Map();
+        /**
+         * Listen-complete state per default complete listen, keyed by path: whether
+         * the current listen has received its initial server response, and waiters
+         * to resolve when it does (see whenListenComplete in api/Database.ts).
+         */
+        this.listenCompletions_ = new Map();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
         this.key = this.repoInfo_.toURLString();
     }
@@ -12023,7 +12094,7 @@ function repoStart(repo, appId, authOverride) {
             return [];
         },
         stopListening: (query, tag) => {
-            repo.server_.unlisten(query, tag);
+            repoStopServerListen(repo, query, tag);
         }
     });
 }
@@ -12093,35 +12164,64 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
  * resolve null instantly and attach exactly as before.
  */
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
+    const pathString = query._path.toString();
+    // tag is null or undefined for a default listen depending on the caller;
+    // loose null covers both.
+    const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
+    if (isDefaultComplete) {
+        const prior = repo.listenCompletions_.get(pathString);
+        repo.listenCompletions_.set(pathString, {
+            complete: false,
+            // Waiters registered before the listen attached carry over.
+            waiters: prior ? prior.waiters : []
+        });
+    }
     const sendListen = () => {
         repo.server_.listen(query, currentHashFn, tag, (status, data) => {
             const events = onComplete(status, data);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-            // A listen 'ok' certifies the (possibly restored) server cache as
-            // current; any other status (permission_denied, listen revoked) evicts
-            // the stored copy — a cached tree must not outlive the access that
-            // produced it. tag is null or undefined for a default listen depending
-            // on the caller; loose null covers both.
-            if (tag == null && repo.persistence_ !== null) {
-                if (status === 'ok') {
-                    repoPersistAfterServerUpdate(repo, query._path);
+            if (isDefaultComplete) {
+                // A listen response — ok or not — certifies the local view against
+                // the server; a persisted 'ok' re-persists it, any other status
+                // evicts the stored copy (a cached tree must not outlive the access
+                // that produced it).
+                const completion = repo.listenCompletions_.get(pathString);
+                if (completion && !completion.complete) {
+                    completion.complete = true;
+                    const waiters = completion.waiters;
+                    completion.waiters = [];
+                    for (const waiter of waiters) {
+                        waiter();
+                    }
                 }
-                else {
-                    repo.persistence_.evict(query._path);
+                if (repo.persistence_ !== null) {
+                    if (status === 'ok') {
+                        repoPersistAfterServerUpdate(repo, query._path);
+                    }
+                    else {
+                        repo.persistence_.evict(query._path);
+                    }
                 }
             }
         });
     };
     const persistence = repo.persistence_;
-    if (persistence === null ||
-        tag != null ||
-        !query._queryParams.loadsAllData()) {
+    if (persistence === null || !isDefaultComplete) {
         sendListen();
         return;
     }
-    const pathString = query._path.toString();
     persistence.track(pathString);
+    // stopListening can arrive while the restore is pending — before the
+    // outbound listen exists — in which case its unlisten() is a no-op. The
+    // token lets it cancel this listen instead of leaving it to attach as an
+    // orphaned server subscription with no view to ever stop it.
+    const token = { cancelled: false };
+    repo.pendingSeedRestores_.set(pathString, token);
     void persistence.restore(pathString).then(record => {
+        if (token.cancelled) {
+            return;
+        }
+        repo.pendingSeedRestores_.delete(pathString);
         if (record !== null) {
             try {
                 const node = buildSeedNode(record);
@@ -12135,6 +12235,54 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             }
         }
         sendListen();
+    });
+}
+/**
+ * Stops a server listen. With persistence, a complete default listen may
+ * still be waiting on its restore — cancel it so it never attaches — and its
+ * root leaves write-through tracking (flushing the final tree to IndexedDB),
+ * releasing the in-memory copy that only live listens need.
+ */
+function repoStopServerListen(repo, query, tag) {
+    const pathString = query._path.toString();
+    if (tag != null || !query._queryParams.loadsAllData()) {
+        repo.server_.unlisten(query, tag);
+        return;
+    }
+    const pending = repo.pendingSeedRestores_.get(pathString);
+    if (pending) {
+        pending.cancelled = true;
+        repo.pendingSeedRestores_.delete(pathString);
+        // The listen was never sent; nothing to unlisten.
+    }
+    else {
+        repo.server_.unlisten(query, tag);
+    }
+    // Resolve outstanding completion waiters — the listen they were watching is
+    // gone, and a promise that can never settle would leak its callers.
+    const completion = repo.listenCompletions_.get(pathString);
+    if (completion) {
+        repo.listenCompletions_.delete(pathString);
+        for (const waiter of completion.waiters) {
+            waiter();
+        }
+    }
+    repo.persistence_?.untrack(pathString);
+}
+/**
+ * Resolves when the current default complete listen at `pathString` has
+ * received its initial response from the server — the moment a restored
+ * cache is certified (unchanged tree) or replaced (changed tree). Resolves
+ * immediately if that already happened, or if no such listen exists; also
+ * resolves if the listen stops first, so callers never hang.
+ */
+function repoWhenListenComplete(repo, pathString) {
+    const completion = repo.listenCompletions_.get(pathString);
+    if (!completion || completion.complete) {
+        return Promise.resolve();
+    }
+    return new Promise(resolve => {
+        completion.waiters.push(resolve);
     });
 }
 /**
@@ -14946,7 +15094,10 @@ function goOffline(db) {
 function getPersistedValue(db, pathString) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('getPersistedValue');
-    const repo = db._repo;
+    // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
+    // and reading a stored record must not start the instance (which would
+    // lock out later transport/emulator configuration).
+    const repo = db._repoInternal;
     const persistence = repo.persistence_;
     if (persistence === null) {
         return Promise.resolve(null);
@@ -14993,7 +15144,9 @@ function getPersistedValue(db, pathString) {
 function setPersistenceEnabled(db, enabled) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
-    const repo = db._repo;
+    // _repoInternal, not the _repo getter: configuration must not start the
+    // instance, or a later connectDatabaseEmulator() would refuse to run.
+    const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
             repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
@@ -15005,6 +15158,21 @@ function setPersistenceEnabled(db, enabled) {
             repo.persistence_ = null;
         }
     }
+}
+/**
+ * Resolves when the default complete listen at `pathString` has received its
+ * initial response from the server. With persistence, listeners may fire
+ * first with the restored cache; this is the signal that the server has since
+ * certified that data as current (unchanged tree) or replaced it (changed
+ * tree). Resolves immediately when that already happened or no such listen
+ * exists, and when the listen stops before completing — it never hangs.
+ *
+ * @internal
+ */
+function whenListenComplete(db, pathString) {
+    db = util.getModularInstance(db);
+    db._checkNotDeleted('whenListenComplete');
+    return repoWhenListenComplete(db._repoInternal, new Path(pathString).toString());
 }
 /**
  * Reconnects to the server and synchronizes the offline Database state
@@ -15319,6 +15487,7 @@ exports._setPersistenceEnabled = setPersistenceEnabled;
 exports._setSDKVersion = setSDKVersion;
 exports._validatePathString = validatePathString;
 exports._validateWritablePath = validateWritablePath;
+exports._whenListenComplete = whenListenComplete;
 exports.child = child;
 exports.connectDatabaseEmulator = connectDatabaseEmulator;
 exports.enableLogging = enableLogging;
@@ -15358,3 +15527,4 @@ exports.setWithPriority = setWithPriority;
 exports.startAfter = startAfter;
 exports.startAt = startAt;
 exports.update = update;
+//# sourceMappingURL=index.cjs.js.map

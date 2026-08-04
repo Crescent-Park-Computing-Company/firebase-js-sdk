@@ -1862,10 +1862,22 @@ declare class PersistenceManager {
      */
     track(pathString: string): void;
     /**
+     * The root's last listen stopped: flush any pending write-through so
+     * IndexedDB holds the final tree for the next session, then release the
+     * in-memory copy — only live listens need it.
+     */
+    untrack(pathString: string): void;
+    /**
      * The nearest tracked root at-or-above `pathString`, or null.
      */
     trackedRootFor(pathString: string): string | null;
     private open_;
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
+     * cursor walk. Best-effort: any failure leaves the records for the next
+     * session's sweep.
+     */
+    private sweepExpired_;
     private openAtVersion_;
     private key_;
     private idbGet_;
@@ -2257,6 +2269,23 @@ declare class Repo {
      * enabled it before this Repo's first listen.
      */
     persistence_: PersistenceManager | null;
+    /**
+     * Listens held back while their persisted root restores, keyed by path.
+     * stopListening flips the token so a listen whose last registration was
+     * removed mid-restore is never sent (see repoStartServerListen).
+     */
+    pendingSeedRestores_: Map<string, {
+        cancelled: boolean;
+    }>;
+    /**
+     * Listen-complete state per default complete listen, keyed by path: whether
+     * the current listen has received its initial server response, and waiters
+     * to resolve when it does (see whenListenComplete in api/Database.ts).
+     */
+    listenCompletions_: Map<string, {
+        complete: boolean;
+        waiters: Array<() => void>;
+    }>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -2923,6 +2952,8 @@ declare interface ViewCache {
 declare interface ViewProcessor {
     readonly filter: NodeFilter_2;
 }
+
+/* Excluded from this release type: _whenListenComplete */
 
 /**
  * Defines a single user-initiated write operation. May be the result of a set(), transaction(), or update() call. In
