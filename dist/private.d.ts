@@ -1824,6 +1824,89 @@ declare class Path {
     toString(): string;
 }
 
+declare interface PersistedRecord {
+    json: unknown;
+    hash?: string;
+    compoundHash?: SeedCompoundHash;
+    updatedAt: number;
+    revision: number;
+}
+
+/**
+ * How long after the last server update a root's write-through runs. The
+ * flush serializes the whole root (val(true) + the structured clone into
+ * IndexedDB), so it is deliberately coarse for very large roots.
+ */
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
+
+/**
+ * One PersistenceManager per Repo. `prefix` namespaces records so multiple
+ * databases/apps sharing the page don't collide. `idbFactory` exists for
+ * tests (Node has no IndexedDB); production uses the global.
+ */
+declare class PersistenceManager {
+    private prefix_;
+    private idbFactory_;
+    private db_;
+    /**
+     * Roots that flow through persistence (complete default listens).
+     */
+    private trackedRoots_;
+    /**
+     * Latest server tree per root; revision couples hashes to trees.
+     */
+    private latest_;
+    private writeTimers_;
+    private disposed_;
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null);
+    /**
+     * Marks a root as persistence-managed; write-throughs only run for
+     * tracked roots (and their descendants' updates).
+     */
+    track(pathString: string): void;
+    /**
+     * The nearest tracked root at-or-above `pathString`, or null.
+     */
+    trackedRootFor(pathString: string): string | null;
+    private open_;
+    private key_;
+    private idbGet_;
+    private idbPut_;
+    private idbDelete_;
+    /**
+     * Restores the persisted record for a root. Resolves null on miss, expiry,
+     * storage failure, or timeout — the caller then attaches unseeded.
+     */
+    restore(pathString: string): Promise<PersistedRecord | null>;
+    /**
+     * Write-through: the server confirmed `node` as the state of the tracked
+     * root `path`. Debounced per root; hashes recompute afterwards in idle
+     * slices against the same revision.
+     */
+    serverCacheUpdated(path: Path, node: Node_2): void;
+    /**
+     * The viewer lost access to a root: a cached copy must not outlive the
+     * access that produced it.
+     */
+    evict(path: Path): void;
+    dispose(): void;
+    /**
+     * Test seam: forces a pending debounced flush to run now.
+     */
+    flushNow(pathString: string): Promise<void>;
+    private flush_;
+}
+
+export declare const _persistenceStats: {
+    restoredRoots: string[];
+    restoreMisses: string[];
+    writeThroughs: number;
+    hashRecomputes: number;
+    staleHashDiscards: number;
+    evictions: number;
+    storageFailures: number;
+};
+
 /**
  * Firebase connection.  Abstracts wire protocol and handles reconnecting.
  *
@@ -2179,6 +2262,11 @@ declare class Repo {
     /** Stores queues of outstanding transactions for Firebase locations. */
     transactionQueueTree_: Tree<Transaction[]>;
     persistentConnection_: PersistentConnection | null;
+    /**
+     * Server-cache persistence (see core/Persistence.ts); null unless the app
+     * enabled it before this Repo's first listen.
+     */
+    persistence_: PersistenceManager | null;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -2358,6 +2446,8 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
+
+/* Excluded from this release type: _setPersistenceEnabled */
 
 /**
  * Sets a priority for the data at this Database location.
