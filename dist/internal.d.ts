@@ -610,6 +610,30 @@ export declare function get(query: Query): Promise<DataSnapshot>;
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
 
 /**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @internal
+ */
+/**
+ * Reads the persisted server cache for `path` WITHOUT attaching a listener —
+ * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @internal
+ */
+export declare function _getPersistedValue(db: Database, pathString: string): Promise<unknown | null>;
+
+/**
  * Disconnects from the server (all Database operations will be completed
  * offline).
  *
@@ -2633,19 +2657,6 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-/**
- * Enables client-side persistence of the server cache for this Database
- * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
- * and restored on the next startup, where they paint immediately and
- * revalidate with the server via the hash protocol — an unchanged tree costs
- * a handshake, a changed one costs range-merge deltas.
- *
- * Must be called before the first listener attaches (matching the mobile
- * SDKs' setPersistenceEnabled contract); listens attached earlier simply
- * bypass persistence. No-ops where IndexedDB is unavailable.
- *
- * @internal
- */
 export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 /**

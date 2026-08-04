@@ -14895,6 +14895,49 @@ function goOffline(db) {
  *
  * @internal
  */
+/**
+ * Reads the persisted server cache for `path` WITHOUT attaching a listener —
+ * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @internal
+ */
+function getPersistedValue(db, pathString) {
+    db = util.getModularInstance(db);
+    db._checkNotDeleted('getPersistedValue');
+    const repo = db._repo;
+    const persistence = repo.persistence_;
+    if (persistence === null) {
+        return Promise.resolve(null);
+    }
+    // Records are stored per listened ROOT; a peek at a subpath restores the
+    // deepest stored ancestor (walking up from the full path) and drills into
+    // its JSON along the remaining segments.
+    const path = new Path(pathString);
+    const attempt = (candidate) => persistence.restore(candidate.toString()).then(record => {
+        if (record !== null) {
+            // candidate is an ancestor of (or equal to) path by construction.
+            let cursor = newRelativePath(candidate, path);
+            let value = record.json;
+            while (!pathIsEmpty(cursor)) {
+                if (value === null || typeof value !== 'object') {
+                    return null;
+                }
+                value = value[pathGetFront(cursor)];
+                cursor = pathPopFront(cursor);
+            }
+            return value === undefined ? null : value;
+        }
+        const parent = pathParent(candidate);
+        if (parent === null) {
+            return null;
+        }
+        return attempt(parent);
+    });
+    return attempt(path);
+}
 function setPersistenceEnabled(db, enabled) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
@@ -15196,6 +15239,7 @@ exports._TEST_ACCESS_hijackHash = hijackHash;
 exports._clearServerCacheSeeds = clearServerCacheSeeds;
 exports._computeCanonicalHash = computeCanonicalHash;
 exports._computeCompoundHash = computeCompoundHash;
+exports._getPersistedValue = getPersistedValue;
 exports._initStandalone = _initStandalone;
 exports._persistenceStats = persistenceStats;
 exports._repoManagerDatabaseFromApp = repoManagerDatabaseFromApp;

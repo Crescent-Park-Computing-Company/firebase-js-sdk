@@ -596,6 +596,8 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  */
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
 
+/* Excluded from this release type: _getPersistedValue */
+
 /**
  * Disconnects from the server (all Database operations will be completed
  * offline).
@@ -2447,7 +2449,7 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-/* Excluded from this release type: _setPersistenceEnabled */
+export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.

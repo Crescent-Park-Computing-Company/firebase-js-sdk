@@ -14909,6 +14909,49 @@ function goOffline(db) {
  *
  * @internal
  */
+/**
+ * Reads the persisted server cache for `path` WITHOUT attaching a listener —
+ * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @internal
+ */
+function getPersistedValue(db, pathString) {
+    db = getModularInstance(db);
+    db._checkNotDeleted('getPersistedValue');
+    const repo = db._repo;
+    const persistence = repo.persistence_;
+    if (persistence === null) {
+        return Promise.resolve(null);
+    }
+    // Records are stored per listened ROOT; a peek at a subpath restores the
+    // deepest stored ancestor (walking up from the full path) and drills into
+    // its JSON along the remaining segments.
+    const path = new Path(pathString);
+    const attempt = (candidate) => persistence.restore(candidate.toString()).then(record => {
+        if (record !== null) {
+            // candidate is an ancestor of (or equal to) path by construction.
+            let cursor = newRelativePath(candidate, path);
+            let value = record.json;
+            while (!pathIsEmpty(cursor)) {
+                if (value === null || typeof value !== 'object') {
+                    return null;
+                }
+                value = value[pathGetFront(cursor)];
+                cursor = pathPopFront(cursor);
+            }
+            return value === undefined ? null : value;
+        }
+        const parent = pathParent(candidate);
+        if (parent === null) {
+            return null;
+        }
+        return attempt(parent);
+    });
+    return attempt(path);
+}
 function setPersistenceEnabled(db, enabled) {
     db = getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
@@ -15214,4 +15257,4 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
  */
 registerDatabase();
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, _initStandalone, persistenceStats as _persistenceStats, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, persistenceStats as _persistenceStats, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
