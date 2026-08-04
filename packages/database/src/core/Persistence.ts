@@ -144,6 +144,27 @@ export class PersistenceManager {
   }
 
   /**
+   * The root's last listen stopped: flush any pending write-through so
+   * IndexedDB holds the final tree for the next session, then release the
+   * in-memory copy — only live listens need it.
+   */
+  untrack(pathString: string): void {
+    if (!this.trackedRoots_.has(pathString)) {
+      return;
+    }
+    this.trackedRoots_.delete(pathString);
+    // Release the tree only after the flush settles: flush_'s hash recompute
+    // re-reads latest_ to couple hashes to trees, so deleting synchronously
+    // would store the final record hashless. Skip the delete if the root was
+    // re-tracked meanwhile — the new listen owns the entry now.
+    void this.flushNow(pathString).then(() => {
+      if (!this.trackedRoots_.has(pathString)) {
+        this.latest_.delete(pathString);
+      }
+    });
+  }
+
+  /**
    * The nearest tracked root at-or-above `pathString`, or null.
    */
   trackedRootFor(pathString: string): string | null {
@@ -184,7 +205,48 @@ export class PersistenceManager {
         return upgraded;
       });
     });
+    // One sweep per manager, off the first open: restore() only expires the
+    // exact keys it is asked for, so without this, roots that are never
+    // listened to again would sit in IndexedDB forever.
+    void this.db_.then(db => {
+      if (db !== null) {
+        this.sweepExpired_(db);
+      }
+    });
     return this.db_;
+  }
+
+  /**
+   * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
+   * cursor walk. Best-effort: any failure leaves the records for the next
+   * session's sweep.
+   */
+  private sweepExpired_(db: IDBDatabase): void {
+    const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+    const prefix = this.key_('');
+    try {
+      const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          return;
+        }
+        const key = cursor.key;
+        const record = cursor.value as PersistedRecord | undefined;
+        if (
+          typeof key === 'string' &&
+          key.startsWith(prefix) &&
+          (typeof record?.updatedAt !== 'number' || record.updatedAt < cutoff)
+        ) {
+          persistenceStats.evictions++;
+          cursor.delete();
+        }
+        cursor.continue();
+      };
+    } catch (e) {
+      // Sweeping is opportunistic; never let it surface.
+    }
   }
 
   private openAtVersion_(

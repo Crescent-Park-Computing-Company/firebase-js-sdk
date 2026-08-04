@@ -450,7 +450,10 @@ export function getPersistedValue(
 ): Promise<unknown | null> {
   db = getModularInstance(db);
   db._checkNotDeleted('getPersistedValue');
-  const repo = db._repo;
+  // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
+  // and reading a stored record must not start the instance (which would
+  // lock out later transport/emulator configuration).
+  const repo = db._repoInternal;
   const persistence = repo.persistence_;
   if (persistence === null) {
     return Promise.resolve(null);
@@ -499,7 +502,9 @@ export function getPersistedValue(
 export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceEnabled');
-  const repo = db._repo;
+  // _repoInternal, not the _repo getter: configuration must not start the
+  // instance, or a later connectDatabaseEmulator() would refuse to run.
+  const repo = db._repoInternal;
   if (enabled) {
     if (repo.persistence_ === null) {
       repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());

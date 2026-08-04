@@ -200,6 +200,13 @@ export class Repo {
    */
   persistence_: PersistenceManager | null = null;
 
+  /**
+   * Listens held back while their persisted root restores, keyed by path.
+   * stopListening flips the token so a listen whose last registration was
+   * removed mid-restore is never sent (see repoStartServerListen).
+   */
+  pendingSeedRestores_ = new Map<string, { cancelled: boolean }>();
+
   constructor(
     public repoInfo_: RepoInfo,
     public forceRestClient_: boolean,
@@ -337,7 +344,7 @@ export function repoStart(
       return [];
     },
     stopListening: (query, tag) => {
-      repo.server_.unlisten(query, tag);
+      repoStopServerListen(repo, query, tag);
     }
   });
 }
@@ -433,7 +440,7 @@ function repoOnDataUpdate(
  * carrying the restored tree's hashes. Roots that were never persisted
  * resolve null instantly and attach exactly as before.
  */
-function repoStartServerListen(
+export function repoStartServerListen(
   repo: Repo,
   query: QueryContext,
   tag: number | null,
@@ -473,7 +480,17 @@ function repoStartServerListen(
   }
   const pathString = query._path.toString();
   persistence.track(pathString);
+  // stopListening can arrive while the restore is pending — before the
+  // outbound listen exists — in which case its unlisten() is a no-op. The
+  // token lets it cancel this listen instead of leaving it to attach as an
+  // orphaned server subscription with no view to ever stop it.
+  const token = { cancelled: false };
+  repo.pendingSeedRestores_.set(pathString, token);
   void persistence.restore(pathString).then(record => {
+    if (token.cancelled) {
+      return;
+    }
+    repo.pendingSeedRestores_.delete(pathString);
     if (record !== null) {
       try {
         const node = buildSeedNode(record);
@@ -495,6 +512,33 @@ function repoStartServerListen(
     }
     sendListen();
   });
+}
+
+/**
+ * Stops a server listen. With persistence, a complete default listen may
+ * still be waiting on its restore — cancel it so it never attaches — and its
+ * root leaves write-through tracking (flushing the final tree to IndexedDB),
+ * releasing the in-memory copy that only live listens need.
+ */
+export function repoStopServerListen(
+  repo: Repo,
+  query: QueryContext,
+  tag: number | null
+): void {
+  const pathString = query._path.toString();
+  if (tag != null || !query._queryParams.loadsAllData()) {
+    repo.server_.unlisten(query, tag);
+    return;
+  }
+  const pending = repo.pendingSeedRestores_.get(pathString);
+  if (pending) {
+    pending.cancelled = true;
+    repo.pendingSeedRestores_.delete(pathString);
+    // The listen was never sent; nothing to unlisten.
+  } else {
+    repo.server_.unlisten(query, tag);
+  }
+  repo.persistence_?.untrack(pathString);
 }
 
 /**

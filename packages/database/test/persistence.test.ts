@@ -24,6 +24,11 @@ import {
   persistenceStats
 } from '../src/core/Persistence';
 import {
+  repoStartServerListen,
+  repoStopServerListen,
+  Repo
+} from '../src/core/Repo';
+import {
   computeCanonicalHash,
   computeCompoundHash
 } from '../src/core/ServerCacheSeed';
@@ -65,6 +70,38 @@ function makeFakeIndexedDB(options: { startWithoutStore?: boolean } = {}): {
     delete: (key: string) => {
       data.delete(key);
       return makeRequest(undefined);
+    },
+    openCursor: () => {
+      // Walks a snapshot of the entries, one onsuccess per row then null,
+      // mirroring IndexedDB's cursor contract closely enough for the sweep.
+      const entries = [...data.entries()];
+      const req: {
+        result: unknown;
+        onsuccess: null | (() => void);
+        onerror: null | (() => void);
+      } = { result: null, onsuccess: null, onerror: null };
+      let index = 0;
+      const step = () => {
+        if (index < entries.length) {
+          const [key, value] = entries[index++];
+          req.result = {
+            key,
+            value,
+            delete: () => {
+              data.delete(key);
+              return makeRequest(undefined);
+            },
+            continue: () => async(step)
+          };
+        } else {
+          req.result = null;
+        }
+        if (req.onsuccess) {
+          req.onsuccess();
+        }
+      };
+      async(step);
+      return req;
     }
   };
   const tx = {
@@ -250,6 +287,125 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     expect(await manager.restore(path.toString())).to.equal(null);
   });
+
+  it('untrack flushes the final tree, keeps the record, drops the memory', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    const path = new Path('rotated/root');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ kept: true }));
+
+    manager.untrack(path.toString());
+    await flushAsync();
+
+    // The debounced write-through still landed…
+    expect(data.has('test-repo|/rotated/root')).to.equal(true);
+    const restored = (await manager.restore(
+      path.toString()
+    )) as PersistedRecord;
+    expect(restored.json).to.deep.equal({ kept: true });
+    // …but the root no longer flows through persistence: a later update is
+    // ignored, proving both the tracking and the retained tree are gone.
+    manager.serverCacheUpdated(path, nodeFromJSON({ kept: false }));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    expect(
+      ((await manager.restore(path.toString())) as PersistedRecord).json
+    ).to.deep.equal({ kept: true });
+  });
+
+  it('sweeps expired records for its own prefix on first open', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
+    data.set('test-repo|/old/root', {
+      json: { stale: true },
+      updatedAt: expired,
+      revision: 1
+    });
+    data.set('test-repo|/fresh/root', {
+      json: { fresh: true },
+      updatedAt: Date.now(),
+      revision: 1
+    });
+    data.set('other-repo|/old/root', {
+      json: { foreign: true },
+      updatedAt: expired,
+      revision: 1
+    });
+
+    const manager = new PersistenceManager('test-repo', factory);
+    // Any operation triggers the first open, which chains the sweep.
+    await manager.restore('/fresh/root');
+    await flushAsync();
+    await flushAsync();
+
+    expect(data.has('test-repo|/old/root')).to.equal(false);
+    expect(data.has('test-repo|/fresh/root')).to.equal(true);
+    // Another manager's records are not this manager's to expire.
+    expect(data.has('other-repo|/old/root')).to.equal(true);
+  });
+});
+
+describe('repoStartServerListen / repoStopServerListen', () => {
+  /**
+   * The minimal Repo surface the two functions touch. `listen` records calls;
+   * restore resolution is controlled by the manager's fake IndexedDB.
+   */
+  function makeListenHarness() {
+    const { factory } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    const calls: string[] = [];
+    const repo = {
+      pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
+      persistence_: manager,
+      server_: {
+        listen: (...args: unknown[]) => calls.push('listen'),
+        unlisten: (...args: unknown[]) => calls.push('unlisten')
+      }
+    } as unknown as Repo;
+    const path = new Path('users/alice');
+    const query = {
+      _path: path,
+      _queryParams: { loadsAllData: () => true }
+    } as never;
+    const hashFn = (() => '') as never;
+    const onComplete = (() => []) as never;
+    return { repo, query, path, hashFn, onComplete, calls };
+  }
+
+  it('sends the listen after the restore resolves', async () => {
+    const { repo, query, hashFn, onComplete, calls } = makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    expect(calls).to.deep.equal([]);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
+  });
+
+  it('a stop during the restore cancels the listen instead of orphaning it', async () => {
+    const { repo, query, hashFn, onComplete, calls } = makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    repoStopServerListen(repo, query, null);
+    await flushAsync();
+    // Neither sent nor unlistened: the listen never existed on the wire.
+    expect(calls).to.deep.equal([]);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
+    // And the root left tracking with the live listens gone.
+    expect(
+      repo.persistence_!.trackedRootFor(new Path('users/alice').toString())
+    ).to.equal(null);
+  });
+
+  it('a normal stop unlistens and untracks the root', async () => {
+    const { repo, query, path, hashFn, onComplete, calls } =
+      makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    repoStopServerListen(repo, query, null);
+    expect(calls).to.deep.equal(['listen', 'unlisten']);
+    // Untracked: a subsequent server update no longer flows to storage.
+    expect(repo.persistence_!.trackedRootFor(path.toString())).to.equal(null);
+  });
 });
 
 describe('getPersistedValue', () => {
@@ -262,7 +418,7 @@ describe('getPersistedValue', () => {
     const repo = { persistence_: manager };
     const db = {
       _checkNotDeleted: () => {},
-      _repo: repo
+      _repoInternal: repo
       // getModularInstance returns objects without _delegate untouched.
     };
     return { db, manager };
