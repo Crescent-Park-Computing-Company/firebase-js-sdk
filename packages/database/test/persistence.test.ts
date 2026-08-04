@@ -26,6 +26,7 @@ import {
 import {
   repoStartServerListen,
   repoStopServerListen,
+  repoWhenListenComplete,
   Repo
 } from '../src/core/Repo';
 import {
@@ -33,7 +34,9 @@ import {
   computeCompoundHash
 } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
+import { SyncTree } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
+import { EventQueue } from '../src/core/view/EventQueue';
 
 /**
  * A minimal in-memory IDBFactory covering exactly the calls the manager
@@ -355,11 +358,29 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const { factory } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
     const calls: string[] = [];
+    const serverCallbacks: Array<(status: string) => void> = [];
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
+      listenCompletions_: new Map<
+        string,
+        { complete: boolean; waiters: Array<() => void> }
+      >(),
       persistence_: manager,
+      eventQueue_: new EventQueue(),
+      serverSyncTree_: new SyncTree({
+        startListening: () => [],
+        stopListening: () => {}
+      }),
       server_: {
-        listen: (...args: unknown[]) => calls.push('listen'),
+        listen: (
+          _query: unknown,
+          _hashFn: unknown,
+          _tag: unknown,
+          onListen: (status: string) => void
+        ) => {
+          calls.push('listen');
+          serverCallbacks.push(onListen);
+        },
         unlisten: (...args: unknown[]) => calls.push('unlisten')
       }
     } as unknown as Repo;
@@ -370,7 +391,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     } as never;
     const hashFn = (() => '') as never;
     const onComplete = (() => []) as never;
-    return { repo, query, path, hashFn, onComplete, calls };
+    return { repo, query, path, hashFn, onComplete, calls, serverCallbacks };
   }
 
   it('sends the listen after the restore resolves', async () => {
@@ -405,6 +426,51 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(calls).to.deep.equal(['listen', 'unlisten']);
     // Untracked: a subsequent server update no longer flows to storage.
     expect(repo.persistence_!.trackedRootFor(path.toString())).to.equal(null);
+  });
+
+  it('whenListenComplete resolves on the server response, not the restore', async () => {
+    const { repo, query, path, hashFn, onComplete, serverCallbacks } =
+      makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    let settled = false;
+    void repoWhenListenComplete(repo, path.toString()).then(() => {
+      settled = true;
+    });
+    // The restore resolves and the listen goes out — still not complete.
+    await flushAsync();
+    expect(settled).to.equal(false);
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    expect(settled).to.equal(true);
+    // Already complete: a late waiter resolves immediately.
+    let late = false;
+    void repoWhenListenComplete(repo, path.toString()).then(() => {
+      late = true;
+    });
+    await flushAsync();
+    expect(late).to.equal(true);
+  });
+
+  it('whenListenComplete resolves when the listen stops first', async () => {
+    const { repo, query, path, hashFn, onComplete } = makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    let settled = false;
+    void repoWhenListenComplete(repo, path.toString()).then(() => {
+      settled = true;
+    });
+    repoStopServerListen(repo, query, null);
+    await flushAsync();
+    expect(settled).to.equal(true);
+  });
+
+  it('whenListenComplete resolves immediately with no listen at all', async () => {
+    const { repo } = makeListenHarness();
+    let settled = false;
+    void repoWhenListenComplete(repo, '/nowhere').then(() => {
+      settled = true;
+    });
+    await flushAsync();
+    expect(settled).to.equal(true);
   });
 });
 

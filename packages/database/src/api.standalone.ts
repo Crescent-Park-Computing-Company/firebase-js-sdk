@@ -81,7 +81,8 @@ export {
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export {
   getPersistedValue as _getPersistedValue,
-  setPersistenceEnabled as _setPersistenceEnabled
+  setPersistenceEnabled as _setPersistenceEnabled,
+  whenListenComplete as _whenListenComplete
 } from './api/Database';
 export {
   persistenceStats as _persistenceStats,

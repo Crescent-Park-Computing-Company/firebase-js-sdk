@@ -41,7 +41,13 @@ import {
   FirebaseAuthTokenProvider
 } from '../core/AuthTokenProvider';
 import { PersistenceManager } from '../core/Persistence';
-import { Repo, repoInterrupt, repoResume, repoStart } from '../core/Repo';
+import {
+  Repo,
+  repoInterrupt,
+  repoResume,
+  repoStart,
+  repoWhenListenComplete
+} from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import {
@@ -515,6 +521,28 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
       repo.persistence_ = null;
     }
   }
+}
+
+/**
+ * Resolves when the default complete listen at `pathString` has received its
+ * initial response from the server. With persistence, listeners may fire
+ * first with the restored cache; this is the signal that the server has since
+ * certified that data as current (unchanged tree) or replaced it (changed
+ * tree). Resolves immediately when that already happened or no such listen
+ * exists, and when the listen stops before completing — it never hangs.
+ *
+ * @internal
+ */
+export function whenListenComplete(
+  db: Database,
+  pathString: string
+): Promise<void> {
+  db = getModularInstance(db);
+  db._checkNotDeleted('whenListenComplete');
+  return repoWhenListenComplete(
+    db._repoInternal,
+    new Path(pathString).toString()
+  );
 }
 
 /**

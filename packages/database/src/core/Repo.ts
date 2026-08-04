@@ -207,6 +207,16 @@ export class Repo {
    */
   pendingSeedRestores_ = new Map<string, { cancelled: boolean }>();
 
+  /**
+   * Listen-complete state per default complete listen, keyed by path: whether
+   * the current listen has received its initial server response, and waiters
+   * to resolve when it does (see whenListenComplete in api/Database.ts).
+   */
+  listenCompletions_ = new Map<
+    string,
+    { complete: boolean; waiters: Array<() => void> }
+  >();
+
   constructor(
     public repoInfo_: RepoInfo,
     public forceRestClient_: boolean,
@@ -447,6 +457,18 @@ export function repoStartServerListen(
   currentHashFn: ListenHashFn,
   onComplete: (status: string, data?: unknown) => Event[]
 ): void {
+  const pathString = query._path.toString();
+  // tag is null or undefined for a default listen depending on the caller;
+  // loose null covers both.
+  const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
+  if (isDefaultComplete) {
+    const prior = repo.listenCompletions_.get(pathString);
+    repo.listenCompletions_.set(pathString, {
+      complete: false,
+      // Waiters registered before the listen attached carry over.
+      waiters: prior ? prior.waiters : []
+    });
+  }
   const sendListen = () => {
     repo.server_.listen(query, currentHashFn, tag, (status, data) => {
       const events = onComplete(status, data);
@@ -455,30 +477,35 @@ export function repoStartServerListen(
         query._path,
         events
       );
-      // A listen 'ok' certifies the (possibly restored) server cache as
-      // current; any other status (permission_denied, listen revoked) evicts
-      // the stored copy — a cached tree must not outlive the access that
-      // produced it. tag is null or undefined for a default listen depending
-      // on the caller; loose null covers both.
-      if (tag == null && repo.persistence_ !== null) {
-        if (status === 'ok') {
-          repoPersistAfterServerUpdate(repo, query._path);
-        } else {
-          repo.persistence_.evict(query._path);
+      if (isDefaultComplete) {
+        // A listen response — ok or not — certifies the local view against
+        // the server; a persisted 'ok' re-persists it, any other status
+        // evicts the stored copy (a cached tree must not outlive the access
+        // that produced it).
+        const completion = repo.listenCompletions_.get(pathString);
+        if (completion && !completion.complete) {
+          completion.complete = true;
+          const waiters = completion.waiters;
+          completion.waiters = [];
+          for (const waiter of waiters) {
+            waiter();
+          }
+        }
+        if (repo.persistence_ !== null) {
+          if (status === 'ok') {
+            repoPersistAfterServerUpdate(repo, query._path);
+          } else {
+            repo.persistence_.evict(query._path);
+          }
         }
       }
     });
   };
   const persistence = repo.persistence_;
-  if (
-    persistence === null ||
-    tag != null ||
-    !query._queryParams.loadsAllData()
-  ) {
+  if (persistence === null || !isDefaultComplete) {
     sendListen();
     return;
   }
-  const pathString = query._path.toString();
   persistence.track(pathString);
   // stopListening can arrive while the restore is pending — before the
   // outbound listen exists — in which case its unlisten() is a no-op. The
@@ -538,7 +565,36 @@ export function repoStopServerListen(
   } else {
     repo.server_.unlisten(query, tag);
   }
+  // Resolve outstanding completion waiters — the listen they were watching is
+  // gone, and a promise that can never settle would leak its callers.
+  const completion = repo.listenCompletions_.get(pathString);
+  if (completion) {
+    repo.listenCompletions_.delete(pathString);
+    for (const waiter of completion.waiters) {
+      waiter();
+    }
+  }
   repo.persistence_?.untrack(pathString);
+}
+
+/**
+ * Resolves when the current default complete listen at `pathString` has
+ * received its initial response from the server — the moment a restored
+ * cache is certified (unchanged tree) or replaced (changed tree). Resolves
+ * immediately if that already happened, or if no such listen exists; also
+ * resolves if the listen stops first, so callers never hang.
+ */
+export function repoWhenListenComplete(
+  repo: Repo,
+  pathString: string
+): Promise<void> {
+  const completion = repo.listenCompletions_.get(pathString);
+  if (!completion || completion.complete) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    completion.waiters.push(resolve);
+  });
 }
 
 /**
