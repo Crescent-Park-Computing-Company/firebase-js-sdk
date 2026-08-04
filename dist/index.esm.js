@@ -12015,7 +12015,7 @@ function repoStart(repo, appId, authOverride) {
                     // the listen-complete counts as a server update for persistence. Any
                     // other status (permission_denied, listen revoked) evicts the stored
                     // copy: a cached tree must not outlive the access that produced it.
-                    if (tag === null && repo.persistence_ !== null) {
+                    if (tag == null && repo.persistence_ !== null) {
                         if (status === 'ok') {
                             repoPersistAfterServerUpdate(repo, query._path);
                         }
@@ -12032,8 +12032,10 @@ function repoStart(repo, appId, authOverride) {
             // the restored tree's hashes. Roots the app never persisted resolve
             // null instantly and attach exactly as before.
             const persistence = repo.persistence_;
+            // tag is null OR undefined for a default (non-query) listen depending on
+            // the caller; loose null covers both.
             if (persistence !== null &&
-                tag === null &&
+                tag == null &&
                 query._queryParams.loadsAllData()) {
                 const pathString = query._path.toString();
                 persistence.track(pathString);
@@ -12119,7 +12121,7 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
         affectedPath = repoRerunTransactions(repo, path);
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
-    if (tag === null) {
+    if (tag == null) {
         repoPersistAfterServerUpdate(repo, path);
     }
 }
@@ -12171,7 +12173,7 @@ function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
         affectedPath = repoRerunTransactions(repo, path);
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
-    if (tag === null) {
+    if (tag == null) {
         repoPersistAfterServerUpdate(repo, path);
     }
 }
