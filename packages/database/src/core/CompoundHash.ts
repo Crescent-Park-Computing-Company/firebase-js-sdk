@@ -307,3 +307,82 @@ export function estimateSerializedNodeSize(node: Node): number {
     return sum;
   }
 }
+
+/**
+ * Computes a compound hash in bounded slices of main-thread time, yielding to
+ * the event loop between slices, so hashing a large tree for persistence
+ * never blocks the UI the way a monolithic walk would.
+ *
+ * The recursive walk of compoundHashFromNode is driven as an explicit frame
+ * stack — a `child` frame runs builder.startChild, pushes its subtree, and a
+ * matching `end` frame runs builder.endChild — so the builder sees the exact
+ * call sequence the recursion produces and the resulting hash is identical.
+ */
+export function compoundHashFromNodeAsync(
+  node: Node,
+  splitStrategy?: CompoundHashSplitStrategy,
+  sliceMs = 12
+): Promise<CompoundHash> {
+  if (node.isEmpty()) {
+    return Promise.resolve(new CompoundHash([], ['']));
+  }
+  const strategy = splitStrategy || simpleSizeSplitStrategy(node);
+  const builder = new CompoundHashBuilder(strategy);
+
+  type Frame =
+    | { kind: 'node'; node: Node }
+    | { kind: 'child'; key: string; child: Node }
+    | { kind: 'end' };
+  // Popped last-in-first-out; children are pushed in reverse key order so
+  // they pop in key order.
+  const stack: Frame[] = [{ kind: 'node', node }];
+
+  const processFrame = (frame: Frame): void => {
+    if (frame.kind === 'end') {
+      builder.endChild();
+      return;
+    }
+    const current = frame.kind === 'node' ? frame.node : frame.child;
+    if (frame.kind === 'child') {
+      builder.startChild(frame.key);
+      stack.push({ kind: 'end' });
+    }
+    if (current.isLeafNode()) {
+      builder.processLeaf(current as LeafNode);
+      // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
+      // child frame) already sits on the stack.
+      return;
+    }
+    const children: Array<[string, Node]> = [];
+    forEachChildWithPriority(current, (key, child) => {
+      children.push([key, child]);
+    });
+    for (let i = children.length - 1; i >= 0; i--) {
+      stack.push({ kind: 'child', key: children[i][0], child: children[i][1] });
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    const schedule =
+      typeof requestIdleCallback === 'function'
+        ? (fn: () => void) => requestIdleCallback(() => fn(), { timeout: 200 })
+        : (fn: () => void) => setTimeout(fn, 0);
+    const step = (): void => {
+      try {
+        const deadline = Date.now() + sliceMs;
+        while (stack.length > 0 && Date.now() < deadline) {
+          processFrame(stack.pop()!);
+        }
+        if (stack.length > 0) {
+          schedule(step);
+          return;
+        }
+        builder.finishHashing();
+        resolve(new CompoundHash(builder.posts, builder.hashes));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    step();
+  });
+}

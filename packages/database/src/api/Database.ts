@@ -40,10 +40,19 @@ import {
   EmulatorTokenProvider,
   FirebaseAuthTokenProvider
 } from '../core/AuthTokenProvider';
+import { PersistenceManager } from '../core/Persistence';
 import { Repo, repoInterrupt, repoResume, repoStart } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { parseRepoInfo } from '../core/util/libs/parser';
-import { newEmptyPath, pathIsEmpty } from '../core/util/Path';
+import {
+  newEmptyPath,
+  newRelativePath,
+  Path,
+  pathGetFront,
+  pathIsEmpty,
+  pathParent,
+  pathPopFront
+} from '../core/util/Path';
 import {
   warn,
   fatal,
@@ -424,6 +433,83 @@ export function goOffline(db: Database): void {
   db = getModularInstance(db);
   db._checkNotDeleted('goOffline');
   repoInterrupt(db._repo);
+}
+
+/**
+ * Reads the persisted server cache for `path` WITHOUT attaching a listener —
+ * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @internal
+ */
+export function getPersistedValue(
+  db: Database,
+  pathString: string
+): Promise<unknown | null> {
+  db = getModularInstance(db);
+  db._checkNotDeleted('getPersistedValue');
+  const repo = db._repo;
+  const persistence = repo.persistence_;
+  if (persistence === null) {
+    return Promise.resolve(null);
+  }
+  // Records are stored per listened ROOT; a peek at a subpath restores the
+  // deepest stored ancestor (walking up from the full path) and drills into
+  // its JSON along the remaining segments.
+  const path = new Path(pathString);
+  const attempt = (candidate: Path): Promise<unknown | null> =>
+    persistence.restore(candidate.toString()).then(record => {
+      if (record !== null) {
+        // candidate is an ancestor of (or equal to) path by construction.
+        let cursor = newRelativePath(candidate, path);
+        let value: unknown = record.json;
+        while (!pathIsEmpty(cursor)) {
+          if (value === null || typeof value !== 'object') {
+            return null;
+          }
+          value = (value as Record<string, unknown>)[pathGetFront(cursor)!];
+          cursor = pathPopFront(cursor);
+        }
+        return value === undefined ? null : value;
+      }
+      const parent = pathParent(candidate);
+      if (parent === null) {
+        return null;
+      }
+      return attempt(parent);
+    });
+  return attempt(path);
+}
+
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @internal
+ */
+export function setPersistenceEnabled(db: Database, enabled: boolean): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceEnabled');
+  const repo = db._repo;
+  if (enabled) {
+    if (repo.persistence_ === null) {
+      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+    }
+  } else {
+    if (repo.persistence_ !== null) {
+      repo.persistence_.dispose();
+      repo.persistence_ = null;
+    }
+  }
 }
 
 /**

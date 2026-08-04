@@ -107,7 +107,9 @@ export function seedServerCache(
   seeds.set(normalizeSeedPath(path), { json, hash, compoundHash });
 }
 
-/** Removes all registered seeds. * @internal
+/**
+ * Removes all registered seeds.
+ * @internal
  */
 export function clearServerCacheSeeds(): void {
   seeds.clear();

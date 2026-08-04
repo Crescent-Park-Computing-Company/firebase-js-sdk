@@ -38,6 +38,7 @@ jobs:
           TS_NODE_FILES=true TS_NODE_CACHE=NO TS_NODE_COMPILER_OPTIONS='{"module":"commonjs"}' \
           npx mocha \
             'test/compoundhash.test.ts' \
+            'test/persistence.test.ts' \
             'test/rangemerge.test.ts' \
             'test/servercacheseed.test.ts' \
             'test/compound_write.test.ts' \

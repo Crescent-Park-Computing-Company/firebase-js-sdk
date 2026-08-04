@@ -28,10 +28,12 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
+import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
+import { buildSeedNode, ListenHashFn } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
@@ -64,6 +66,7 @@ import {
   syncTreeApplyUserMerge,
   syncTreeApplyUserOverwrite,
   syncTreeCalcCompleteEventCache,
+  syncTreeGetCompleteServerCache,
   syncTreeGetServerValue,
   syncTreeRemoveEventRegistration,
   syncTreeTagForQuery
@@ -190,6 +193,12 @@ export class Repo {
 
   // TODO: This should be @private but it's used by test_access.js and internal.js
   persistentConnection_: PersistentConnection | null = null;
+
+  /**
+   * Server-cache persistence (see core/Persistence.ts); null unless the app
+   * enabled it before this Repo's first listen.
+   */
+  persistence_: PersistenceManager | null = null;
 
   constructor(
     public repoInfo_: RepoInfo,
@@ -323,14 +332,7 @@ export function repoStart(
 
   repo.serverSyncTree_ = new SyncTree({
     startListening: (query, tag, currentHashFn, onComplete) => {
-      repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-        const events = onComplete(status, data);
-        eventQueueRaiseEventsForChangedPath(
-          repo.eventQueue_,
-          query._path,
-          events
-        );
-      });
+      repoStartServerListen(repo, query, tag, currentHashFn, onComplete);
       // No synchronous events for network-backed sync trees
       return [];
     },
@@ -417,6 +419,108 @@ function repoOnDataUpdate(
     affectedPath = repoRerunTransactions(repo, path);
   }
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  if (tag == null) {
+    repoPersistAfterServerUpdate(repo, path);
+  }
+}
+
+/**
+ * Sends a listen for the server sync tree, restoring the persisted server
+ * cache first where applicable: a complete default listen on a persisted
+ * root is held until the stored tree restores (bounded inside restore()),
+ * the restored tree is applied as server data — raising cached events
+ * immediately, mobile-persistence semantics — and the listen then goes out
+ * carrying the restored tree's hashes. Roots that were never persisted
+ * resolve null instantly and attach exactly as before.
+ */
+function repoStartServerListen(
+  repo: Repo,
+  query: QueryContext,
+  tag: number | null,
+  currentHashFn: ListenHashFn,
+  onComplete: (status: string, data?: unknown) => Event[]
+): void {
+  const sendListen = () => {
+    repo.server_.listen(query, currentHashFn, tag, (status, data) => {
+      const events = onComplete(status, data);
+      eventQueueRaiseEventsForChangedPath(
+        repo.eventQueue_,
+        query._path,
+        events
+      );
+      // A listen 'ok' certifies the (possibly restored) server cache as
+      // current; any other status (permission_denied, listen revoked) evicts
+      // the stored copy — a cached tree must not outlive the access that
+      // produced it. tag is null or undefined for a default listen depending
+      // on the caller; loose null covers both.
+      if (tag == null && repo.persistence_ !== null) {
+        if (status === 'ok') {
+          repoPersistAfterServerUpdate(repo, query._path);
+        } else {
+          repo.persistence_.evict(query._path);
+        }
+      }
+    });
+  };
+  const persistence = repo.persistence_;
+  if (
+    persistence === null ||
+    tag != null ||
+    !query._queryParams.loadsAllData()
+  ) {
+    sendListen();
+    return;
+  }
+  const pathString = query._path.toString();
+  persistence.track(pathString);
+  void persistence.restore(pathString).then(record => {
+    if (record !== null) {
+      try {
+        const node = buildSeedNode(record);
+        if (!node.isEmpty()) {
+          const events = syncTreeApplyServerOverwrite(
+            repo.serverSyncTree_,
+            query._path,
+            node
+          );
+          eventQueueRaiseEventsForChangedPath(
+            repo.eventQueue_,
+            query._path,
+            events
+          );
+        }
+      } catch (e) {
+        // A malformed record must never break the listen.
+      }
+    }
+    sendListen();
+  });
+}
+
+/**
+ * Persistence write-through: after the server updated `path` (overwrite,
+ * merge, range merge, or listen-complete certification), re-persist the
+ * nearest persistence-tracked root containing it. Reads the SyncTree's own
+ * complete server cache — the exact tree the SDK now holds as server truth —
+ * so what is stored is always what was applied, never a re-derivation.
+ */
+function repoPersistAfterServerUpdate(repo: Repo, path: Path): void {
+  const persistence = repo.persistence_;
+  if (persistence === null) {
+    return;
+  }
+  const rootString = persistence.trackedRootFor(path.toString());
+  if (rootString === null) {
+    return;
+  }
+  const rootPath = new Path(rootString);
+  const serverCache = syncTreeGetCompleteServerCache(
+    repo.serverSyncTree_,
+    rootPath
+  );
+  if (serverCache !== null) {
+    persistence.serverCacheUpdated(rootPath, serverCache);
+  }
 }
 
 /**
@@ -461,6 +565,9 @@ function repoOnRangeMergeUpdate(
     affectedPath = repoRerunTransactions(repo, path);
   }
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  if (tag == null) {
+    repoPersistAfterServerUpdate(repo, path);
+  }
 }
 
 // TODO: This should be @private but it's used by test_access.js and internal.js

@@ -80,6 +80,14 @@ export {
 // internal exports
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export {
+  getPersistedValue as _getPersistedValue,
+  setPersistenceEnabled as _setPersistenceEnabled
+} from './api/Database';
+export {
+  persistenceStats as _persistenceStats,
+  PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS
+} from './core/Persistence';
+export {
   seedServerCache as _seedServerCache,
   clearServerCacheSeeds as _clearServerCacheSeeds,
   computeCanonicalHash as _computeCanonicalHash,

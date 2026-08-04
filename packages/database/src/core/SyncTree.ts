@@ -323,6 +323,26 @@ export function syncTreeApplyTaggedListenComplete(
 }
 
 /**
+ * The complete (default) view's server cache at `path`, or null when no
+ * complete view exists there. Used by persistence write-through to read the
+ * tree the server just confirmed.
+ */
+export function syncTreeGetCompleteServerCache(
+  syncTree: SyncTree,
+  path: Path
+): Node | null {
+  const syncPoint = syncTree.syncPointTree_.get(path);
+  if (!syncPoint) {
+    return null;
+  }
+  const view = syncPointGetCompleteView(syncPoint);
+  if (!view) {
+    return null;
+  }
+  return viewGetServerCache(view) || null;
+}
+
+/**
  * Applies server range merges against the complete (default) view at the
  * given path and promotes the merged tree through the standard
  * server-overwrite path.
