@@ -18,6 +18,7 @@
 import { assert, isNodeSdk, jsonEval, stringify } from '@firebase/util';
 
 import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
+import { serverCacheSeedStats } from '../core/ServerCacheSeed';
 import { StatsCollection } from '../core/stats/StatsCollection';
 import { statsManagerGetCollection } from '../core/stats/StatsManager';
 import { PersistentStorage } from '../core/storage/storage';
@@ -339,6 +340,7 @@ export class WebSocketConnection implements Transport {
     const data = mess['data'] as string;
     this.bytesReceived += data.length;
     this.stats_.incrementCounter('bytes_received', data.length);
+    serverCacheSeedStats.bytesReceived += data.length;
 
     this.resetKeepAlive();
 

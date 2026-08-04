@@ -35,6 +35,11 @@ import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
+import {
+  ListenHashFn,
+  normalizeStatsPath,
+  serverCacheSeedStats
+} from './ServerCacheSeed';
 import { OnlineMonitor } from './util/OnlineMonitor';
 import { Path } from './util/Path';
 import { error, log, logWrapper, warn, ObjectToUniqueKey } from './util/util';
@@ -55,7 +60,7 @@ const INVALID_TOKEN_THRESHOLD = 3;
 interface ListenSpec {
   onComplete(s: string, p?: unknown): void;
 
-  hashFn(): string;
+  hashFn: ListenHashFn;
 
   query: QueryContext;
   tag: number | null;
@@ -155,7 +160,12 @@ export class PersistentConnection extends ServerActions {
     private onServerInfoUpdate_: (a: unknown) => void,
     private authTokenProvider_: AuthTokenProvider,
     private appCheckTokenProvider_: AppCheckTokenProvider,
-    private authOverride_?: object | null
+    private authOverride_?: object | null,
+    private onRangeMergeUpdate_?: (
+      path: string,
+      ranges: Array<{ s?: string; e?: string; m: unknown }>,
+      tag: number | null
+    ) => void
   ) {
     super();
 
@@ -224,7 +234,7 @@ export class PersistentConnection extends ServerActions {
 
   listen(
     query: QueryContext,
-    currentHashFn: () => string,
+    currentHashFn: ListenHashFn,
     tag: number | null,
     onComplete: (a: string, b: unknown) => void
   ) {
@@ -288,9 +298,40 @@ export class PersistentConnection extends ServerActions {
 
     req[/*hash*/ 'h'] = listenSpec.hashFn();
 
+    // When the server cache was seeded from app-persisted data, send its
+    // compound hash too: a miss on the simple hash then downgrades to
+    // range merges covering only the changed ranges instead of a full
+    // download (see ServerCacheSeed).
+    const compoundHash = listenSpec.hashFn.compoundHash?.();
+    if (compoundHash) {
+      req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
+      serverCacheSeedStats.listensSentWithCompoundHash++;
+    }
+    if (req['h'] !== '') {
+      serverCacheSeedStats.listensSentWithHash++;
+    }
+    const hadHash = req['h'] !== '';
+    const pushesBefore =
+      serverCacheSeedStats.dataPushesByPath[normalizeStatsPath(pathString)] ||
+      0;
+
     this.sendRequest(action, req, (message: { [k: string]: unknown }) => {
       const payload: unknown = message[/*data*/ 'd'];
       const status = message[/*status*/ 's'] as string;
+
+      if (status === 'ok') {
+        serverCacheSeedStats.listenOks++;
+        // An 'ok' with no data pushed for this path since the listen went
+        // out means the server accepted our hash as current.
+        if (
+          hadHash &&
+          (serverCacheSeedStats.dataPushesByPath[
+            normalizeStatsPath(pathString)
+          ] || 0) === pushesBefore
+        ) {
+          serverCacheSeedStats.hashMatches++;
+        }
+      }
 
       // print warnings in any case...
       PersistentConnection.warnOnListenWarnings_(payload, query);
@@ -659,6 +700,15 @@ export class PersistentConnection extends ServerActions {
 
   private onDataPush_(action: string, body: { [k: string]: unknown }) {
     this.log_('handleServerMessage', action, body);
+    if (
+      (action === 'd' || action === 'm' || action === 'rm') &&
+      body &&
+      body['p'] !== undefined
+    ) {
+      const statsPath = normalizeStatsPath(body['p'] as string);
+      serverCacheSeedStats.dataPushesByPath[statsPath] =
+        (serverCacheSeedStats.dataPushesByPath[statsPath] || 0) + 1;
+    }
     if (action === 'd') {
       this.onDataUpdate_(
         body[/*path*/ 'p'] as string,
@@ -672,6 +722,15 @@ export class PersistentConnection extends ServerActions {
         body[/*data*/ 'd'],
         /*isMerge=*/ true,
         body['t'] as number
+      );
+    } else if (action === 'rm') {
+      // Range merge: the listen carried a compound hash and only some of its
+      // ranges differed — the server resends just those ranges.
+      serverCacheSeedStats.rangeMergesReceived++;
+      this.onRangeMergeUpdate_?.(
+        body[/*path*/ 'p'] as string,
+        body[/*ranges*/ 'd'] as Array<{ s?: string; e?: string; m: unknown }>,
+        body['t'] as number | null
       );
     } else if (action === 'c') {
       this.onListenRevoked_(

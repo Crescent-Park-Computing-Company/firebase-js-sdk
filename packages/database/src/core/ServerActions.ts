@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+import { ListenHashFn } from './ServerCacheSeed';
 import { QueryContext } from './view/EventRegistration';
 
 /**
@@ -26,7 +27,7 @@ import { QueryContext } from './view/EventRegistration';
 export abstract class ServerActions {
   abstract listen(
     query: QueryContext,
-    currentHashFn: () => string,
+    currentHashFn: ListenHashFn,
     tag: number | null,
     onComplete: (a: string, b: unknown) => void
   ): void;

@@ -18,6 +18,7 @@
 import { base64Encode, isNodeSdk, stringify } from '@firebase/util';
 
 import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
+import { serverCacheSeedStats } from '../core/ServerCacheSeed';
 import { StatsCollection } from '../core/stats/StatsCollection';
 import { statsManagerGetCollection } from '../core/stats/StatsManager';
 import {
@@ -396,6 +397,7 @@ export class BrowserPollConnection implements Transport {
     const bytesReceived = stringify(args).length;
     this.bytesReceived += bytesReceived;
     this.stats_.incrementCounter('bytes_received', bytesReceived);
+    serverCacheSeedStats.bytesReceived += bytesReceived;
   }
 }
 

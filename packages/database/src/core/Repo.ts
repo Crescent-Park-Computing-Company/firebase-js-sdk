@@ -35,6 +35,7 @@ import { ServerActions } from './ServerActions';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
+import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
 import {
   newSparseSnapshotTree,
@@ -56,8 +57,10 @@ import {
   syncTreeAddEventRegistration,
   syncTreeApplyServerMerge,
   syncTreeApplyServerOverwrite,
+  syncTreeApplyServerRangeMerges,
   syncTreeApplyTaggedQueryMerge,
   syncTreeApplyTaggedQueryOverwrite,
+  syncTreeApplyTaggedRangeMerges,
   syncTreeApplyUserMerge,
   syncTreeApplyUserOverwrite,
   syncTreeCalcCompleteEventCache,
@@ -266,7 +269,14 @@ export function repoStart(
       },
       repo.authTokenProvider_,
       repo.appCheckProvider_,
-      authOverride
+      authOverride,
+      (
+        pathString: string,
+        ranges: Array<{ s?: string; e?: string; m: unknown }>,
+        tag: number | null
+      ) => {
+        repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
+      }
     );
 
     repo.server_ = repo.persistentConnection_;
@@ -399,6 +409,50 @@ function repoOnDataUpdate(
   } else {
     const snap = nodeFromJSON(data);
     events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, snap);
+  }
+  let affectedPath = path;
+  if (events.length > 0) {
+    // Since we have a listener outstanding for each transaction, receiving any events
+    // is a proxy for some change having occurred.
+    affectedPath = repoRerunTransactions(repo, path);
+  }
+  eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+}
+
+/**
+ * Handles a server range-merge push: the listen carried a compound hash and
+ * only some of its ranges differed. Each wire range is
+ * `{ s?, e?, m }` — exclusive-start path, inclusive-end path (either bound
+ * may be missing, meaning open), and the update tree for that range —
+ * applied in order against the locally cached server data.
+ */
+function repoOnRangeMergeUpdate(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  tag: number | null
+): void {
+  // For testing.
+  repo.dataUpdateCount++;
+  const path = new Path(pathString);
+  const merges = ranges.map(
+    range =>
+      new RangeMerge(
+        typeof range.s === 'string' ? new Path(range.s) : null,
+        typeof range.e === 'string' ? new Path(range.e) : null,
+        nodeFromJSON(range.m)
+      )
+  );
+  let events: Event[];
+  if (tag) {
+    events = syncTreeApplyTaggedRangeMerges(
+      repo.serverSyncTree_,
+      path,
+      merges,
+      tag
+    );
+  } else {
+    events = syncTreeApplyServerRangeMerges(repo.serverSyncTree_, path, merges);
   }
   let affectedPath = path;
   if (events.length > 0) {

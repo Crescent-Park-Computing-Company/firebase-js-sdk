@@ -80,6 +80,14 @@ export {
 // internal exports
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export {
+  seedServerCache as _seedServerCache,
+  clearServerCacheSeeds as _clearServerCacheSeeds,
+  computeCanonicalHash as _computeCanonicalHash,
+  computeCompoundHash as _computeCompoundHash,
+  serverCacheSeedStats as _serverCacheSeedStats,
+  SeedCompoundHash
+} from './core/ServerCacheSeed';
+export {
   ReferenceImpl as _ReferenceImpl,
   QueryImpl as _QueryImpl
 } from './api/Reference_impl';
