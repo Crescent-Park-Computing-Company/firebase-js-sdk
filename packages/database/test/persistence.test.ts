@@ -59,6 +59,7 @@ import {
 function makeFakeIndexedDB(
   options: {
     startWithoutStore?: boolean;
+    dbVersion?: number;
     onPut?: (key: string, value: unknown) => void;
   } = {}
 ): {
@@ -69,7 +70,10 @@ function makeFakeIndexedDB(
   // Mirrors real IndexedDB semantics closely enough for the manager: object
   // stores exist only once created in a version-change transaction, and a
   // versioned open above the current version fires onupgradeneeded.
-  const state = { version: 1, hasStore: !options.startWithoutStore };
+  const state = {
+    version: options.dbVersion ?? 3,
+    hasStore: !options.startWithoutStore
+  };
   const async = (fn: () => void) => {
     void Promise.resolve().then(fn);
   };
@@ -106,6 +110,10 @@ function makeFakeIndexedDB(
       if (options.onPut) {
         options.onPut(key, value);
       }
+      return makeRequest(undefined);
+    },
+    clear: () => {
+      data.clear();
       return makeRequest(undefined);
     },
     delete: (key: string) => {
@@ -185,12 +193,14 @@ function makeFakeIndexedDB(
         onsuccess: null | (() => void);
         onerror: null | (() => void);
         onblocked: null | (() => void);
+        transaction: null | { objectStore: () => typeof store };
       } = {
         result: null,
         onupgradeneeded: null,
         onsuccess: null,
         onerror: null,
-        onblocked: null
+        onblocked: null,
+        transaction: null
       };
       async(() => {
         const upgrading = version !== undefined && version > state.version;
@@ -198,6 +208,7 @@ function makeFakeIndexedDB(
           state.version = version!;
         }
         req.result = makeDb();
+        req.transaction = upgrading ? { objectStore: () => store } : null;
         if (upgrading && req.onupgradeneeded) {
           req.onupgradeneeded();
         }
@@ -433,6 +444,19 @@ describe('PersistenceManager', () => {
     const restored = (await manager.restore('/legacy/root')) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(json);
     expect(restored.hash).to.equal(computeCanonicalHash(json));
+  });
+
+  it('clears pre-chunk cache formats without reading their values', async () => {
+    const { factory, data } = makeFakeIndexedDB({ dbVersion: 1 });
+    data.set('test-repo|/huge/legacy', {
+      json: { old: true },
+      updatedAt: Date.now(),
+      revision: 'old-1'
+    });
+    const manager = new PersistenceManager('test-repo', factory);
+    // First open upgrades + clears inside IDB; restore never gets the value.
+    expect(await manager.restore('/huge/legacy')).to.equal(null);
+    expect(data.size).to.equal(0);
   });
 
   it('resolves null for a root never persisted', async () => {
