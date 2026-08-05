@@ -417,6 +417,28 @@ describe('PersistenceManager', () => {
     expect(hashSidecarGets).to.equal(0);
   });
 
+  it('does not repopulate in-memory state after the root is untracked', async () => {
+    const seeded = makeFakeIndexedDB();
+    const path = new Path('late/root');
+    const writer = new PersistenceManager('test-repo', seeded.factory);
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ cached: true }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    const readerFactory = makeFakeIndexedDB();
+    for (const [key, value] of seeded.data) {
+      readerFactory.data.set(key, value);
+    }
+    const reader = new PersistenceManager('test-repo', readerFactory.factory);
+    reader.track(path.toString());
+    const restoring = reader.restoreForListen(path.toString());
+    reader.untrack(path.toString());
+
+    expect(await restoring).to.equal(null);
+    expect(reader.trackedRootFor(path.toString())).to.equal(null);
+  });
+
   it('an unchanged tree with an aging manifest refreshes the manifest alone', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
@@ -1238,6 +1260,33 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(completed).to.equal(true);
     expect(calls).to.deep.equal(['listen']);
+  });
+
+  it('rejects hashes and cached data from different manifest revisions', async () => {
+    const { repo, query, hashFn, onComplete, calls } = makeListenHarness();
+    const node = nodeFromJSON({ cached: 'revision-a' });
+    const compoundHash = computeCompoundHash(node.val(true));
+    repo.persistence_ = {
+      track: () => {},
+      restoreListenMetadata: () =>
+        Promise.resolve({ hash: 'hash-b', compoundHash, revision: 'revision-b' }),
+      restoreForListen: () =>
+        Promise.resolve({
+          node,
+          hash: 'hash-a',
+          compoundHash,
+          updatedAt: Date.now(),
+          revision: 'revision-a'
+        }),
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
   });
 
   it('restarts seeded reconciliation only when the persisted base fails validation', async () => {

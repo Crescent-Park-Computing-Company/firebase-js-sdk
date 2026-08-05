@@ -668,6 +668,14 @@ export function repoStartServerListen(
         return;
       }
 
+      if (metadata && metadata.revision !== record.revision) {
+        // Another tab committed a different manifest between the metadata
+        // read and the shared chunk decode. Never certify revision A's tree
+        // with revision B's hashes.
+        restartCurrentListen();
+        return;
+      }
+
       const alreadyCertified =
         syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
         null;

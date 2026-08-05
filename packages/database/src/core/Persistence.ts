@@ -1068,7 +1068,11 @@ export class PersistenceManager {
       return Promise.resolve(null);
     }
     return this.readRecord_(pathString).then(result => {
-      if (result === null || this.disposed_) {
+      if (
+        result === null ||
+        this.disposed_ ||
+        !this.trackedRoots_.has(pathString)
+      ) {
         return null;
       }
       this.lastFlush_.set(pathString, {
