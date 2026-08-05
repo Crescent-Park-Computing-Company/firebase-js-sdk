@@ -76,7 +76,7 @@ export declare function estimateSerializedNodeSize(node: Node): number;
  * never blocks the UI the way a monolithic walk would. Same traversal as
  * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
  */
-export declare function compoundHashFromNodeAsync(node: Node, splitStrategy?: CompoundHashSplitStrategy, sliceMs?: number): Promise<CompoundHash>;
+export declare function compoundHashFromNodeAsync(node: Node, splitStrategy?: CompoundHashSplitStrategy, sliceMs?: number, onProgress?: () => void): Promise<CompoundHash>;
 /**
  * Computes the canonical Node hash without populating every subtree's
  * lazyHash_. Only frames on the current depth-first path are retained; each
@@ -84,7 +84,7 @@ export declare function compoundHashFromNodeAsync(node: Node, splitStrategy?: Co
  * write time, stores the resulting root hash in the manifest, and stamps only
  * the restored root on the next boot.
  */
-export declare function canonicalHashFromNodeAsync(node: Node, sliceMs?: number): Promise<string>;
+export declare function canonicalHashFromNodeAsync(node: Node, sliceMs?: number, onProgress?: () => void): Promise<string>;
 /**
  * Computes node.hash() — the canonical listen hash — in bounded slices.
  * Node hashes cache per node (lazyHash_) and nodes are immutable, so the

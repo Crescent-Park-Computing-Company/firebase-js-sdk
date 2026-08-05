@@ -1980,7 +1980,7 @@ function scheduleSlice(fn) {
  * never blocks the UI the way a monolithic walk would. Same traversal as
  * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
  */
-function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
+function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12, onProgress = () => { }) {
     if (node.isEmpty()) {
         return Promise.resolve(new CompoundHash([], ['']));
     }
@@ -1991,6 +1991,7 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
         const step = () => {
             try {
                 if (!walker.drainUntil(Date.now() + sliceMs)) {
+                    onProgress();
                     scheduleSlice(step);
                     return;
                 }
@@ -2011,7 +2012,7 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
  * write time, stores the resulting root hash in the manifest, and stamps only
  * the restored root on the next boot.
  */
-function canonicalHashFromNodeAsync(node, sliceMs = 12) {
+function canonicalHashFromNodeAsync(node, sliceMs = 12, onProgress = () => { }) {
     if (node.isEmpty()) {
         return Promise.resolve('');
     }
@@ -2081,6 +2082,7 @@ function canonicalHashFromNodeAsync(node, sliceMs = 12) {
                         }
                     }
                     if (stack.length > 0 && Date.now() >= deadline) {
+                        onProgress();
                         scheduleSlice(step);
                         return;
                     }
@@ -4413,14 +4415,14 @@ class PersistenceManager {
                 if (result === 'mismatch') {
                     return result;
                 }
-                const actualHash = await canonicalHashFromNodeAsync(result.record.node);
+                const actualHash = await canonicalHashFromNodeAsync(result.record.node, 12, onProgress);
                 if (typeof result.record.hash === 'string' &&
                     actualHash !== result.record.hash) {
                     return 'mismatch';
                 }
                 result.record.hash = actualHash;
                 if (!result.record.compoundHash) {
-                    const compound = await compoundHashFromNodeAsync(result.record.node);
+                    const compound = await compoundHashFromNodeAsync(result.record.node, undefined, 12, onProgress);
                     result.record.compoundHash = {
                         hashes: compound.hashes,
                         posts: compound.posts
@@ -16736,5 +16738,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
  */
 registerDatabase();
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, persistenceStats as _persistenceStats, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.esm.js.map

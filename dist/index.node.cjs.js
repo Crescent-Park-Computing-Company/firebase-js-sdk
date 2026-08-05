@@ -1914,7 +1914,7 @@ function scheduleSlice(fn) {
  * never blocks the UI the way a monolithic walk would. Same traversal as
  * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
  */
-function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
+function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12, onProgress = () => { }) {
     if (node.isEmpty()) {
         return Promise.resolve(new CompoundHash([], ['']));
     }
@@ -1925,6 +1925,7 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
         const step = () => {
             try {
                 if (!walker.drainUntil(Date.now() + sliceMs)) {
+                    onProgress();
                     scheduleSlice(step);
                     return;
                 }
@@ -1945,7 +1946,7 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
  * write time, stores the resulting root hash in the manifest, and stamps only
  * the restored root on the next boot.
  */
-function canonicalHashFromNodeAsync(node, sliceMs = 12) {
+function canonicalHashFromNodeAsync(node, sliceMs = 12, onProgress = () => { }) {
     if (node.isEmpty()) {
         return Promise.resolve('');
     }
@@ -2015,6 +2016,7 @@ function canonicalHashFromNodeAsync(node, sliceMs = 12) {
                         }
                     }
                     if (stack.length > 0 && Date.now() >= deadline) {
+                        onProgress();
                         scheduleSlice(step);
                         return;
                     }
@@ -5124,14 +5126,14 @@ class PersistenceManager {
                 if (result === 'mismatch') {
                     return result;
                 }
-                const actualHash = await canonicalHashFromNodeAsync(result.record.node);
+                const actualHash = await canonicalHashFromNodeAsync(result.record.node, 12, onProgress);
                 if (typeof result.record.hash === 'string' &&
                     actualHash !== result.record.hash) {
                     return 'mismatch';
                 }
                 result.record.hash = actualHash;
                 if (!result.record.compoundHash) {
-                    const compound = await compoundHashFromNodeAsync(result.record.node);
+                    const compound = await compoundHashFromNodeAsync(result.record.node, undefined, 12, onProgress);
                     result.record.compoundHash = {
                         hashes: compound.hashes,
                         posts: compound.posts
@@ -16777,7 +16779,6 @@ exports._computeCompoundHash = computeCompoundHash;
 exports._getPersistedValue = getPersistedValue;
 exports._initStandalone = _initStandalone;
 exports._onPersistenceEvent = onPersistenceEvent;
-exports._persistenceStats = persistenceStats;
 exports._repoManagerDatabaseFromApp = repoManagerDatabaseFromApp;
 exports._seedServerCache = seedServerCache;
 exports._serverCacheSeedStats = serverCacheSeedStats;

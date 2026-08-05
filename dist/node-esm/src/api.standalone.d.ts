@@ -22,7 +22,7 @@ export { increment, serverTimestamp } from './api/ServerValue';
 export { runTransaction, TransactionOptions, TransactionResult } from './api/Transaction';
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export { getPersistedValue as _getPersistedValue, setPersistenceEnabled as _setPersistenceEnabled, setPersistenceAuthScope as _setPersistenceAuthScope, whenListenComplete as _whenListenComplete, seedServerCache as _seedServerCache, clearServerCacheSeeds as _clearServerCacheSeeds } from './api/Database';
-export { persistenceStats as _persistenceStats, onPersistenceEvent as _onPersistenceEvent, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';
+export { onPersistenceEvent as _onPersistenceEvent, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';
 export { computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, serverCacheSeedStats as _serverCacheSeedStats, SeedCompoundHash } from './core/ServerCacheSeed';
 export { ReferenceImpl as _ReferenceImpl, QueryImpl as _QueryImpl } from './api/Reference_impl';
 export { repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp } from './api/Database';

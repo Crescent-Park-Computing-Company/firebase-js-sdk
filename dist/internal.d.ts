@@ -2109,23 +2109,6 @@ declare class PersistenceManager {
     private flush_;
 }
 
-export declare const _persistenceStats: {
-    restoredRoots: string[];
-    restoreMisses: string[];
-    writeThroughs: number;
-    chunksWritten: number;
-    chunksSkipped: number;
-    hashRecomputes: number;
-    evictions: number;
-    storageFailures: number;
-    events: Array<{
-        at: number;
-        path: string;
-        event: string;
-        detail?: string;
-    }>;
-};
-
 /**
  * Firebase connection.  Abstracts wire protocol and handles reconnecting.
  *

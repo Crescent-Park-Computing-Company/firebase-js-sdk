@@ -1000,22 +1000,6 @@ export declare function orderByPriority(): QueryConstraint;
  * {@link https://firebase.google.com/docs/database/web/lists-of-data#sort_data | Sort data}.
  */
 export declare function orderByValue(): QueryConstraint;
-export declare const _persistenceStats: {
-    restoredRoots: string[];
-    restoreMisses: string[];
-    writeThroughs: number;
-    chunksWritten: number;
-    chunksSkipped: number;
-    hashRecomputes: number;
-    evictions: number;
-    storageFailures: number;
-    events: Array<{
-        at: number;
-        path: string;
-        event: string;
-        detail?: string;
-    }>;
-};
 /**
  * Generates a new child location using a unique key and returns its
  * `Reference`.
