@@ -60,6 +60,12 @@ interface Transaction {
 /**
  * A connection to a single data repository.
  */
+interface PendingSeedRestore {
+    cancelled: boolean;
+    listenSent: boolean;
+    buffering: boolean;
+    bufferedActions: Array<() => void>;
+}
 export declare class Repo {
     repoInfo_: RepoInfo;
     forceRestClient_: boolean;
@@ -98,9 +104,7 @@ export declare class Repo {
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
      */
-    pendingSeedRestores_: Map<string, {
-        cancelled: boolean;
-    }>;
+    pendingSeedRestores_: Map<string, PendingSeedRestore>;
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters

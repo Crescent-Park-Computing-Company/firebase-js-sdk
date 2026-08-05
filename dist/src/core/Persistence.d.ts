@@ -47,7 +47,7 @@ export declare const PERSISTENCE_CHUNK_TARGET_BYTES: number;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the chunks and hash record stay put) — so a tree that
+ * a fresh timestamp (the chunks and integrated hashes stay put) — so a tree that
  * never changes but is used daily never ages into the expiry cutoff.
  * @internal
  */
@@ -69,6 +69,12 @@ export interface PersistedRecord {
     compoundHash?: SeedCompoundHash;
     updatedAt: number;
     /** The write token of the manifest this record was assembled from. */
+    revision: string;
+}
+/** Precomputed listen state readable without decoding the cached tree. */
+export interface PersistedListenMetadata {
+    hash: string;
+    compoundHash: SeedCompoundHash;
     revision: string;
 }
 /**
@@ -113,7 +119,7 @@ export declare class PersistenceManager {
     /**
      * Distinguishes this manager's write tokens from every other tab's and
      * session's — numeric counters restart at zero on reload, which let a new
-     * data write pair up with a surviving old hash sidecar.
+     * data write pair up with a write token from another manager instance.
      */
     private instanceId_;
     private writeCounter_;
@@ -126,6 +132,12 @@ export declare class PersistenceManager {
     private flushPending_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
+    /**
+     * One physical IndexedDB decode per root. The pre-auth peek and the
+     * authenticated listener often overlap; without coalescing they each read
+     * every chunk and rebuilt the same large Node tree concurrently.
+     */
+    private activeReads_;
     private sweepTimer_;
     private disposed_;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null);
@@ -163,7 +175,7 @@ export declare class PersistenceManager {
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
      * Expiry is decided by each root's manifest (or legacy record): the
-     * '#'-suffixed chunk and hash records carry no authority of their own and
+     * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
      * are dropped exactly when their manifest is dropped, is missing (orphans
      * from an interrupted write), or no longer lists them. Scoped to this
      * manager's key range and reading keys before values, where the platform
@@ -184,7 +196,7 @@ export declare class PersistenceManager {
     private withStore_;
     /**
      * Reads a root's stored state in one readonly transaction: the manifest
-     * and hash records first, then — for chunked records — each chunk in
+     * the manifest first, then — for chunked records — each chunk in
      * sequence, folded into the assembled tree as it arrives so only one
      * chunk's parsed JSON is ever held at a time. The hash record joins only
      * when its revision matches the manifest's; a chunk whose revision doesn't
@@ -193,8 +205,9 @@ export declare class PersistenceManager {
      * records also resolve null (and are deleted best-effort).
      */
     private readRecord_;
+    private readRecordOnce_;
     /**
-     * Deletes everything stored for a root: manifest, hash record, and every
+     * Deletes everything stored for a root: manifest, legacy hash record, and every
      * chunk the manifest lists (plus, where the platform provides key ranges,
      * any orphaned chunk tail beyond it).
      */
@@ -206,6 +219,20 @@ export declare class PersistenceManager {
      * this tree, so when the server certifies it unchanged (the common warm
      * boot), the follow-up write-through skips without serializing anything.
      */
+    /**
+     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
+     * precomputed hash listen immediately while the shared chunk restore runs
+     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
+     * are structurally valid and coupled to the same revision.
+     */
+    restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
+    /**
+     * Listener restore with no wall/idle fallback: once valid hash metadata has
+     * been sent, a slow local decode must keep progressing rather than restart
+     * the listen unseeded. Null means the persisted base failed validation or a
+     * storage operation failed, not merely that it was slow.
+     */
+    restoreForListen(pathString: string): Promise<PersistedRecord | null>;
     restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * The boot-peek read (see getPersistedValue): resolves the record of the
@@ -257,7 +284,7 @@ export declare class PersistenceManager {
     flushNow(pathString: string): Promise<void>;
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and hash record land as a couple
+     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
      * before the next flush or delete for that root starts, which is the
      * whole storage consistency argument — no cross-operation races to
      * reason about.

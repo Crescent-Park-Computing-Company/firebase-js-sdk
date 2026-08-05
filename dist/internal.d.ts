@@ -1880,6 +1880,23 @@ declare class Path {
 }
 
 /**
+ * A connection to a single data repository.
+ */
+declare interface PendingSeedRestore {
+    cancelled: boolean;
+    listenSent: boolean;
+    buffering: boolean;
+    bufferedActions: Array<() => void>;
+}
+
+/** Precomputed listen state readable without decoding the cached tree. */
+declare interface PersistedListenMetadata {
+    hash: string;
+    compoundHash: SeedCompoundHash;
+    revision: string;
+}
+
+/**
  * What a restore resolves: the assembled tree, with the stored hashes joined
  * when they describe exactly this tree.
  */
@@ -1928,7 +1945,7 @@ declare class PersistenceManager {
     /**
      * Distinguishes this manager's write tokens from every other tab's and
      * session's — numeric counters restart at zero on reload, which let a new
-     * data write pair up with a surviving old hash sidecar.
+     * data write pair up with a write token from another manager instance.
      */
     private instanceId_;
     private writeCounter_;
@@ -1941,6 +1958,12 @@ declare class PersistenceManager {
     private flushPending_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
+    /**
+     * One physical IndexedDB decode per root. The pre-auth peek and the
+     * authenticated listener often overlap; without coalescing they each read
+     * every chunk and rebuilt the same large Node tree concurrently.
+     */
+    private activeReads_;
     private sweepTimer_;
     private disposed_;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null);
@@ -1978,7 +2001,7 @@ declare class PersistenceManager {
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
      * Expiry is decided by each root's manifest (or legacy record): the
-     * '#'-suffixed chunk and hash records carry no authority of their own and
+     * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
      * are dropped exactly when their manifest is dropped, is missing (orphans
      * from an interrupted write), or no longer lists them. Scoped to this
      * manager's key range and reading keys before values, where the platform
@@ -1999,7 +2022,7 @@ declare class PersistenceManager {
     private withStore_;
     /**
      * Reads a root's stored state in one readonly transaction: the manifest
-     * and hash records first, then — for chunked records — each chunk in
+     * the manifest first, then — for chunked records — each chunk in
      * sequence, folded into the assembled tree as it arrives so only one
      * chunk's parsed JSON is ever held at a time. The hash record joins only
      * when its revision matches the manifest's; a chunk whose revision doesn't
@@ -2008,8 +2031,9 @@ declare class PersistenceManager {
      * records also resolve null (and are deleted best-effort).
      */
     private readRecord_;
+    private readRecordOnce_;
     /**
-     * Deletes everything stored for a root: manifest, hash record, and every
+     * Deletes everything stored for a root: manifest, legacy hash record, and every
      * chunk the manifest lists (plus, where the platform provides key ranges,
      * any orphaned chunk tail beyond it).
      */
@@ -2021,6 +2045,20 @@ declare class PersistenceManager {
      * this tree, so when the server certifies it unchanged (the common warm
      * boot), the follow-up write-through skips without serializing anything.
      */
+    /**
+     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
+     * precomputed hash listen immediately while the shared chunk restore runs
+     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
+     * are structurally valid and coupled to the same revision.
+     */
+    restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
+    /**
+     * Listener restore with no wall/idle fallback: once valid hash metadata has
+     * been sent, a slow local decode must keep progressing rather than restart
+     * the listen unseeded. Null means the persisted base failed validation or a
+     * storage operation failed, not merely that it was slow.
+     */
+    restoreForListen(pathString: string): Promise<PersistedRecord | null>;
     restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * The boot-peek read (see getPersistedValue): resolves the record of the
@@ -2072,7 +2110,7 @@ declare class PersistenceManager {
     flushNow(pathString: string): Promise<void>;
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and hash record land as a couple
+     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
      * before the next flush or delete for that root starts, which is the
      * whole storage consistency argument — no cross-operation races to
      * reason about.
@@ -2521,9 +2559,6 @@ export declare function refFromURL(db: Database, url: string): DatabaseReference
  */
 export declare function remove(ref: DatabaseReference): Promise<void>;
 
-/**
- * A connection to a single data repository.
- */
 declare class Repo {
     repoInfo_: RepoInfo;
     forceRestClient_: boolean;
@@ -2562,9 +2597,7 @@ declare class Repo {
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
      */
-    pendingSeedRestores_: Map<string, {
-        cancelled: boolean;
-    }>;
+    pendingSeedRestores_: Map<string, PendingSeedRestore>;
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters

@@ -78,6 +78,14 @@ export declare function estimateSerializedNodeSize(node: Node): number;
  */
 export declare function compoundHashFromNodeAsync(node: Node, splitStrategy?: CompoundHashSplitStrategy, sliceMs?: number): Promise<CompoundHash>;
 /**
+ * Computes the canonical Node hash without populating every subtree's
+ * lazyHash_. Only frames on the current depth-first path are retained; each
+ * child hash is folded into its parent and released. Persistence uses this at
+ * write time, stores the resulting root hash in the manifest, and stamps only
+ * the restored root on the next boot.
+ */
+export declare function canonicalHashFromNodeAsync(node: Node, sliceMs?: number): Promise<string>;
+/**
  * Computes node.hash() — the canonical listen hash — in bounded slices.
  * Node hashes cache per node (lazyHash_) and nodes are immutable, so the
  * walk primes every subtree's hash bottom-up across slices; the final

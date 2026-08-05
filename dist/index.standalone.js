@@ -961,6 +961,284 @@ const KEY_INDEX = new KeyIndex();
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/** Maximum key depth. */
+const MAX_PATH_DEPTH = 32;
+/** Maximum number of (UTF8) bytes in a Firebase path. */
+const MAX_PATH_LENGTH_BYTES = 768;
+/**
+ * An immutable object representing a parsed path.  It's immutable so that you
+ * can pass them around to other functions without worrying about them changing
+ * it.
+ */
+class Path {
+    /**
+     * @param pathOrString - Path string to parse, or another path, or the raw
+     * tokens array
+     */
+    constructor(pathOrString, pieceNum) {
+        if (pieceNum === void 0) {
+            this.pieces_ = pathOrString.split('/');
+            // Remove empty pieces.
+            let copyTo = 0;
+            for (let i = 0; i < this.pieces_.length; i++) {
+                if (this.pieces_[i].length > 0) {
+                    this.pieces_[copyTo] = this.pieces_[i];
+                    copyTo++;
+                }
+            }
+            this.pieces_.length = copyTo;
+            this.pieceNum_ = 0;
+        }
+        else {
+            this.pieces_ = pathOrString;
+            this.pieceNum_ = pieceNum;
+        }
+    }
+    toString() {
+        let pathString = '';
+        for (let i = this.pieceNum_; i < this.pieces_.length; i++) {
+            if (this.pieces_[i] !== '') {
+                pathString += '/' + this.pieces_[i];
+            }
+        }
+        return pathString || '/';
+    }
+}
+function newEmptyPath() {
+    return new Path('');
+}
+function pathGetFront(path) {
+    if (path.pieceNum_ >= path.pieces_.length) {
+        return null;
+    }
+    return path.pieces_[path.pieceNum_];
+}
+/**
+ * @returns The number of segments in this path
+ */
+function pathGetLength(path) {
+    return path.pieces_.length - path.pieceNum_;
+}
+function pathPopFront(path) {
+    let pieceNum = path.pieceNum_;
+    if (pieceNum < path.pieces_.length) {
+        pieceNum++;
+    }
+    return new Path(path.pieces_, pieceNum);
+}
+function pathGetBack(path) {
+    if (path.pieceNum_ < path.pieces_.length) {
+        return path.pieces_[path.pieces_.length - 1];
+    }
+    return null;
+}
+function pathToUrlEncodedString(path) {
+    let pathString = '';
+    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
+        if (path.pieces_[i] !== '') {
+            pathString += '/' + encodeURIComponent(String(path.pieces_[i]));
+        }
+    }
+    return pathString || '/';
+}
+/**
+ * Shallow copy of the parts of the path.
+ *
+ */
+function pathSlice(path, begin = 0) {
+    return path.pieces_.slice(path.pieceNum_ + begin);
+}
+function pathParent(path) {
+    if (path.pieceNum_ >= path.pieces_.length) {
+        return null;
+    }
+    const pieces = [];
+    for (let i = path.pieceNum_; i < path.pieces_.length - 1; i++) {
+        pieces.push(path.pieces_[i]);
+    }
+    return new Path(pieces, 0);
+}
+function pathChild(path, childPathObj) {
+    const pieces = [];
+    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
+        pieces.push(path.pieces_[i]);
+    }
+    if (childPathObj instanceof Path) {
+        for (let i = childPathObj.pieceNum_; i < childPathObj.pieces_.length; i++) {
+            pieces.push(childPathObj.pieces_[i]);
+        }
+    }
+    else {
+        const childPieces = childPathObj.split('/');
+        for (let i = 0; i < childPieces.length; i++) {
+            if (childPieces[i].length > 0) {
+                pieces.push(childPieces[i]);
+            }
+        }
+    }
+    return new Path(pieces, 0);
+}
+/**
+ * @returns True if there are no segments in this path
+ */
+function pathIsEmpty(path) {
+    return path.pieceNum_ >= path.pieces_.length;
+}
+/**
+ * @returns The path from outerPath to innerPath
+ */
+function newRelativePath(outerPath, innerPath) {
+    const outer = pathGetFront(outerPath), inner = pathGetFront(innerPath);
+    if (outer === null) {
+        return innerPath;
+    }
+    else if (outer === inner) {
+        return newRelativePath(pathPopFront(outerPath), pathPopFront(innerPath));
+    }
+    else {
+        throw new Error('INTERNAL ERROR: innerPath (' +
+            innerPath +
+            ') is not within ' +
+            'outerPath (' +
+            outerPath +
+            ')');
+    }
+}
+/**
+ * @returns -1, 0, 1 if left is less, equal, or greater than the right.
+ */
+function pathCompare(left, right) {
+    const leftKeys = pathSlice(left, 0);
+    const rightKeys = pathSlice(right, 0);
+    for (let i = 0; i < leftKeys.length && i < rightKeys.length; i++) {
+        const cmp = nameCompare(leftKeys[i], rightKeys[i]);
+        if (cmp !== 0) {
+            return cmp;
+        }
+    }
+    if (leftKeys.length === rightKeys.length) {
+        return 0;
+    }
+    return leftKeys.length < rightKeys.length ? -1 : 1;
+}
+/**
+ * @returns true if paths are the same.
+ */
+function pathEquals(path, other) {
+    if (pathGetLength(path) !== pathGetLength(other)) {
+        return false;
+    }
+    for (let i = path.pieceNum_, j = other.pieceNum_; i <= path.pieces_.length; i++, j++) {
+        if (path.pieces_[i] !== other.pieces_[j]) {
+            return false;
+        }
+    }
+    return true;
+}
+/**
+ * @returns True if this path is a parent of (or the same as) other
+ */
+function pathContains(path, other) {
+    let i = path.pieceNum_;
+    let j = other.pieceNum_;
+    if (pathGetLength(path) > pathGetLength(other)) {
+        return false;
+    }
+    while (i < path.pieces_.length) {
+        if (path.pieces_[i] !== other.pieces_[j]) {
+            return false;
+        }
+        ++i;
+        ++j;
+    }
+    return true;
+}
+/**
+ * Dynamic (mutable) path used to count path lengths.
+ *
+ * This class is used to efficiently check paths for valid
+ * length (in UTF8 bytes) and depth (used in path validation).
+ *
+ * Throws Error exception if path is ever invalid.
+ *
+ * The definition of a path always begins with '/'.
+ */
+class ValidationPath {
+    /**
+     * @param path - Initial Path.
+     * @param errorPrefix_ - Prefix for any error messages.
+     */
+    constructor(path, errorPrefix_) {
+        this.errorPrefix_ = errorPrefix_;
+        this.parts_ = pathSlice(path, 0);
+        /** Initialize to number of '/' chars needed in path. */
+        this.byteLength_ = Math.max(1, this.parts_.length);
+        for (let i = 0; i < this.parts_.length; i++) {
+            this.byteLength_ += util.stringLength(this.parts_[i]);
+        }
+        validationPathCheckValid(this);
+    }
+}
+function validationPathPush(validationPath, child) {
+    // Count the needed '/'
+    if (validationPath.parts_.length > 0) {
+        validationPath.byteLength_ += 1;
+    }
+    validationPath.parts_.push(child);
+    validationPath.byteLength_ += util.stringLength(child);
+    validationPathCheckValid(validationPath);
+}
+function validationPathPop(validationPath) {
+    const last = validationPath.parts_.pop();
+    validationPath.byteLength_ -= util.stringLength(last);
+    // Un-count the previous '/'
+    if (validationPath.parts_.length > 0) {
+        validationPath.byteLength_ -= 1;
+    }
+}
+function validationPathCheckValid(validationPath) {
+    if (validationPath.byteLength_ > MAX_PATH_LENGTH_BYTES) {
+        throw new Error(validationPath.errorPrefix_ +
+            'has a key path longer than ' +
+            MAX_PATH_LENGTH_BYTES +
+            ' bytes (' +
+            validationPath.byteLength_ +
+            ').');
+    }
+    if (validationPath.parts_.length > MAX_PATH_DEPTH) {
+        throw new Error(validationPath.errorPrefix_ +
+            'path specified exceeds the maximum depth that can be written (' +
+            MAX_PATH_DEPTH +
+            ') or object contains a cycle ' +
+            validationPathToErrorString(validationPath));
+    }
+}
+/**
+ * String for use in error messages - uses '.' notation for path.
+ */
+function validationPathToErrorString(validationPath) {
+    if (validationPath.parts_.length === 0) {
+        return '';
+    }
+    return "in property '" + validationPath.parts_.join('.') + "'";
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 let MAX_NODE$2;
 function setMaxNode$1(val) {
     MAX_NODE$2 = val;
@@ -1020,6 +1298,299 @@ const validatePriorityNode = function (priorityNode) {
     // Don't call getPriority() on MAX_NODE to avoid hitting assertion.
     util.assert(priorityNode === MAX_NODE$2 || priorityNode.getPriority().isEmpty(), "Priority nodes can't have a priority of their own.");
 };
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let __childrenNodeConstructor;
+/**
+ * LeafNode is a class for storing leaf nodes in a DataSnapshot.  It
+ * implements Node and stores the value of the node (a string,
+ * number, or boolean) accessible via getValue().
+ */
+class LeafNode {
+    static set __childrenNodeConstructor(val) {
+        __childrenNodeConstructor = val;
+    }
+    static get __childrenNodeConstructor() {
+        return __childrenNodeConstructor;
+    }
+    /**
+     * @param value_ - The value to store in this leaf node. The object type is
+     * possible in the event of a deferred value
+     * @param priorityNode_ - The priority of this node.
+     */
+    constructor(value_, priorityNode_ = LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
+        this.value_ = value_;
+        this.priorityNode_ = priorityNode_;
+        this.lazyHash_ = null;
+        util.assert(this.value_ !== undefined && this.value_ !== null, "LeafNode shouldn't be created with null/undefined value.");
+        validatePriorityNode(this.priorityNode_);
+    }
+    /** @inheritDoc */
+    isLeafNode() {
+        return true;
+    }
+    /** @inheritDoc */
+    getPriority() {
+        return this.priorityNode_;
+    }
+    /** @inheritDoc */
+    updatePriority(newPriorityNode) {
+        return new LeafNode(this.value_, newPriorityNode);
+    }
+    /** @inheritDoc */
+    getImmediateChild(childName) {
+        // Hack to treat priority as a regular child
+        if (childName === '.priority') {
+            return this.priorityNode_;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
+        }
+    }
+    /** @inheritDoc */
+    getChild(path) {
+        if (pathIsEmpty(path)) {
+            return this;
+        }
+        else if (pathGetFront(path) === '.priority') {
+            return this.priorityNode_;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
+        }
+    }
+    hasChild() {
+        return false;
+    }
+    /** @inheritDoc */
+    getPredecessorChildName(childName, childNode) {
+        return null;
+    }
+    /** @inheritDoc */
+    updateImmediateChild(childName, newChildNode) {
+        if (childName === '.priority') {
+            return this.updatePriority(newChildNode);
+        }
+        else if (newChildNode.isEmpty() && childName !== '.priority') {
+            return this;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateImmediateChild(childName, newChildNode).updatePriority(this.priorityNode_);
+        }
+    }
+    /** @inheritDoc */
+    updateChild(path, newChildNode) {
+        const front = pathGetFront(path);
+        if (front === null) {
+            return newChildNode;
+        }
+        else if (newChildNode.isEmpty() && front !== '.priority') {
+            return this;
+        }
+        else {
+            util.assert(front !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
+            return this.updateImmediateChild(front, LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateChild(pathPopFront(path), newChildNode));
+        }
+    }
+    /** @inheritDoc */
+    isEmpty() {
+        return false;
+    }
+    /** @inheritDoc */
+    numChildren() {
+        return 0;
+    }
+    /** @inheritDoc */
+    forEachChild(index, action) {
+        return false;
+    }
+    val(exportFormat) {
+        if (exportFormat && !this.getPriority().isEmpty()) {
+            return {
+                '.value': this.getValue(),
+                '.priority': this.getPriority().val()
+            };
+        }
+        else {
+            return this.getValue();
+        }
+    }
+    /** @inheritDoc */
+    hash() {
+        if (this.lazyHash_ === null) {
+            let toHash = '';
+            if (!this.priorityNode_.isEmpty()) {
+                toHash +=
+                    'priority:' +
+                        priorityHashText(this.priorityNode_.val()) +
+                        ':';
+            }
+            toHash += leafHashValueText(this.value_, 
+            /* v2= */ false);
+            this.lazyHash_ = sha1(toHash);
+        }
+        return this.lazyHash_;
+    }
+    /** @inheritDoc */
+    stampLazyHash(hash) {
+        if (this.lazyHash_ === null) {
+            this.lazyHash_ = hash;
+        }
+    }
+    /**
+     * Returns the value of the leaf node.
+     * @returns The value of the node.
+     */
+    getValue() {
+        return this.value_;
+    }
+    compareTo(other) {
+        if (other === LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
+            return 1;
+        }
+        else if (other instanceof LeafNode.__childrenNodeConstructor) {
+            return -1;
+        }
+        else {
+            util.assert(other.isLeafNode(), 'Unknown node type');
+            return this.compareToLeafNode_(other);
+        }
+    }
+    /**
+     * Comparison specifically for two leaf nodes
+     */
+    compareToLeafNode_(otherLeaf) {
+        const otherLeafType = typeof otherLeaf.value_;
+        const thisLeafType = typeof this.value_;
+        const otherIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(otherLeafType);
+        const thisIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(thisLeafType);
+        util.assert(otherIndex >= 0, 'Unknown leaf type: ' + otherLeafType);
+        util.assert(thisIndex >= 0, 'Unknown leaf type: ' + thisLeafType);
+        if (otherIndex === thisIndex) {
+            // Same type, compare values
+            if (thisLeafType === 'object') {
+                // Deferred value nodes are all equal, but we should also never get to this point...
+                return 0;
+            }
+            else {
+                // Note that this works because true > false, all others are number or string comparisons
+                if (this.value_ < otherLeaf.value_) {
+                    return -1;
+                }
+                else if (this.value_ === otherLeaf.value_) {
+                    return 0;
+                }
+                else {
+                    return 1;
+                }
+            }
+        }
+        else {
+            return thisIndex - otherIndex;
+        }
+    }
+    withIndex() {
+        return this;
+    }
+    isIndexed() {
+        return true;
+    }
+    equals(other) {
+        if (other === this) {
+            return true;
+        }
+        else if (other.isLeafNode()) {
+            const otherLeaf = other;
+            return (this.value_ === otherLeaf.value_ &&
+                this.priorityNode_.equals(otherLeaf.priorityNode_));
+        }
+        else {
+            return false;
+        }
+    }
+}
+/**
+ * The sort order for comparing leaf nodes of different types. If two leaf nodes have
+ * the same type, the comparison falls back to their value
+ */
+LeafNode.VALUE_TYPE_ORDER = ['object', 'boolean', 'number', 'string'];
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let nodeFromJSON$1;
+let MAX_NODE$1;
+function setNodeFromJSON(val) {
+    nodeFromJSON$1 = val;
+}
+function setMaxNode(val) {
+    MAX_NODE$1 = val;
+}
+class PriorityIndex extends Index {
+    compare(a, b) {
+        const aPriority = a.node.getPriority();
+        const bPriority = b.node.getPriority();
+        const indexCmp = aPriority.compareTo(bPriority);
+        if (indexCmp === 0) {
+            return nameCompare(a.name, b.name);
+        }
+        else {
+            return indexCmp;
+        }
+    }
+    isDefinedOn(node) {
+        return !node.getPriority().isEmpty();
+    }
+    indexedValueChanged(oldNode, newNode) {
+        return !oldNode.getPriority().equals(newNode.getPriority());
+    }
+    minPost() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return NamedNode.MIN;
+    }
+    maxPost() {
+        return new NamedNode(MAX_NAME, new LeafNode('[PRIORITY-POST]', MAX_NODE$1));
+    }
+    makePost(indexValue, name) {
+        const priorityNode = nodeFromJSON$1(indexValue);
+        return new NamedNode(name, new LeafNode('[PRIORITY-POST]', priorityNode));
+    }
+    /**
+     * @returns String representation for inclusion in a query spec
+     */
+    toString() {
+        return '.priority';
+    }
+}
+const PRIORITY_INDEX = new PriorityIndex();
 
 /**
  * @license
@@ -1368,41 +1939,86 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12) {
     });
 }
 /**
- * Computes node.hash() — the canonical listen hash — in bounded slices.
- * Node hashes cache per node (lazyHash_) and nodes are immutable, so the
- * walk primes every subtree's hash bottom-up across slices; the final
- * root hash() then assembles from cached children in one cheap pass, and
- * unchanged subtrees stay primed for the next flush.
+ * Computes the canonical Node hash without populating every subtree's
+ * lazyHash_. Only frames on the current depth-first path are retained; each
+ * child hash is folded into its parent and released. Persistence uses this at
+ * write time, stores the resulting root hash in the manifest, and stamps only
+ * the restored root on the next boot.
  */
-function hashFromNodeAsync(node, sliceMs = 12) {
-    const stack = [{ node, childrenPrimed: false }];
-    const processFrame = (frame) => {
-        if (frame.childrenPrimed || frame.node.isLeafNode()) {
-            frame.node.hash();
-            return;
-        }
-        stack.push({ node: frame.node, childrenPrimed: true });
-        frame.node.forEachChild(KEY_INDEX, (_key, child) => {
-            stack.push({ node: child, childrenPrimed: false });
-        });
-    };
+function canonicalHashFromNodeAsync(node, sliceMs = 12) {
+    if (node.isEmpty()) {
+        return Promise.resolve('');
+    }
+    const stack = [
+        { node, key: null, children: null, nextChild: 0, toHash: '' }
+    ];
     return new Promise((resolve, reject) => {
+        const completeFrame = (hash) => {
+            const finished = stack.pop();
+            if (!finished) {
+                resolve(hash);
+                return;
+            }
+            const parent = stack[stack.length - 1];
+            if (!parent) {
+                resolve(hash);
+            }
+            else if (hash !== '' && finished.key !== null) {
+                parent.toHash += ':' + finished.key + ':' + hash;
+            }
+        };
         const step = () => {
             try {
                 const deadline = Date.now() + sliceMs;
-                // At least one frame per slice: progress is guaranteed even with a
-                // zero budget.
                 while (stack.length > 0) {
-                    processFrame(stack.pop());
-                    if (Date.now() >= deadline) {
-                        break;
+                    const frame = stack[stack.length - 1];
+                    if (frame.node.isLeafNode()) {
+                        const leaf = frame.node;
+                        let text = '';
+                        const priority = leaf.getPriority();
+                        if (!priority.isEmpty()) {
+                            text +=
+                                'priority:' +
+                                    priorityHashText(priority.val()) +
+                                    ':';
+                        }
+                        text += leafHashValueText(leaf.val(), false);
+                        completeFrame(sha1(text));
+                    }
+                    else {
+                        if (frame.children === null) {
+                            const priority = frame.node.getPriority();
+                            if (!priority.isEmpty()) {
+                                frame.toHash =
+                                    'priority:' +
+                                        priorityHashText(priority.val()) +
+                                        ':';
+                            }
+                            const children = [];
+                            frame.children = children;
+                            frame.node.forEachChild(PRIORITY_INDEX, (key, child) => {
+                                children.push([key, child]);
+                            });
+                        }
+                        if (frame.nextChild < frame.children.length) {
+                            const [key, child] = frame.children[frame.nextChild++];
+                            stack.push({
+                                node: child,
+                                key,
+                                children: null,
+                                nextChild: 0,
+                                toHash: ''
+                            });
+                        }
+                        else {
+                            completeFrame(frame.toHash === '' ? '' : sha1(frame.toHash));
+                        }
+                    }
+                    if (stack.length > 0 && Date.now() >= deadline) {
+                        scheduleSlice(step);
+                        return;
                     }
                 }
-                if (stack.length > 0) {
-                    scheduleSlice(step);
-                    return;
-                }
-                resolve(node.hash());
             }
             catch (e) {
                 reject(e);
@@ -1410,284 +2026,6 @@ function hashFromNodeAsync(node, sliceMs = 12) {
         };
         step();
     });
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/** Maximum key depth. */
-const MAX_PATH_DEPTH = 32;
-/** Maximum number of (UTF8) bytes in a Firebase path. */
-const MAX_PATH_LENGTH_BYTES = 768;
-/**
- * An immutable object representing a parsed path.  It's immutable so that you
- * can pass them around to other functions without worrying about them changing
- * it.
- */
-class Path {
-    /**
-     * @param pathOrString - Path string to parse, or another path, or the raw
-     * tokens array
-     */
-    constructor(pathOrString, pieceNum) {
-        if (pieceNum === void 0) {
-            this.pieces_ = pathOrString.split('/');
-            // Remove empty pieces.
-            let copyTo = 0;
-            for (let i = 0; i < this.pieces_.length; i++) {
-                if (this.pieces_[i].length > 0) {
-                    this.pieces_[copyTo] = this.pieces_[i];
-                    copyTo++;
-                }
-            }
-            this.pieces_.length = copyTo;
-            this.pieceNum_ = 0;
-        }
-        else {
-            this.pieces_ = pathOrString;
-            this.pieceNum_ = pieceNum;
-        }
-    }
-    toString() {
-        let pathString = '';
-        for (let i = this.pieceNum_; i < this.pieces_.length; i++) {
-            if (this.pieces_[i] !== '') {
-                pathString += '/' + this.pieces_[i];
-            }
-        }
-        return pathString || '/';
-    }
-}
-function newEmptyPath() {
-    return new Path('');
-}
-function pathGetFront(path) {
-    if (path.pieceNum_ >= path.pieces_.length) {
-        return null;
-    }
-    return path.pieces_[path.pieceNum_];
-}
-/**
- * @returns The number of segments in this path
- */
-function pathGetLength(path) {
-    return path.pieces_.length - path.pieceNum_;
-}
-function pathPopFront(path) {
-    let pieceNum = path.pieceNum_;
-    if (pieceNum < path.pieces_.length) {
-        pieceNum++;
-    }
-    return new Path(path.pieces_, pieceNum);
-}
-function pathGetBack(path) {
-    if (path.pieceNum_ < path.pieces_.length) {
-        return path.pieces_[path.pieces_.length - 1];
-    }
-    return null;
-}
-function pathToUrlEncodedString(path) {
-    let pathString = '';
-    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
-        if (path.pieces_[i] !== '') {
-            pathString += '/' + encodeURIComponent(String(path.pieces_[i]));
-        }
-    }
-    return pathString || '/';
-}
-/**
- * Shallow copy of the parts of the path.
- *
- */
-function pathSlice(path, begin = 0) {
-    return path.pieces_.slice(path.pieceNum_ + begin);
-}
-function pathParent(path) {
-    if (path.pieceNum_ >= path.pieces_.length) {
-        return null;
-    }
-    const pieces = [];
-    for (let i = path.pieceNum_; i < path.pieces_.length - 1; i++) {
-        pieces.push(path.pieces_[i]);
-    }
-    return new Path(pieces, 0);
-}
-function pathChild(path, childPathObj) {
-    const pieces = [];
-    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
-        pieces.push(path.pieces_[i]);
-    }
-    if (childPathObj instanceof Path) {
-        for (let i = childPathObj.pieceNum_; i < childPathObj.pieces_.length; i++) {
-            pieces.push(childPathObj.pieces_[i]);
-        }
-    }
-    else {
-        const childPieces = childPathObj.split('/');
-        for (let i = 0; i < childPieces.length; i++) {
-            if (childPieces[i].length > 0) {
-                pieces.push(childPieces[i]);
-            }
-        }
-    }
-    return new Path(pieces, 0);
-}
-/**
- * @returns True if there are no segments in this path
- */
-function pathIsEmpty(path) {
-    return path.pieceNum_ >= path.pieces_.length;
-}
-/**
- * @returns The path from outerPath to innerPath
- */
-function newRelativePath(outerPath, innerPath) {
-    const outer = pathGetFront(outerPath), inner = pathGetFront(innerPath);
-    if (outer === null) {
-        return innerPath;
-    }
-    else if (outer === inner) {
-        return newRelativePath(pathPopFront(outerPath), pathPopFront(innerPath));
-    }
-    else {
-        throw new Error('INTERNAL ERROR: innerPath (' +
-            innerPath +
-            ') is not within ' +
-            'outerPath (' +
-            outerPath +
-            ')');
-    }
-}
-/**
- * @returns -1, 0, 1 if left is less, equal, or greater than the right.
- */
-function pathCompare(left, right) {
-    const leftKeys = pathSlice(left, 0);
-    const rightKeys = pathSlice(right, 0);
-    for (let i = 0; i < leftKeys.length && i < rightKeys.length; i++) {
-        const cmp = nameCompare(leftKeys[i], rightKeys[i]);
-        if (cmp !== 0) {
-            return cmp;
-        }
-    }
-    if (leftKeys.length === rightKeys.length) {
-        return 0;
-    }
-    return leftKeys.length < rightKeys.length ? -1 : 1;
-}
-/**
- * @returns true if paths are the same.
- */
-function pathEquals(path, other) {
-    if (pathGetLength(path) !== pathGetLength(other)) {
-        return false;
-    }
-    for (let i = path.pieceNum_, j = other.pieceNum_; i <= path.pieces_.length; i++, j++) {
-        if (path.pieces_[i] !== other.pieces_[j]) {
-            return false;
-        }
-    }
-    return true;
-}
-/**
- * @returns True if this path is a parent of (or the same as) other
- */
-function pathContains(path, other) {
-    let i = path.pieceNum_;
-    let j = other.pieceNum_;
-    if (pathGetLength(path) > pathGetLength(other)) {
-        return false;
-    }
-    while (i < path.pieces_.length) {
-        if (path.pieces_[i] !== other.pieces_[j]) {
-            return false;
-        }
-        ++i;
-        ++j;
-    }
-    return true;
-}
-/**
- * Dynamic (mutable) path used to count path lengths.
- *
- * This class is used to efficiently check paths for valid
- * length (in UTF8 bytes) and depth (used in path validation).
- *
- * Throws Error exception if path is ever invalid.
- *
- * The definition of a path always begins with '/'.
- */
-class ValidationPath {
-    /**
-     * @param path - Initial Path.
-     * @param errorPrefix_ - Prefix for any error messages.
-     */
-    constructor(path, errorPrefix_) {
-        this.errorPrefix_ = errorPrefix_;
-        this.parts_ = pathSlice(path, 0);
-        /** Initialize to number of '/' chars needed in path. */
-        this.byteLength_ = Math.max(1, this.parts_.length);
-        for (let i = 0; i < this.parts_.length; i++) {
-            this.byteLength_ += util.stringLength(this.parts_[i]);
-        }
-        validationPathCheckValid(this);
-    }
-}
-function validationPathPush(validationPath, child) {
-    // Count the needed '/'
-    if (validationPath.parts_.length > 0) {
-        validationPath.byteLength_ += 1;
-    }
-    validationPath.parts_.push(child);
-    validationPath.byteLength_ += util.stringLength(child);
-    validationPathCheckValid(validationPath);
-}
-function validationPathPop(validationPath) {
-    const last = validationPath.parts_.pop();
-    validationPath.byteLength_ -= util.stringLength(last);
-    // Un-count the previous '/'
-    if (validationPath.parts_.length > 0) {
-        validationPath.byteLength_ -= 1;
-    }
-}
-function validationPathCheckValid(validationPath) {
-    if (validationPath.byteLength_ > MAX_PATH_LENGTH_BYTES) {
-        throw new Error(validationPath.errorPrefix_ +
-            'has a key path longer than ' +
-            MAX_PATH_LENGTH_BYTES +
-            ' bytes (' +
-            validationPath.byteLength_ +
-            ').');
-    }
-    if (validationPath.parts_.length > MAX_PATH_DEPTH) {
-        throw new Error(validationPath.errorPrefix_ +
-            'path specified exceeds the maximum depth that can be written (' +
-            MAX_PATH_DEPTH +
-            ') or object contains a cycle ' +
-            validationPathToErrorString(validationPath));
-    }
-}
-/**
- * String for use in error messages - uses '.' notation for path.
- */
-function validationPathToErrorString(validationPath) {
-    if (validationPath.parts_.length === 0) {
-        return '';
-    }
-    return "in property '" + validationPath.parts_.join('.') + "'";
 }
 
 /**
@@ -2327,299 +2665,6 @@ function NAME_ONLY_COMPARATOR(left, right) {
 function NAME_COMPARATOR(left, right) {
     return nameCompare(left, right);
 }
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let __childrenNodeConstructor;
-/**
- * LeafNode is a class for storing leaf nodes in a DataSnapshot.  It
- * implements Node and stores the value of the node (a string,
- * number, or boolean) accessible via getValue().
- */
-class LeafNode {
-    static set __childrenNodeConstructor(val) {
-        __childrenNodeConstructor = val;
-    }
-    static get __childrenNodeConstructor() {
-        return __childrenNodeConstructor;
-    }
-    /**
-     * @param value_ - The value to store in this leaf node. The object type is
-     * possible in the event of a deferred value
-     * @param priorityNode_ - The priority of this node.
-     */
-    constructor(value_, priorityNode_ = LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
-        this.value_ = value_;
-        this.priorityNode_ = priorityNode_;
-        this.lazyHash_ = null;
-        util.assert(this.value_ !== undefined && this.value_ !== null, "LeafNode shouldn't be created with null/undefined value.");
-        validatePriorityNode(this.priorityNode_);
-    }
-    /** @inheritDoc */
-    isLeafNode() {
-        return true;
-    }
-    /** @inheritDoc */
-    getPriority() {
-        return this.priorityNode_;
-    }
-    /** @inheritDoc */
-    updatePriority(newPriorityNode) {
-        return new LeafNode(this.value_, newPriorityNode);
-    }
-    /** @inheritDoc */
-    getImmediateChild(childName) {
-        // Hack to treat priority as a regular child
-        if (childName === '.priority') {
-            return this.priorityNode_;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
-        }
-    }
-    /** @inheritDoc */
-    getChild(path) {
-        if (pathIsEmpty(path)) {
-            return this;
-        }
-        else if (pathGetFront(path) === '.priority') {
-            return this.priorityNode_;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
-        }
-    }
-    hasChild() {
-        return false;
-    }
-    /** @inheritDoc */
-    getPredecessorChildName(childName, childNode) {
-        return null;
-    }
-    /** @inheritDoc */
-    updateImmediateChild(childName, newChildNode) {
-        if (childName === '.priority') {
-            return this.updatePriority(newChildNode);
-        }
-        else if (newChildNode.isEmpty() && childName !== '.priority') {
-            return this;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateImmediateChild(childName, newChildNode).updatePriority(this.priorityNode_);
-        }
-    }
-    /** @inheritDoc */
-    updateChild(path, newChildNode) {
-        const front = pathGetFront(path);
-        if (front === null) {
-            return newChildNode;
-        }
-        else if (newChildNode.isEmpty() && front !== '.priority') {
-            return this;
-        }
-        else {
-            util.assert(front !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
-            return this.updateImmediateChild(front, LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateChild(pathPopFront(path), newChildNode));
-        }
-    }
-    /** @inheritDoc */
-    isEmpty() {
-        return false;
-    }
-    /** @inheritDoc */
-    numChildren() {
-        return 0;
-    }
-    /** @inheritDoc */
-    forEachChild(index, action) {
-        return false;
-    }
-    val(exportFormat) {
-        if (exportFormat && !this.getPriority().isEmpty()) {
-            return {
-                '.value': this.getValue(),
-                '.priority': this.getPriority().val()
-            };
-        }
-        else {
-            return this.getValue();
-        }
-    }
-    /** @inheritDoc */
-    hash() {
-        if (this.lazyHash_ === null) {
-            let toHash = '';
-            if (!this.priorityNode_.isEmpty()) {
-                toHash +=
-                    'priority:' +
-                        priorityHashText(this.priorityNode_.val()) +
-                        ':';
-            }
-            toHash += leafHashValueText(this.value_, 
-            /* v2= */ false);
-            this.lazyHash_ = sha1(toHash);
-        }
-        return this.lazyHash_;
-    }
-    /** @inheritDoc */
-    stampLazyHash(hash) {
-        if (this.lazyHash_ === null) {
-            this.lazyHash_ = hash;
-        }
-    }
-    /**
-     * Returns the value of the leaf node.
-     * @returns The value of the node.
-     */
-    getValue() {
-        return this.value_;
-    }
-    compareTo(other) {
-        if (other === LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
-            return 1;
-        }
-        else if (other instanceof LeafNode.__childrenNodeConstructor) {
-            return -1;
-        }
-        else {
-            util.assert(other.isLeafNode(), 'Unknown node type');
-            return this.compareToLeafNode_(other);
-        }
-    }
-    /**
-     * Comparison specifically for two leaf nodes
-     */
-    compareToLeafNode_(otherLeaf) {
-        const otherLeafType = typeof otherLeaf.value_;
-        const thisLeafType = typeof this.value_;
-        const otherIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(otherLeafType);
-        const thisIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(thisLeafType);
-        util.assert(otherIndex >= 0, 'Unknown leaf type: ' + otherLeafType);
-        util.assert(thisIndex >= 0, 'Unknown leaf type: ' + thisLeafType);
-        if (otherIndex === thisIndex) {
-            // Same type, compare values
-            if (thisLeafType === 'object') {
-                // Deferred value nodes are all equal, but we should also never get to this point...
-                return 0;
-            }
-            else {
-                // Note that this works because true > false, all others are number or string comparisons
-                if (this.value_ < otherLeaf.value_) {
-                    return -1;
-                }
-                else if (this.value_ === otherLeaf.value_) {
-                    return 0;
-                }
-                else {
-                    return 1;
-                }
-            }
-        }
-        else {
-            return thisIndex - otherIndex;
-        }
-    }
-    withIndex() {
-        return this;
-    }
-    isIndexed() {
-        return true;
-    }
-    equals(other) {
-        if (other === this) {
-            return true;
-        }
-        else if (other.isLeafNode()) {
-            const otherLeaf = other;
-            return (this.value_ === otherLeaf.value_ &&
-                this.priorityNode_.equals(otherLeaf.priorityNode_));
-        }
-        else {
-            return false;
-        }
-    }
-}
-/**
- * The sort order for comparing leaf nodes of different types. If two leaf nodes have
- * the same type, the comparison falls back to their value
- */
-LeafNode.VALUE_TYPE_ORDER = ['object', 'boolean', 'number', 'string'];
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let nodeFromJSON$1;
-let MAX_NODE$1;
-function setNodeFromJSON(val) {
-    nodeFromJSON$1 = val;
-}
-function setMaxNode(val) {
-    MAX_NODE$1 = val;
-}
-class PriorityIndex extends Index {
-    compare(a, b) {
-        const aPriority = a.node.getPriority();
-        const bPriority = b.node.getPriority();
-        const indexCmp = aPriority.compareTo(bPriority);
-        if (indexCmp === 0) {
-            return nameCompare(a.name, b.name);
-        }
-        else {
-            return indexCmp;
-        }
-    }
-    isDefinedOn(node) {
-        return !node.getPriority().isEmpty();
-    }
-    indexedValueChanged(oldNode, newNode) {
-        return !oldNode.getPriority().equals(newNode.getPriority());
-    }
-    minPost() {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return NamedNode.MIN;
-    }
-    maxPost() {
-        return new NamedNode(MAX_NAME, new LeafNode('[PRIORITY-POST]', MAX_NODE$1));
-    }
-    makePost(indexValue, name) {
-        const priorityNode = nodeFromJSON$1(indexValue);
-        return new NamedNode(name, new LeafNode('[PRIORITY-POST]', priorityNode));
-    }
-    /**
-     * @returns String representation for inclusion in a query spec
-     */
-    toString() {
-        return '.priority';
-    }
-}
-const PRIORITY_INDEX = new PriorityIndex();
 
 /**
  * @license
@@ -4196,13 +4241,12 @@ EmulatorTokenProvider.OWNER = 'owner';
  * tab whose live tree already occupies hundreds of MB. Instead each root is
  * stored as:
  *
- *   - a small MANIFEST record (`<prefix>|<path>`): revision, updatedAt, and
- *     the per-chunk revision join keys — no tree data;
+ *   - a small MANIFEST record (`<prefix>|<path>`): revision, updatedAt,
+ *     per-chunk revision joins, and the precomputed root/compound protocol
+ *     hashes — no tree data;
  *   - CHUNK records (`<prefix>|<path>#c<index>`): disjoint subtrees of
  *     roughly PERSISTENCE_CHUNK_TARGET_BYTES each, as arrays of
- *     [relative path, exported JSON] entries (see planChunks);
- *   - a HASH record (`<prefix>|<path>#hash`): the tree's canonical listen
- *     hash and compound hash, recomputed after a write in idle-time slices.
+ *     [relative path, exported JSON] entries (see planChunks).
  *
  * Chunking bounds peak memory on both sides — a flush serializes and clones
  * one chunk at a time, a restore parses one chunk at a time into the shared
@@ -4218,31 +4262,26 @@ EmulatorTokenProvider.OWNER = 'owner';
  * chunk carries the token of the write that produced it, and the manifest
  * lists the token expected of every chunk. A restore joins only when all
  * chunk tokens match the manifest (an interrupted or interleaved write
- * degrades to a miss, never to a stitched tree), and joins the hash record
- * only when ITS token matches too — a recompute pending at shutdown restores
- * WITHOUT hashes: the data still paints, the listen just goes out hashless,
- * exactly a cold load for that root.
+ * degrades to a miss, never to a stitched tree). Protocol hashes are attached
+ * back to that SAME manifest only while its revision still matches — a
+ * recompute pending at shutdown restores without hashes.
  *
  * Records written before chunking (a single record with the exported JSON
  * inline) still restore; their next write replaces them with the chunked
  * layout.
  *
  * Storage: one IndexedDB database ('firebase-database-persistence'), one
- * object store, keyed by `<repo prefix>|<path>` plus the '#'-suffixed
- * sidecars above ('#' cannot appear in a path segment). All storage failures
+ * object store, keyed by `<repo prefix>|<path>` plus its '#'-suffixed chunks
+ * ('#' cannot appear in a path segment). Pre-v3 hash sidecars are read/delete
+ * compatibility only. All storage failures
  * degrade to cold loads; nothing here may ever break the live connection.
  */
 const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 5;
-const PERSISTENCE_FORMAT_VERSION = 2;
-// Not a possible Firebase node hash (real hashes are empty only for the empty
-// tree, otherwise base64 SHA-1). Forces a simple-hash miss so the server must
-// validate the supplied compound ranges, including when the server tree is
-// now empty.
-const COMPOUND_HASH_ONLY_SENTINEL = '!compound-hash-only';
+const PERSISTENCE_DB_VERSION = 7;
+const PERSISTENCE_FORMAT_VERSION = 4;
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -4273,7 +4312,7 @@ const PERSISTENCE_CHUNK_TARGET_BYTES = 1024 * 1024;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the chunks and hash record stay put) — so a tree that
+ * a fresh timestamp (the chunks and integrated hashes stay put) — so a tree that
  * never changes but is used daily never ages into the expiry cutoff.
  * @internal
  */
@@ -4403,7 +4442,7 @@ class PersistenceManager {
         /**
          * Distinguishes this manager's write tokens from every other tab's and
          * session's — numeric counters restart at zero on reload, which let a new
-         * data write pair up with a surviving old hash sidecar.
+         * data write pair up with a write token from another manager instance.
          */
         this.instanceId_ = Math.random().toString(36).slice(2, 10);
         this.writeCounter_ = 0;
@@ -4416,6 +4455,12 @@ class PersistenceManager {
         this.flushPending_ = new Set();
         /** In-flight storage operations per root (see enqueue_). */
         this.queues_ = new Map();
+        /**
+         * One physical IndexedDB decode per root. The pre-auth peek and the
+         * authenticated listener often overlap; without coalescing they each read
+         * every chunk and rebuilt the same large Node tree concurrently.
+         */
+        this.activeReads_ = new Map();
         this.sweepTimer_ = null;
         this.disposed_ = false;
     }
@@ -4543,7 +4588,7 @@ class PersistenceManager {
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
      * Expiry is decided by each root's manifest (or legacy record): the
-     * '#'-suffixed chunk and hash records carry no authority of their own and
+     * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
      * are dropped exactly when their manifest is dropped, is missing (orphans
      * from an interrupted write), or no longer lists them. Scoped to this
      * manager's key range and reading keys before values, where the platform
@@ -4610,6 +4655,11 @@ class PersistenceManager {
                         const base = key.slice(0, key.indexOf('#', prefix.length));
                         const decision = decisions.get(base);
                         let drop = decision === undefined || decision.expired;
+                        if (!drop &&
+                            decision?.currentFormat &&
+                            key === base + HASH_KEY_SUFFIX) {
+                            drop = true;
+                        }
                         if (!drop && key.startsWith(base + CHUNK_KEY_INFIX)) {
                             const chunkIndex = parseInt(key.slice(base.length + CHUNK_KEY_INFIX.length), 10);
                             if (!Number.isFinite(chunkIndex) ||
@@ -4641,7 +4691,10 @@ class PersistenceManager {
                             expired,
                             chunkCount: record && typeof record.chunkCount === 'number'
                                 ? record.chunkCount
-                                : 0
+                                : 0,
+                            currentFormat: typeof record?.chunkCount === 'number' &&
+                                record.formatVersion ===
+                                    PERSISTENCE_FORMAT_VERSION
                         });
                         if (expired) {
                             persistenceStats.evictions++;
@@ -4747,7 +4800,7 @@ class PersistenceManager {
     }
     /**
      * Reads a root's stored state in one readonly transaction: the manifest
-     * and hash records first, then — for chunked records — each chunk in
+     * the manifest first, then — for chunked records — each chunk in
      * sequence, folded into the assembled tree as it arrives so only one
      * chunk's parsed JSON is ever held at a time. The hash record joins only
      * when its revision matches the manifest's; a chunk whose revision doesn't
@@ -4756,6 +4809,35 @@ class PersistenceManager {
      * records also resolve null (and are deleted best-effort).
      */
     readRecord_(pathString, onProgress = () => { }) {
+        const active = this.activeReads_.get(pathString);
+        if (active) {
+            active.progress.add(onProgress);
+            // Joining an already-progressing read is itself progress for this
+            // caller's idle timeout.
+            onProgress();
+            return active.promise;
+        }
+        const progress = new Set([onProgress]);
+        const emitProgress = () => {
+            for (const callback of progress) {
+                callback();
+            }
+        };
+        const promise = this.readRecordOnce_(pathString, emitProgress);
+        const entry = { promise, progress };
+        this.activeReads_.set(pathString, entry);
+        void promise.then(() => {
+            if (this.activeReads_.get(pathString) === entry) {
+                this.activeReads_.delete(pathString);
+            }
+        }, () => {
+            if (this.activeReads_.get(pathString) === entry) {
+                this.activeReads_.delete(pathString);
+            }
+        });
+        return promise;
+    }
+    readRecordOnce_(pathString, onProgress) {
         const key = this.key_(pathString);
         // Metadata first, in a short transaction. Each chunk then gets its OWN
         // transaction: WebKit may retain every IDBRequest result until the
@@ -4763,14 +4845,20 @@ class PersistenceManager {
         // recreates the root-sized memory spike despite the chunked records.
         const metadata = this.withStore_('readonly', null, (store, done) => {
             const dataReq = store.get(key);
-            const hashReq = store.get(key + HASH_KEY_SUFFIX);
-            hashReq.onsuccess = () => {
+            dataReq.onsuccess = () => {
                 const stored = dataReq.result;
                 if (!stored) {
                     done(null);
                     return;
                 }
-                done({
+                if (!isLegacyRecord(stored)) {
+                    done({ stored });
+                    return;
+                }
+                // Backward compatibility only: current-format manifests carry their
+                // protocol hashes natively and never touch this old sidecar key.
+                const hashReq = store.get(key + HASH_KEY_SUFFIX);
+                hashReq.onsuccess = () => done({
                     stored,
                     hashes: hashReq.result
                 });
@@ -4783,9 +4871,13 @@ class PersistenceManager {
             }
             onProgress();
             const { stored, hashes } = meta;
-            const joined = hashes && hashes.revision === stored.revision
-                ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
-                : {};
+            const joined = isLegacyRecord(stored)
+                ? hashes && hashes.revision === stored.revision
+                    ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
+                    : {}
+                : typeof stored.hash === 'string' && stored.compoundHash
+                    ? { hash: stored.hash, compoundHash: stored.compoundHash }
+                    : {};
             if (isLegacyRecord(stored)) {
                 return {
                     record: {
@@ -4868,7 +4960,7 @@ class PersistenceManager {
         });
     }
     /**
-     * Deletes everything stored for a root: manifest, hash record, and every
+     * Deletes everything stored for a root: manifest, legacy hash record, and every
      * chunk the manifest lists (plus, where the platform provides key ranges,
      * any orphaned chunk tail beyond it).
      */
@@ -4906,6 +4998,72 @@ class PersistenceManager {
      * this tree, so when the server certifies it unchanged (the common warm
      * boot), the follow-up write-through skips without serializing anything.
      */
+    /**
+     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
+     * precomputed hash listen immediately while the shared chunk restore runs
+     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
+     * are structurally valid and coupled to the same revision.
+     */
+    restoreListenMetadata(pathString) {
+        if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        const key = this.key_(pathString);
+        return this.withStore_('readonly', null, (store, done) => {
+            const req = store.get(key);
+            req.onsuccess = () => {
+                const manifest = req.result;
+                if (!manifest ||
+                    isLegacyRecord(manifest) ||
+                    manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+                    typeof manifest.chunkCount !== 'number' ||
+                    manifest.chunkCount <= 0 ||
+                    !Array.isArray(manifest.chunkRevisions) ||
+                    manifest.chunkRevisions.length !== manifest.chunkCount ||
+                    Date.now() - manifest.updatedAt > PERSISTENCE_MAX_AGE_MS ||
+                    typeof manifest.hash !== 'string' ||
+                    !manifest.compoundHash ||
+                    !Array.isArray(manifest.compoundHash.hashes) ||
+                    !Array.isArray(manifest.compoundHash.posts) ||
+                    manifest.compoundHash.hashes.length !==
+                        manifest.compoundHash.posts.length + 1) {
+                    done(null);
+                    return;
+                }
+                done({
+                    hash: manifest.hash,
+                    compoundHash: manifest.compoundHash,
+                    revision: manifest.revision
+                });
+            };
+        });
+    }
+    /**
+     * Listener restore with no wall/idle fallback: once valid hash metadata has
+     * been sent, a slow local decode must keep progressing rather than restart
+     * the listen unseeded. Null means the persisted base failed validation or a
+     * storage operation failed, not merely that it was slow.
+     */
+    restoreForListen(pathString) {
+        if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        return this.readRecord_(pathString).then(result => {
+            if (result === null || this.disposed_) {
+                return null;
+            }
+            this.lastFlush_.set(pathString, {
+                rootNode: result.record.node,
+                revision: result.record.revision,
+                plans: result.plans,
+                chunkRevisions: result.chunkRevisions,
+                chunkCount: result.chunkCount,
+                storedUpdatedAt: result.record.updatedAt
+            });
+            persistenceStats.restoredRoots.push(pathString);
+            return result.record;
+        });
+    }
     restore(pathString) {
         if (this.disposed_) {
             return Promise.resolve(null);
@@ -4946,20 +5104,20 @@ class PersistenceManager {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
-        // Deepest first: the path itself, then each ancestor up to the root.
         const candidates = [];
         let path = new Path(pathString);
         while (path !== null) {
             candidates.push(path.toString());
             path = pathParent(path);
         }
-        const read = this.withStore_('readonly', [], (store, done) => {
+        return this.raceRestoreTimeout_(onProgress => this.withStore_('readonly', [], (store, done) => {
             const results = new Array(candidates.length);
             let remaining = candidates.length;
             candidates.forEach((candidate, i) => {
                 const req = store.get(this.key_(candidate));
                 req.onsuccess = () => {
                     results[i] = req.result;
+                    onProgress();
                     if (--remaining === 0) {
                         done(results);
                     }
@@ -4986,9 +5144,8 @@ class PersistenceManager {
                 return null;
             }
             const root = candidates[best];
-            return this.readRecord_(root).then(result => result === null ? null : { root, record: result.record });
-        });
-        return this.raceRestoreTimeout_(read);
+            return this.readRecord_(root, onProgress).then(result => result === null ? null : { root, record: result.record });
+        }));
     }
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
@@ -5100,6 +5257,7 @@ class PersistenceManager {
             clearTimeout(this.sweepTimer_);
         }
         this.flushPending_.clear();
+        this.activeReads_.clear();
         this.latest_.clear();
         this.lastFlush_.clear();
     }
@@ -5117,7 +5275,7 @@ class PersistenceManager {
     }
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and hash record land as a couple
+     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
      * before the next flush or delete for that root starts, which is the
      * whole storage consistency argument — no cross-operation races to
      * reason about.
@@ -5179,17 +5337,16 @@ class PersistenceManager {
             plans.length === prev.plans.length) {
             // Content-identical to the stored state; only the timestamp is stale.
             // Rewrite the manifest alone, KEEPING the previous revision so the
-            // stored hash record stays joined to it.
-            const manifest = {
-                formatVersion: PERSISTENCE_FORMAT_VERSION,
-                revision: prev.revision,
-                updatedAt: now,
-                chunkCount: plans.length,
-                chunkRevisions: prev.chunkRevisions
-            };
+            // integrated protocol hashes stay joined to it.
             return this.withStore_('readwrite', false, (store, done) => {
-                store.put(manifest, key);
-                done(true);
+                const req = store.get(key);
+                req.onsuccess = () => {
+                    const current = req.result;
+                    if (current && current.revision === prev.revision) {
+                        store.put({ ...current, updatedAt: now }, key);
+                        done(true);
+                    }
+                };
             }).then(ok => {
                 if (ok && !this.disposed_) {
                     this.lastFlush_.set(pathString, {
@@ -5206,8 +5363,8 @@ class PersistenceManager {
         // last as the authoritative join. A crash mid-sequence leaves the old
         // manifest or a revision mismatch — a safe restore miss, never a stitched
         // tree. Peak transient memory is one chunk's exported JSON plus its clone.
-        // The hash follows as a small sidecar, conditionally joined to this exact
-        // manifest revision.
+        // Protocol hashes are attached back onto this same manifest after the
+        // idle computation, never stored as a separate current-format sidecar.
         const manifest = {
             formatVersion: PERSISTENCE_FORMAT_VERSION,
             revision,
@@ -5272,36 +5429,34 @@ class PersistenceManager {
                 chunkCount: plans.length,
                 storedUpdatedAt: now
             });
-            // A compound hash is sufficient for zero-download revalidation:
-            // send an impossible sentinel simple hash and let the server compare ranges. Avoiding
-            // node.hash() is crucial on large roots — it permanently cached one SHA
-            // string on every node, a large retained-memory jump absent on a normal
-            // cold load.
-            return compoundHashFromNodeAsync(node).then(compoundHash => {
-                const hash = COMPOUND_HASH_ONLY_SENTINEL;
+            // Compute protocol hashes once, when server data is persisted. The
+            // canonical traversal is non-retaining (it does not fill every child's
+            // lazyHash_); only this listened root is stamped and stored natively in
+            // its manifest for future tab loads.
+            return Promise.all([
+                canonicalHashFromNodeAsync(node),
+                compoundHashFromNodeAsync(node)
+            ]).then(([hash, compoundHash]) => {
+                node.stampLazyHash(hash);
                 if (this.disposed_) {
                     return;
                 }
                 persistenceStats.hashRecomputes++;
-                const hashRecord = {
-                    hash,
-                    compoundHash: {
-                        hashes: compoundHash.hashes,
-                        posts: compoundHash.posts
-                    },
-                    updatedAt: now,
-                    revision
-                };
                 return this.withStore_('readwrite', undefined, store => {
                     // Another tab may have replaced the manifest while we hashed;
-                    // only attach the hash if the manifest still carries OUR token
-                    // (the read and the put share one transaction, so this is
-                    // atomic).
+                    // attach protocol hashes only to the exact cached root revision.
                     const dataReq = store.get(key);
                     dataReq.onsuccess = () => {
                         const current = dataReq.result;
                         if (current && current.revision === revision) {
-                            store.put(hashRecord, key + HASH_KEY_SUFFIX);
+                            store.put({
+                                ...current,
+                                hash,
+                                compoundHash: {
+                                    hashes: compoundHash.hashes,
+                                    posts: compoundHash.posts
+                                }
+                            }, key);
                         }
                     };
                 });
@@ -12862,9 +13017,21 @@ const INTERRUPT_REASON = 'repo_interrupt';
  * client / server hashes for some data, we won't retry indefinitely.
  */
 const MAX_TRANSACTION_RETRIES = 25;
-/**
- * A connection to a single data repository.
- */
+function repoPendingRestoreForPath(repo, pathString) {
+    let bestPath = null;
+    let best = null;
+    for (const [root, pending] of repo.pendingSeedRestores_) {
+        if (pathString === root ||
+            (pathString.length > root.length &&
+                pathString.startsWith(root === '/' ? root : root + '/'))) {
+            if (bestPath === null || root.length > bestPath.length) {
+                bestPath = root;
+                best = pending;
+            }
+        }
+    }
+    return best;
+}
 class Repo {
     constructor(repoInfo_, forceRestClient_, authTokenProvider_, appCheckProvider_) {
         this.repoInfo_ = repoInfo_;
@@ -13007,6 +13174,11 @@ function repoGenerateServerValues(repo) {
  * Called by realtime when we get new messages from the server.
  */
 function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
+    const pending = tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
+    if (pending?.listenSent && pending.buffering) {
+        pending.bufferedActions.push(() => repoOnDataUpdate(repo, pathString, data, isMerge, tag));
+        return;
+    }
     // For testing.
     repo.dataUpdateCount++;
     const path = new Path(pathString);
@@ -13054,85 +13226,157 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
  */
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
     const pathString = query._path.toString();
-    // tag is null or undefined for a default listen depending on the caller;
-    // loose null covers both.
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
     if (isDefaultComplete) {
         const prior = repo.listenCompletions_.get(pathString);
         repo.listenCompletions_.set(pathString, {
             complete: false,
-            // Waiters registered before the listen attached carry over.
             waiters: prior ? prior.waiters : []
         });
     }
-    const sendListen = () => {
-        repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-            const events = onComplete(status, data);
-            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-            if (isDefaultComplete) {
-                // A listen response — ok or not — certifies the local view against
-                // the server; a persisted 'ok' re-persists it, any other status
-                // evicts the stored copy (a cached tree must not outlive the access
-                // that produced it).
-                const completion = repo.listenCompletions_.get(pathString);
-                if (completion && !completion.complete) {
-                    completion.complete = true;
-                    const waiters = completion.waiters;
-                    completion.waiters = [];
-                    for (const waiter of waiters) {
-                        waiter();
-                    }
+    let pendingToken = null;
+    const processListenResponse = (status, data) => {
+        const events = onComplete(status, data);
+        eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        if (isDefaultComplete) {
+            const completion = repo.listenCompletions_.get(pathString);
+            if (completion && !completion.complete) {
+                completion.complete = true;
+                const waiters = completion.waiters;
+                completion.waiters = [];
+                for (const waiter of waiters) {
+                    waiter();
                 }
-                if (repo.persistence_ !== null) {
-                    if (status === 'ok') {
-                        repoPersistAfterServerUpdate(repo, query._path);
-                    }
-                    else {
-                        repo.persistence_.evict(query._path);
-                    }
+            }
+            if (repo.persistence_ !== null) {
+                if (status === 'ok') {
+                    repoPersistAfterServerUpdate(repo, query._path);
                 }
+                else {
+                    repo.persistence_.evict(query._path);
+                }
+            }
+        }
+    };
+    const sendListen = (hashFn, owner = pendingToken) => {
+        if (owner) {
+            owner.listenSent = true;
+        }
+        repo.server_.listen(query, hashFn, tag, (status, data) => {
+            if (owner?.cancelled) {
+                return;
+            }
+            const apply = () => processListenResponse(status, data);
+            if (owner?.buffering && status !== 'ok') {
+                // Access was revoked/denied before the cached base finished loading.
+                // Process that immediately and prevent stale cached bytes from ever
+                // painting; this is not a latency fallback.
+                owner.cancelled = true;
+                owner.buffering = false;
+                owner.bufferedActions = [];
+                if (repo.pendingSeedRestores_.get(pathString) === owner) {
+                    repo.pendingSeedRestores_.delete(pathString);
+                }
+                pendingToken = null;
+                apply();
+            }
+            else if (owner?.buffering) {
+                owner.bufferedActions.push(apply);
+            }
+            else {
+                apply();
             }
         });
     };
     const persistence = repo.persistence_;
     if (persistence === null || !isDefaultComplete) {
-        sendListen();
+        sendListen(currentHashFn, null);
         return;
     }
     persistence.track(pathString);
-    // stopListening can arrive while the restore is pending — before the
-    // outbound listen exists — in which case its unlisten() is a no-op. The
-    // token lets it cancel this listen instead of leaving it to attach as an
-    // orphaned server subscription with no view to ever stop it.
-    const token = { cancelled: false };
-    repo.pendingSeedRestores_.set(pathString, token);
-    // The token stays registered until the listen is actually sent: every
-    // deferred stage below re-checks it, so a stop arriving anywhere in the
-    // restore-or-hash window cancels cleanly instead of orphaning the listen.
-    const sendSeededListen = () => {
-        repo.pendingSeedRestores_.delete(pathString);
-        sendListen();
+    const token = {
+        cancelled: false,
+        listenSent: false,
+        buffering: true,
+        bufferedActions: []
     };
-    void persistence.restore(pathString).then(record => {
-        if (token.cancelled) {
+    pendingToken = token;
+    repo.pendingSeedRestores_.set(pathString, token);
+    const isCurrent = () => !token.cancelled &&
+        repo.pendingSeedRestores_.get(pathString) === token;
+    /**
+     * Restart against the current in-memory view ONLY when the persisted base
+     * failed validation (or became incompatible with fresher local server
+     * state). Slow cache progress and slow network responses never call this.
+     */
+    const restartCurrentListen = () => {
+        if (!isCurrent()) {
             return;
         }
-        // If the server certified this exact path while the restore was in
-        // flight (an overlapping listen, a get()), the live data wins — applying
-        // the stored tree now would clobber fresher server state with stale
-        // bytes.
+        const wasSent = token.listenSent;
+        token.cancelled = true;
+        token.buffering = false;
+        token.bufferedActions = [];
+        repo.pendingSeedRestores_.delete(pathString);
+        pendingToken = null;
+        if (wasSent) {
+            repo.server_.unlisten(query, tag);
+        }
+        sendListen(currentHashFn, null);
+    };
+    const finishBufferedListen = () => {
+        if (!isCurrent()) {
+            return;
+        }
+        token.buffering = false;
+        repo.pendingSeedRestores_.delete(pathString);
+        pendingToken = null;
+        const actions = token.bufferedActions;
+        token.bufferedActions = [];
+        for (const action of actions) {
+            action();
+        }
+    };
+    // Two phases over the SAME physical cache read:
+    // 1) tiny precomputed hashes start the server comparison immediately;
+    // 2) chunks rebuild the cached base while server deltas buffer in arrival order.
+    const metadataPromise = persistence.restoreListenMetadata(pathString);
+    const recordPromise = persistence.restoreForListen(pathString);
+    void metadataPromise.then(metadata => {
+        if (!metadata || !isCurrent()) {
+            return;
+        }
+        const storedHashFn = (() => metadata.hash);
+        storedHashFn.compoundHash = () => metadata.compoundHash;
+        sendListen(storedHashFn, token);
+    });
+    void Promise.all([metadataPromise, recordPromise]).then(([metadata, record]) => {
+        if (!isCurrent()) {
+            return;
+        }
+        // If hashes were already sent, null means the persisted base failed
+        // format/chunk/revision/storage validation. This is the ONLY path that
+        // restarts an in-flight seeded listen unseeded/current.
+        if (record === null) {
+            if (token.listenSent) {
+                restartCurrentListen();
+            }
+            else {
+                token.buffering = false;
+                repo.pendingSeedRestores_.delete(pathString);
+                pendingToken = null;
+                sendListen(currentHashFn, null);
+            }
+            return;
+        }
         const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
             null;
-        if (record === null || alreadyCertified) {
-            sendSeededListen();
+        if (alreadyCertified) {
+            // The persisted base lost the race to fresher server state; hashes
+            // computed for it are no longer valid for this view.
+            restartCurrentListen();
             return;
         }
-        // Fresh server data may also live BELOW the listen path — a get() at a
-        // child, an overlapping deeper listen, an active query. Certified
-        // descendant trees are grafted over the restored bytes so the seed never
-        // regresses them; a descendant view holding server data it cannot
-        // certify as complete (a filtered query) cannot be grafted, so the seed
-        // is skipped outright — a cold load for this root, never a regression.
         let seeded = record.node;
         let grafted = false;
         for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)) {
@@ -13141,19 +13385,19 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
                 grafted = true;
             }
             else {
-                sendSeededListen();
+                // Partial live data cannot be safely grafted into the persisted
+                // base: this is a validation incompatibility, not a timeout.
+                restartCurrentListen();
                 return;
             }
         }
         if (seeded.isEmpty()) {
-            sendSeededListen();
+            restartCurrentListen();
             return;
         }
         let applied = false;
         try {
             if (!grafted) {
-                // Grafting changed the tree, so the STORED hashes no longer
-                // describe it — stamping them would certify the wrong tree.
                 seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
             }
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
@@ -13161,51 +13405,42 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
         }
         catch (e) {
-            // A malformed record or a failed apply must never break the listen:
-            // fall through and attach — user callbacks cannot land here (the
-            // event queue guards them), so the sync tree saw no partial apply
-            // events and the listen simply goes out against whatever state it
-            // holds.
+            // Malformed persisted data / apply failure is cache validation failure.
         }
-        // The replay runs user callbacks synchronously — one may have
-        // unsubscribed (stopListening saw a pending token and cancelled) or even
-        // re-subscribed (a NEW token now owns the path). Only the uncancelled,
-        // still-current token may send.
-        if (token.cancelled ||
-            repo.pendingSeedRestores_.get(pathString) !== token) {
+        if (!isCurrent()) {
             return;
         }
-        if (applied && !grafted && typeof record.hash === 'string') {
-            sendSeededListen();
+        if (!applied || grafted) {
+            restartCurrentListen();
             return;
         }
-        if (!applied) {
-            sendSeededListen();
+        if (token.listenSent && metadata !== null) {
+            finishBufferedListen();
             return;
         }
-        // A record persisted before its hash landed (or a grafted tree, whose
-        // stored hashes no longer apply) restores hashless. Priming the hash
-        // here — in idle slices, before the listen goes out — keeps the two
-        // invariants of the seeded path: the listen carries a real hash (zero
-        // download when the tree is unchanged), and hashFn never runs a
-        // synchronous O(tree) walk on the main thread at listen time. The prime
-        // is raced against the restore budget: a busy main thread starves idle
-        // slices, and restored-but-never-subscribed is worse than a hashless
-        // listen.
-        let proceeded = false;
-        const proceed = () => {
-            if (proceeded) {
+        // A valid tree without persisted hash metadata is uncommon (shutdown
+        // between manifest and hash commit). No listen was sent yet; compute its
+        // hash without a timeout fallback, then attach normally.
+        if (typeof record.hash === 'string') {
+            token.buffering = false;
+            repo.pendingSeedRestores_.delete(pathString);
+            pendingToken = null;
+            sendListen(currentHashFn, null);
+            return;
+        }
+        void canonicalHashFromNodeAsync(seeded).then(hash => {
+            if (!isCurrent()) {
                 return;
             }
-            proceeded = true;
-            clearTimeout(primeTimer);
-            if (!token.cancelled &&
-                repo.pendingSeedRestores_.get(pathString) === token) {
-                sendSeededListen();
-            }
-        };
-        const primeTimer = setTimeout(proceed, PERSISTENCE_RESTORE_TIMEOUT_MS);
-        void hashFromNodeAsync(seeded).then(proceed, proceed);
+            seeded.stampLazyHash(hash);
+            token.buffering = false;
+            repo.pendingSeedRestores_.delete(pathString);
+            pendingToken = null;
+            sendListen(currentHashFn, null);
+        }, restartCurrentListen);
+    }, () => {
+        // IndexedDB/storage failure is a validation failure; latency is not.
+        restartCurrentListen();
     });
 }
 /**
@@ -13223,8 +13458,12 @@ function repoStopServerListen(repo, query, tag) {
     const pending = repo.pendingSeedRestores_.get(pathString);
     if (pending) {
         pending.cancelled = true;
+        pending.buffering = false;
+        pending.bufferedActions = [];
         repo.pendingSeedRestores_.delete(pathString);
-        // The listen was never sent; nothing to unlisten.
+        if (pending.listenSent) {
+            repo.server_.unlisten(query, tag);
+        }
     }
     else {
         repo.server_.unlisten(query, tag);
@@ -13303,6 +13542,11 @@ function repoPersistAfterServerUpdate(repo, path) {
  * applied in order against the locally cached server data.
  */
 function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
+    const pending = tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
+    if (pending?.listenSent && pending.buffering) {
+        pending.bufferedActions.push(() => repoOnRangeMergeUpdate(repo, pathString, ranges, tag));
+        return;
+    }
     // For testing.
     repo.dataUpdateCount++;
     const path = new Path(pathString);
