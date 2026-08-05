@@ -17,7 +17,11 @@
 
 import { isIndexedDBAvailable } from '@firebase/util';
 
-import { compoundHashFromNodeAsync, hashFromNodeAsync } from './CompoundHash';
+import {
+  compoundHashFromNodeAsync,
+  estimateSerializedNodeSize,
+  hashFromNodeAsync
+} from './CompoundHash';
 import { SeedCompoundHash } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { Path, pathParent } from './util/Path';
@@ -91,7 +95,11 @@ export interface PersistedRecord {
   hash?: string;
   compoundHash?: SeedCompoundHash;
   updatedAt: number;
-  revision: number;
+  /**
+   * Write token unique ACROSS manager instances (tabs, reloads) — the join
+   * key coupling a hash record to the exact data write it describes.
+   */
+  revision: string;
 }
 
 /** The hash follow-up record stored next to a data record. */
@@ -99,7 +107,7 @@ interface PersistedHashRecord {
   hash: string;
   compoundHash: SeedCompoundHash;
   updatedAt: number;
-  revision: number;
+  revision: string;
 }
 
 /**
@@ -141,8 +149,14 @@ export class PersistenceManager {
    * can never collide with a tree that arrived after its root was evicted
    * and re-tracked.
    */
-  private latest_ = new Map<string, { node: Node; revision: number }>();
-  private revisionCounter_ = 0;
+  private latest_ = new Map<string, { node: Node; revision: string }>();
+  /**
+   * Distinguishes this manager's write tokens from every other tab's and
+   * session's — numeric counters restart at zero on reload, which let a new
+   * data write pair up with a surviving old hash sidecar.
+   */
+  private instanceId_ = Math.random().toString(36).slice(2, 10);
+  private writeCounter_ = 0;
   private writeTimers_ = new Map<string, ReturnType<typeof setTimeout>>();
   /** In-flight storage operations per root (see enqueue_). */
   private queues_ = new Map<string, Promise<void>>();
@@ -152,8 +166,19 @@ export class PersistenceManager {
     private prefix_: string,
     private idbFactory_: IDBFactory | null = isIndexedDBAvailable()
       ? indexedDB
-      : null
+      : null,
+    private maxRootBytes_: number = Infinity
   ) {}
+
+  /**
+   * A replacement manager for a different key prefix — used when emulator
+   * configuration changes the RepoInfo after persistence was enabled but
+   * before the repo started (no queues or tracked roots exist yet).
+   */
+  rebindTo(prefix: string): PersistenceManager {
+    this.dispose();
+    return new PersistenceManager(prefix, this.idbFactory_, this.maxRootBytes_);
+  }
 
   /**
    * Marks a root as persistence-managed; write-throughs only run for
@@ -505,7 +530,10 @@ export class PersistenceManager {
     if (!this.trackedRoots_.has(pathString)) {
       return;
     }
-    this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
+    this.latest_.set(pathString, {
+      node,
+      revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36)
+    });
     // Trailing throttle, NOT a resetting debounce: the timer set by the first
     // update in a burst survives later updates, so a root that churns faster
     // than the interval (a chat streaming, an editing session) still flushes
@@ -587,6 +615,16 @@ export class PersistenceManager {
       return Promise.resolve();
     }
     const { node, revision } = entry;
+    if (
+      this.maxRootBytes_ !== Infinity &&
+      estimateSerializedNodeSize(node) > this.maxRootBytes_
+    ) {
+      // Persisting costs a transient serialize + structured-clone + restore
+      // parse of the whole root — multiples of its size in peak memory. On
+      // constrained devices that is a crash, so oversized roots simply stay
+      // unpersisted (their boot is a normal cold load).
+      return Promise.resolve();
+    }
     persistenceStats.writeThroughs++;
     // The tree is serialized and written exactly once, hashless — a crash
     // before the recompute leaves a restorable tree that seeds without a
@@ -601,6 +639,10 @@ export class PersistenceManager {
     };
     const put = this.withStore_<void>('readwrite', undefined, store => {
       store.put(record, this.key_(pathString));
+      // Atomically invalidate the previous hash sidecar: between this write
+      // and the recompute below, the stored state is "data, hashless" — never
+      // "new data, old hash".
+      store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
     });
     return put.then(() =>
       Promise.all([
@@ -621,7 +663,16 @@ export class PersistenceManager {
           revision
         };
         return this.withStore_<void>('readwrite', undefined, store => {
-          store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
+          // Another tab may have replaced the data record while we hashed;
+          // only attach the hash if the record still carries OUR token (the
+          // read and the put share one transaction, so this is atomic).
+          const dataReq = store.get(this.key_(pathString));
+          dataReq.onsuccess = () => {
+            const current = dataReq.result as PersistedRecord | undefined;
+            if (current && current.revision === revision) {
+              store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
+            }
+          };
         });
       })
     );

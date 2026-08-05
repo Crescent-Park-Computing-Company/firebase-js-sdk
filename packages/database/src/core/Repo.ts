@@ -563,6 +563,16 @@ export function repoStartServerListen(
       seeded
     );
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+    // The replay runs user callbacks synchronously — one may have
+    // unsubscribed (stopListening saw a pending token and cancelled) or even
+    // re-subscribed (a NEW token now owns the path). Only the uncancelled,
+    // still-current token may send.
+    if (
+      token.cancelled ||
+      repo.pendingSeedRestores_.get(pathString) !== token
+    ) {
+      return;
+    }
     // A record persisted before its hash landed restores hashless. Priming
     // the hash here — in idle slices, before the listen goes out — keeps the
     // two invariants of the seeded path: the listen carries a real hash

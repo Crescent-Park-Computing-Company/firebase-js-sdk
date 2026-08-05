@@ -411,6 +411,17 @@ export function connectDatabaseEmulator(
 
   // Modify the repo to apply emulator settings
   repoManagerApplyEmulatorSettings(repo, hostAndPort, options, tokenProvider);
+
+  // Persistence enabled before this call captured the production URL as its
+  // storage prefix; rebind it to the emulator's so emulator sessions never
+  // restore production records or write emulator data under the production
+  // namespace. (Emulator config only happens pre-start, so no listens or
+  // tracked roots exist yet.)
+  if (repo.persistence_ !== null) {
+    repo.persistence_ = repo.persistence_.rebindTo(
+      repo.repoInfo_.toURLString()
+    );
+  }
 }
 
 /**
@@ -492,7 +503,19 @@ export function getPersistedValue(
  *
  * @internal
  */
-export function setPersistenceEnabled(db: Database, enabled: boolean): void {
+export function setPersistenceEnabled(
+  db: Database,
+  enabled: boolean,
+  options?: {
+    /**
+     * Roots whose estimated serialized size exceeds this stay unpersisted:
+     * persisting costs a transient serialize/clone/parse of the whole root —
+     * multiples of its size in peak memory — which memory-constrained
+     * devices cannot afford for very large trees.
+     */
+    maxRootBytes?: number;
+  }
+): void {
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceEnabled');
   // _repoInternal, not the _repo getter: configuration must not start the
@@ -500,7 +523,11 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   const repo = db._repoInternal;
   if (enabled) {
     if (repo.persistence_ === null) {
-      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+      repo.persistence_ = new PersistenceManager(
+        repo.repoInfo_.toURLString(),
+        undefined,
+        options?.maxRootBytes ?? Infinity
+      );
     }
   } else {
     if (repo.persistence_ !== null) {

@@ -239,7 +239,7 @@ describe('PersistenceManager', () => {
     data.set('test-repo|/old/root', {
       json: { a: 1 },
       updatedAt: Date.now() - 15 * 24 * 60 * 60 * 1000,
-      revision: 1
+      revision: 'ext-1'
     });
     expect(await manager.restore('/old/root')).to.equal(null);
     await flushAsync();
@@ -268,6 +268,36 @@ describe('PersistenceManager', () => {
     // The stored record is the SECOND tree with the SECOND tree's hash.
     expect(restored.json).to.deep.equal({ v: 2 });
     expect(restored.hash).to.equal(computeCanonicalHash({ v: 2 }));
+  });
+
+  it('a surviving hash sidecar from another session never pairs with new data', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    // Session 1 left a data+hash pair. Simulate its numeric-free token.
+    data.set('test-repo|/shared/root', {
+      json: { old: true },
+      updatedAt: Date.now(),
+      revision: 'oldtab-1'
+    });
+    data.set('test-repo|/shared/root#hash', {
+      hash: computeCanonicalHash({ old: true }),
+      compoundHash: computeCompoundHash({ old: true }),
+      updatedAt: Date.now(),
+      revision: 'oldtab-1'
+    });
+    // Session 2 (this manager) writes a NEW tree; its data put atomically
+    // deletes the old sidecar, so even before its own hash lands the store
+    // can never say "new data, old hash".
+    const manager = new PersistenceManager('test-repo', factory);
+    const path = new Path('shared/root');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ fresh: true }));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const restored = (await manager.restore(
+      path.toString()
+    )) as PersistedRecord;
+    expect(restored.json).to.deep.equal({ fresh: true });
+    expect(restored.hash).to.equal(computeCanonicalHash({ fresh: true }));
   });
 
   it('a burst within the debounce flushes the newest tree', async () => {
@@ -389,17 +419,17 @@ describe('PersistenceManager', () => {
     data.set('test-repo|/old/root', {
       json: { stale: true },
       updatedAt: expired,
-      revision: 1
+      revision: 'ext-1'
     });
     data.set('test-repo|/fresh/root', {
       json: { fresh: true },
       updatedAt: Date.now(),
-      revision: 1
+      revision: 'ext-1'
     });
     data.set('other-repo|/old/root', {
       json: { foreign: true },
       updatedAt: expired,
-      revision: 1
+      revision: 'ext-1'
     });
 
     const manager = new PersistenceManager('test-repo', factory);
@@ -503,6 +533,42 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(repo.persistence_!.trackedRootFor(path.toString())).to.equal(null);
   });
 
+  it('an unsubscribe from inside the cached replay cancels the listen', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, data } =
+      makeListenHarness();
+    data.set('test-repo|' + path.toString(), {
+      json: { a: 1 },
+      updatedAt: Date.now(),
+      revision: 'ext-2'
+    });
+    // A replayed event callback unsubscribes synchronously: registration's
+    // event runner calls repoStopServerListen mid-replay.
+    const realQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    const registration = {
+      respondsTo: () => true,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createEvent: () => null as any,
+      getEventRunner: () => () => {
+        repoStopServerListen(repo, query, null);
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => true,
+      hasAnyCallback: () => true
+    };
+    syncTreeAddEventRegistration(repo.serverSyncTree_, realQuery, registration);
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    // The wire listen must never have been sent — no orphan to unlisten.
+    expect(calls).to.deep.equal([]);
+  });
+
   it('a hashless record is hash-primed and still sends the listen', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
@@ -510,7 +576,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     data.set('test-repo|' + path.toString(), {
       json: { a: 1 },
       updatedAt: Date.now(),
-      revision: 1
+      revision: 'ext-1'
     });
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
@@ -573,7 +639,7 @@ describe('stale restore vs live server data', () => {
     data.set('test-repo|/users/alice', {
       json: { stale: true },
       updatedAt: Date.now(),
-      revision: 1
+      revision: 'ext-1'
     });
 
     const calls: string[] = [];
