@@ -59,12 +59,29 @@ function makeFakeIndexedDB(options: { startWithoutStore?: boolean } = {}): {
     void Promise.resolve().then(fn);
   };
   const makeRequest = (result: unknown) => {
+    // Mirrors real IDBRequest semantics: reading `result` before the request
+    // completes throws InvalidStateError.
+    let doneFlag = false;
     const req: {
-      result: unknown;
+      readonly result: unknown;
       onsuccess: null | (() => void);
       onerror: null | (() => void);
-    } = { result, onsuccess: null, onerror: null };
-    async(() => req.onsuccess && req.onsuccess());
+    } = {
+      get result() {
+        if (!doneFlag) {
+          throw new Error('InvalidStateError: request not done');
+        }
+        return result;
+      },
+      onsuccess: null,
+      onerror: null
+    };
+    async(() => {
+      doneFlag = true;
+      if (req.onsuccess) {
+        req.onsuccess();
+      }
+    });
     return req;
   };
   const store = {
