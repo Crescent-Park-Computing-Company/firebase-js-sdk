@@ -4236,6 +4236,10 @@ EmulatorTokenProvider.OWNER = 'owner';
  * degrade to cold loads; nothing here may ever break the live connection.
  */
 const STORE = 'firebase-server-cache';
+// Version 3 invalidates every cache written before per-chunk transactions.
+// The upgrade clears the store inside IndexedDB without materializing the old
+// (potentially huge monolithic) values into JavaScript memory.
+const PERSISTENCE_DB_VERSION = 3;
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -4489,36 +4493,34 @@ class PersistenceManager {
             if (db === null) {
                 return null;
             }
+            // One-time migration away from monolithic / shared-transaction cache
+            // formats. Close and upgrade BEFORE any get(): clearing in the version
+            // change transaction drops the old values inside IndexedDB, without
+            // structured-cloning them into the WebKit heap (which is exactly what
+            // crashed large legacy accounts during restore).
+            if (db.version < PERSISTENCE_DB_VERSION) {
+                db.close();
+                return this.openAtVersion_(PERSISTENCE_DB_VERSION);
+            }
             if (db.objectStoreNames.contains(STORE)) {
                 return db;
             }
-            // The database exists but lacks the store — e.g. it was created by a
-            // versionless open from other tooling. Object stores can only be added
-            // in a version-change transaction, so reopen one version up.
             const nextVersion = db.version + 1;
             db.close();
-            return this.openAtVersion_(nextVersion).then(upgraded => {
-                if (upgraded !== null && !upgraded.objectStoreNames.contains(STORE)) {
-                    persistenceStats.storageFailures++;
-                    upgraded.close();
-                    return null;
-                }
-                return upgraded;
-            });
+            return this.openAtVersion_(nextVersion);
+        }).then(db => {
+            if (db !== null && !db.objectStoreNames.contains(STORE)) {
+                persistenceStats.storageFailures++;
+                db.close();
+                return null;
+            }
+            return db;
         });
-        // One sweep per manager, DEFERRED well past startup: restore() only
-        // expires the exact keys it is asked for, so without a sweep, roots that
-        // are never listened to again would sit in IndexedDB forever — but the
-        // sweep's store-wide transaction must never sit in front of the boot
-        // restores, which IndexedDB queues behind any earlier overlapping-scope
-        // transaction.
         void this.db_.then(db => {
             if (db !== null && !this.disposed_ && this.sweepTimer_ === null) {
                 this.sweepTimer_ = setTimeout(() => {
                     void this.sweepExpired_();
                 }, PERSISTENCE_SWEEP_DELAY_MS);
-                // Node returns a Timeout object; never hold the process open for a
-                // housekeeping timer. Browsers return a number — no-op there.
                 this.sweepTimer_.unref?.();
             }
         });
@@ -4659,6 +4661,10 @@ class PersistenceManager {
                     const db = req.result;
                     if (!db.objectStoreNames.contains(STORE)) {
                         db.createObjectStore(STORE);
+                    }
+                    else if (version === PERSISTENCE_DB_VERSION) {
+                        // Clear in-IDB: no old record is cloned into JS memory.
+                        req.transaction.objectStore(STORE).clear();
                     }
                 };
                 req.onsuccess = () => resolve(req.result);
