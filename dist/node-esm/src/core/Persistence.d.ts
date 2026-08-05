@@ -51,7 +51,6 @@ export declare const persistenceStats: {
     restoreMisses: string[];
     writeThroughs: number;
     hashRecomputes: number;
-    staleHashDiscards: number;
     evictions: number;
     storageFailures: number;
 };
@@ -77,6 +76,8 @@ export declare class PersistenceManager {
     private latest_;
     private revisionCounter_;
     private writeTimers_;
+    /** In-flight storage operations per root (see enqueue_). */
+    private queues_;
     private disposed_;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null);
     /**
@@ -158,5 +159,12 @@ export declare class PersistenceManager {
      * Test seam: forces a pending debounced flush to run now.
      */
     flushNow(pathString: string): Promise<void>;
+    /**
+     * Chains an operation onto the root's queue. One writer per root at a
+     * time: a flush's data and hash records land as a couple before the next
+     * flush or delete for that root starts, which is the whole storage
+     * consistency argument — no cross-operation races to reason about.
+     */
+    private enqueue_;
     private flush_;
 }

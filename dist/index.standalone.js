@@ -4206,7 +4206,6 @@ const persistenceStats = {
     restoreMisses: [],
     writeThroughs: 0,
     hashRecomputes: 0,
-    staleHashDiscards: 0,
     evictions: 0,
     storageFailures: 0
 };
@@ -4236,6 +4235,8 @@ class PersistenceManager {
         this.latest_ = new Map();
         this.revisionCounter_ = 0;
         this.writeTimers_ = new Map();
+        /** In-flight storage operations per root (see enqueue_). */
+        this.queues_ = new Map();
         this.disposed_ = false;
     }
     /**
@@ -4255,10 +4256,9 @@ class PersistenceManager {
             return;
         }
         this.trackedRoots_.delete(pathString);
-        // Release the tree only after the flush settles: flush_'s hash recompute
-        // re-reads latest_ to couple hashes to trees, so deleting synchronously
-        // would store the final record hashless. Skip the delete if the root was
-        // re-tracked meanwhile — the new listen owns the entry now.
+        // Release the tree only after the final flush settles (flush_ reads
+        // latest_ when it runs). Skip the delete if the root was re-tracked
+        // meanwhile — the new listen owns the entry now.
         void this.flushNow(pathString).then(() => {
             if (!this.trackedRoots_.has(pathString)) {
                 this.latest_.delete(pathString);
@@ -4551,14 +4551,17 @@ class PersistenceManager {
             return;
         }
         this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
-        const existing = this.writeTimers_.get(pathString);
-        if (existing) {
-            clearTimeout(existing);
+        // Trailing throttle, NOT a resetting debounce: the timer set by the first
+        // update in a burst survives later updates, so a root that churns faster
+        // than the interval (a chat streaming, an editing session) still flushes
+        // every interval instead of never. The flush reads latest_ when it runs,
+        // so it always writes the newest tree.
+        if (!this.writeTimers_.has(pathString)) {
+            this.writeTimers_.set(pathString, setTimeout(() => {
+                this.writeTimers_.delete(pathString);
+                this.enqueue_(pathString, () => this.flush_(pathString));
+            }, PERSISTENCE_WRITE_DEBOUNCE_MS));
         }
-        this.writeTimers_.set(pathString, setTimeout(() => {
-            this.writeTimers_.delete(pathString);
-            void this.flush_(pathString);
-        }, PERSISTENCE_WRITE_DEBOUNCE_MS));
     }
     /**
      * The viewer lost access to a root: a cached copy must not outlive the
@@ -4573,7 +4576,9 @@ class PersistenceManager {
             this.writeTimers_.delete(pathString);
         }
         persistenceStats.evictions++;
-        void this.deleteRecord_(pathString);
+        // Through the queue: a flush already running for this root finishes its
+        // writes first, then the delete removes them — never the reverse.
+        this.enqueue_(pathString, () => this.deleteRecord_(pathString));
     }
     dispose() {
         this.disposed_ = true;
@@ -4592,7 +4597,26 @@ class PersistenceManager {
             clearTimeout(timer);
             this.writeTimers_.delete(pathString);
         }
-        return this.flush_(pathString);
+        return this.enqueue_(pathString, () => this.flush_(pathString));
+    }
+    /**
+     * Chains an operation onto the root's queue. One writer per root at a
+     * time: a flush's data and hash records land as a couple before the next
+     * flush or delete for that root starts, which is the whole storage
+     * consistency argument — no cross-operation races to reason about.
+     */
+    enqueue_(pathString, op) {
+        const next = (this.queues_.get(pathString) ?? Promise.resolve()).then(op);
+        // Settle-or-not, the chain must continue; storage failures are already
+        // absorbed (and counted) inside withStore_.
+        const settled = next.catch(() => { });
+        this.queues_.set(pathString, settled);
+        void settled.then(() => {
+            if (this.queues_.get(pathString) === settled) {
+                this.queues_.delete(pathString);
+            }
+        });
+        return next;
     }
     flush_(pathString) {
         const entry = this.latest_.get(pathString);
@@ -4603,7 +4627,10 @@ class PersistenceManager {
         persistenceStats.writeThroughs++;
         // The tree is serialized and written exactly once, hashless — a crash
         // before the recompute leaves a restorable tree that seeds without a
-        // hash instead of nothing. The hashes follow as a small separate record.
+        // hash instead of nothing. The hashes follow as a small separate record,
+        // and because flushes for a root are serialized (enqueue_), the pair is
+        // always coupled: the hash written here describes the data written here,
+        // even if newer updates arrived while hashing.
         const record = {
             json: node.val(true),
             updatedAt: Date.now(),
@@ -4616,12 +4643,7 @@ class PersistenceManager {
             hashFromNodeAsync(node),
             compoundHashFromNodeAsync(node)
         ]).then(([hash, compoundHash]) => {
-            const current = this.latest_.get(pathString);
-            if (!current || current.revision !== revision || this.disposed_) {
-                // A newer server update superseded this tree while it hashed; its
-                // own flush persists fresh hashes. Discarding keeps stored hashes
-                // coupled to stored trees.
-                persistenceStats.staleHashDiscards++;
+            if (this.disposed_) {
                 return;
             }
             persistenceStats.hashRecomputes++;
@@ -12393,29 +12415,55 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
     // orphaned server subscription with no view to ever stop it.
     const token = { cancelled: false };
     repo.pendingSeedRestores_.set(pathString, token);
+    // The token stays registered until the listen is actually sent: every
+    // deferred stage below re-checks it, so a stop arriving anywhere in the
+    // restore-or-hash window cancels cleanly instead of orphaning the listen.
+    const sendSeededListen = () => {
+        repo.pendingSeedRestores_.delete(pathString);
+        sendListen();
+    };
     void persistence.restore(pathString).then(record => {
         if (token.cancelled) {
             return;
         }
-        repo.pendingSeedRestores_.delete(pathString);
         // If the server certified this path while the restore was in flight (an
         // overlapping listen, a get()), the live data wins — applying the stored
         // tree now would clobber fresher server state with stale bytes.
         const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
             null;
-        if (record !== null && !alreadyCertified) {
-            try {
-                const node = buildSeedNode(record);
-                if (!node.isEmpty()) {
-                    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, node);
-                    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-                }
-            }
-            catch (e) {
-                // A malformed record must never break the listen.
-            }
+        if (record === null || alreadyCertified) {
+            sendSeededListen();
+            return;
         }
-        sendListen();
+        let node = null;
+        try {
+            node = buildSeedNode(record);
+        }
+        catch (e) {
+            // A malformed record must never break the listen.
+        }
+        if (node === null || node.isEmpty()) {
+            sendSeededListen();
+            return;
+        }
+        const seeded = node;
+        const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
+        eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        // A record persisted before its hash landed restores hashless. Priming
+        // the hash here — in idle slices, before the listen goes out — keeps the
+        // two invariants of the seeded path: the listen carries a real hash
+        // (zero download when the tree is unchanged), and hashFn never runs a
+        // synchronous O(tree) walk on the main thread at listen time.
+        if (typeof record.hash === 'string') {
+            sendSeededListen();
+            return;
+        }
+        const proceed = () => {
+            if (!token.cancelled) {
+                sendSeededListen();
+            }
+        };
+        void hashFromNodeAsync(seeded).then(proceed, proceed);
     });
 }
 /**
