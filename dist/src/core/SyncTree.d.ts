@@ -128,6 +128,24 @@ export declare function syncTreeApplyTaggedListenComplete(syncTree: SyncTree, pa
  */
 export declare function syncTreeGetCompleteServerCache(syncTree: SyncTree, path: Path): Node | null;
 /**
+ * The server-cache state of every view at or below `path`, except the
+ * complete default view at `path` itself (the caller's own). Used by the
+ * persistence restore path to decide what a stored tree may be applied
+ * over: a view with a COMPLETE server cache contributes its certified tree
+ * (to graft over the restored bytes); a view holding server data it cannot
+ * certify as complete — a filtered query, a partially filled cache — is
+ * reported as partial, because grafting it is impossible and overwriting it
+ * would replace live server data with stale bytes.
+ *
+ * Ordered shallowest-first, so grafting in order lets deeper (more
+ * specific) trees win where they nest.
+ */
+export declare function syncTreeGetDescendantServerCacheStates(syncTree: SyncTree, path: Path): Array<{
+    path: Path;
+    complete: Node | null;
+    hasPartialData: boolean;
+}>;
+/**
  * Applies server range merges against the complete (default) view at the
  * given path and promotes the merged tree through the standard
  * server-overwrite path.

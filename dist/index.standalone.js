@@ -1272,9 +1272,18 @@ function leafHashRepresentation(node) {
     return representation;
 }
 /**
+ * Sizes computed for interior (children) nodes, keyed by node identity.
+ * Nodes are immutable and structurally shared across server updates, so a
+ * subtree's estimate stays valid for as long as the subtree object lives —
+ * repeated estimations of a large mostly-unchanged tree (the persistence
+ * write path re-plans its chunks on every flush) only walk the changed
+ * spine. Leaves are cheap to size and are not cached.
+ */
+const serializedSizeCache = new WeakMap();
+/**
  * Estimates the serialized size of a node in bytes — a cheap approximation
- * that only drives the default split threshold, never a wire value (port of
- * Android NodeSizeEstimator).
+ * that only drives the default split threshold and the persistence chunk
+ * planner, never a wire value (port of Android NodeSizeEstimator).
  */
 function estimateSerializedNodeSize(node) {
     if (node.isEmpty()) {
@@ -1300,6 +1309,10 @@ function estimateSerializedNodeSize(node) {
         return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
     }
     else {
+        const cached = serializedSizeCache.get(node);
+        if (cached !== undefined) {
+            return cached;
+        }
         let sum = 1; // opening brace
         node.forEachChild(KEY_INDEX, (key, child) => {
             // key, quotes, colon, comma
@@ -1308,6 +1321,7 @@ function estimateSerializedNodeSize(node) {
         if (!node.getPriority().isEmpty()) {
             sum += 12 + estimateSerializedNodeSize(node.getPriority());
         }
+        serializedSizeCache.set(node, sum);
         return sum;
     }
 }
@@ -3416,23 +3430,29 @@ class ServerCacheSeedStore {
     }
 }
 /**
- * Builds the node for a seed, stamping the precomputed canonical hash into
- * the node's lazy-hash slot (so hash() returns it without an O(tree) walk)
- * and attaching the precomputed compound hash for the listen to send.
+ * Builds the node for a seed, stamping the precomputed hashes (see
+ * stampSeedHashes).
+ */
+function buildSeedNode(seed) {
+    return stampSeedHashes(nodeFromJSON(seed.json), seed.hash, seed.compoundHash);
+}
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
  *
- * An empty tree is returned unstamped: nodeFromJSON maps it to the shared
+ * An empty tree is returned unstamped: an empty node is the shared
  * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
  * empty node in the app.
  */
-function buildSeedNode(seed) {
-    const node = nodeFromJSON(seed.json);
+function stampSeedHashes(node, hash, compoundHash) {
     if (node.isEmpty()) {
         return node;
     }
-    if (typeof seed.hash === 'string' && seed.hash.length > 0) {
-        node.stampLazyHash(seed.hash);
+    if (typeof hash === 'string' && hash.length > 0) {
+        node.stampLazyHash(hash);
     }
-    const compoundHash = seed.compoundHash;
     if (compoundHash &&
         Array.isArray(compoundHash.hashes) &&
         Array.isArray(compoundHash.posts) &&
@@ -4154,29 +4174,49 @@ EmulatorTokenProvider.OWNER = 'owner';
  * tree's hashes. An unchanged tree costs a hash handshake; a changed one
  * costs range-merge deltas; a cold root costs exactly today's full download.
  *
- * What is persisted, per top-level listened ROOT (a complete, unfiltered
- * listen), as TWO records under adjacent keys:
- *   - the data record: the last server-confirmed tree as exported JSON
- *     (val(true) — priorities preserved), written through debounced on
- *     server overwrites / merges / range merges / listen-completes;
- *   - the hash record: the tree's canonical listen hash and compound hash,
- *     recomputed AFTER each write-through in idle-time slices and stored
- *     separately, so a flush serializes the tree exactly once and the hash
- *     lands as a small follow-up write.
+ * MEMORY MODEL — why storage is chunked. A root is persisted per top-level
+ * listened ROOT (a complete, unfiltered listen), but never as one monolithic
+ * value: serializing a large tree in one piece costs a full exported-JSON
+ * copy plus a full structured clone in peak memory on every write, and the
+ * mirror image on every restore — enough to OOM a memory-constrained mobile
+ * tab whose live tree already occupies hundreds of MB. Instead each root is
+ * stored as:
  *
- * Coupling stored hashes to stored trees: every write-through stamps the
- * data record with a manager-wide monotonic `revision`; the async recompute
- * carries the revision it hashed and its result is discarded when a newer
- * write-through superseded it. On restore the hash record is joined only
- * when its revision matches the data record's — a mismatch (recompute
- * pending at shutdown) restores WITHOUT hashes: the data still paints, the
- * listen just goes out hashless, exactly a cold load for that root.
+ *   - a small MANIFEST record (`<prefix>|<path>`): revision, updatedAt, and
+ *     the per-chunk revision join keys — no tree data;
+ *   - CHUNK records (`<prefix>|<path>#c<index>`): disjoint subtrees of
+ *     roughly PERSISTENCE_CHUNK_TARGET_BYTES each, as arrays of
+ *     [relative path, exported JSON] entries (see planChunks);
+ *   - a HASH record (`<prefix>|<path>#hash`): the tree's canonical listen
+ *     hash and compound hash, recomputed after a write in idle-time slices.
+ *
+ * Chunking bounds peak memory on both sides — a flush serializes and clones
+ * one chunk at a time, a restore parses one chunk at a time into the shared
+ * immutable tree — and makes writes INCREMENTAL: nodes are immutable and
+ * structurally shared, so a chunk whose subtrees are reference-identical to
+ * the previously stored plan is skipped entirely. The common warm-boot flow
+ * (restore, listen 'ok' certifying the unchanged tree) therefore writes
+ * nothing at all, and a small change to a huge root rewrites only the chunks
+ * it touched.
+ *
+ * Coupling stored hashes to stored trees: every write stamps the manifest
+ * with a write token unique across sessions and tabs (`revision`); each
+ * chunk carries the token of the write that produced it, and the manifest
+ * lists the token expected of every chunk. A restore joins only when all
+ * chunk tokens match the manifest (an interrupted or interleaved write
+ * degrades to a miss, never to a stitched tree), and joins the hash record
+ * only when ITS token matches too — a recompute pending at shutdown restores
+ * WITHOUT hashes: the data still paints, the listen just goes out hashless,
+ * exactly a cold load for that root.
+ *
+ * Records written before chunking (a single record with the exported JSON
+ * inline) still restore; their next write replaces them with the chunked
+ * layout.
  *
  * Storage: one IndexedDB database ('firebase-database-persistence'), one
- * object store, keyed "<repo prefix>|<path>" (data) and
- * "<repo prefix>|<path>#hash" (hashes; '#' cannot appear in a path segment).
- * All storage failures degrade to cold loads; nothing here may ever break
- * the live connection.
+ * object store, keyed by `<repo prefix>|<path>` plus the '#'-suffixed
+ * sidecars above ('#' cannot appear in a path segment). All storage failures
+ * degrade to cold loads; nothing here may ever break the live connection.
  */
 const STORE = 'firebase-server-cache';
 /**
@@ -4186,8 +4226,8 @@ const STORE = 'firebase-server-cache';
 const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 /**
  * How long after the last server update a root's write-through runs. The
- * flush serializes the whole root (val(true) + the structured clone into
- * IndexedDB), so it is deliberately coarse for very large roots.
+ * flush re-serializes the chunks the update dirtied, so it is deliberately
+ * coarse.
  * @internal
  */
 const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
@@ -4198,6 +4238,29 @@ const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /**
+ * Target serialized size of one chunk record. Peak transient memory of a
+ * flush or restore is a few multiples of THIS (one chunk's exported JSON
+ * plus its structured clone), not of the whole root. A single leaf larger
+ * than the target still becomes one oversized chunk — leaves cannot split.
+ * @internal
+ */
+const PERSISTENCE_CHUNK_TARGET_BYTES = 1024 * 1024;
+/**
+ * A stored tree whose content hasn't changed is left untouched by flushes
+ * until its manifest is this old, then the manifest alone is rewritten with
+ * a fresh timestamp (the chunks and hash record stay put) — so a tree that
+ * never changes but is used daily never ages into the expiry cutoff.
+ * @internal
+ */
+const PERSISTENCE_REFRESH_AGE_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long after startup the expiry sweep runs. Deferred so the sweep's
+ * store-wide transaction can never delay the boot restores, which IndexedDB
+ * would otherwise queue behind it.
+ * @internal
+ */
+const PERSISTENCE_SWEEP_DELAY_MS = 15000;
+/**
  * Counters for observing persistence effectiveness.
  * @internal
  */
@@ -4205,11 +4268,85 @@ const persistenceStats = {
     restoredRoots: [],
     restoreMisses: [],
     writeThroughs: 0,
+    chunksWritten: 0,
+    chunksSkipped: 0,
     hashRecomputes: 0,
     evictions: 0,
     storageFailures: 0
 };
 const HASH_KEY_SUFFIX = '#hash';
+const CHUNK_KEY_INFIX = '#c';
+/**
+ * Zero-padded so chunk keys sort in index order ('#c000002' < '#c000010'),
+ * and below '#hash' ('c' < 'h') — one key range spans exactly a root's
+ * chunk records.
+ */
+function chunkKeySuffix(index) {
+    return CHUNK_KEY_INFIX + String(index).padStart(6, '0');
+}
+function isLegacyRecord(record) {
+    return record.json !== undefined;
+}
+/**
+ * Splits a tree into chunk plans of roughly PERSISTENCE_CHUNK_TARGET_BYTES
+ * each: subtrees at or under the target are emitted whole (greedily binned
+ * with their siblings), larger ones recurse into their children, with a
+ * split node's own priority emitted as a trailing '.priority' entry.
+ * Entries are disjoint and in a fixed traversal order, so applying them in
+ * sequence over an empty node rebuilds the exact tree — and the same tree
+ * always yields the same plan, which is what lets flushes compare plans
+ * entry-by-entry against structurally shared previous trees.
+ */
+function planChunks(root) {
+    const plans = [];
+    let current = [];
+    let currentSize = 0;
+    const flushBin = () => {
+        if (current.length > 0) {
+            plans.push(current);
+            current = [];
+            currentSize = 0;
+        }
+    };
+    const emit = (relPath, node, size) => {
+        if (currentSize > 0 && currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES) {
+            flushBin();
+        }
+        current.push({ relPath, node });
+        currentSize += size;
+        if (currentSize >= PERSISTENCE_CHUNK_TARGET_BYTES) {
+            flushBin();
+        }
+    };
+    const walk = (relPath, node) => {
+        const size = estimateSerializedNodeSize(node);
+        if (node.isLeafNode() || size <= PERSISTENCE_CHUNK_TARGET_BYTES) {
+            emit(relPath, node, size);
+            return;
+        }
+        node.forEachChild(KEY_INDEX, (key, child) => {
+            walk(relPath === '' ? key : relPath + '/' + key, child);
+        });
+        const priority = node.getPriority();
+        if (!priority.isEmpty()) {
+            emit(relPath === '' ? '.priority' : relPath + '/.priority', priority, estimateSerializedNodeSize(priority));
+        }
+    };
+    walk('', root);
+    flushBin();
+    return plans;
+}
+function samePlan(a, b) {
+    if (a.length !== b.length) {
+        return false;
+    }
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].relPath !== b[i].relPath || a[i].node !== b[i].node) {
+            return false;
+        }
+    }
+    return true;
+}
 /**
  * One PersistenceManager per Repo. `prefix` namespaces records so multiple
  * databases/apps sharing the page don't collide. `idbFactory` exists for
@@ -4218,10 +4355,9 @@ const HASH_KEY_SUFFIX = '#hash';
 class PersistenceManager {
     constructor(prefix_, idbFactory_ = util.isIndexedDBAvailable()
         ? indexedDB
-        : null, maxRootBytes_ = Infinity) {
+        : null) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
-        this.maxRootBytes_ = maxRootBytes_;
         this.db_ = null;
         /**
          * Roots that flow through persistence (complete default listens).
@@ -4235,6 +4371,11 @@ class PersistenceManager {
          */
         this.latest_ = new Map();
         /**
+         * What IndexedDB currently holds per root (see FlushedState) — the basis
+         * for skipping clean chunks and no-op flushes.
+         */
+        this.lastFlush_ = new Map();
+        /**
          * Distinguishes this manager's write tokens from every other tab's and
          * session's — numeric counters restart at zero on reload, which let a new
          * data write pair up with a surviving old hash sidecar.
@@ -4242,8 +4383,15 @@ class PersistenceManager {
         this.instanceId_ = Math.random().toString(36).slice(2, 10);
         this.writeCounter_ = 0;
         this.writeTimers_ = new Map();
+        /**
+         * Roots whose throttle fired while their queue was busy: exactly one
+         * flush is re-enqueued when the queue drains, however many intervals
+         * elapsed meanwhile — the queue can never grow faster than it drains.
+         */
+        this.flushPending_ = new Set();
         /** In-flight storage operations per root (see enqueue_). */
         this.queues_ = new Map();
+        this.sweepTimer_ = null;
         this.disposed_ = false;
     }
     /**
@@ -4253,7 +4401,7 @@ class PersistenceManager {
      */
     rebindTo(prefix) {
         this.dispose();
-        return new PersistenceManager(prefix, this.idbFactory_, this.maxRootBytes_);
+        return new PersistenceManager(prefix, this.idbFactory_);
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -4263,36 +4411,58 @@ class PersistenceManager {
         this.trackedRoots_.add(pathString);
     }
     /**
-     * The root's last listen stopped: flush any pending write-through so
-     * IndexedDB holds the final tree for the next session, then release the
-     * in-memory copy — only live listens need it.
+     * The root's last listen stopped. When a live tracked ancestor covers the
+     * root, its record — which contains this subtree and keeps flushing — is
+     * the one future sessions should restore, so the child's own record is
+     * deleted rather than left to shadow it. Otherwise any pending
+     * write-through is flushed so IndexedDB holds the final tree for the next
+     * session. Either way the in-memory copies are released — only live
+     * listens need them.
      */
     untrack(pathString) {
         if (!this.trackedRoots_.has(pathString)) {
             return;
         }
         this.trackedRoots_.delete(pathString);
+        const timer = this.writeTimers_.get(pathString);
+        if (timer) {
+            clearTimeout(timer);
+            this.writeTimers_.delete(pathString);
+        }
+        this.flushPending_.delete(pathString);
+        if (this.trackedRootFor(pathString) !== null) {
+            this.latest_.delete(pathString);
+            this.lastFlush_.delete(pathString);
+            void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+            return;
+        }
         // Release the tree only after the final flush settles (flush_ reads
         // latest_ when it runs). Skip the delete if the root was re-tracked
-        // meanwhile — the new listen owns the entry now.
-        void this.flushNow(pathString).then(() => {
+        // meanwhile — the new listen owns the entry now. flushNow never rejects
+        // today, but cleanup on both callbacks keeps this leak-proof either way.
+        const release = () => {
             if (!this.trackedRoots_.has(pathString)) {
                 this.latest_.delete(pathString);
+                this.lastFlush_.delete(pathString);
             }
-        });
+        };
+        void this.flushNow(pathString).then(release, release);
     }
     /**
-     * The nearest tracked root at-or-above `pathString`, or null.
+     * The nearest (deepest) tracked root at-or-above `pathString`, or null.
      */
     trackedRootFor(pathString) {
+        let best = null;
         for (const root of this.trackedRoots_) {
             if (pathString === root ||
                 (pathString.length > root.length &&
                     pathString.startsWith(root === '/' ? root : root + '/'))) {
-                return root;
+                if (best === null || root.length > best.length) {
+                    best = root;
+                }
             }
         }
-        return null;
+        return best;
     }
     open_() {
         if (this.db_) {
@@ -4319,47 +4489,144 @@ class PersistenceManager {
                 return upgraded;
             });
         });
-        // One sweep per manager, off the first open: restore() only expires the
-        // exact keys it is asked for, so without this, roots that are never
-        // listened to again would sit in IndexedDB forever.
+        // One sweep per manager, DEFERRED well past startup: restore() only
+        // expires the exact keys it is asked for, so without a sweep, roots that
+        // are never listened to again would sit in IndexedDB forever — but the
+        // sweep's store-wide transaction must never sit in front of the boot
+        // restores, which IndexedDB queues behind any earlier overlapping-scope
+        // transaction.
         void this.db_.then(db => {
-            if (db !== null) {
-                this.sweepExpired_(db);
+            if (db !== null && !this.disposed_ && this.sweepTimer_ === null) {
+                this.sweepTimer_ = setTimeout(() => {
+                    void this.sweepExpired_();
+                }, PERSISTENCE_SWEEP_DELAY_MS);
+                // Node returns a Timeout object; never hold the process open for a
+                // housekeeping timer. Browsers return a number — no-op there.
+                this.sweepTimer_.unref?.();
             }
         });
         return this.db_;
     }
     /**
-     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
-     * cursor walk. Both record kinds carry `updatedAt`, so data and hash
-     * records expire together. Best-effort: any failure leaves the records
-     * for the next session's sweep.
+     * Test seam: runs the deferred expiry sweep immediately.
+     * @internal
      */
-    sweepExpired_(db) {
+    sweepNow() {
+        if (this.sweepTimer_ !== null) {
+            clearTimeout(this.sweepTimer_);
+        }
+        return this.sweepExpired_();
+    }
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
+     * Expiry is decided by each root's manifest (or legacy record): the
+     * '#'-suffixed chunk and hash records carry no authority of their own and
+     * are dropped exactly when their manifest is dropped, is missing (orphans
+     * from an interrupted write), or no longer lists them. Scoped to this
+     * manager's key range and reading keys before values, where the platform
+     * allows, so foreign records are never materialized. Best-effort: any
+     * failure leaves the records for the next session's sweep.
+     */
+    sweepExpired_() {
         const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
         const prefix = this.key_('');
+        let range;
         try {
-            const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
-            const req = store.openCursor();
+            // Not in every embedding (Node test environments) — without it the
+            // cursor walks the whole store and filters by prefix in JS.
+            range =
+                typeof IDBKeyRange !== 'undefined'
+                    ? IDBKeyRange.bound(prefix, prefix + '\uffff')
+                    : undefined;
+        }
+        catch (e) {
+            range = undefined;
+        }
+        return this.withStore_('readonly', [], (store, done) => {
+            const keys = [];
+            // openKeyCursor never materializes values; the value-cursor fallback
+            // (test fakes) walks values but only retains keys.
+            const keyCursorStore = store;
+            const req = typeof keyCursorStore.openKeyCursor === 'function'
+                ? keyCursorStore.openKeyCursor(range)
+                : store.openCursor(range);
             req.onsuccess = () => {
                 const cursor = req.result;
                 if (!cursor) {
+                    done(keys);
                     return;
                 }
-                const key = cursor.key;
-                const record = cursor.value;
-                if (typeof key === 'string' &&
-                    key.startsWith(prefix) &&
-                    (typeof record?.updatedAt !== 'number' || record.updatedAt < cutoff)) {
-                    persistenceStats.evictions++;
-                    cursor.delete();
+                if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
+                    keys.push(cursor.key);
                 }
                 cursor.continue();
             };
-        }
-        catch (e) {
-            // Sweeping is opportunistic; never let it surface.
-        }
+        }).then(keys => {
+            if (keys.length === 0) {
+                return;
+            }
+            const baseKeys = [];
+            const suffixedKeys = [];
+            for (const key of keys) {
+                if (key.indexOf('#', prefix.length) === -1) {
+                    baseKeys.push(key);
+                }
+                else {
+                    suffixedKeys.push(key);
+                }
+            }
+            return this.withStore_('readwrite', undefined, store => {
+                // Decide each base record (manifests are tiny; legacy records
+                // materialize one at a time), then settle the suffixed records
+                // against those decisions — all in one transaction, so a flush
+                // cannot interleave between the read and the delete.
+                const decisions = new Map();
+                let index = 0;
+                const settleSuffixed = () => {
+                    for (const key of suffixedKeys) {
+                        const base = key.slice(0, key.indexOf('#', prefix.length));
+                        const decision = decisions.get(base);
+                        let drop = decision === undefined || decision.expired;
+                        if (!drop && key.startsWith(base + CHUNK_KEY_INFIX)) {
+                            const chunkIndex = parseInt(key.slice(base.length + CHUNK_KEY_INFIX.length), 10);
+                            if (!Number.isFinite(chunkIndex) ||
+                                chunkIndex >= decisions.get(base).chunkCount) {
+                                drop = true;
+                            }
+                        }
+                        if (drop) {
+                            store.delete(key);
+                        }
+                    }
+                };
+                const step = () => {
+                    if (index >= baseKeys.length) {
+                        settleSuffixed();
+                        return;
+                    }
+                    const key = baseKeys[index++];
+                    const req = store.get(key);
+                    req.onsuccess = () => {
+                        const record = req.result;
+                        const expired = !record ||
+                            typeof record.updatedAt !== 'number' ||
+                            record.updatedAt < cutoff;
+                        decisions.set(key, {
+                            expired,
+                            chunkCount: record && typeof record.chunkCount === 'number'
+                                ? record.chunkCount
+                                : 0
+                        });
+                        if (expired) {
+                            persistenceStats.evictions++;
+                            store.delete(key);
+                        }
+                        step();
+                    };
+                };
+                step();
+            });
+        });
     }
     openAtVersion_(version) {
         return new Promise(resolve => {
@@ -4426,14 +4693,20 @@ class PersistenceManager {
         }));
     }
     /**
-     * Reads a root's data record and joins its hash record when the revisions
-     * match, in one readonly transaction. Expired records resolve null (and
-     * are deleted best-effort).
+     * Reads a root's stored state in one readonly transaction: the manifest
+     * and hash records first, then — for chunked records — each chunk in
+     * sequence, folded into the assembled tree as it arrives so only one
+     * chunk's parsed JSON is ever held at a time. The hash record joins only
+     * when its revision matches the manifest's; a chunk whose revision doesn't
+     * match the manifest's expectation (an interrupted or foreign write)
+     * resolves null, and the leftovers are deleted best-effort. Expired
+     * records also resolve null (and are deleted best-effort).
      */
     readRecord_(pathString) {
+        const key = this.key_(pathString);
         return this.withStore_('readonly', null, (store, done) => {
-            const dataReq = store.get(this.key_(pathString));
-            const hashReq = store.get(this.key_(pathString) + HASH_KEY_SUFFIX);
+            const dataReq = store.get(key);
+            const hashReq = store.get(key + HASH_KEY_SUFFIX);
             // Same store, same transaction: requests complete in issue order, so
             // when hashReq's success fires, dataReq.result is safe to read.
             // (Reading a request's result before IT completes throws.)
@@ -4444,46 +4717,146 @@ class PersistenceManager {
                     return;
                 }
                 const hashes = hashReq.result;
-                if (hashes && hashes.revision === record.revision) {
+                const joined = hashes && hashes.revision === record.revision
+                    ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
+                    : {};
+                if (isLegacyRecord(record)) {
                     done({
-                        json: record.json,
-                        hash: hashes.hash,
-                        compoundHash: hashes.compoundHash,
-                        updatedAt: record.updatedAt,
-                        revision: record.revision
+                        record: {
+                            node: nodeFromJSON(record.json),
+                            ...joined,
+                            updatedAt: record.updatedAt,
+                            revision: record.revision
+                        },
+                        plans: null,
+                        chunkRevisions: null,
+                        chunkCount: null
                     });
+                    return;
                 }
-                else {
-                    done(record);
+                const manifest = record;
+                if (typeof manifest.chunkCount !== 'number' ||
+                    manifest.chunkCount <= 0 ||
+                    !Array.isArray(manifest.chunkRevisions) ||
+                    manifest.chunkRevisions.length !== manifest.chunkCount) {
+                    done('mismatch');
+                    return;
                 }
+                let assembled = ChildrenNode.EMPTY_NODE;
+                const plans = [];
+                let index = 0;
+                const readChunk = () => {
+                    const chunkReq = store.get(key + chunkKeySuffix(index));
+                    chunkReq.onsuccess = () => {
+                        const chunk = chunkReq.result;
+                        if (!chunk ||
+                            chunk.revision !== manifest.chunkRevisions[index] ||
+                            !Array.isArray(chunk.entries)) {
+                            done('mismatch');
+                            return;
+                        }
+                        const plan = [];
+                        for (const [relPath, json] of chunk.entries) {
+                            const node = nodeFromJSON(json);
+                            assembled = assembled.updateChild(new Path(relPath), node);
+                            plan.push({ relPath, node });
+                        }
+                        plans.push(plan);
+                        index++;
+                        if (index < manifest.chunkCount) {
+                            readChunk();
+                        }
+                        else {
+                            done({
+                                record: {
+                                    node: assembled,
+                                    ...joined,
+                                    updatedAt: manifest.updatedAt,
+                                    revision: manifest.revision
+                                },
+                                plans,
+                                chunkRevisions: manifest.chunkRevisions,
+                                chunkCount: manifest.chunkCount
+                            });
+                        }
+                    };
+                };
+                readChunk();
             };
-        }).then(record => {
-            if (!record) {
+        }).then(result => {
+            if (result === null) {
                 return null;
             }
-            if (Date.now() - record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+            if (result === 'mismatch') {
                 persistenceStats.evictions++;
                 void this.deleteRecord_(pathString);
                 return null;
             }
-            return record;
+            if (Date.now() - result.record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+                persistenceStats.evictions++;
+                void this.deleteRecord_(pathString);
+                return null;
+            }
+            return result;
         });
     }
+    /**
+     * Deletes everything stored for a root: manifest, hash record, and every
+     * chunk the manifest lists (plus, where the platform provides key ranges,
+     * any orphaned chunk tail beyond it).
+     */
     deleteRecord_(pathString) {
+        const key = this.key_(pathString);
         return this.withStore_('readwrite', undefined, store => {
-            store.delete(this.key_(pathString));
-            store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
+            const req = store.get(key);
+            req.onsuccess = () => {
+                const record = req.result;
+                const chunkCount = record && typeof record.chunkCount === 'number'
+                    ? record.chunkCount
+                    : 0;
+                store.delete(key);
+                store.delete(key + HASH_KEY_SUFFIX);
+                for (let i = 0; i < chunkCount; i++) {
+                    store.delete(key + chunkKeySuffix(i));
+                }
+                if (typeof IDBKeyRange !== 'undefined') {
+                    try {
+                        // Orphans beyond the manifest's count (interrupted older
+                        // writes); the sweep also reclaims these eventually.
+                        store.delete(IDBKeyRange.bound(key + CHUNK_KEY_INFIX, key + CHUNK_KEY_INFIX + '\uffff'));
+                    }
+                    catch (e) {
+                        // Key-range deletes are an optimization, never a requirement.
+                    }
+                }
+            };
         });
     }
     /**
      * Restores the persisted record for a root. Resolves null on miss, expiry,
-     * storage failure, or timeout — the caller then attaches unseeded.
+     * storage failure, or timeout — the caller then attaches unseeded. A hit
+     * also primes the flush-skip state: the store is KNOWN to hold exactly
+     * this tree, so when the server certifies it unchanged (the common warm
+     * boot), the follow-up write-through skips without serializing anything.
      */
     restore(pathString) {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
-        return this.raceRestoreTimeout_(this.readRecord_(pathString)).then(record => {
+        const read = this.readRecord_(pathString).then(result => {
+            if (result !== null && !this.disposed_) {
+                this.lastFlush_.set(pathString, {
+                    rootNode: result.record.node,
+                    revision: result.record.revision,
+                    plans: result.plans,
+                    chunkRevisions: result.chunkRevisions,
+                    chunkCount: result.chunkCount,
+                    storedUpdatedAt: result.record.updatedAt
+                });
+            }
+            return result === null ? null : result.record;
+        });
+        return this.raceRestoreTimeout_(read).then(record => {
             if (record) {
                 persistenceStats.restoredRoots.push(pathString);
             }
@@ -4495,10 +4868,13 @@ class PersistenceManager {
     }
     /**
      * The boot-peek read (see getPersistedValue): resolves the record of the
-     * DEEPEST persisted ancestor of `pathString` (or of the path itself),
-     * fetching the whole ancestor chain in one readonly transaction. Expired
-     * ancestors are skipped (and deleted best-effort). Does not touch the
-     * restore counters — a peek is not a listen restore.
+     * FRESHEST persisted ancestor of `pathString` (or of the path itself; ties
+     * go to the deepest). Freshness decides because ancestors keep flushing
+     * after a covered child's record froze — the deepest record is not
+     * necessarily the current one. Reads the ancestor chain's manifests in one
+     * transaction, then assembles only the chosen root. Expired ancestors are
+     * skipped. Does not touch the restore counters or the flush-skip state —
+     * a peek is not a listen restore.
      */
     restoreNearest(pathString) {
         if (this.disposed_) {
@@ -4525,9 +4901,10 @@ class PersistenceManager {
             });
         }).then(results => {
             const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+            let best = null;
             for (let i = 0; i < results.length; i++) {
                 const record = results[i];
-                if (!record) {
+                if (!record || typeof record.updatedAt !== 'number') {
                     continue;
                 }
                 if (record.updatedAt < cutoff) {
@@ -4535,9 +4912,15 @@ class PersistenceManager {
                     void this.deleteRecord_(candidates[i]);
                     continue;
                 }
-                return { root: candidates[i], record };
+                if (best === null || record.updatedAt > results[best].updatedAt) {
+                    best = i;
+                }
             }
-            return null;
+            if (best === null) {
+                return null;
+            }
+            const root = candidates[best];
+            return this.readRecord_(root).then(result => result === null ? null : { root, record: result.record });
         });
         return this.raceRestoreTimeout_(read);
     }
@@ -4558,8 +4941,11 @@ class PersistenceManager {
     }
     /**
      * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Debounced per root; hashes recompute afterwards in idle
-     * slices against the same revision.
+     * root `path`. Throttled per root; hashes recompute afterwards in idle
+     * slices against the same revision. A tree the store is known to already
+     * hold — the warm boot's listen-'ok' certifying the restored tree
+     * unchanged — is skipped outright unless its stored timestamp needs a
+     * refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     serverCacheUpdated(path, node) {
         if (this.disposed_) {
@@ -4567,6 +4953,12 @@ class PersistenceManager {
         }
         const pathString = path.toString();
         if (!this.trackedRoots_.has(pathString)) {
+            return;
+        }
+        const prev = this.lastFlush_.get(pathString);
+        if (prev &&
+            prev.rootNode === node &&
+            Date.now() - prev.storedUpdatedAt < PERSISTENCE_REFRESH_AGE_MS) {
             return;
         }
         this.latest_.set(pathString, {
@@ -4581,17 +4973,35 @@ class PersistenceManager {
         if (!this.writeTimers_.has(pathString)) {
             this.writeTimers_.set(pathString, setTimeout(() => {
                 this.writeTimers_.delete(pathString);
-                this.enqueue_(pathString, () => this.flush_(pathString));
+                this.scheduleFlush_(pathString);
             }, PERSISTENCE_WRITE_DEBOUNCE_MS));
         }
     }
     /**
+     * Enqueues a flush unless the root's queue is still working — then one
+     * flush is marked pending and enqueued when the queue drains. Without the
+     * mark, a root whose flush takes longer than the throttle interval would
+     * queue flushes faster than they complete, unboundedly.
+     */
+    scheduleFlush_(pathString) {
+        if (this.queues_.has(pathString)) {
+            this.flushPending_.add(pathString);
+            return;
+        }
+        void this.enqueue_(pathString, () => this.flush_(pathString));
+    }
+    /**
      * The viewer lost access to a root: a cached copy must not outlive the
-     * access that produced it.
+     * access that produced it, and the root leaves write-through tracking
+     * entirely — SyncTree never calls stopListening for server-revoked
+     * listens, so nothing else would ever untrack it.
      */
     evict(path) {
         const pathString = path.toString();
+        this.trackedRoots_.delete(pathString);
         this.latest_.delete(pathString);
+        this.lastFlush_.delete(pathString);
+        this.flushPending_.delete(pathString);
         const timer = this.writeTimers_.get(pathString);
         if (timer) {
             clearTimeout(timer);
@@ -4600,7 +5010,7 @@ class PersistenceManager {
         persistenceStats.evictions++;
         // Through the queue: a flush already running for this root finishes its
         // writes first, then the delete removes them — never the reverse.
-        this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+        void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
     }
     dispose() {
         this.disposed_ = true;
@@ -4608,10 +5018,15 @@ class PersistenceManager {
             clearTimeout(timer);
         }
         this.writeTimers_.clear();
+        if (this.sweepTimer_ !== null) {
+            clearTimeout(this.sweepTimer_);
+        }
+        this.flushPending_.clear();
         this.latest_.clear();
+        this.lastFlush_.clear();
     }
     /**
-     * Test seam: forces a pending debounced flush to run now.
+     * Test seam: forces a pending throttled flush to run now.
      */
     flushNow(pathString) {
         const timer = this.writeTimers_.get(pathString);
@@ -4619,13 +5034,15 @@ class PersistenceManager {
             clearTimeout(timer);
             this.writeTimers_.delete(pathString);
         }
+        this.flushPending_.delete(pathString);
         return this.enqueue_(pathString, () => this.flush_(pathString));
     }
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's data and hash records land as a couple before the next
-     * flush or delete for that root starts, which is the whole storage
-     * consistency argument — no cross-operation races to reason about.
+     * time: a flush's manifest, chunks, and hash record land as a couple
+     * before the next flush or delete for that root starts, which is the
+     * whole storage consistency argument — no cross-operation races to
+     * reason about.
      */
     enqueue_(pathString, op) {
         const next = (this.queues_.get(pathString) ?? Promise.resolve()).then(op);
@@ -4636,6 +5053,9 @@ class PersistenceManager {
         void settled.then(() => {
             if (this.queues_.get(pathString) === settled) {
                 this.queues_.delete(pathString);
+                if (this.flushPending_.delete(pathString) && !this.disposed_) {
+                    void this.enqueue_(pathString, () => this.flush_(pathString));
+                }
             }
         });
         return next;
@@ -4646,63 +5066,154 @@ class PersistenceManager {
             return Promise.resolve();
         }
         const { node, revision } = entry;
-        if (this.maxRootBytes_ !== Infinity &&
-            estimateSerializedNodeSize(node) > this.maxRootBytes_) {
-            // Persisting costs a transient serialize + structured-clone + restore
-            // parse of the whole root — multiples of its size in peak memory. On
-            // constrained devices that is a crash, so oversized roots simply stay
-            // unpersisted (their boot is a normal cold load).
+        const prev = this.lastFlush_.get(pathString);
+        const now = Date.now();
+        if (prev &&
+            prev.rootNode === node &&
+            now - prev.storedUpdatedAt < PERSISTENCE_REFRESH_AGE_MS) {
+            // The store already holds exactly this tree, freshly enough.
             return Promise.resolve();
         }
+        const key = this.key_(pathString);
+        const plans = planChunks(node);
+        const chunkRevisions = [];
+        const dirtyIndexes = [];
+        for (let i = 0; i < plans.length; i++) {
+            const prevPlan = prev !== undefined &&
+                prev.plans !== null &&
+                prev.chunkRevisions !== null &&
+                i < prev.plans.length
+                ? prev.plans[i]
+                : null;
+            if (prevPlan !== null && samePlan(prevPlan, plans[i])) {
+                chunkRevisions.push(prev.chunkRevisions[i]);
+            }
+            else {
+                chunkRevisions.push(revision);
+                dirtyIndexes.push(i);
+            }
+        }
+        persistenceStats.chunksWritten += dirtyIndexes.length;
+        persistenceStats.chunksSkipped += plans.length - dirtyIndexes.length;
+        if (dirtyIndexes.length === 0 &&
+            prev !== undefined &&
+            prev.plans !== null &&
+            plans.length === prev.plans.length) {
+            // Content-identical to the stored state; only the timestamp is stale.
+            // Rewrite the manifest alone, KEEPING the previous revision so the
+            // stored hash record stays joined to it.
+            const manifest = {
+                revision: prev.revision,
+                updatedAt: now,
+                chunkCount: plans.length,
+                chunkRevisions: prev.chunkRevisions
+            };
+            return this.withStore_('readwrite', false, (store, done) => {
+                store.put(manifest, key);
+                done(true);
+            }).then(ok => {
+                if (ok && !this.disposed_) {
+                    this.lastFlush_.set(pathString, {
+                        ...prev,
+                        rootNode: node,
+                        plans,
+                        storedUpdatedAt: now
+                    });
+                }
+            });
+        }
         persistenceStats.writeThroughs++;
-        // The tree is serialized and written exactly once, hashless — a crash
-        // before the recompute leaves a restorable tree that seeds without a
-        // hash instead of nothing. The hashes follow as a small separate record,
-        // and because flushes for a root are serialized (enqueue_), the pair is
-        // always coupled: the hash written here describes the data written here,
-        // even if newer updates arrived while hashing.
-        const record = {
-            json: node.val(true),
-            updatedAt: Date.now(),
-            revision
+        // Chunks and manifest land in ONE transaction — all or nothing — with
+        // each chunk serialized only when its put is issued, so peak transient
+        // memory is one chunk's exported JSON plus its structured clone. The
+        // tree is written hashless first — a crash before the recompute leaves
+        // a restorable tree that seeds without a hash instead of nothing. The
+        // hashes follow as a small separate record, and because flushes for a
+        // root are serialized (enqueue_), the pair is always coupled: the hash
+        // written here describes the manifest written here, even if newer
+        // updates arrived while hashing.
+        const manifest = {
+            revision,
+            updatedAt: now,
+            chunkCount: plans.length,
+            chunkRevisions
         };
-        const put = this.withStore_('readwrite', undefined, store => {
-            store.put(record, this.key_(pathString));
+        const prevChunkCount = prev !== undefined ? prev.chunkCount : null;
+        const put = this.withStore_('readwrite', false, (store, done) => {
+            for (const i of dirtyIndexes) {
+                const chunk = {
+                    revision,
+                    entries: plans[i].map(e => [e.relPath, e.node.val(true)])
+                };
+                store.put(chunk, key + chunkKeySuffix(i));
+            }
+            store.put(manifest, key);
+            if (prevChunkCount !== null) {
+                for (let i = plans.length; i < prevChunkCount; i++) {
+                    store.delete(key + chunkKeySuffix(i));
+                }
+            }
+            else if (typeof IDBKeyRange !== 'undefined') {
+                try {
+                    // First write over unknown prior state: drop any chunk tail an
+                    // earlier session may have left beyond the new count. (Without
+                    // key ranges the sweep reclaims such orphans instead.)
+                    store.delete(IDBKeyRange.bound(key + chunkKeySuffix(plans.length), key + CHUNK_KEY_INFIX + '\uffff'));
+                }
+                catch (e) {
+                    // Key-range deletes are an optimization, never a requirement.
+                }
+            }
             // Atomically invalidate the previous hash sidecar: between this write
             // and the recompute below, the stored state is "data, hashless" — never
             // "new data, old hash".
-            store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
+            store.delete(key + HASH_KEY_SUFFIX);
+            done(true);
         });
-        return put.then(() => Promise.all([
-            hashFromNodeAsync(node),
-            compoundHashFromNodeAsync(node)
-        ]).then(([hash, compoundHash]) => {
-            if (this.disposed_) {
+        return put.then(ok => {
+            if (!ok || this.disposed_) {
                 return;
             }
-            persistenceStats.hashRecomputes++;
-            const hashRecord = {
-                hash,
-                compoundHash: {
-                    hashes: compoundHash.hashes,
-                    posts: compoundHash.posts
-                },
-                updatedAt: record.updatedAt,
-                revision
-            };
-            return this.withStore_('readwrite', undefined, store => {
-                // Another tab may have replaced the data record while we hashed;
-                // only attach the hash if the record still carries OUR token (the
-                // read and the put share one transaction, so this is atomic).
-                const dataReq = store.get(this.key_(pathString));
-                dataReq.onsuccess = () => {
-                    const current = dataReq.result;
-                    if (current && current.revision === revision) {
-                        store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
-                    }
-                };
+            this.lastFlush_.set(pathString, {
+                rootNode: node,
+                revision,
+                plans,
+                chunkRevisions,
+                chunkCount: plans.length,
+                storedUpdatedAt: now
             });
-        }));
+            return Promise.all([
+                hashFromNodeAsync(node),
+                compoundHashFromNodeAsync(node)
+            ]).then(([hash, compoundHash]) => {
+                if (this.disposed_) {
+                    return;
+                }
+                persistenceStats.hashRecomputes++;
+                const hashRecord = {
+                    hash,
+                    compoundHash: {
+                        hashes: compoundHash.hashes,
+                        posts: compoundHash.posts
+                    },
+                    updatedAt: now,
+                    revision
+                };
+                return this.withStore_('readwrite', undefined, store => {
+                    // Another tab may have replaced the manifest while we hashed;
+                    // only attach the hash if the manifest still carries OUR token
+                    // (the read and the put share one transaction, so this is
+                    // atomic).
+                    const dataReq = store.get(key);
+                    dataReq.onsuccess = () => {
+                        const current = dataReq.result;
+                        if (current && current.revision === revision) {
+                            store.put(hashRecord, key + HASH_KEY_SUFFIX);
+                        }
+                    };
+                });
+            });
+        });
     }
 }
 
@@ -10927,6 +11438,48 @@ function syncTreeGetCompleteServerCache(syncTree, path) {
     return viewGetCompleteServerCache(view, newEmptyPath());
 }
 /**
+ * The server-cache state of every view at or below `path`, except the
+ * complete default view at `path` itself (the caller's own). Used by the
+ * persistence restore path to decide what a stored tree may be applied
+ * over: a view with a COMPLETE server cache contributes its certified tree
+ * (to graft over the restored bytes); a view holding server data it cannot
+ * certify as complete — a filtered query, a partially filled cache — is
+ * reported as partial, because grafting it is impossible and overwriting it
+ * would replace live server data with stale bytes.
+ *
+ * Ordered shallowest-first, so grafting in order lets deeper (more
+ * specific) trees win where they nest.
+ */
+function syncTreeGetDescendantServerCacheStates(syncTree, path) {
+    const states = [];
+    syncTree.syncPointTree_.subtree(path).foreach((relativePath, syncPoint) => {
+        for (const view of syncPoint.views.values()) {
+            if (pathIsEmpty(relativePath) &&
+                view.query._queryParams.loadsAllData()) {
+                // The default view at `path` is the one being restored into; the
+                // caller checks its state separately.
+                continue;
+            }
+            const complete = viewGetCompleteServerCache(view, newEmptyPath());
+            if (complete !== null) {
+                states.push({ path: relativePath, complete, hasPartialData: false });
+            }
+            else {
+                const raw = viewGetServerCache(view);
+                if (raw !== null && !raw.isEmpty()) {
+                    states.push({
+                        path: relativePath,
+                        complete: null,
+                        hasPartialData: true
+                    });
+                }
+            }
+        }
+    });
+    states.sort((a, b) => pathGetLength(a.path) - pathGetLength(b.path));
+    return states;
+}
+/**
  * Applies server range merges against the complete (default) view at the
  * given path and promotes the merged tree through the standard
  * server-overwrite path.
@@ -12038,7 +12591,9 @@ const validatePathString = function (fnName, argumentName, pathString, optional)
     }
 };
 const validateRootPathString = function (fnName, argumentName, pathString, optional) {
-    if (pathString) {
+    // Non-string input falls through to validatePathString's descriptive
+    // error instead of throwing a bare TypeError here.
+    if (typeof pathString === 'string' && pathString) {
         // Allow '/.info/' at the beginning.
         pathString = pathString.replace(/^\/*\.info(\/|$)/, '/');
     }
@@ -12469,29 +13024,56 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         if (token.cancelled) {
             return;
         }
-        // If the server certified this path while the restore was in flight (an
-        // overlapping listen, a get()), the live data wins — applying the stored
-        // tree now would clobber fresher server state with stale bytes.
+        // If the server certified this exact path while the restore was in
+        // flight (an overlapping listen, a get()), the live data wins — applying
+        // the stored tree now would clobber fresher server state with stale
+        // bytes.
         const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
             null;
         if (record === null || alreadyCertified) {
             sendSeededListen();
             return;
         }
-        let node = null;
-        try {
-            node = buildSeedNode(record);
+        // Fresh server data may also live BELOW the listen path — a get() at a
+        // child, an overlapping deeper listen, an active query. Certified
+        // descendant trees are grafted over the restored bytes so the seed never
+        // regresses them; a descendant view holding server data it cannot
+        // certify as complete (a filtered query) cannot be grafted, so the seed
+        // is skipped outright — a cold load for this root, never a regression.
+        let seeded = record.node;
+        let grafted = false;
+        for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)) {
+            if (state.complete !== null) {
+                seeded = seeded.updateChild(state.path, state.complete);
+                grafted = true;
+            }
+            else {
+                sendSeededListen();
+                return;
+            }
         }
-        catch (e) {
-            // A malformed record must never break the listen.
-        }
-        if (node === null || node.isEmpty()) {
+        if (seeded.isEmpty()) {
             sendSeededListen();
             return;
         }
-        const seeded = node;
-        const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
-        eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        let applied = false;
+        try {
+            if (!grafted) {
+                // Grafting changed the tree, so the STORED hashes no longer
+                // describe it — stamping them would certify the wrong tree.
+                seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
+            }
+            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
+            applied = true;
+            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        }
+        catch (e) {
+            // A malformed record or a failed apply must never break the listen:
+            // fall through and attach — user callbacks cannot land here (the
+            // event queue guards them), so the sync tree saw no partial apply
+            // events and the listen simply goes out against whatever state it
+            // holds.
+        }
         // The replay runs user callbacks synchronously — one may have
         // unsubscribed (stopListening saw a pending token and cancelled) or even
         // re-subscribed (a NEW token now owns the path). Only the uncancelled,
@@ -12500,20 +13082,36 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             repo.pendingSeedRestores_.get(pathString) !== token) {
             return;
         }
-        // A record persisted before its hash landed restores hashless. Priming
-        // the hash here — in idle slices, before the listen goes out — keeps the
-        // two invariants of the seeded path: the listen carries a real hash
-        // (zero download when the tree is unchanged), and hashFn never runs a
-        // synchronous O(tree) walk on the main thread at listen time.
-        if (typeof record.hash === 'string') {
+        if (applied && !grafted && typeof record.hash === 'string') {
             sendSeededListen();
             return;
         }
+        if (!applied) {
+            sendSeededListen();
+            return;
+        }
+        // A record persisted before its hash landed (or a grafted tree, whose
+        // stored hashes no longer apply) restores hashless. Priming the hash
+        // here — in idle slices, before the listen goes out — keeps the two
+        // invariants of the seeded path: the listen carries a real hash (zero
+        // download when the tree is unchanged), and hashFn never runs a
+        // synchronous O(tree) walk on the main thread at listen time. The prime
+        // is raced against the restore budget: a busy main thread starves idle
+        // slices, and restored-but-never-subscribed is worse than a hashless
+        // listen.
+        let proceeded = false;
         const proceed = () => {
-            if (!token.cancelled) {
+            if (proceeded) {
+                return;
+            }
+            proceeded = true;
+            clearTimeout(primeTimer);
+            if (!token.cancelled &&
+                repo.pendingSeedRestores_.get(pathString) === token) {
                 sendSeededListen();
             }
         };
+        const primeTimer = setTimeout(proceed, PERSISTENCE_RESTORE_TIMEOUT_MS);
         void hashFromNodeAsync(seeded).then(proceed, proceed);
     });
 }
@@ -12564,6 +13162,23 @@ function repoWhenListenComplete(repo, pathString) {
     return new Promise(resolve => {
         completion.waiters.push(resolve);
     });
+}
+/**
+ * Settles every outstanding whenListenComplete waiter and clears the
+ * completion registry. Called when the repo is deleted (deleteApp): its
+ * listens can never respond again, and an unsettleable waiter would hang
+ * its caller and retain the Repo forever.
+ */
+function repoSettleListenCompletions(repo) {
+    for (const completion of repo.listenCompletions_.values()) {
+        completion.complete = true;
+        const waiters = completion.waiters;
+        completion.waiters = [];
+        for (const waiter of waiters) {
+            waiter();
+        }
+    }
+    repo.listenCompletions_.clear();
 }
 /**
  * Persistence write-through: after the server updated `path` (overwrite,
@@ -15177,6 +15792,11 @@ function repoManagerDeleteRepo(repo, appName) {
         fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
     }
     repoInterrupt(repo);
+    // The repo's listens can never respond after this: settle any
+    // whenListenComplete waiters (they would otherwise hang forever and
+    // retain the repo), and stop the persistence timers.
+    repoSettleListenCompletions(repo);
+    repo.persistence_?.dispose();
     delete appRepos[repo.key];
 }
 /**
@@ -15359,6 +15979,7 @@ function goOffline(db) {
 function getPersistedValue(db, pathString) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('getPersistedValue');
+    validateRootPathString('getPersistedValue', 'path', pathString, false);
     // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
     // and reading a stored record must not start the instance (which would
     // lock out later transport/emulator configuration).
@@ -15368,18 +15989,17 @@ function getPersistedValue(db, pathString) {
         return Promise.resolve(null);
     }
     // Records are stored per listened ROOT; a peek at a subpath restores the
-    // deepest stored ancestor (one IndexedDB read over the whole chain) and
-    // drills into its tree along the remaining segments. Going through the
-    // node model — not the raw stored JSON — matters: records hold EXPORT
-    // format (val(true)), and a raw walk would surface '.value'/'.priority'
-    // wrappers instead of the values snapshot.val() semantics promise.
+    // freshest stored ancestor (one IndexedDB read over the whole chain) and
+    // drills into its assembled tree along the remaining segments — restored
+    // records hold EXPORT format, and the node model is what maps it back to
+    // the values snapshot.val() semantics promise.
     const path = new Path(pathString);
     return persistence.restoreNearest(path.toString()).then(result => {
         if (result === null) {
             return null;
         }
         const relativePath = newRelativePath(new Path(result.root), path);
-        return nodeFromJSON(result.record.json).getChild(relativePath).val();
+        return result.record.node.getChild(relativePath).val();
     });
 }
 /**
@@ -15395,7 +16015,7 @@ function getPersistedValue(db, pathString) {
  *
  * @internal
  */
-function setPersistenceEnabled(db, enabled, options) {
+function setPersistenceEnabled(db, enabled) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
     // _repoInternal, not the _repo getter: configuration must not start the
@@ -15403,7 +16023,7 @@ function setPersistenceEnabled(db, enabled, options) {
     const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
-            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString(), undefined, options?.maxRootBytes ?? Infinity);
+            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
         }
     }
     else {
@@ -15434,6 +16054,7 @@ function setPersistenceEnabled(db, enabled, options) {
 function seedServerCache(db, path, json, hash, compoundHash) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('seedServerCache');
+    validateRootPathString('seedServerCache', 'path', path, false);
     // _repoInternal: seeding is boot-time configuration and must not start
     // the instance.
     db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
@@ -15460,6 +16081,7 @@ function clearServerCacheSeeds(db) {
 function whenListenComplete(db, pathString) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('whenListenComplete');
+    validateRootPathString('whenListenComplete', 'path', pathString, false);
     return repoWhenListenComplete(db._repoInternal, new Path(pathString).toString());
 }
 /**

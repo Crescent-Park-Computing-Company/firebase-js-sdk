@@ -66,8 +66,8 @@ export declare function simpleSizeSplitStrategy(node: Node): CompoundHashSplitSt
 export declare function compoundHashFromNode(node: Node, splitStrategy?: CompoundHashSplitStrategy): CompoundHash;
 /**
  * Estimates the serialized size of a node in bytes — a cheap approximation
- * that only drives the default split threshold, never a wire value (port of
- * Android NodeSizeEstimator).
+ * that only drives the default split threshold and the persistence chunk
+ * planner, never a wire value (port of Android NodeSizeEstimator).
  */
 export declare function estimateSerializedNodeSize(node: Node): number;
 /**

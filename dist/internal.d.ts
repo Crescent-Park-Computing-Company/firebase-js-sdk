@@ -1879,22 +1879,23 @@ declare class Path {
     toString(): string;
 }
 
+/**
+ * What a restore resolves: the assembled tree, with the stored hashes joined
+ * when they describe exactly this tree.
+ */
 declare interface PersistedRecord {
-    json: unknown;
+    node: Node_2;
     hash?: string;
     compoundHash?: SeedCompoundHash;
     updatedAt: number;
-    /**
-     * Write token unique ACROSS manager instances (tabs, reloads) — the join
-     * key coupling a hash record to the exact data write it describes.
-     */
+    /** The write token of the manifest this record was assembled from. */
     revision: string;
 }
 
 /**
  * How long after the last server update a root's write-through runs. The
- * flush serializes the whole root (val(true) + the structured clone into
- * IndexedDB), so it is deliberately coarse for very large roots.
+ * flush re-serializes the chunks the update dirtied, so it is deliberately
+ * coarse.
  * @internal
  */
 export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
@@ -1907,7 +1908,6 @@ export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
-    private maxRootBytes_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1921,6 +1921,11 @@ declare class PersistenceManager {
      */
     private latest_;
     /**
+     * What IndexedDB currently holds per root (see FlushedState) — the basis
+     * for skipping clean chunks and no-op flushes.
+     */
+    private lastFlush_;
+    /**
      * Distinguishes this manager's write tokens from every other tab's and
      * session's — numeric counters restart at zero on reload, which let a new
      * data write pair up with a surviving old hash sidecar.
@@ -1928,10 +1933,17 @@ declare class PersistenceManager {
     private instanceId_;
     private writeCounter_;
     private writeTimers_;
+    /**
+     * Roots whose throttle fired while their queue was busy: exactly one
+     * flush is re-enqueued when the queue drains, however many intervals
+     * elapsed meanwhile — the queue can never grow faster than it drains.
+     */
+    private flushPending_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
+    private sweepTimer_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, maxRootBytes_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but
@@ -1944,21 +1956,34 @@ declare class PersistenceManager {
      */
     track(pathString: string): void;
     /**
-     * The root's last listen stopped: flush any pending write-through so
-     * IndexedDB holds the final tree for the next session, then release the
-     * in-memory copy — only live listens need it.
+     * The root's last listen stopped. When a live tracked ancestor covers the
+     * root, its record — which contains this subtree and keeps flushing — is
+     * the one future sessions should restore, so the child's own record is
+     * deleted rather than left to shadow it. Otherwise any pending
+     * write-through is flushed so IndexedDB holds the final tree for the next
+     * session. Either way the in-memory copies are released — only live
+     * listens need them.
      */
     untrack(pathString: string): void;
     /**
-     * The nearest tracked root at-or-above `pathString`, or null.
+     * The nearest (deepest) tracked root at-or-above `pathString`, or null.
      */
     trackedRootFor(pathString: string): string | null;
     private open_;
     /**
-     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) by
-     * cursor walk. Both record kinds carry `updatedAt`, so data and hash
-     * records expire together. Best-effort: any failure leaves the records
-     * for the next session's sweep.
+     * Test seam: runs the deferred expiry sweep immediately.
+     * @internal
+     */
+    sweepNow(): Promise<void>;
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
+     * Expiry is decided by each root's manifest (or legacy record): the
+     * '#'-suffixed chunk and hash records carry no authority of their own and
+     * are dropped exactly when their manifest is dropped, is missing (orphans
+     * from an interrupted write), or no longer lists them. Scoped to this
+     * manager's key range and reading keys before values, where the platform
+     * allows, so foreign records are never materialized. Best-effort: any
+     * failure leaves the records for the next session's sweep.
      */
     private sweepExpired_;
     private openAtVersion_;
@@ -1973,23 +1998,39 @@ declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's data record and joins its hash record when the revisions
-     * match, in one readonly transaction. Expired records resolve null (and
-     * are deleted best-effort).
+     * Reads a root's stored state in one readonly transaction: the manifest
+     * and hash records first, then — for chunked records — each chunk in
+     * sequence, folded into the assembled tree as it arrives so only one
+     * chunk's parsed JSON is ever held at a time. The hash record joins only
+     * when its revision matches the manifest's; a chunk whose revision doesn't
+     * match the manifest's expectation (an interrupted or foreign write)
+     * resolves null, and the leftovers are deleted best-effort. Expired
+     * records also resolve null (and are deleted best-effort).
      */
     private readRecord_;
+    /**
+     * Deletes everything stored for a root: manifest, hash record, and every
+     * chunk the manifest lists (plus, where the platform provides key ranges,
+     * any orphaned chunk tail beyond it).
+     */
     private deleteRecord_;
     /**
      * Restores the persisted record for a root. Resolves null on miss, expiry,
-     * storage failure, or timeout — the caller then attaches unseeded.
+     * storage failure, or timeout — the caller then attaches unseeded. A hit
+     * also primes the flush-skip state: the store is KNOWN to hold exactly
+     * this tree, so when the server certifies it unchanged (the common warm
+     * boot), the follow-up write-through skips without serializing anything.
      */
     restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * The boot-peek read (see getPersistedValue): resolves the record of the
-     * DEEPEST persisted ancestor of `pathString` (or of the path itself),
-     * fetching the whole ancestor chain in one readonly transaction. Expired
-     * ancestors are skipped (and deleted best-effort). Does not touch the
-     * restore counters — a peek is not a listen restore.
+     * FRESHEST persisted ancestor of `pathString` (or of the path itself; ties
+     * go to the deepest). Freshness decides because ancestors keep flushing
+     * after a covered child's record froze — the deepest record is not
+     * necessarily the current one. Reads the ancestor chain's manifests in one
+     * transaction, then assembles only the chosen root. Expired ancestors are
+     * skipped. Does not touch the restore counters or the flush-skip state —
+     * a peek is not a listen restore.
      */
     restoreNearest(pathString: string): Promise<{
         root: string;
@@ -2003,25 +2044,38 @@ declare class PersistenceManager {
     private raceRestoreTimeout_;
     /**
      * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Debounced per root; hashes recompute afterwards in idle
-     * slices against the same revision.
+     * root `path`. Throttled per root; hashes recompute afterwards in idle
+     * slices against the same revision. A tree the store is known to already
+     * hold — the warm boot's listen-'ok' certifying the restored tree
+     * unchanged — is skipped outright unless its stored timestamp needs a
+     * refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     serverCacheUpdated(path: Path, node: Node_2): void;
     /**
+     * Enqueues a flush unless the root's queue is still working — then one
+     * flush is marked pending and enqueued when the queue drains. Without the
+     * mark, a root whose flush takes longer than the throttle interval would
+     * queue flushes faster than they complete, unboundedly.
+     */
+    private scheduleFlush_;
+    /**
      * The viewer lost access to a root: a cached copy must not outlive the
-     * access that produced it.
+     * access that produced it, and the root leaves write-through tracking
+     * entirely — SyncTree never calls stopListening for server-revoked
+     * listens, so nothing else would ever untrack it.
      */
     evict(path: Path): void;
     dispose(): void;
     /**
-     * Test seam: forces a pending debounced flush to run now.
+     * Test seam: forces a pending throttled flush to run now.
      */
     flushNow(pathString: string): Promise<void>;
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's data and hash records land as a couple before the next
-     * flush or delete for that root starts, which is the whole storage
-     * consistency argument — no cross-operation races to reason about.
+     * time: a flush's manifest, chunks, and hash record land as a couple
+     * before the next flush or delete for that root starts, which is the
+     * whole storage consistency argument — no cross-operation races to
+     * reason about.
      */
     private enqueue_;
     private flush_;
@@ -2035,6 +2089,8 @@ export declare const _persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
     writeThroughs: number;
+    chunksWritten: number;
+    chunksSkipped: number;
     hashRecomputes: number;
     evictions: number;
     storageFailures: number;
@@ -2805,15 +2861,7 @@ export declare function set(ref: DatabaseReference, value: unknown): Promise<voi
  *
  * @internal
  */
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean, options?: {
-    /**
-     * Roots whose estimated serialized size exceeds this stay unpersisted:
-     * persisting costs a transient serialize/clone/parse of the whole root —
-     * multiples of its size in peak memory — which memory-constrained
-     * devices cannot afford for very large trees.
-     */
-    maxRootBytes?: number;
-}): void;
+export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.

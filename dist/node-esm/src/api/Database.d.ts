@@ -133,15 +133,7 @@ export declare function getPersistedValue(db: Database, pathString: string): Pro
  *
  * @internal
  */
-export declare function setPersistenceEnabled(db: Database, enabled: boolean, options?: {
-    /**
-     * Roots whose estimated serialized size exceeds this stay unpersisted:
-     * persisting costs a transient serialize/clone/parse of the whole root —
-     * multiples of its size in peak memory — which memory-constrained
-     * devices cannot afford for very large trees.
-     */
-    maxRootBytes?: number;
-}): void;
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 /**
  * Registers cached JSON as the initial server cache for `path` on this
  * Database instance. Must be called before the listener for that exact path

@@ -84,15 +84,21 @@ export declare class ServerCacheSeedStore {
     clear(): void;
 }
 /**
- * Builds the node for a seed, stamping the precomputed canonical hash into
- * the node's lazy-hash slot (so hash() returns it without an O(tree) walk)
- * and attaching the precomputed compound hash for the listen to send.
+ * Builds the node for a seed, stamping the precomputed hashes (see
+ * stampSeedHashes).
+ */
+export declare function buildSeedNode(seed: ServerCacheSeed): Node;
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
  *
- * An empty tree is returned unstamped: nodeFromJSON maps it to the shared
+ * An empty tree is returned unstamped: an empty node is the shared
  * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
  * empty node in the app.
  */
-export declare function buildSeedNode(seed: ServerCacheSeed): Node;
+export declare function stampSeedHashes(node: Node, hash?: string, compoundHash?: SeedCompoundHash): Node;
 export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined;
 /**
  * The canonical listen hash of a JSON value — exactly what an unseeded

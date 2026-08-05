@@ -150,6 +150,13 @@ export declare function repoStopServerListen(repo: Repo, query: QueryContext, ta
  * resolves if the listen stops first, so callers never hang.
  */
 export declare function repoWhenListenComplete(repo: Repo, pathString: string): Promise<void>;
+/**
+ * Settles every outstanding whenListenComplete waiter and clears the
+ * completion registry. Called when the repo is deleted (deleteApp): its
+ * listens can never respond again, and an unsettleable waiter would hang
+ * its caller and retain the Repo forever.
+ */
+export declare function repoSettleListenCompletions(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**
  * The purpose of `getValue` is to return the latest known value
