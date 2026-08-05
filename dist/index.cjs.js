@@ -3532,7 +3532,8 @@ const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 3;
+const PERSISTENCE_DB_VERSION = 4;
+const PERSISTENCE_FORMAT_VERSION = 1;
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -3921,6 +3922,9 @@ class PersistenceManager {
                     req.onsuccess = () => {
                         const record = req.result;
                         const expired = !record ||
+                            (typeof record.chunkCount === 'number' &&
+                                record.formatVersion !==
+                                    PERSISTENCE_FORMAT_VERSION) ||
                             typeof record.updatedAt !== 'number' ||
                             record.updatedAt < cutoff;
                         decisions.set(key, {
@@ -4062,7 +4066,8 @@ class PersistenceManager {
                 };
             }
             const manifest = stored;
-            if (typeof manifest.chunkCount !== 'number' ||
+            if (manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+                typeof manifest.chunkCount !== 'number' ||
                 manifest.chunkCount <= 0 ||
                 !Array.isArray(manifest.chunkRevisions) ||
                 manifest.chunkRevisions.length !== manifest.chunkCount) {
@@ -4430,6 +4435,7 @@ class PersistenceManager {
             // Rewrite the manifest alone, KEEPING the previous revision so the
             // stored hash record stays joined to it.
             const manifest = {
+                formatVersion: PERSISTENCE_FORMAT_VERSION,
                 revision: prev.revision,
                 updatedAt: now,
                 chunkCount: plans.length,
@@ -4460,6 +4466,7 @@ class PersistenceManager {
         // written here describes the manifest written here, even if newer
         // updates arrived while hashing.
         const manifest = {
+            formatVersion: PERSISTENCE_FORMAT_VERSION,
             revision,
             updatedAt: now,
             chunkCount: plans.length,
