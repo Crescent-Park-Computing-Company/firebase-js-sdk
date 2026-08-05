@@ -93,7 +93,8 @@ const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 3;
+const PERSISTENCE_DB_VERSION = 4;
+const PERSISTENCE_FORMAT_VERSION = 1;
 
 /**
  * Records older than this are dropped (staleness makes a full download
@@ -157,6 +158,7 @@ export interface PersistedRecord {
 
 /** The manifest record stored at a root's main key. */
 interface PersistedManifest {
+  formatVersion: number;
   revision: string;
   updatedAt: number;
   chunkCount: number;
@@ -613,6 +615,9 @@ export class PersistenceManager {
               | undefined;
             const expired =
               !record ||
+              (typeof record.chunkCount === 'number' &&
+                (record as { formatVersion?: number }).formatVersion !==
+                  PERSISTENCE_FORMAT_VERSION) ||
               typeof record.updatedAt !== 'number' ||
               record.updatedAt < cutoff;
             decisions.set(key, {
@@ -774,6 +779,7 @@ export class PersistenceManager {
         }
         const manifest = stored;
         if (
+          manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
           typeof manifest.chunkCount !== 'number' ||
           manifest.chunkCount <= 0 ||
           !Array.isArray(manifest.chunkRevisions) ||
@@ -1186,6 +1192,7 @@ export class PersistenceManager {
       // Rewrite the manifest alone, KEEPING the previous revision so the
       // stored hash record stays joined to it.
       const manifest: PersistedManifest = {
+        formatVersion: PERSISTENCE_FORMAT_VERSION,
         revision: prev.revision,
         updatedAt: now,
         chunkCount: plans.length,
@@ -1216,6 +1223,7 @@ export class PersistenceManager {
     // written here describes the manifest written here, even if newer
     // updates arrived while hashing.
     const manifest: PersistedManifest = {
+      formatVersion: PERSISTENCE_FORMAT_VERSION,
       revision,
       updatedAt: now,
       chunkCount: plans.length,
