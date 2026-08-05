@@ -71,7 +71,7 @@ function makeFakeIndexedDB(
   // stores exist only once created in a version-change transaction, and a
   // versioned open above the current version fires onupgradeneeded.
   const state = {
-    version: options.dbVersion ?? 4,
+    version: options.dbVersion ?? 5,
     hasStore: !options.startWithoutStore
   };
   const async = (fn: () => void) => {
@@ -266,7 +266,7 @@ describe('PersistenceManager', () => {
     )) as PersistedRecord;
     expect(restored).to.not.equal(null);
     expect(restored.node.val(true)).to.deep.equal(json);
-    expect(restored.hash).to.equal('');
+    expect(restored.hash).to.equal('!compound-hash-only');
     expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
   });
 
@@ -296,7 +296,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
-    expect(restored.hash).to.equal('');
+    expect(restored.hash).to.equal('!compound-hash-only');
   });
 
   it('rewrites only the chunks an update dirtied', async () => {
@@ -341,7 +341,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(v2.val(true));
-    expect(restored.hash).to.equal('');
+    expect(restored.hash).to.equal('!compound-hash-only');
   });
 
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
@@ -380,7 +380,7 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 1,
+      formatVersion: 2,
       revision: 'ext-1',
       updatedAt: oldUpdatedAt,
       chunkCount: 1,
@@ -503,7 +503,7 @@ describe('PersistenceManager', () => {
     // Manifest expects two chunks of revision ext-2, but chunk 1 still
     // carries an older write's token (interrupted mid-write).
     data.set('test-repo|/torn/root', {
-      formatVersion: 1,
+      formatVersion: 2,
       revision: 'ext-2',
       updatedAt: Date.now(),
       chunkCount: 2,
@@ -552,14 +552,14 @@ describe('PersistenceManager', () => {
     // bled into it.
     const mid = (await manager.restore(path.toString())) as PersistedRecord;
     expect(mid.node.val(true)).to.deep.equal({ v: 1 });
-    expect(mid.hash).to.equal('');
+    expect(mid.hash).to.equal('!compound-hash-only');
 
     // And flush #2 (still throttled) then writes the v2 pair.
     await manager.flushNow(path.toString());
     await flushAsync();
     const final = (await manager.restore(path.toString())) as PersistedRecord;
     expect(final.node.val(true)).to.deep.equal({ v: 2 });
-    expect(final.hash).to.equal('');
+    expect(final.hash).to.equal('!compound-hash-only');
   });
 
   it('a surviving hash sidecar from another session never pairs with new data', async () => {
@@ -589,7 +589,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ fresh: true });
-    expect(restored.hash).to.equal('');
+    expect(restored.hash).to.equal('!compound-hash-only');
   });
 
   it('a burst within the throttle window flushes the newest tree', async () => {
@@ -607,7 +607,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ n: 2 });
-    expect(restored.hash).to.equal('');
+    expect(restored.hash).to.equal('!compound-hash-only');
   });
 
   it('a throttle firing into a busy queue coalesces to one trailing flush', async () => {
@@ -801,7 +801,7 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 1,
+      formatVersion: 2,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
@@ -822,7 +822,7 @@ describe('PersistenceManager', () => {
     // own), and even when its own updatedAt is ancient (a refreshed
     // manifest keeps its couple alive).
     data.set('test-repo|/fresh/root', {
-      formatVersion: 1,
+      formatVersion: 2,
       revision: 'ext-2',
       updatedAt: Date.now(),
       chunkCount: 1,
