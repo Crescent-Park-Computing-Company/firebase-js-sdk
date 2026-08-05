@@ -4308,6 +4308,9 @@ function writeSchemaMarker() {
  * likely anyway; bounded retention caps disk use).
  */
 const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const PERSISTENCE_MAX_CACHE_BYTES = 100 * 1024 * 1024;
+const PERSISTENCE_MAX_PRUNABLE_ROOTS = 1000;
+const PERSISTENCE_PRUNE_TARGET_RATIO = 0.8;
 /**
  * How long after the last server update a root's write-through runs. The
  * flush re-serializes the chunks the update dirtied, so it is deliberately
@@ -4324,10 +4327,6 @@ const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * fires neither success nor error can never hold the live listen forever.
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
-/** Hard wall-clock cap for a warm restore. Slow progress still yields to the
- * live path before a constrained phone spends tens of seconds rebuilding a
- * cache and retaining its partial tree. */
-const PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS = 12000;
 /** How long a completed optimistic peek waits for its real listener. */
 const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
 /**
@@ -4357,6 +4356,12 @@ const PERSISTENCE_SWEEP_DELAY_MS = 15000;
  * Counters for observing persistence effectiveness.
  * @internal
  */
+const persistenceEventListeners = new Set();
+/** @internal */
+function onPersistenceEvent(listener) {
+    persistenceEventListeners.add(listener);
+    return () => persistenceEventListeners.delete(listener);
+}
 const persistenceStats = {
     restoredRoots: [],
     restoreMisses: [],
@@ -4365,8 +4370,19 @@ const persistenceStats = {
     chunksSkipped: 0,
     hashRecomputes: 0,
     evictions: 0,
-    storageFailures: 0
+    storageFailures: 0,
+    events: []
 };
+function recordPersistenceEvent(path, event, detail) {
+    const item = { at: Date.now(), path, event, detail };
+    persistenceStats.events.push(item);
+    for (const listener of persistenceEventListeners) {
+        listener(item);
+    }
+    if (persistenceStats.events.length > 100) {
+        persistenceStats.events.splice(0, persistenceStats.events.length - 100);
+    }
+}
 const HASH_KEY_SUFFIX = '#hash';
 const CHUNK_KEY_INFIX = '#c';
 /**
@@ -4448,21 +4464,28 @@ function samePlan(a, b) {
  */
 class PersistenceManager {
     setAuthScope(scope) {
-        if (scope === this.authScope_)
+        if (scope === this.authScope_) {
             return;
-        this.authScope_ = scope;
-        // A decode started under one identity must never be handed to another.
-        for (const read of this.activeReads_.values())
-            read.cancelled = true;
+        }
+        for (const timer of this.writeTimers_.values()) {
+            clearTimeout(timer);
+        }
+        this.writeTimers_.clear();
+        this.flushPending_.clear();
+        this.latest_.clear();
+        this.lastFlush_.clear();
         this.activeReads_.clear();
+        this.authScope_ = scope;
+        recordPersistenceEvent('*', 'auth-scope-change', scope ? 'signed-in' : 'signed-out');
     }
     constructor(prefix_, idbFactory_ = isIndexedDBAvailable()
         ? indexedDB
-        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS) {
+        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS, cacheMaxBytes_ = PERSISTENCE_MAX_CACHE_BYTES) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
         this.schemaKnownCurrent_ = schemaKnownCurrent_;
         this.operationTimeoutMs_ = operationTimeoutMs_;
+        this.cacheMaxBytes_ = cacheMaxBytes_;
         this.db_ = null;
         /**
          * Roots that flow through persistence (complete default listens).
@@ -4518,8 +4541,11 @@ class PersistenceManager {
      * before the repo started (no queues or tracked roots exist yet).
      */
     rebindTo(prefix) {
+        const scope = this.authScope_;
         this.dispose();
-        return new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_);
+        const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_);
+        rebound.setAuthScope(scope);
+        return rebound;
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -4704,6 +4730,29 @@ class PersistenceManager {
                 // cannot interleave between the read and the delete.
                 const decisions = new Map();
                 let index = 0;
+                const pruneLru = () => {
+                    const activeKeys = new Set([...this.trackedRoots_].map(path => this.key_(path)));
+                    const live = [...decisions.entries()].filter(([, d]) => !d.expired);
+                    let totalBytes = live.reduce((sum, [, d]) => sum + d.estimatedBytes, 0);
+                    if (totalBytes <= this.cacheMaxBytes_ &&
+                        live.length <= PERSISTENCE_MAX_PRUNABLE_ROOTS) {
+                        return;
+                    }
+                    const targetBytes = this.cacheMaxBytes_ * PERSISTENCE_PRUNE_TARGET_RATIO;
+                    const targetRoots = Math.floor(PERSISTENCE_MAX_PRUNABLE_ROOTS * PERSISTENCE_PRUNE_TARGET_RATIO);
+                    const candidates = live
+                        .filter(([key]) => !activeKeys.has(key))
+                        .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+                    let liveRoots = live.length;
+                    for (const [, decision] of candidates) {
+                        if (totalBytes <= targetBytes && liveRoots <= targetRoots) {
+                            break;
+                        }
+                        decision.expired = true;
+                        totalBytes -= decision.estimatedBytes;
+                        liveRoots--;
+                    }
+                };
                 const settleSuffixed = () => {
                     for (const key of suffixedKeys) {
                         const base = key.slice(0, key.indexOf('#', prefix.length));
@@ -4728,6 +4777,13 @@ class PersistenceManager {
                 };
                 const step = () => {
                     if (index >= baseKeys.length) {
+                        pruneLru();
+                        for (const [key, decision] of decisions) {
+                            if (decision.expired) {
+                                persistenceStats.evictions++;
+                                store.delete(key);
+                            }
+                        }
                         settleSuffixed();
                         return;
                     }
@@ -4748,12 +4804,16 @@ class PersistenceManager {
                                 : 0,
                             currentFormat: typeof record?.chunkCount === 'number' &&
                                 record.formatVersion ===
-                                    PERSISTENCE_FORMAT_VERSION
+                                    PERSISTENCE_FORMAT_VERSION,
+                            updatedAt: record && typeof record.updatedAt === 'number'
+                                ? record.updatedAt
+                                : 0,
+                            estimatedBytes: record && typeof record.estimatedBytes === 'number'
+                                ? record.estimatedBytes
+                                : typeof record?.chunkCount === 'number'
+                                    ? record.chunkCount * PERSISTENCE_CHUNK_TARGET_BYTES
+                                    : 0
                         });
-                        if (expired) {
-                            persistenceStats.evictions++;
-                            store.delete(key);
-                        }
                         step();
                     };
                 };
@@ -4909,19 +4969,18 @@ class PersistenceManager {
             return active.promise;
         }
         const progress = new Set([onProgress]);
+        const emitProgress = () => {
+            for (const callback of progress) {
+                callback();
+            }
+        };
+        const promise = this.readRecordOnce_(pathString, emitProgress, expectedAuthScope);
         const entry = {
-            promise: null,
+            promise,
             progress,
             retainAfterResolve,
-            cancelled: false,
             cleanupTimer: null
         };
-        const emitProgress = () => {
-            for (const callback of progress)
-                callback();
-        };
-        entry.promise = this.readRecordOnce_(pathString, emitProgress, () => !entry.cancelled, expectedAuthScope);
-        const promise = entry.promise;
         this.activeReads_.set(pathString, entry);
         const release = () => {
             entry.progress.clear();
@@ -4941,7 +5000,7 @@ class PersistenceManager {
         void promise.then(release, release);
         return promise;
     }
-    readRecordOnce_(pathString, onProgress, shouldContinue = () => true, expectedAuthScope = this.authScope_) {
+    readRecordOnce_(pathString, onProgress, expectedAuthScope = this.authScope_) {
         const key = this.key_(pathString);
         // Metadata first, in a short transaction. Each chunk then gets its OWN
         // transaction: WebKit may retain every IDBRequest result until the
@@ -4976,8 +5035,9 @@ class PersistenceManager {
             onProgress();
             const { stored, hashes } = meta;
             // Pre-scope records cannot be attributed to an authenticated user.
-            if (isLegacyRecord(stored) && expectedAuthScope !== null)
+            if (isLegacyRecord(stored) && expectedAuthScope !== null) {
                 return 'mismatch';
+            }
             const joined = isLegacyRecord(stored)
                 ? hashes && hashes.revision === stored.revision
                     ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
@@ -5006,23 +5066,21 @@ class PersistenceManager {
                 manifest.chunkRevisions.length !== manifest.chunkCount) {
                 return 'mismatch';
             }
-            if (manifest.authScope !== expectedAuthScope)
+            if (manifest.authScope !== expectedAuthScope) {
                 return null;
+            }
             let assembled = ChildrenNode.EMPTY_NODE;
             const plans = [];
             let chain = Promise.resolve(true);
             for (let index = 0; index < manifest.chunkCount; index++) {
                 chain = chain.then(status => {
-                    if (status === 'mismatch' || status === 'cancelled')
+                    if (status === 'mismatch') {
                         return status;
-                    if (!shouldContinue())
-                        return 'cancelled';
+                    }
                     return this.withStore_('readonly', null, (store, done) => {
                         const req = store.get(key + chunkKeySuffix(index));
                         req.onsuccess = () => done(req.result ?? null);
                     }).then(chunk => {
-                        if (!shouldContinue())
-                            return 'cancelled';
                         if (!chunk ||
                             chunk.revision !== manifest.chunkRevisions[index] ||
                             !Array.isArray(chunk.entries)) {
@@ -5040,7 +5098,8 @@ class PersistenceManager {
                     });
                 });
             }
-            return chain.then(status => status === 'mismatch' || status === 'cancelled'
+            return chain
+                .then(status => status === 'mismatch'
                 ? status
                 : {
                     record: {
@@ -5052,14 +5111,31 @@ class PersistenceManager {
                     plans,
                     chunkRevisions: manifest.chunkRevisions,
                     chunkCount: manifest.chunkCount
-                });
+                })
+                .then(async (result) => {
+                if (result === 'mismatch') {
+                    return result;
+                }
+                const actualHash = await canonicalHashFromNodeAsync(result.record.node);
+                if (typeof result.record.hash === 'string' &&
+                    actualHash !== result.record.hash) {
+                    return 'mismatch';
+                }
+                result.record.hash = actualHash;
+                if (!result.record.compoundHash) {
+                    const compound = await compoundHashFromNodeAsync(result.record.node);
+                    result.record.compoundHash = {
+                        hashes: compound.hashes,
+                        posts: compound.posts
+                    };
+                }
+                return result;
+            });
         })
             .then(result => {
             if (result === null) {
                 return null;
             }
-            if (result === 'cancelled')
-                return null;
             if (result === 'mismatch') {
                 persistenceStats.evictions++;
                 void this.deleteRecord_(pathString);
@@ -5113,63 +5189,19 @@ class PersistenceManager {
      * boot), the follow-up write-through skips without serializing anything.
      */
     /**
-     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
-     * precomputed hash listen immediately while the shared chunk restore runs
-     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
-     * are structurally valid and coupled to the same revision.
-     */
-    restoreListenMetadata(pathString) {
-        if (this.disposed_) {
-            return Promise.resolve(null);
-        }
-        if (!this.schemaKnownCurrent_) {
-            return Promise.resolve(null);
-        }
-        const key = this.key_(pathString);
-        return this.withStore_('readonly', null, (store, done) => {
-            const req = store.get(key);
-            req.onsuccess = () => {
-                const manifest = req.result;
-                if (!manifest ||
-                    isLegacyRecord(manifest) ||
-                    manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-                    manifest.authScope !== this.authScope_ ||
-                    typeof manifest.chunkCount !== 'number' ||
-                    manifest.chunkCount <= 0 ||
-                    !Array.isArray(manifest.chunkRevisions) ||
-                    manifest.chunkRevisions.length !== manifest.chunkCount ||
-                    Date.now() - manifest.updatedAt > PERSISTENCE_MAX_AGE_MS ||
-                    typeof manifest.hash !== 'string' ||
-                    !manifest.compoundHash ||
-                    !Array.isArray(manifest.compoundHash.hashes) ||
-                    !Array.isArray(manifest.compoundHash.posts) ||
-                    manifest.compoundHash.hashes.length !==
-                        manifest.compoundHash.posts.length + 1) {
-                    done(null);
-                    return;
-                }
-                done({
-                    hash: manifest.hash,
-                    compoundHash: manifest.compoundHash,
-                    revision: manifest.revision
-                });
-            };
-        });
-    }
-    /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
      * the authenticated listener can consume the same immutable Node instead of
      * decoding a large IndexedDB record twice during boot.
      */
     peek(pathString, expectedAuthScope = this.authScope_) {
         if (this.disposed_ || !this.schemaKnownCurrent_) {
+            recordPersistenceEvent(pathString, 'peek-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve(null);
         }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => (result === null ? null : result.record)), this.operationTimeoutMs_, PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS, () => {
-            const active = this.activeReads_.get(pathString);
-            if (active)
-                active.cancelled = true;
-        });
+        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
+            recordPersistenceEvent(pathString, result ? 'peek-hit' : 'peek-miss');
+            return result === null ? null : result.record;
+        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout'));
     }
     /**
      * Listener restore with an idle (no-progress) bound. Healthy chunked reads
@@ -5178,10 +5210,8 @@ class PersistenceManager {
      * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString) {
-        if (this.disposed_) {
-            return Promise.resolve(null);
-        }
-        if (!this.schemaKnownCurrent_) {
+        if (this.disposed_ || !this.schemaKnownCurrent_) {
+            recordPersistenceEvent(pathString, 'restore-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve(null);
         }
         return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
@@ -5200,10 +5230,9 @@ class PersistenceManager {
             });
             persistenceStats.restoredRoots.push(pathString);
             return result.record;
-        }), this.operationTimeoutMs_, PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS, () => {
-            const active = this.activeReads_.get(pathString);
-            if (active)
-                active.cancelled = true;
+        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'restore-idle-timeout')).then(record => {
+            recordPersistenceEvent(pathString, record ? 'restore-hit' : 'restore-miss');
+            return record;
         });
     }
     restore(pathString) {
@@ -5240,33 +5269,28 @@ class PersistenceManager {
      * chunked restores reset the timer after every completed chunk; callers
      * that pass an already-started Promise retain the old total-time bound.
      */
-    raceRestoreTimeout_(readOrStart, timeoutMs = this.operationTimeoutMs_, totalTimeoutMs = PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS, onTimeout = () => { }) {
+    raceRestoreTimeout_(readOrStart, timeoutMs = this.operationTimeoutMs_, onTimeout = () => { }) {
         let timer;
-        let totalTimer;
         let settled = false;
         let timeoutResolve = () => { };
         const timeout = new Promise(resolve => {
             timeoutResolve = resolve;
         });
-        const expire = () => {
-            if (settled)
-                return;
-            onTimeout();
-            timeoutResolve(null);
-        };
         const arm = () => {
-            if (settled)
+            if (settled) {
                 return;
+            }
             clearTimeout(timer);
-            timer = setTimeout(expire, timeoutMs);
+            timer = setTimeout(() => {
+                onTimeout();
+                timeoutResolve(null);
+            }, timeoutMs);
         };
         const read = typeof readOrStart === 'function' ? readOrStart(arm) : readOrStart;
         arm();
-        totalTimer = setTimeout(expire, totalTimeoutMs);
         return Promise.race([read, timeout]).then(result => {
             settled = true;
             clearTimeout(timer);
-            clearTimeout(totalTimer);
             return result;
         });
     }
@@ -5294,8 +5318,16 @@ class PersistenceManager {
         }
         this.latest_.set(pathString, {
             node,
-            revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36)
+            revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
+            authScope: this.authScope_
         });
+        // Android persists each authoritative server update transactionally. On
+        // web, guarantee the first complete tree immediately, then throttle later
+        // churn so a quick reload never races an arbitrary 10-second empty window.
+        if (!prev && !this.queues_.has(pathString)) {
+            this.scheduleFlush_(pathString);
+            return;
+        }
         // Trailing throttle, NOT a resetting debounce: the timer set by the first
         // update in a burst survives later updates, so a root that churns faster
         // than the interval (a chat streaming, an editing session) still flushes
@@ -5321,6 +5353,14 @@ class PersistenceManager {
         }
         void this.enqueue_(pathString, () => this.flush_(pathString));
     }
+    /** Drop an unusable persisted record but keep the live root tracked. */
+    invalidate(path) {
+        const pathString = path.toString();
+        this.latest_.delete(pathString);
+        this.lastFlush_.delete(pathString);
+        recordPersistenceEvent(pathString, 'invalidate', 'corrupt-or-incompatible');
+        void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+    }
     /**
      * The viewer lost access to a root: a cached copy must not outlive the
      * access that produced it, and the root leaves write-through tracking
@@ -5339,6 +5379,7 @@ class PersistenceManager {
             this.writeTimers_.delete(pathString);
         }
         persistenceStats.evictions++;
+        recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
         // Through the queue: a flush already running for this root finishes its
         // writes first, then the delete removes them — never the reverse.
         void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
@@ -5354,7 +5395,6 @@ class PersistenceManager {
         }
         this.flushPending_.clear();
         for (const read of this.activeReads_.values()) {
-            read.cancelled = true;
             if (read.cleanupTimer !== null) {
                 clearTimeout(read.cleanupTimer);
             }
@@ -5404,7 +5444,7 @@ class PersistenceManager {
         if (!entry || this.disposed_) {
             return Promise.resolve();
         }
-        const { node, revision } = entry;
+        const { node, revision, authScope } = entry;
         const prev = this.lastFlush_.get(pathString);
         const now = Date.now();
         if (prev &&
@@ -5472,7 +5512,8 @@ class PersistenceManager {
             formatVersion: PERSISTENCE_FORMAT_VERSION,
             revision,
             updatedAt: now,
-            authScope: this.authScope_,
+            authScope,
+            estimatedBytes: estimateSerializedNodeSize(node),
             chunkCount: plans.length,
             chunkRevisions
         };
@@ -5533,6 +5574,7 @@ class PersistenceManager {
                 chunkCount: plans.length,
                 storedUpdatedAt: now
             });
+            recordPersistenceEvent(pathString, 'stored', `${plans.length} chunks`);
             // Compute protocol hashes once, when server data is persisted. The
             // canonical traversal is non-retaining (it does not fill every child's
             // lazyHash_); only this listened root is stamped and stored natively in
@@ -13123,21 +13165,6 @@ const INTERRUPT_REASON = 'repo_interrupt';
  * client / server hashes for some data, we won't retry indefinitely.
  */
 const MAX_TRANSACTION_RETRIES = 25;
-function repoPendingRestoreForPath(repo, pathString) {
-    let bestPath = null;
-    let best = null;
-    for (const [root, pending] of repo.pendingSeedRestores_) {
-        if (pathString === root ||
-            (pathString.length > root.length &&
-                pathString.startsWith(root === '/' ? root : root + '/'))) {
-            if (bestPath === null || root.length > bestPath.length) {
-                bestPath = root;
-                best = pending;
-            }
-        }
-    }
-    return best;
-}
 class Repo {
     constructor(repoInfo_, forceRestClient_, authTokenProvider_, appCheckProvider_) {
         this.repoInfo_ = repoInfo_;
@@ -13280,11 +13307,6 @@ function repoGenerateServerValues(repo) {
  * Called by realtime when we get new messages from the server.
  */
 function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
-    const pending = tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
-    if (pending?.listenSent && pending.buffering) {
-        pending.bufferedActions.push(() => repoOnDataUpdate(repo, pathString, data, isMerge, tag));
-        return;
-    }
     // For testing.
     repo.dataUpdateCount++;
     const path = new Path(pathString);
@@ -13340,11 +13362,13 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             waiters: prior ? prior.waiters : []
         });
     }
-    let pendingToken = null;
-    const processListenResponse = (status, data) => {
-        const events = onComplete(status, data);
-        eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-        if (isDefaultComplete) {
+    const sendListen = () => {
+        repo.server_.listen(query, currentHashFn, tag, (status, data) => {
+            const events = onComplete(status, data);
+            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+            if (!isDefaultComplete) {
+                return;
+            }
             const completion = repo.listenCompletions_.get(pathString);
             if (completion && !completion.complete) {
                 completion.complete = true;
@@ -13362,198 +13386,62 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
                     repo.persistence_.evict(query._path);
                 }
             }
-        }
-    };
-    const sendListen = (hashFn, owner = pendingToken) => {
-        if (owner) {
-            owner.listenSent = true;
-        }
-        repo.server_.listen(query, hashFn, tag, (status, data) => {
-            if (owner?.cancelled) {
-                return;
-            }
-            const apply = () => processListenResponse(status, data);
-            if (owner?.buffering && status !== 'ok') {
-                // Access was revoked/denied before the cached base finished loading.
-                // Process that immediately and prevent stale cached bytes from ever
-                // painting; this is not a latency fallback.
-                owner.cancelled = true;
-                owner.buffering = false;
-                owner.bufferedActions = [];
-                if (repo.pendingSeedRestores_.get(pathString) === owner) {
-                    repo.pendingSeedRestores_.delete(pathString);
-                }
-                pendingToken = null;
-                apply();
-            }
-            else if (owner?.buffering) {
-                owner.bufferedActions.push(apply);
-            }
-            else {
-                apply();
-            }
         });
     };
     const persistence = repo.persistence_;
     if (persistence === null || !isDefaultComplete) {
-        sendListen(currentHashFn, null);
+        sendListen();
         return;
     }
+    // Android's battle-tested order: synchronously hydrate the SyncTree from
+    // persistence, then create the wire listen from that exact in-memory view.
+    // IndexedDB is async, so we hold only this root's first listen behind an
+    // idle-progress timeout; on miss/corruption/stall we attach cold.
     persistence.track(pathString);
-    const token = {
-        cancelled: false,
-        listenSent: false,
-        buffering: true,
-        bufferedActions: []
-    };
-    pendingToken = token;
+    const token = { cancelled: false };
     repo.pendingSeedRestores_.set(pathString, token);
     const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
-    /**
-     * Restart against the current in-memory view ONLY when the persisted base
-     * failed validation (or became incompatible with fresher local server
-     * state). Slow cache progress and slow network responses never call this.
-     */
-    const restartCurrentListen = () => {
+    const finish = () => {
         if (!isCurrent()) {
             return;
         }
-        const wasSent = token.listenSent;
-        token.cancelled = true;
-        token.buffering = false;
-        token.bufferedActions = [];
         repo.pendingSeedRestores_.delete(pathString);
-        pendingToken = null;
-        if (wasSent) {
-            repo.server_.unlisten(query, tag);
-        }
-        sendListen(currentHashFn, null);
+        sendListen();
     };
-    const finishBufferedListen = () => {
+    void persistence.restoreForListen(pathString).then(record => {
         if (!isCurrent()) {
             return;
         }
-        token.buffering = false;
-        repo.pendingSeedRestores_.delete(pathString);
-        pendingToken = null;
-        const actions = token.bufferedActions;
-        token.bufferedActions = [];
-        for (const action of actions) {
-            action();
-        }
-    };
-    // Two phases over the SAME physical cache read:
-    // 1) tiny precomputed hashes start the server comparison immediately;
-    // 2) chunks rebuild the cached base while server deltas buffer in arrival order.
-    const metadataPromise = persistence.restoreListenMetadata(pathString);
-    const recordPromise = persistence.restoreForListen(pathString);
-    void metadataPromise.then(metadata => {
-        if (!metadata || !isCurrent()) {
+        if (record === null ||
+            syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
+            finish();
             return;
         }
-        const storedHashFn = (() => metadata.hash);
-        storedHashFn.compoundHash = () => metadata.compoundHash;
-        sendListen(storedHashFn, token);
-    });
-    void Promise.all([metadataPromise, recordPromise]).then(([metadata, record]) => {
-        if (!isCurrent()) {
-            return;
-        }
-        // If hashes were already sent, null means the persisted base failed
-        // format/chunk/revision/storage validation. This is the ONLY path that
-        // restarts an in-flight seeded listen unseeded/current.
-        if (record === null) {
-            if (token.listenSent) {
-                restartCurrentListen();
-            }
-            else {
-                token.buffering = false;
-                repo.pendingSeedRestores_.delete(pathString);
-                pendingToken = null;
-                sendListen(currentHashFn, null);
-            }
-            return;
-        }
-        if (metadata && metadata.revision !== record.revision) {
-            // Another tab committed a different manifest between the metadata
-            // read and the shared chunk decode. Never certify revision A's tree
-            // with revision B's hashes.
-            restartCurrentListen();
-            return;
-        }
-        const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
-            null;
-        if (alreadyCertified) {
-            // The persisted base lost the race to fresher server state; hashes
-            // computed for it are no longer valid for this view.
-            restartCurrentListen();
-            return;
-        }
-        let seeded = record.node;
-        let grafted = false;
+        let restored = record.node;
         for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)) {
-            if (state.complete !== null) {
-                seeded = seeded.updateChild(state.path, state.complete);
-                grafted = true;
-            }
-            else {
-                // Partial live data cannot be safely grafted into the persisted
-                // base: this is a validation incompatibility, not a timeout.
-                restartCurrentListen();
+            if (state.complete === null) {
+                // A live partial/filtered descendant cannot be safely merged with a
+                // persisted ancestor. Fail closed to the normal full server load.
+                finish();
                 return;
             }
+            restored = restored.updateChild(state.path, state.complete);
         }
-        if (seeded.isEmpty()) {
-            restartCurrentListen();
-            return;
-        }
-        let applied = false;
-        try {
-            if (!grafted) {
-                seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
+        if (!restored.isEmpty()) {
+            try {
+                restored = stampSeedHashes(restored, record.hash, record.compoundHash);
+                const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
+                eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             }
-            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
-            applied = true;
-            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-        }
-        catch (e) {
-            // Malformed persisted data / apply failure is cache validation failure.
-        }
-        if (!isCurrent()) {
-            return;
-        }
-        if (!applied || grafted) {
-            restartCurrentListen();
-            return;
-        }
-        if (token.listenSent && metadata !== null) {
-            finishBufferedListen();
-            return;
-        }
-        // A valid tree without persisted hash metadata is uncommon (shutdown
-        // between manifest and hash commit). No listen was sent yet; compute its
-        // hash without a timeout fallback, then attach normally.
-        if (typeof record.hash === 'string') {
-            token.buffering = false;
-            repo.pendingSeedRestores_.delete(pathString);
-            pendingToken = null;
-            sendListen(currentHashFn, null);
-            return;
-        }
-        void canonicalHashFromNodeAsync(seeded).then(hash => {
-            if (!isCurrent()) {
-                return;
+            catch {
+                // Corrupt or incompatible persisted state is a cache miss. Delete the
+                // record but keep tracking so the full server reload replaces it.
+                persistence.invalidate(query._path);
             }
-            seeded.stampLazyHash(hash);
-            token.buffering = false;
-            repo.pendingSeedRestores_.delete(pathString);
-            pendingToken = null;
-            sendListen(currentHashFn, null);
-        }, restartCurrentListen);
-    }, () => {
-        // IndexedDB/storage failure is a validation failure; latency is not.
-        restartCurrentListen();
-    });
+        }
+        // User callbacks above may synchronously remove this listener.
+        finish();
+    }, finish);
 }
 /**
  * Stops a server listen. With persistence, a complete default listen may
@@ -13570,12 +13458,7 @@ function repoStopServerListen(repo, query, tag) {
     const pending = repo.pendingSeedRestores_.get(pathString);
     if (pending) {
         pending.cancelled = true;
-        pending.buffering = false;
-        pending.bufferedActions = [];
         repo.pendingSeedRestores_.delete(pathString);
-        if (pending.listenSent) {
-            repo.server_.unlisten(query, tag);
-        }
     }
     else {
         repo.server_.unlisten(query, tag);
@@ -13616,8 +13499,6 @@ function repoWhenListenComplete(repo, pathString) {
 function repoCancelPendingSeedRestores(repo) {
     for (const pending of repo.pendingSeedRestores_.values()) {
         pending.cancelled = true;
-        pending.buffering = false;
-        pending.bufferedActions = [];
     }
     repo.pendingSeedRestores_.clear();
 }
@@ -13631,6 +13512,12 @@ function repoSettleListenCompletions(repo) {
         }
     }
     repo.listenCompletions_.clear();
+}
+function repoDispose(repo) {
+    repoInterrupt(repo);
+    repoCancelPendingSeedRestores(repo);
+    repoSettleListenCompletions(repo);
+    repo.persistence_?.dispose();
 }
 /**
  * Persistence write-through: after the server updated `path` (overwrite,
@@ -13662,11 +13549,6 @@ function repoPersistAfterServerUpdate(repo, path) {
  * applied in order against the locally cached server data.
  */
 function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
-    const pending = tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
-    if (pending?.listenSent && pending.buffering) {
-        pending.bufferedActions.push(() => repoOnRangeMergeUpdate(repo, pathString, ranges, tag));
-        return;
-    }
     // For testing.
     repo.dataUpdateCount++;
     const path = new Path(pathString);
@@ -16248,13 +16130,7 @@ function repoManagerDeleteRepo(repo, appName) {
     if (!appRepos || appRepos[repo.key] !== repo) {
         fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
     }
-    repoInterrupt(repo);
-    repoCancelPendingSeedRestores(repo);
-    // The repo's listens can never respond after this: settle any
-    // whenListenComplete waiters (they would otherwise hang forever and
-    // retain the repo), and stop the persistence timers.
-    repoSettleListenCompletions(repo);
-    repo.persistence_?.dispose();
+    repoDispose(repo);
     delete appRepos[repo.key];
 }
 /**
@@ -16472,8 +16348,9 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
     // Prime the manager with the trusted expected identity so the later auth
     // callback for that same user can reuse this physical decode. A different
     // real auth uid changes scope and cancels it before any listener consumes it.
-    if (expectedAuthScope !== null)
+    if (expectedAuthScope !== null) {
         persistence.setAuthScope(expectedAuthScope);
+    }
     // Exact-root by design: callers peek the same path they are about to
     // listen to. This lets the authenticated listener consume the same decoded
     // Node and prevents a fresher ancestor record from being mistaken for the
@@ -16498,6 +16375,9 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
 function setPersistenceEnabled(db, enabled) {
     db = getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
+    if (db._instanceStarted) {
+        fatal('setPersistenceEnabled() must be called before the first Database operation.');
+    }
     // _repoInternal, not the _repo getter: configuration must not start the
     // instance, or a later connectDatabaseEmulator() would refuse to run.
     const repo = db._repoInternal;
@@ -16872,5 +16752,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
 setWebSocketImpl(Websocket.Client);
 registerDatabase('node');
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, persistenceStats as _persistenceStats, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, persistenceStats as _persistenceStats, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.node.esm.js.map

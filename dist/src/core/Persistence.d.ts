@@ -22,6 +22,7 @@ import { Path } from './util/Path';
  * likely anyway; bounded retention caps disk use).
  */
 export declare const PERSISTENCE_MAX_AGE_MS: number;
+export declare const PERSISTENCE_MAX_CACHE_BYTES: number;
 /**
  * How long after the last server update a root's write-through runs. The
  * flush re-serializes the chunks the update dirtied, so it is deliberately
@@ -38,10 +39,6 @@ export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * fires neither success nor error can never hold the live listen forever.
  */
 export declare const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
-/** Hard wall-clock cap for a warm restore. Slow progress still yields to the
- * live path before a constrained phone spends tens of seconds rebuilding a
- * cache and retaining its partial tree. */
-export declare const PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS = 12000;
 /**
  * Target serialized size of one chunk record. Peak transient memory of a
  * flush or restore is a few multiples of THIS (one chunk's exported JSON
@@ -77,16 +74,13 @@ export interface PersistedRecord {
     /** The write token of the manifest this record was assembled from. */
     revision: string;
 }
-/** Precomputed listen state readable without decoding the cached tree. */
-export interface PersistedListenMetadata {
-    hash: string;
-    compoundHash: SeedCompoundHash;
-    revision: string;
-}
-/**
- * Counters for observing persistence effectiveness.
- * @internal
- */
+/** @internal */
+export declare function onPersistenceEvent(listener: (event: {
+    at: number;
+    path: string;
+    event: string;
+    detail?: string;
+}) => void): () => void;
 export declare const persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
@@ -96,6 +90,12 @@ export declare const persistenceStats: {
     hashRecomputes: number;
     evictions: number;
     storageFailures: number;
+    events: Array<{
+        at: number;
+        path: string;
+        event: string;
+        detail?: string;
+    }>;
 };
 /**
  * One PersistenceManager per Repo. `prefix` namespaces records so multiple
@@ -107,6 +107,7 @@ export declare class PersistenceManager {
     private idbFactory_;
     private schemaKnownCurrent_;
     private operationTimeoutMs_;
+    private cacheMaxBytes_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -150,7 +151,7 @@ export declare class PersistenceManager {
     private disposed_;
     private authScope_;
     setAuthScope(scope: string | null): void;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but
@@ -230,13 +231,6 @@ export declare class PersistenceManager {
      * boot), the follow-up write-through skips without serializing anything.
      */
     /**
-     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
-     * precomputed hash listen immediately while the shared chunk restore runs
-     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
-     * are structurally valid and coupled to the same revision.
-     */
-    restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
-    /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
      * the authenticated listener can consume the same immutable Node instead of
      * decoding a large IndexedDB record twice during boot.
@@ -272,6 +266,8 @@ export declare class PersistenceManager {
      * queue flushes faster than they complete, unboundedly.
      */
     private scheduleFlush_;
+    /** Drop an unusable persisted record but keep the live root tracked. */
+    invalidate(path: Path): void;
     /**
      * The viewer lost access to a root: a cached copy must not outlive the
      * access that produced it, and the root leaves write-through tracking

@@ -1714,6 +1714,14 @@ export declare class OnDisconnect {
  */
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
 
+/** @internal */
+export declare function _onPersistenceEvent(listener: (event: {
+    at: number;
+    path: string;
+    event: string;
+    detail?: string;
+}) => void): () => void;
+
 /**
  * Listens for data changes at a particular location.
  *
@@ -1884,16 +1892,6 @@ declare class Path {
  */
 declare interface PendingSeedRestore {
     cancelled: boolean;
-    listenSent: boolean;
-    buffering: boolean;
-    bufferedActions: Array<() => void>;
-}
-
-/** Precomputed listen state readable without decoding the cached tree. */
-declare interface PersistedListenMetadata {
-    hash: string;
-    compoundHash: SeedCompoundHash;
-    revision: string;
 }
 
 /**
@@ -1927,6 +1925,7 @@ declare class PersistenceManager {
     private idbFactory_;
     private schemaKnownCurrent_;
     private operationTimeoutMs_;
+    private cacheMaxBytes_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1970,7 +1969,7 @@ declare class PersistenceManager {
     private disposed_;
     private authScope_;
     setAuthScope(scope: string | null): void;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but
@@ -2050,13 +2049,6 @@ declare class PersistenceManager {
      * boot), the follow-up write-through skips without serializing anything.
      */
     /**
-     * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
-     * precomputed hash listen immediately while the shared chunk restore runs
-     * in parallel. A result is returned only when the manifest and its integrated protocol hashes
-     * are structurally valid and coupled to the same revision.
-     */
-    restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
-    /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
      * the authenticated listener can consume the same immutable Node instead of
      * decoding a large IndexedDB record twice during boot.
@@ -2092,6 +2084,8 @@ declare class PersistenceManager {
      * queue flushes faster than they complete, unboundedly.
      */
     private scheduleFlush_;
+    /** Drop an unusable persisted record but keep the live root tracked. */
+    invalidate(path: Path): void;
     /**
      * The viewer lost access to a root: a cached copy must not outlive the
      * access that produced it, and the root leaves write-through tracking
@@ -2115,10 +2109,6 @@ declare class PersistenceManager {
     private flush_;
 }
 
-/**
- * Counters for observing persistence effectiveness.
- * @internal
- */
 export declare const _persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
@@ -2128,6 +2118,12 @@ export declare const _persistenceStats: {
     hashRecomputes: number;
     evictions: number;
     storageFailures: number;
+    events: Array<{
+        at: number;
+        path: string;
+        event: string;
+        detail?: string;
+    }>;
 };
 
 /**

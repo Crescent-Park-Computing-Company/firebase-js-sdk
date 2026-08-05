@@ -62,9 +62,6 @@ interface Transaction {
  */
 interface PendingSeedRestore {
     cancelled: boolean;
-    listenSent: boolean;
-    buffering: boolean;
-    bufferedActions: Array<() => void>;
 }
 export declare class Repo {
     repoInfo_: RepoInfo;
@@ -162,6 +159,7 @@ export declare function repoWhenListenComplete(repo: Repo, pathString: string): 
  */
 export declare function repoCancelPendingSeedRestores(repo: Repo): void;
 export declare function repoSettleListenCompletions(repo: Repo): void;
+export declare function repoDispose(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**
  * The purpose of `getValue` is to return the latest known value
