@@ -4236,8 +4236,13 @@ const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 4;
-const PERSISTENCE_FORMAT_VERSION = 1;
+const PERSISTENCE_DB_VERSION = 5;
+const PERSISTENCE_FORMAT_VERSION = 2;
+// Not a possible Firebase node hash (real hashes are empty only for the empty
+// tree, otherwise base64 SHA-1). Forces a simple-hash miss so the server must
+// validate the supplied compound ranges, including when the server tree is
+// now empty.
+const COMPOUND_HASH_ONLY_SENTINEL = '!compound-hash-only';
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -4668,12 +4673,35 @@ class PersistenceManager {
                         req.transaction.objectStore(STORE).clear();
                     }
                 };
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => {
-                    persistenceStats.storageFailures++;
-                    resolve(null);
+                let settled = false;
+                req.onsuccess = () => {
+                    const db = req.result;
+                    if (settled) {
+                        // An upgrade that was initially blocked may succeed after we
+                        // already degraded this manager to a cold load. Do not leak that
+                        // late connection — it would block the next schema upgrade.
+                        db.close();
+                        return;
+                    }
+                    settled = true;
+                    // Cooperate with a newer tab's future upgrade instead of blocking
+                    // it for the lifetime of this page.
+                    db.onversionchange = () => db.close();
+                    resolve(db);
                 };
-                req.onblocked = () => resolve(null);
+                req.onerror = () => {
+                    if (!settled) {
+                        settled = true;
+                        persistenceStats.storageFailures++;
+                        resolve(null);
+                    }
+                };
+                req.onblocked = () => {
+                    if (!settled) {
+                        settled = true;
+                        resolve(null);
+                    }
+                };
             }
             catch (e) {
                 persistenceStats.storageFailures++;
@@ -5160,15 +5188,12 @@ class PersistenceManager {
             });
         }
         persistenceStats.writeThroughs++;
-        // Chunks and manifest land in ONE transaction — all or nothing — with
-        // each chunk serialized only when its put is issued, so peak transient
-        // memory is one chunk's exported JSON plus its structured clone. The
-        // tree is written hashless first — a crash before the recompute leaves
-        // a restorable tree that seeds without a hash instead of nothing. The
-        // hashes follow as a small separate record, and because flushes for a
-        // root are serialized (enqueue_), the pair is always coupled: the hash
-        // written here describes the manifest written here, even if newer
-        // updates arrived while hashing.
+        // Dirty chunks land in separate short transactions; the manifest commits
+        // last as the authoritative join. A crash mid-sequence leaves the old
+        // manifest or a revision mismatch — a safe restore miss, never a stitched
+        // tree. Peak transient memory is one chunk's exported JSON plus its clone.
+        // The hash follows as a small sidecar, conditionally joined to this exact
+        // manifest revision.
         const manifest = {
             formatVersion: PERSISTENCE_FORMAT_VERSION,
             revision,
@@ -5234,12 +5259,12 @@ class PersistenceManager {
                 storedUpdatedAt: now
             });
             // A compound hash is sufficient for zero-download revalidation:
-            // send an empty simple hash and let the server compare ranges. Avoiding
+            // send an impossible sentinel simple hash and let the server compare ranges. Avoiding
             // node.hash() is crucial on large roots — it permanently cached one SHA
             // string on every node, a large retained-memory jump absent on a normal
             // cold load.
             return compoundHashFromNodeAsync(node).then(compoundHash => {
-                const hash = '';
+                const hash = COMPOUND_HASH_ONLY_SENTINEL;
                 if (this.disposed_) {
                     return;
                 }
