@@ -3450,8 +3450,11 @@ function stampSeedHashes(node, hash, compoundHash) {
     if (node.isEmpty()) {
         return node;
     }
-    if (typeof hash === 'string' && hash.length > 0) {
-        node.stampLazyHash(hash);
+    if (typeof hash === 'string') {
+        nodeCanonicalHashes.set(node, hash);
+        if (hash.length > 0) {
+            node.stampLazyHash(hash);
+        }
     }
     if (compoundHash &&
         Array.isArray(compoundHash.hashes) &&
@@ -3467,11 +3470,22 @@ function stampSeedHashes(node, hash, compoundHash) {
  * arrived send only the simple hash (which is then correct by construction).
  */
 const nodeCompoundHashes = new WeakMap();
+const nodeCanonicalHashes = new WeakMap();
 function setNodeCompoundHash(node, compoundHash) {
     nodeCompoundHashes.set(node, compoundHash);
 }
 function getNodeCompoundHash(node) {
     return nodeCompoundHashes.get(node);
+}
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+function getNodeCanonicalHash(node) {
+    return nodeCanonicalHashes.get(node);
 }
 /**
  * The canonical listen hash of a JSON value — exactly what an unseeded
@@ -4704,56 +4718,70 @@ class PersistenceManager {
      */
     readRecord_(pathString) {
         const key = this.key_(pathString);
-        return this.withStore_('readonly', null, (store, done) => {
+        // Metadata first, in a short transaction. Each chunk then gets its OWN
+        // transaction: WebKit may retain every IDBRequest result until the
+        // transaction closes, so issuing all chunk reads in one transaction
+        // recreates the root-sized memory spike despite the chunked records.
+        const metadata = this.withStore_('readonly', null, (store, done) => {
             const dataReq = store.get(key);
             const hashReq = store.get(key + HASH_KEY_SUFFIX);
-            // Same store, same transaction: requests complete in issue order, so
-            // when hashReq's success fires, dataReq.result is safe to read.
-            // (Reading a request's result before IT completes throws.)
             hashReq.onsuccess = () => {
-                const record = dataReq.result;
-                if (!record) {
+                const stored = dataReq.result;
+                if (!stored) {
                     done(null);
                     return;
                 }
-                const hashes = hashReq.result;
-                const joined = hashes && hashes.revision === record.revision
-                    ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
-                    : {};
-                if (isLegacyRecord(record)) {
-                    done({
-                        record: {
-                            node: nodeFromJSON(record.json),
-                            ...joined,
-                            updatedAt: record.updatedAt,
-                            revision: record.revision
-                        },
-                        plans: null,
-                        chunkRevisions: null,
-                        chunkCount: null
-                    });
-                    return;
-                }
-                const manifest = record;
-                if (typeof manifest.chunkCount !== 'number' ||
-                    manifest.chunkCount <= 0 ||
-                    !Array.isArray(manifest.chunkRevisions) ||
-                    manifest.chunkRevisions.length !== manifest.chunkCount) {
-                    done('mismatch');
-                    return;
-                }
-                let assembled = ChildrenNode.EMPTY_NODE;
-                const plans = [];
-                let index = 0;
-                const readChunk = () => {
-                    const chunkReq = store.get(key + chunkKeySuffix(index));
-                    chunkReq.onsuccess = () => {
-                        const chunk = chunkReq.result;
+                done({
+                    stored,
+                    hashes: hashReq.result
+                });
+            };
+        });
+        return metadata
+            .then(meta => {
+            if (meta === null) {
+                return null;
+            }
+            const { stored, hashes } = meta;
+            const joined = hashes && hashes.revision === stored.revision
+                ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
+                : {};
+            if (isLegacyRecord(stored)) {
+                return {
+                    record: {
+                        node: nodeFromJSON(stored.json),
+                        ...joined,
+                        updatedAt: stored.updatedAt,
+                        revision: stored.revision
+                    },
+                    plans: null,
+                    chunkRevisions: null,
+                    chunkCount: null
+                };
+            }
+            const manifest = stored;
+            if (typeof manifest.chunkCount !== 'number' ||
+                manifest.chunkCount <= 0 ||
+                !Array.isArray(manifest.chunkRevisions) ||
+                manifest.chunkRevisions.length !== manifest.chunkCount) {
+                return 'mismatch';
+            }
+            let assembled = ChildrenNode.EMPTY_NODE;
+            const plans = [];
+            let chain = Promise.resolve(true);
+            for (let index = 0; index < manifest.chunkCount; index++) {
+                chain = chain.then(status => {
+                    if (status === 'mismatch') {
+                        return status;
+                    }
+                    return this.withStore_('readonly', null, (store, done) => {
+                        const req = store.get(key + chunkKeySuffix(index));
+                        req.onsuccess = () => done(req.result ?? null);
+                    }).then(chunk => {
                         if (!chunk ||
                             chunk.revision !== manifest.chunkRevisions[index] ||
                             !Array.isArray(chunk.entries)) {
-                            done('mismatch');
-                            return;
+                            return 'mismatch';
                         }
                         const plan = [];
                         for (const [relPath, json] of chunk.entries) {
@@ -4762,28 +4790,25 @@ class PersistenceManager {
                             plan.push({ relPath, node });
                         }
                         plans.push(plan);
-                        index++;
-                        if (index < manifest.chunkCount) {
-                            readChunk();
-                        }
-                        else {
-                            done({
-                                record: {
-                                    node: assembled,
-                                    ...joined,
-                                    updatedAt: manifest.updatedAt,
-                                    revision: manifest.revision
-                                },
-                                plans,
-                                chunkRevisions: manifest.chunkRevisions,
-                                chunkCount: manifest.chunkCount
-                            });
-                        }
-                    };
-                };
-                readChunk();
-            };
-        }).then(result => {
+                        return true;
+                    });
+                });
+            }
+            return chain.then(status => status === 'mismatch'
+                ? status
+                : {
+                    record: {
+                        node: assembled,
+                        ...joined,
+                        updatedAt: manifest.updatedAt,
+                        revision: manifest.revision
+                    },
+                    plans,
+                    chunkRevisions: manifest.chunkRevisions,
+                    chunkCount: manifest.chunkCount
+                });
+        })
+            .then(result => {
             if (result === null) {
                 return null;
             }
@@ -5139,36 +5164,49 @@ class PersistenceManager {
             chunkRevisions
         };
         const prevChunkCount = prev !== undefined ? prev.chunkCount : null;
-        const put = this.withStore_('readwrite', false, (store, done) => {
-            for (const i of dirtyIndexes) {
+        // One transaction PER dirty chunk. WebKit may retain every put's
+        // structured-clone input until its transaction closes; one transaction
+        // for all chunks therefore retained a root-sized exported JSON graph and
+        // defeated chunking. The manifest is committed last in a tiny transaction
+        // and is the authoritative join, so a crash between chunks is a safe miss.
+        let put = Promise.resolve(true);
+        for (const i of dirtyIndexes) {
+            put = put.then(ok => {
+                if (!ok) {
+                    return false;
+                }
                 const chunk = {
                     revision,
                     entries: plans[i].map(e => [e.relPath, e.node.val(true)])
                 };
-                store.put(chunk, key + chunkKeySuffix(i));
+                return this.withStore_('readwrite', false, (store, done) => {
+                    store.put(chunk, key + chunkKeySuffix(i));
+                    done(true);
+                });
+            });
+        }
+        put = put.then(ok => {
+            if (!ok) {
+                return false;
             }
-            store.put(manifest, key);
-            if (prevChunkCount !== null) {
-                for (let i = plans.length; i < prevChunkCount; i++) {
-                    store.delete(key + chunkKeySuffix(i));
+            return this.withStore_('readwrite', false, (store, done) => {
+                store.put(manifest, key);
+                if (prevChunkCount !== null) {
+                    for (let i = plans.length; i < prevChunkCount; i++) {
+                        store.delete(key + chunkKeySuffix(i));
+                    }
                 }
-            }
-            else if (typeof IDBKeyRange !== 'undefined') {
-                try {
-                    // First write over unknown prior state: drop any chunk tail an
-                    // earlier session may have left beyond the new count. (Without
-                    // key ranges the sweep reclaims such orphans instead.)
-                    store.delete(IDBKeyRange.bound(key + chunkKeySuffix(plans.length), key + CHUNK_KEY_INFIX + '\uffff'));
+                else if (typeof IDBKeyRange !== 'undefined') {
+                    try {
+                        store.delete(IDBKeyRange.bound(key + chunkKeySuffix(plans.length), key + CHUNK_KEY_INFIX + '\uffff'));
+                    }
+                    catch (e) {
+                        // Key-range deletes are an optimization, never a requirement.
+                    }
                 }
-                catch (e) {
-                    // Key-range deletes are an optimization, never a requirement.
-                }
-            }
-            // Atomically invalidate the previous hash sidecar: between this write
-            // and the recompute below, the stored state is "data, hashless" — never
-            // "new data, old hash".
-            store.delete(key + HASH_KEY_SUFFIX);
-            done(true);
+                store.delete(key + HASH_KEY_SUFFIX);
+                done(true);
+            });
         });
         return put.then(ok => {
             if (!ok || this.disposed_) {
@@ -5182,10 +5220,13 @@ class PersistenceManager {
                 chunkCount: plans.length,
                 storedUpdatedAt: now
             });
-            return Promise.all([
-                hashFromNodeAsync(node),
-                compoundHashFromNodeAsync(node)
-            ]).then(([hash, compoundHash]) => {
+            // A compound hash is sufficient for zero-download revalidation:
+            // send an empty simple hash and let the server compare ranges. Avoiding
+            // node.hash() is crucial on large roots — it permanently cached one SHA
+            // string on every node, a large retained-memory jump absent on a normal
+            // cold load.
+            return compoundHashFromNodeAsync(node).then(compoundHash => {
+                const hash = '';
                 if (this.disposed_) {
                     return;
                 }
@@ -11862,7 +11903,7 @@ function syncTreeCreateListenerForView_(syncTree, view) {
     const tag = syncTreeTagForQuery(syncTree, query);
     const hashFn = () => {
         const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-        return cache.hash();
+        return getNodeCanonicalHash(cache) ?? cache.hash();
     };
     // The compound hash rides as a property on hashFn so it threads through
     // the existing listen-provider chain untouched. Only a seeded node carries

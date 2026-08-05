@@ -101,6 +101,14 @@ export declare function buildSeedNode(seed: ServerCacheSeed): Node;
 export declare function stampSeedHashes(node: Node, hash?: string, compoundHash?: SeedCompoundHash): Node;
 export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined;
 /**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+export declare function getNodeCanonicalHash(node: Node): string | undefined;
+/**
  * The canonical listen hash of a JSON value — exactly what an unseeded
  * client would send for this tree. Exposed so apps can precompute seeds'
  * hashes off the main thread with the SDK's own canonicalization.
