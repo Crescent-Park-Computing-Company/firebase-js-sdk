@@ -4341,7 +4341,9 @@ class PersistenceManager {
             return Promise.resolve(null);
         }
         return this.readRecord_(pathString).then(result => {
-            if (result === null || this.disposed_) {
+            if (result === null ||
+                this.disposed_ ||
+                !this.trackedRoots_.has(pathString)) {
                 return null;
             }
             this.lastFlush_.set(pathString, {
@@ -13358,6 +13360,13 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
                 pendingToken = null;
                 sendListen(currentHashFn, null);
             }
+            return;
+        }
+        if (metadata && metadata.revision !== record.revision) {
+            // Another tab committed a different manifest between the metadata
+            // read and the shared chunk decode. Never certify revision A's tree
+            // with revision B's hashes.
+            restartCurrentListen();
             return;
         }
         const alreadyCertified = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
