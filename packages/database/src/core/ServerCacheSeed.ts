@@ -116,23 +116,34 @@ export class ServerCacheSeedStore {
 }
 
 /**
- * Builds the node for a seed, stamping the precomputed canonical hash into
- * the node's lazy-hash slot (so hash() returns it without an O(tree) walk)
- * and attaching the precomputed compound hash for the listen to send.
+ * Builds the node for a seed, stamping the precomputed hashes (see
+ * stampSeedHashes).
+ */
+export function buildSeedNode(seed: ServerCacheSeed): Node {
+  return stampSeedHashes(nodeFromJSON(seed.json), seed.hash, seed.compoundHash);
+}
+
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
  *
- * An empty tree is returned unstamped: nodeFromJSON maps it to the shared
+ * An empty tree is returned unstamped: an empty node is the shared
  * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
  * empty node in the app.
  */
-export function buildSeedNode(seed: ServerCacheSeed): Node {
-  const node = nodeFromJSON(seed.json);
+export function stampSeedHashes(
+  node: Node,
+  hash?: string,
+  compoundHash?: SeedCompoundHash
+): Node {
   if (node.isEmpty()) {
     return node;
   }
-  if (typeof seed.hash === 'string' && seed.hash.length > 0) {
-    node.stampLazyHash(seed.hash);
+  if (typeof hash === 'string' && hash.length > 0) {
+    node.stampLazyHash(hash);
   }
-  const compoundHash = seed.compoundHash;
   if (
     compoundHash &&
     Array.isArray(compoundHash.hashes) &&

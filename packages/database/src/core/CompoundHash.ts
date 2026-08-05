@@ -313,9 +313,19 @@ function leafHashRepresentation(node: LeafNode): string {
 }
 
 /**
+ * Sizes computed for interior (children) nodes, keyed by node identity.
+ * Nodes are immutable and structurally shared across server updates, so a
+ * subtree's estimate stays valid for as long as the subtree object lives —
+ * repeated estimations of a large mostly-unchanged tree (the persistence
+ * write path re-plans its chunks on every flush) only walk the changed
+ * spine. Leaves are cheap to size and are not cached.
+ */
+const serializedSizeCache = new WeakMap<Node, number>();
+
+/**
  * Estimates the serialized size of a node in bytes — a cheap approximation
- * that only drives the default split threshold, never a wire value (port of
- * Android NodeSizeEstimator).
+ * that only drives the default split threshold and the persistence chunk
+ * planner, never a wire value (port of Android NodeSizeEstimator).
  */
 export function estimateSerializedNodeSize(node: Node): number {
   if (node.isEmpty()) {
@@ -337,6 +347,10 @@ export function estimateSerializedNodeSize(node: Node): number {
     // Account for the extra overhead of the ".value" and ".priority" keys.
     return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
   } else {
+    const cached = serializedSizeCache.get(node);
+    if (cached !== undefined) {
+      return cached;
+    }
     let sum = 1; // opening brace
     node.forEachChild(KEY_INDEX, (key, child) => {
       // key, quotes, colon, comma
@@ -345,6 +359,7 @@ export function estimateSerializedNodeSize(node: Node): number {
     if (!node.getPriority().isEmpty()) {
       sum += 12 + estimateSerializedNodeSize(node.getPriority());
     }
+    serializedSizeCache.set(node, sum);
     return sum;
   }
 }

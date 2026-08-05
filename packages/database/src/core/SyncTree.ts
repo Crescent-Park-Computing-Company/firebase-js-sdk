@@ -59,6 +59,7 @@ import {
   newRelativePath,
   Path,
   pathGetFront,
+  pathGetLength,
   pathIsEmpty
 } from './util/Path';
 import { each, errorForServerCode } from './util/util';
@@ -355,6 +356,57 @@ export function syncTreeGetCompleteServerCache(
   // and persisting uncertified data would surface it as server truth on the
   // next boot.
   return viewGetCompleteServerCache(view, newEmptyPath());
+}
+
+/**
+ * The server-cache state of every view at or below `path`, except the
+ * complete default view at `path` itself (the caller's own). Used by the
+ * persistence restore path to decide what a stored tree may be applied
+ * over: a view with a COMPLETE server cache contributes its certified tree
+ * (to graft over the restored bytes); a view holding server data it cannot
+ * certify as complete — a filtered query, a partially filled cache — is
+ * reported as partial, because grafting it is impossible and overwriting it
+ * would replace live server data with stale bytes.
+ *
+ * Ordered shallowest-first, so grafting in order lets deeper (more
+ * specific) trees win where they nest.
+ */
+export function syncTreeGetDescendantServerCacheStates(
+  syncTree: SyncTree,
+  path: Path
+): Array<{ path: Path; complete: Node | null; hasPartialData: boolean }> {
+  const states: Array<{
+    path: Path;
+    complete: Node | null;
+    hasPartialData: boolean;
+  }> = [];
+  syncTree.syncPointTree_.subtree(path).foreach((relativePath, syncPoint) => {
+    for (const view of syncPoint.views.values()) {
+      if (
+        pathIsEmpty(relativePath) &&
+        view.query._queryParams.loadsAllData()
+      ) {
+        // The default view at `path` is the one being restored into; the
+        // caller checks its state separately.
+        continue;
+      }
+      const complete = viewGetCompleteServerCache(view, newEmptyPath());
+      if (complete !== null) {
+        states.push({ path: relativePath, complete, hasPartialData: false });
+      } else {
+        const raw = viewGetServerCache(view);
+        if (raw !== null && !raw.isEmpty()) {
+          states.push({
+            path: relativePath,
+            complete: null,
+            hasPartialData: true
+          });
+        }
+      }
+    }
+  });
+  states.sort((a, b) => pathGetLength(a.path) - pathGetLength(b.path));
+  return states;
 }
 
 /**

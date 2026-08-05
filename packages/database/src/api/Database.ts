@@ -45,12 +45,12 @@ import {
   Repo,
   repoInterrupt,
   repoResume,
+  repoSettleListenCompletions,
   repoStart,
   repoWhenListenComplete
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { SeedCompoundHash } from '../core/ServerCacheSeed';
-import { nodeFromJSON } from '../core/snap/nodeFromJSON';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import {
   newEmptyPath,
@@ -64,7 +64,10 @@ import {
   log,
   enableLogging as enableLoggingImpl
 } from '../core/util/util';
-import { validateUrl } from '../core/util/validation';
+import {
+  validateRootPathString,
+  validateUrl
+} from '../core/util/validation';
 import { BrowserPollConnection } from '../realtime/BrowserPollConnection';
 import { TransportManager } from '../realtime/TransportManager';
 import { WebSocketConnection } from '../realtime/WebSocketConnection';
@@ -201,6 +204,11 @@ function repoManagerDeleteRepo(repo: Repo, appName: string): void {
     fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
   }
   repoInterrupt(repo);
+  // The repo's listens can never respond after this: settle any
+  // whenListenComplete waiters (they would otherwise hang forever and
+  // retain the repo), and stop the persistence timers.
+  repoSettleListenCompletions(repo);
+  repo.persistence_?.dispose();
   delete appRepos[repo.key];
 }
 
@@ -466,6 +474,7 @@ export function getPersistedValue(
 ): Promise<unknown | null> {
   db = getModularInstance(db);
   db._checkNotDeleted('getPersistedValue');
+  validateRootPathString('getPersistedValue', 'path', pathString, false);
   // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
   // and reading a stored record must not start the instance (which would
   // lock out later transport/emulator configuration).
@@ -475,18 +484,17 @@ export function getPersistedValue(
     return Promise.resolve(null);
   }
   // Records are stored per listened ROOT; a peek at a subpath restores the
-  // deepest stored ancestor (one IndexedDB read over the whole chain) and
-  // drills into its tree along the remaining segments. Going through the
-  // node model — not the raw stored JSON — matters: records hold EXPORT
-  // format (val(true)), and a raw walk would surface '.value'/'.priority'
-  // wrappers instead of the values snapshot.val() semantics promise.
+  // freshest stored ancestor (one IndexedDB read over the whole chain) and
+  // drills into its assembled tree along the remaining segments — restored
+  // records hold EXPORT format, and the node model is what maps it back to
+  // the values snapshot.val() semantics promise.
   const path = new Path(pathString);
   return persistence.restoreNearest(path.toString()).then(result => {
     if (result === null) {
       return null;
     }
     const relativePath = newRelativePath(new Path(result.root), path);
-    return nodeFromJSON(result.record.json).getChild(relativePath).val();
+    return result.record.node.getChild(relativePath).val();
   });
 }
 
@@ -503,19 +511,7 @@ export function getPersistedValue(
  *
  * @internal
  */
-export function setPersistenceEnabled(
-  db: Database,
-  enabled: boolean,
-  options?: {
-    /**
-     * Roots whose estimated serialized size exceeds this stay unpersisted:
-     * persisting costs a transient serialize/clone/parse of the whole root —
-     * multiples of its size in peak memory — which memory-constrained
-     * devices cannot afford for very large trees.
-     */
-    maxRootBytes?: number;
-  }
-): void {
+export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceEnabled');
   // _repoInternal, not the _repo getter: configuration must not start the
@@ -524,9 +520,7 @@ export function setPersistenceEnabled(
   if (enabled) {
     if (repo.persistence_ === null) {
       repo.persistence_ = new PersistenceManager(
-        repo.repoInfo_.toURLString(),
-        undefined,
-        options?.maxRootBytes ?? Infinity
+        repo.repoInfo_.toURLString()
       );
     }
   } else {
@@ -564,6 +558,7 @@ export function seedServerCache(
 ): void {
   db = getModularInstance(db);
   db._checkNotDeleted('seedServerCache');
+  validateRootPathString('seedServerCache', 'path', path, false);
   // _repoInternal: seeding is boot-time configuration and must not start
   // the instance.
   db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
@@ -595,6 +590,7 @@ export function whenListenComplete(
 ): Promise<void> {
   db = getModularInstance(db);
   db._checkNotDeleted('whenListenComplete');
+  validateRootPathString('whenListenComplete', 'path', pathString, false);
   return repoWhenListenComplete(
     db._repoInternal,
     new Path(pathString).toString()

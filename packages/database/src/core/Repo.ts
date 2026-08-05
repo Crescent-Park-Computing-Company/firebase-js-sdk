@@ -29,15 +29,18 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { hashFromNodeAsync } from './CompoundHash';
-import { PersistenceManager } from './Persistence';
+import {
+  PERSISTENCE_RESTORE_TIMEOUT_MS,
+  PersistenceManager
+} from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
 import {
-  buildSeedNode,
   ListenHashFn,
-  ServerCacheSeedStore
+  ServerCacheSeedStore,
+  stampSeedHashes
 } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
@@ -72,6 +75,7 @@ import {
   syncTreeApplyUserOverwrite,
   syncTreeCalcCompleteEventCache,
   syncTreeGetCompleteServerCache,
+  syncTreeGetDescendantServerCacheStates,
   syncTreeGetServerValue,
   syncTreeRemoveEventRegistration,
   syncTreeTagForQuery
@@ -536,9 +540,10 @@ export function repoStartServerListen(
     if (token.cancelled) {
       return;
     }
-    // If the server certified this path while the restore was in flight (an
-    // overlapping listen, a get()), the live data wins — applying the stored
-    // tree now would clobber fresher server state with stale bytes.
+    // If the server certified this exact path while the restore was in
+    // flight (an overlapping listen, a get()), the live data wins — applying
+    // the stored tree now would clobber fresher server state with stale
+    // bytes.
     const alreadyCertified =
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
       null;
@@ -546,23 +551,55 @@ export function repoStartServerListen(
       sendSeededListen();
       return;
     }
-    let node: Node | null = null;
-    try {
-      node = buildSeedNode(record);
-    } catch (e) {
-      // A malformed record must never break the listen.
+    // Fresh server data may also live BELOW the listen path — a get() at a
+    // child, an overlapping deeper listen, an active query. Certified
+    // descendant trees are grafted over the restored bytes so the seed never
+    // regresses them; a descendant view holding server data it cannot
+    // certify as complete (a filtered query) cannot be grafted, so the seed
+    // is skipped outright — a cold load for this root, never a regression.
+    let seeded = record.node;
+    let grafted = false;
+    for (const state of syncTreeGetDescendantServerCacheStates(
+      repo.serverSyncTree_,
+      query._path
+    )) {
+      if (state.complete !== null) {
+        seeded = seeded.updateChild(state.path, state.complete);
+        grafted = true;
+      } else {
+        sendSeededListen();
+        return;
+      }
     }
-    if (node === null || node.isEmpty()) {
+    if (seeded.isEmpty()) {
       sendSeededListen();
       return;
     }
-    const seeded = node;
-    const events = syncTreeApplyServerOverwrite(
-      repo.serverSyncTree_,
-      query._path,
-      seeded
-    );
-    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+    let applied = false;
+    try {
+      if (!grafted) {
+        // Grafting changed the tree, so the STORED hashes no longer
+        // describe it — stamping them would certify the wrong tree.
+        seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
+      }
+      const events = syncTreeApplyServerOverwrite(
+        repo.serverSyncTree_,
+        query._path,
+        seeded
+      );
+      applied = true;
+      eventQueueRaiseEventsForChangedPath(
+        repo.eventQueue_,
+        query._path,
+        events
+      );
+    } catch (e) {
+      // A malformed record or a failed apply must never break the listen:
+      // fall through and attach — user callbacks cannot land here (the
+      // event queue guards them), so the sync tree saw no partial apply
+      // events and the listen simply goes out against whatever state it
+      // holds.
+    }
     // The replay runs user callbacks synchronously — one may have
     // unsubscribed (stopListening saw a pending token and cancelled) or even
     // re-subscribed (a NEW token now owns the path). Only the uncancelled,
@@ -573,20 +610,38 @@ export function repoStartServerListen(
     ) {
       return;
     }
-    // A record persisted before its hash landed restores hashless. Priming
-    // the hash here — in idle slices, before the listen goes out — keeps the
-    // two invariants of the seeded path: the listen carries a real hash
-    // (zero download when the tree is unchanged), and hashFn never runs a
-    // synchronous O(tree) walk on the main thread at listen time.
-    if (typeof record.hash === 'string') {
+    if (applied && !grafted && typeof record.hash === 'string') {
       sendSeededListen();
       return;
     }
+    if (!applied) {
+      sendSeededListen();
+      return;
+    }
+    // A record persisted before its hash landed (or a grafted tree, whose
+    // stored hashes no longer apply) restores hashless. Priming the hash
+    // here — in idle slices, before the listen goes out — keeps the two
+    // invariants of the seeded path: the listen carries a real hash (zero
+    // download when the tree is unchanged), and hashFn never runs a
+    // synchronous O(tree) walk on the main thread at listen time. The prime
+    // is raced against the restore budget: a busy main thread starves idle
+    // slices, and restored-but-never-subscribed is worse than a hashless
+    // listen.
+    let proceeded = false;
     const proceed = () => {
-      if (!token.cancelled) {
+      if (proceeded) {
+        return;
+      }
+      proceeded = true;
+      clearTimeout(primeTimer);
+      if (
+        !token.cancelled &&
+        repo.pendingSeedRestores_.get(pathString) === token
+      ) {
         sendSeededListen();
       }
     };
+    const primeTimer = setTimeout(proceed, PERSISTENCE_RESTORE_TIMEOUT_MS);
     void hashFromNodeAsync(seeded).then(proceed, proceed);
   });
 }
@@ -645,6 +700,24 @@ export function repoWhenListenComplete(
   return new Promise(resolve => {
     completion.waiters.push(resolve);
   });
+}
+
+/**
+ * Settles every outstanding whenListenComplete waiter and clears the
+ * completion registry. Called when the repo is deleted (deleteApp): its
+ * listens can never respond again, and an unsettleable waiter would hang
+ * its caller and retain the Repo forever.
+ */
+export function repoSettleListenCompletions(repo: Repo): void {
+  for (const completion of repo.listenCompletions_.values()) {
+    completion.complete = true;
+    const waiters = completion.waiters;
+    completion.waiters = [];
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+  repo.listenCompletions_.clear();
 }
 
 /**
