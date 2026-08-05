@@ -478,6 +478,10 @@ export function getPersistedValue(
   if (persistence === null) {
     return Promise.resolve(null);
   }
+  // Prime the manager with the trusted expected identity so the later auth
+  // callback for that same user can reuse this physical decode. A different
+  // real auth uid changes scope and cancels it before any listener consumes it.
+  if (expectedAuthScope !== null) persistence.setAuthScope(expectedAuthScope);
   // Exact-root by design: callers peek the same path they are about to
   // listen to. This lets the authenticated listener consume the same decoded
   // Node and prevents a fresher ancestor record from being mistaken for the
