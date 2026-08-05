@@ -1925,6 +1925,7 @@ export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
+    private schemaKnownCurrent_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1966,7 +1967,7 @@ declare class PersistenceManager {
     private activeReads_;
     private sweepTimer_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but

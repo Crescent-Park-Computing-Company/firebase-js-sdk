@@ -4275,8 +4275,34 @@ const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 7;
-const PERSISTENCE_FORMAT_VERSION = 4;
+const PERSISTENCE_DB_VERSION = 8;
+const PERSISTENCE_FORMAT_VERSION = 5;
+const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
+function readSchemaMarker() {
+    if (typeof localStorage === 'undefined') {
+        // Node/tests and non-browser embeddings: let IndexedDB itself decide.
+        return true;
+    }
+    try {
+        return (localStorage.getItem(PERSISTENCE_SCHEMA_MARKER_KEY) ===
+            String(PERSISTENCE_DB_VERSION));
+    }
+    catch (e) {
+        // Storage-disabled browsers still get best-effort persistence.
+        return true;
+    }
+}
+function writeSchemaMarker() {
+    if (typeof localStorage === 'undefined') {
+        return;
+    }
+    try {
+        localStorage.setItem(PERSISTENCE_SCHEMA_MARKER_KEY, String(PERSISTENCE_DB_VERSION));
+    }
+    catch (e) {
+        // Best-effort optimization only.
+    }
+}
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -4414,9 +4440,10 @@ function samePlan(a, b) {
 class PersistenceManager {
     constructor(prefix_, idbFactory_ = isIndexedDBAvailable()
         ? indexedDB
-        : null) {
+        : null, schemaKnownCurrent_ = readSchemaMarker()) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
+        this.schemaKnownCurrent_ = schemaKnownCurrent_;
         this.db_ = null;
         /**
          * Roots that flow through persistence (complete default listens).
@@ -4458,6 +4485,12 @@ class PersistenceManager {
         this.activeReads_ = new Map();
         this.sweepTimer_ = null;
         this.disposed_ = false;
+        if (!this.schemaKnownCurrent_) {
+            // Do not put the cold server listen behind a potentially slow Safari
+            // version-change transaction. Migration runs in the background; restore
+            // APIs return a cache miss synchronously for this boot.
+            void this.open_();
+        }
     }
     /**
      * A replacement manager for a different key prefix — used when emulator
@@ -4557,6 +4590,10 @@ class PersistenceManager {
                 persistenceStats.storageFailures++;
                 db.close();
                 return null;
+            }
+            if (db !== null) {
+                this.schemaKnownCurrent_ = true;
+                writeSchemaMarker();
             }
             return db;
         });
@@ -5003,6 +5040,9 @@ class PersistenceManager {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
+        if (!this.schemaKnownCurrent_) {
+            return Promise.resolve(null);
+        }
         const key = this.key_(pathString);
         return this.withStore_('readonly', null, (store, done) => {
             const req = store.get(key);
@@ -5043,6 +5083,9 @@ class PersistenceManager {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
+        if (!this.schemaKnownCurrent_) {
+            return Promise.resolve(null);
+        }
         return this.readRecord_(pathString).then(result => {
             if (result === null ||
                 this.disposed_ ||
@@ -5063,6 +5106,9 @@ class PersistenceManager {
     }
     restore(pathString) {
         if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        if (!this.schemaKnownCurrent_) {
             return Promise.resolve(null);
         }
         return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
@@ -5099,6 +5145,9 @@ class PersistenceManager {
      */
     restoreNearest(pathString) {
         if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        if (!this.schemaKnownCurrent_) {
             return Promise.resolve(null);
         }
         const candidates = [];
