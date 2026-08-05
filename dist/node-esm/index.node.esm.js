@@ -4413,7 +4413,10 @@ class PersistenceManager {
         return this.withStore_('readonly', null, (store, done) => {
             const dataReq = store.get(this.key_(pathString));
             const hashReq = store.get(this.key_(pathString) + HASH_KEY_SUFFIX);
-            dataReq.onsuccess = () => {
+            // Same store, same transaction: requests complete in issue order, so
+            // when hashReq's success fires, dataReq.result is safe to read.
+            // (Reading a request's result before IT completes throws.)
+            hashReq.onsuccess = () => {
                 const record = dataReq.result;
                 if (!record) {
                     done(null);
