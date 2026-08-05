@@ -28,9 +28,8 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
-import { hashFromNodeAsync } from './CompoundHash';
+import { canonicalHashFromNodeAsync } from './CompoundHash';
 import {
-  PERSISTENCE_RESTORE_TIMEOUT_MS,
   PersistenceManager
 } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
@@ -177,6 +176,34 @@ interface Transaction {
 /**
  * A connection to a single data repository.
  */
+interface PendingSeedRestore {
+  cancelled: boolean;
+  listenSent: boolean;
+  buffering: boolean;
+  bufferedActions: Array<() => void>;
+}
+
+function repoPendingRestoreForPath(
+  repo: Repo,
+  pathString: string
+): PendingSeedRestore | null {
+  let bestPath: string | null = null;
+  let best: PendingSeedRestore | null = null;
+  for (const [root, pending] of repo.pendingSeedRestores_) {
+    if (
+      pathString === root ||
+      (pathString.length > root.length &&
+        pathString.startsWith(root === '/' ? root : root + '/'))
+    ) {
+      if (bestPath === null || root.length > bestPath.length) {
+        bestPath = root;
+        best = pending;
+      }
+    }
+  }
+  return best;
+}
+
 export class Repo {
   /** Key for uniquely identifying this repo, used in RepoManager */
   readonly key: string;
@@ -220,7 +247,7 @@ export class Repo {
    * stopListening flips the token so a listen whose last registration was
    * removed mid-restore is never sent (see repoStartServerListen).
    */
-  pendingSeedRestores_ = new Map<string, { cancelled: boolean }>();
+  pendingSeedRestores_ = new Map<string, PendingSeedRestore>();
 
   /**
    * Listen-complete state per default complete listen, keyed by path: whether
@@ -403,6 +430,14 @@ function repoOnDataUpdate(
   isMerge: boolean,
   tag: number | null
 ): void {
+  const pending =
+    tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
+  if (pending?.listenSent && pending.buffering) {
+    pending.bufferedActions.push(() =>
+      repoOnDataUpdate(repo, pathString, data, isMerge, tag)
+    );
+    return;
+  }
   // For testing.
   repo.dataUpdateCount++;
   const path = new Path(pathString);
@@ -474,176 +509,262 @@ export function repoStartServerListen(
   onComplete: (status: string, data?: unknown) => Event[]
 ): void {
   const pathString = query._path.toString();
-  // tag is null or undefined for a default listen depending on the caller;
-  // loose null covers both.
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
   if (isDefaultComplete) {
     const prior = repo.listenCompletions_.get(pathString);
     repo.listenCompletions_.set(pathString, {
       complete: false,
-      // Waiters registered before the listen attached carry over.
       waiters: prior ? prior.waiters : []
     });
   }
-  const sendListen = () => {
-    repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-      const events = onComplete(status, data);
-      eventQueueRaiseEventsForChangedPath(
-        repo.eventQueue_,
-        query._path,
-        events
-      );
-      if (isDefaultComplete) {
-        // A listen response — ok or not — certifies the local view against
-        // the server; a persisted 'ok' re-persists it, any other status
-        // evicts the stored copy (a cached tree must not outlive the access
-        // that produced it).
-        const completion = repo.listenCompletions_.get(pathString);
-        if (completion && !completion.complete) {
-          completion.complete = true;
-          const waiters = completion.waiters;
-          completion.waiters = [];
-          for (const waiter of waiters) {
-            waiter();
-          }
+
+  let pendingToken: PendingSeedRestore | null = null;
+  const processListenResponse = (status: string, data?: unknown) => {
+    const events = onComplete(status, data);
+    eventQueueRaiseEventsForChangedPath(
+      repo.eventQueue_,
+      query._path,
+      events
+    );
+    if (isDefaultComplete) {
+      const completion = repo.listenCompletions_.get(pathString);
+      if (completion && !completion.complete) {
+        completion.complete = true;
+        const waiters = completion.waiters;
+        completion.waiters = [];
+        for (const waiter of waiters) {
+          waiter();
         }
-        if (repo.persistence_ !== null) {
-          if (status === 'ok') {
-            repoPersistAfterServerUpdate(repo, query._path);
-          } else {
-            repo.persistence_.evict(query._path);
-          }
+      }
+      if (repo.persistence_ !== null) {
+        if (status === 'ok') {
+          repoPersistAfterServerUpdate(repo, query._path);
+        } else {
+          repo.persistence_.evict(query._path);
         }
+      }
+    }
+  };
+
+  const sendListen = (
+    hashFn: ListenHashFn,
+    owner: PendingSeedRestore | null = pendingToken
+  ) => {
+    if (owner) {
+      owner.listenSent = true;
+    }
+    repo.server_.listen(query, hashFn, tag, (status, data) => {
+      if (owner?.cancelled) {
+        return;
+      }
+      const apply = () => processListenResponse(status, data);
+      if (owner?.buffering && status !== 'ok') {
+        // Access was revoked/denied before the cached base finished loading.
+        // Process that immediately and prevent stale cached bytes from ever
+        // painting; this is not a latency fallback.
+        owner.cancelled = true;
+        owner.buffering = false;
+        owner.bufferedActions = [];
+        if (repo.pendingSeedRestores_.get(pathString) === owner) {
+          repo.pendingSeedRestores_.delete(pathString);
+        }
+        pendingToken = null;
+        apply();
+      } else if (owner?.buffering) {
+        owner.bufferedActions.push(apply);
+      } else {
+        apply();
       }
     });
   };
+
   const persistence = repo.persistence_;
   if (persistence === null || !isDefaultComplete) {
-    sendListen();
+    sendListen(currentHashFn, null);
     return;
   }
+
   persistence.track(pathString);
-  // stopListening can arrive while the restore is pending — before the
-  // outbound listen exists — in which case its unlisten() is a no-op. The
-  // token lets it cancel this listen instead of leaving it to attach as an
-  // orphaned server subscription with no view to ever stop it.
-  const token = { cancelled: false };
-  repo.pendingSeedRestores_.set(pathString, token);
-  // The token stays registered until the listen is actually sent: every
-  // deferred stage below re-checks it, so a stop arriving anywhere in the
-  // restore-or-hash window cancels cleanly instead of orphaning the listen.
-  const sendSeededListen = () => {
-    repo.pendingSeedRestores_.delete(pathString);
-    sendListen();
+  const token: PendingSeedRestore = {
+    cancelled: false,
+    listenSent: false,
+    buffering: true,
+    bufferedActions: []
   };
-  void persistence.restore(pathString).then(record => {
-    if (token.cancelled) {
+  pendingToken = token;
+  repo.pendingSeedRestores_.set(pathString, token);
+
+  const isCurrent = () =>
+    !token.cancelled &&
+    repo.pendingSeedRestores_.get(pathString) === token;
+
+  /**
+   * Restart against the current in-memory view ONLY when the persisted base
+   * failed validation (or became incompatible with fresher local server
+   * state). Slow cache progress and slow network responses never call this.
+   */
+  const restartCurrentListen = () => {
+    if (!isCurrent()) {
       return;
     }
-    // If the server certified this exact path while the restore was in
-    // flight (an overlapping listen, a get()), the live data wins — applying
-    // the stored tree now would clobber fresher server state with stale
-    // bytes.
-    const alreadyCertified =
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
-      null;
-    if (record === null || alreadyCertified) {
-      sendSeededListen();
+    const wasSent = token.listenSent;
+    token.cancelled = true;
+    token.buffering = false;
+    token.bufferedActions = [];
+    repo.pendingSeedRestores_.delete(pathString);
+    pendingToken = null;
+    if (wasSent) {
+      repo.server_.unlisten(query, tag);
+    }
+    sendListen(currentHashFn, null);
+  };
+
+  const finishBufferedListen = () => {
+    if (!isCurrent()) {
       return;
     }
-    // Fresh server data may also live BELOW the listen path — a get() at a
-    // child, an overlapping deeper listen, an active query. Certified
-    // descendant trees are grafted over the restored bytes so the seed never
-    // regresses them; a descendant view holding server data it cannot
-    // certify as complete (a filtered query) cannot be grafted, so the seed
-    // is skipped outright — a cold load for this root, never a regression.
-    let seeded = record.node;
-    let grafted = false;
-    for (const state of syncTreeGetDescendantServerCacheStates(
-      repo.serverSyncTree_,
-      query._path
-    )) {
-      if (state.complete !== null) {
-        seeded = seeded.updateChild(state.path, state.complete);
-        grafted = true;
-      } else {
-        sendSeededListen();
-        return;
-      }
+    token.buffering = false;
+    repo.pendingSeedRestores_.delete(pathString);
+    pendingToken = null;
+    const actions = token.bufferedActions;
+    token.bufferedActions = [];
+    for (const action of actions) {
+      action();
     }
-    if (seeded.isEmpty()) {
-      sendSeededListen();
+  };
+
+  // Two phases over the SAME physical cache read:
+  // 1) tiny precomputed hashes start the server comparison immediately;
+  // 2) chunks rebuild the cached base while server deltas buffer in arrival order.
+  const metadataPromise = persistence.restoreListenMetadata(pathString);
+  const recordPromise = persistence.restoreForListen(pathString);
+
+  void metadataPromise.then(metadata => {
+    if (!metadata || !isCurrent()) {
       return;
     }
-    let applied = false;
-    try {
-      if (!grafted) {
-        // Grafting changed the tree, so the STORED hashes no longer
-        // describe it — stamping them would certify the wrong tree.
-        seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
-      }
-      const events = syncTreeApplyServerOverwrite(
-        repo.serverSyncTree_,
-        query._path,
-        seeded
-      );
-      applied = true;
-      eventQueueRaiseEventsForChangedPath(
-        repo.eventQueue_,
-        query._path,
-        events
-      );
-    } catch (e) {
-      // A malformed record or a failed apply must never break the listen:
-      // fall through and attach — user callbacks cannot land here (the
-      // event queue guards them), so the sync tree saw no partial apply
-      // events and the listen simply goes out against whatever state it
-      // holds.
-    }
-    // The replay runs user callbacks synchronously — one may have
-    // unsubscribed (stopListening saw a pending token and cancelled) or even
-    // re-subscribed (a NEW token now owns the path). Only the uncancelled,
-    // still-current token may send.
-    if (
-      token.cancelled ||
-      repo.pendingSeedRestores_.get(pathString) !== token
-    ) {
-      return;
-    }
-    if (applied && !grafted && typeof record.hash === 'string') {
-      sendSeededListen();
-      return;
-    }
-    if (!applied) {
-      sendSeededListen();
-      return;
-    }
-    // A record persisted before its hash landed (or a grafted tree, whose
-    // stored hashes no longer apply) restores hashless. Priming the hash
-    // here — in idle slices, before the listen goes out — keeps the two
-    // invariants of the seeded path: the listen carries a real hash (zero
-    // download when the tree is unchanged), and hashFn never runs a
-    // synchronous O(tree) walk on the main thread at listen time. The prime
-    // is raced against the restore budget: a busy main thread starves idle
-    // slices, and restored-but-never-subscribed is worse than a hashless
-    // listen.
-    let proceeded = false;
-    const proceed = () => {
-      if (proceeded) {
-        return;
-      }
-      proceeded = true;
-      clearTimeout(primeTimer);
-      if (
-        !token.cancelled &&
-        repo.pendingSeedRestores_.get(pathString) === token
-      ) {
-        sendSeededListen();
-      }
-    };
-    const primeTimer = setTimeout(proceed, PERSISTENCE_RESTORE_TIMEOUT_MS);
-    void hashFromNodeAsync(seeded).then(proceed, proceed);
+    const storedHashFn = (() => metadata.hash) as ListenHashFn;
+    storedHashFn.compoundHash = () => metadata.compoundHash;
+    sendListen(storedHashFn, token);
   });
+
+  void Promise.all([metadataPromise, recordPromise]).then(
+    ([metadata, record]) => {
+      if (!isCurrent()) {
+        return;
+      }
+      // If hashes were already sent, null means the persisted base failed
+      // format/chunk/revision/storage validation. This is the ONLY path that
+      // restarts an in-flight seeded listen unseeded/current.
+      if (record === null) {
+        if (token.listenSent) {
+          restartCurrentListen();
+        } else {
+          token.buffering = false;
+          repo.pendingSeedRestores_.delete(pathString);
+          pendingToken = null;
+          sendListen(currentHashFn, null);
+        }
+        return;
+      }
+
+      const alreadyCertified =
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+        null;
+      if (alreadyCertified) {
+        // The persisted base lost the race to fresher server state; hashes
+        // computed for it are no longer valid for this view.
+        restartCurrentListen();
+        return;
+      }
+
+      let seeded = record.node;
+      let grafted = false;
+      for (const state of syncTreeGetDescendantServerCacheStates(
+        repo.serverSyncTree_,
+        query._path
+      )) {
+        if (state.complete !== null) {
+          seeded = seeded.updateChild(state.path, state.complete);
+          grafted = true;
+        } else {
+          // Partial live data cannot be safely grafted into the persisted
+          // base: this is a validation incompatibility, not a timeout.
+          restartCurrentListen();
+          return;
+        }
+      }
+      if (seeded.isEmpty()) {
+        restartCurrentListen();
+        return;
+      }
+
+      let applied = false;
+      try {
+        if (!grafted) {
+          seeded = stampSeedHashes(
+            seeded,
+            record.hash,
+            record.compoundHash
+          );
+        }
+        const events = syncTreeApplyServerOverwrite(
+          repo.serverSyncTree_,
+          query._path,
+          seeded
+        );
+        applied = true;
+        eventQueueRaiseEventsForChangedPath(
+          repo.eventQueue_,
+          query._path,
+          events
+        );
+      } catch (e) {
+        // Malformed persisted data / apply failure is cache validation failure.
+      }
+
+      if (!isCurrent()) {
+        return;
+      }
+      if (!applied || grafted) {
+        restartCurrentListen();
+        return;
+      }
+
+      if (token.listenSent && metadata !== null) {
+        finishBufferedListen();
+        return;
+      }
+
+      // A valid tree without persisted hash metadata is uncommon (shutdown
+      // between manifest and hash commit). No listen was sent yet; compute its
+      // hash without a timeout fallback, then attach normally.
+      if (typeof record.hash === 'string') {
+        token.buffering = false;
+        repo.pendingSeedRestores_.delete(pathString);
+        pendingToken = null;
+        sendListen(currentHashFn, null);
+        return;
+      }
+      void canonicalHashFromNodeAsync(seeded).then(
+        hash => {
+          if (!isCurrent()) {
+            return;
+          }
+          seeded.stampLazyHash(hash);
+          token.buffering = false;
+          repo.pendingSeedRestores_.delete(pathString);
+          pendingToken = null;
+          sendListen(currentHashFn, null);
+        },
+        restartCurrentListen
+      );
+    },
+    () => {
+      // IndexedDB/storage failure is a validation failure; latency is not.
+      restartCurrentListen();
+    }
+  );
 }
 
 /**
@@ -665,8 +786,12 @@ export function repoStopServerListen(
   const pending = repo.pendingSeedRestores_.get(pathString);
   if (pending) {
     pending.cancelled = true;
+    pending.buffering = false;
+    pending.bufferedActions = [];
     repo.pendingSeedRestores_.delete(pathString);
-    // The listen was never sent; nothing to unlisten.
+    if (pending.listenSent) {
+      repo.server_.unlisten(query, tag);
+    }
   } else {
     repo.server_.unlisten(query, tag);
   }
@@ -759,6 +884,14 @@ function repoOnRangeMergeUpdate(
   ranges: Array<{ s?: string; e?: string; m: unknown }>,
   tag: number | null
 ): void {
+  const pending =
+    tag == null ? repoPendingRestoreForPath(repo, pathString) : null;
+  if (pending?.listenSent && pending.buffering) {
+    pending.bufferedActions.push(() =>
+      repoOnRangeMergeUpdate(repo, pathString, ranges, tag)
+    );
+    return;
+  }
   // For testing.
   repo.dataUpdateCount++;
   const path = new Path(pathString);

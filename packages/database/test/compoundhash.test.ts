@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 
 import {
+  canonicalHashFromNodeAsync,
   CompoundHash,
   compoundHashFromNode,
   compoundHashFromNodeAsync,
@@ -211,6 +212,15 @@ describe('CompoundHash', () => {
       expect(asyncHash.hashes).to.deep.equal(syncHash.hashes);
       expect(asyncHash.posts).to.deep.equal(syncHash.posts);
     }
+  });
+
+  it('non-retaining canonical hash ignores lazy hash state', async () => {
+    const json = { a: 1, b: { c: 'x', '.priority': 2 } };
+    const node = nodeFromJSON(json);
+    node.stampLazyHash('deliberately-wrong');
+    expect(await canonicalHashFromNodeAsync(node, 1)).to.equal(
+      nodeFromJSON(json).hash()
+    );
   });
 
   it('async simple hash matches node.hash()', async () => {

@@ -18,6 +18,7 @@
 import { isIndexedDBAvailable } from '@firebase/util';
 
 import {
+  canonicalHashFromNodeAsync,
   compoundHashFromNodeAsync,
   estimateSerializedNodeSize
 } from './CompoundHash';
@@ -52,13 +53,12 @@ import { Path, pathParent } from './util/Path';
  * tab whose live tree already occupies hundreds of MB. Instead each root is
  * stored as:
  *
- *   - a small MANIFEST record (`<prefix>|<path>`): revision, updatedAt, and
- *     the per-chunk revision join keys — no tree data;
+ *   - a small MANIFEST record (`<prefix>|<path>`): revision, updatedAt,
+ *     per-chunk revision joins, and the precomputed root/compound protocol
+ *     hashes — no tree data;
  *   - CHUNK records (`<prefix>|<path>#c<index>`): disjoint subtrees of
  *     roughly PERSISTENCE_CHUNK_TARGET_BYTES each, as arrays of
- *     [relative path, exported JSON] entries (see planChunks);
- *   - a HASH record (`<prefix>|<path>#hash`): the tree's canonical listen
- *     hash and compound hash, recomputed after a write in idle-time slices.
+ *     [relative path, exported JSON] entries (see planChunks).
  *
  * Chunking bounds peak memory on both sides — a flush serializes and clones
  * one chunk at a time, a restore parses one chunk at a time into the shared
@@ -74,18 +74,18 @@ import { Path, pathParent } from './util/Path';
  * chunk carries the token of the write that produced it, and the manifest
  * lists the token expected of every chunk. A restore joins only when all
  * chunk tokens match the manifest (an interrupted or interleaved write
- * degrades to a miss, never to a stitched tree), and joins the hash record
- * only when ITS token matches too — a recompute pending at shutdown restores
- * WITHOUT hashes: the data still paints, the listen just goes out hashless,
- * exactly a cold load for that root.
+ * degrades to a miss, never to a stitched tree). Protocol hashes are attached
+ * back to that SAME manifest only while its revision still matches — a
+ * recompute pending at shutdown restores without hashes.
  *
  * Records written before chunking (a single record with the exported JSON
  * inline) still restore; their next write replaces them with the chunked
  * layout.
  *
  * Storage: one IndexedDB database ('firebase-database-persistence'), one
- * object store, keyed by `<repo prefix>|<path>` plus the '#'-suffixed
- * sidecars above ('#' cannot appear in a path segment). All storage failures
+ * object store, keyed by `<repo prefix>|<path>` plus its '#'-suffixed chunks
+ * ('#' cannot appear in a path segment). Pre-v3 hash sidecars are read/delete
+ * compatibility only. All storage failures
  * degrade to cold loads; nothing here may ever break the live connection.
  */
 
@@ -93,14 +93,8 @@ const STORE = 'firebase-server-cache';
 // Version 3 invalidates every cache written before per-chunk transactions.
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 5;
-const PERSISTENCE_FORMAT_VERSION = 2;
-// Not a possible Firebase node hash (real hashes are empty only for the empty
-// tree, otherwise base64 SHA-1). Forces a simple-hash miss so the server must
-// validate the supplied compound ranges, including when the server tree is
-// now empty.
-const COMPOUND_HASH_ONLY_SENTINEL = '!compound-hash-only';
-
+const PERSISTENCE_DB_VERSION = 7;
+const PERSISTENCE_FORMAT_VERSION = 4;
 /**
  * Records older than this are dropped (staleness makes a full download
  * likely anyway; bounded retention caps disk use).
@@ -135,7 +129,7 @@ export const PERSISTENCE_CHUNK_TARGET_BYTES = 1024 * 1024;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the chunks and hash record stay put) — so a tree that
+ * a fresh timestamp (the chunks and integrated hashes stay put) — so a tree that
  * never changes but is used daily never ages into the expiry cutoff.
  * @internal
  */
@@ -162,10 +156,20 @@ export interface PersistedRecord {
   revision: string;
 }
 
+/** Precomputed listen state readable without decoding the cached tree. */
+export interface PersistedListenMetadata {
+  hash: string;
+  compoundHash: SeedCompoundHash;
+  revision: string;
+}
+
 /** The manifest record stored at a root's main key. */
 interface PersistedManifest {
   formatVersion: number;
   revision: string;
+  /** Protocol hashes integrated with the cached root they describe. */
+  hash?: string;
+  compoundHash?: SeedCompoundHash;
   updatedAt: number;
   chunkCount: number;
   /**
@@ -365,7 +369,7 @@ export class PersistenceManager {
   /**
    * Distinguishes this manager's write tokens from every other tab's and
    * session's — numeric counters restart at zero on reload, which let a new
-   * data write pair up with a surviving old hash sidecar.
+   * data write pair up with a write token from another manager instance.
    */
   private instanceId_ = Math.random().toString(36).slice(2, 10);
   private writeCounter_ = 0;
@@ -378,6 +382,18 @@ export class PersistenceManager {
   private flushPending_ = new Set<string>();
   /** In-flight storage operations per root (see enqueue_). */
   private queues_ = new Map<string, Promise<void>>();
+  /**
+   * One physical IndexedDB decode per root. The pre-auth peek and the
+   * authenticated listener often overlap; without coalescing they each read
+   * every chunk and rebuilt the same large Node tree concurrently.
+   */
+  private activeReads_ = new Map<
+    string,
+    {
+      promise: Promise<ReadResult | null>;
+      progress: Set<() => void>;
+    }
+  >();
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
   private disposed_ = false;
 
@@ -520,7 +536,7 @@ export class PersistenceManager {
   /**
    * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
    * Expiry is decided by each root's manifest (or legacy record): the
-   * '#'-suffixed chunk and hash records carry no authority of their own and
+   * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
    * are dropped exactly when their manifest is dropped, is missing (orphans
    * from an interrupted write), or no longer lists them. Scoped to this
    * manager's key range and reading keys before values, where the platform
@@ -583,7 +599,7 @@ export class PersistenceManager {
         // cannot interleave between the read and the delete.
         const decisions = new Map<
           string,
-          { expired: boolean; chunkCount: number }
+          { expired: boolean; chunkCount: number; currentFormat: boolean }
         >();
         let index = 0;
         const settleSuffixed = () => {
@@ -591,6 +607,13 @@ export class PersistenceManager {
             const base = key.slice(0, key.indexOf('#', prefix.length));
             const decision = decisions.get(base);
             let drop = decision === undefined || decision.expired;
+            if (
+              !drop &&
+              decision?.currentFormat &&
+              key === base + HASH_KEY_SUFFIX
+            ) {
+              drop = true;
+            }
             if (!drop && key.startsWith(base + CHUNK_KEY_INFIX)) {
               const chunkIndex = parseInt(
                 key.slice(base.length + CHUNK_KEY_INFIX.length),
@@ -631,7 +654,11 @@ export class PersistenceManager {
               chunkCount:
                 record && typeof record.chunkCount === 'number'
                   ? record.chunkCount
-                  : 0
+                  : 0,
+              currentFormat:
+                typeof record?.chunkCount === 'number' &&
+                (record as { formatVersion?: number }).formatVersion ===
+                  PERSISTENCE_FORMAT_VERSION
             });
             if (expired) {
               persistenceStats.evictions++;
@@ -748,7 +775,7 @@ export class PersistenceManager {
 
   /**
    * Reads a root's stored state in one readonly transaction: the manifest
-   * and hash records first, then — for chunked records — each chunk in
+   * the manifest first, then — for chunked records — each chunk in
    * sequence, folded into the assembled tree as it arrives so only one
    * chunk's parsed JSON is ever held at a time. The hash record joins only
    * when its revision matches the manifest's; a chunk whose revision doesn't
@@ -760,6 +787,42 @@ export class PersistenceManager {
     pathString: string,
     onProgress: () => void = () => {}
   ): Promise<ReadResult | null> {
+    const active = this.activeReads_.get(pathString);
+    if (active) {
+      active.progress.add(onProgress);
+      // Joining an already-progressing read is itself progress for this
+      // caller's idle timeout.
+      onProgress();
+      return active.promise;
+    }
+    const progress = new Set<() => void>([onProgress]);
+    const emitProgress = () => {
+      for (const callback of progress) {
+        callback();
+      }
+    };
+    const promise = this.readRecordOnce_(pathString, emitProgress);
+    const entry = { promise, progress };
+    this.activeReads_.set(pathString, entry);
+    void promise.then(
+      () => {
+        if (this.activeReads_.get(pathString) === entry) {
+          this.activeReads_.delete(pathString);
+        }
+      },
+      () => {
+        if (this.activeReads_.get(pathString) === entry) {
+          this.activeReads_.delete(pathString);
+        }
+      }
+    );
+    return promise;
+  }
+
+  private readRecordOnce_(
+    pathString: string,
+    onProgress: () => void
+  ): Promise<ReadResult | null> {
     const key = this.key_(pathString);
     // Metadata first, in a short transaction. Each chunk then gets its OWN
     // transaction: WebKit may retain every IDBRequest result until the
@@ -770,8 +833,7 @@ export class PersistenceManager {
       hashes?: PersistedHashRecord;
     } | null>('readonly', null, (store, done) => {
       const dataReq = store.get(key);
-      const hashReq = store.get(key + HASH_KEY_SUFFIX);
-      hashReq.onsuccess = () => {
+      dataReq.onsuccess = () => {
         const stored = dataReq.result as
           | PersistedManifest
           | LegacyPersistedRecord
@@ -780,10 +842,18 @@ export class PersistenceManager {
           done(null);
           return;
         }
-        done({
-          stored,
-          hashes: hashReq.result as PersistedHashRecord | undefined
-        });
+        if (!isLegacyRecord(stored)) {
+          done({ stored });
+          return;
+        }
+        // Backward compatibility only: current-format manifests carry their
+        // protocol hashes natively and never touch this old sidecar key.
+        const hashReq = store.get(key + HASH_KEY_SUFFIX);
+        hashReq.onsuccess = () =>
+          done({
+            stored,
+            hashes: hashReq.result as PersistedHashRecord | undefined
+          });
       };
     });
     return metadata
@@ -793,9 +863,12 @@ export class PersistenceManager {
         }
         onProgress();
         const { stored, hashes } = meta;
-        const joined =
-          hashes && hashes.revision === stored.revision
+        const joined = isLegacyRecord(stored)
+          ? hashes && hashes.revision === stored.revision
             ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
+            : {}
+          : typeof stored.hash === 'string' && stored.compoundHash
+            ? { hash: stored.hash, compoundHash: stored.compoundHash }
             : {};
         if (isLegacyRecord(stored)) {
           return {
@@ -891,7 +964,7 @@ export class PersistenceManager {
   }
 
   /**
-   * Deletes everything stored for a root: manifest, hash record, and every
+   * Deletes everything stored for a root: manifest, legacy hash record, and every
    * chunk the manifest lists (plus, where the platform provides key ranges,
    * any orphaned chunk tail beyond it).
    */
@@ -935,6 +1008,82 @@ export class PersistenceManager {
    * this tree, so when the server certifies it unchanged (the common warm
    * boot), the follow-up write-through skips without serializing anything.
    */
+  /**
+   * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
+   * precomputed hash listen immediately while the shared chunk restore runs
+   * in parallel. A result is returned only when the manifest and its integrated protocol hashes
+   * are structurally valid and coupled to the same revision.
+   */
+  restoreListenMetadata(
+    pathString: string
+  ): Promise<PersistedListenMetadata | null> {
+    if (this.disposed_) {
+      return Promise.resolve(null);
+    }
+    const key = this.key_(pathString);
+    return this.withStore_<PersistedListenMetadata | null>(
+      'readonly',
+      null,
+      (store, done) => {
+        const req = store.get(key);
+        req.onsuccess = () => {
+          const manifest = req.result as PersistedManifest | undefined;
+          if (
+            !manifest ||
+            isLegacyRecord(manifest) ||
+            manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+            typeof manifest.chunkCount !== 'number' ||
+            manifest.chunkCount <= 0 ||
+            !Array.isArray(manifest.chunkRevisions) ||
+            manifest.chunkRevisions.length !== manifest.chunkCount ||
+            Date.now() - manifest.updatedAt > PERSISTENCE_MAX_AGE_MS ||
+            typeof manifest.hash !== 'string' ||
+            !manifest.compoundHash ||
+            !Array.isArray(manifest.compoundHash.hashes) ||
+            !Array.isArray(manifest.compoundHash.posts) ||
+            manifest.compoundHash.hashes.length !==
+              manifest.compoundHash.posts.length + 1
+          ) {
+            done(null);
+            return;
+          }
+          done({
+            hash: manifest.hash,
+            compoundHash: manifest.compoundHash,
+            revision: manifest.revision
+          });
+        };
+      }
+    );
+  }
+
+  /**
+   * Listener restore with no wall/idle fallback: once valid hash metadata has
+   * been sent, a slow local decode must keep progressing rather than restart
+   * the listen unseeded. Null means the persisted base failed validation or a
+   * storage operation failed, not merely that it was slow.
+   */
+  restoreForListen(pathString: string): Promise<PersistedRecord | null> {
+    if (this.disposed_) {
+      return Promise.resolve(null);
+    }
+    return this.readRecord_(pathString).then(result => {
+      if (result === null || this.disposed_) {
+        return null;
+      }
+      this.lastFlush_.set(pathString, {
+        rootNode: result.record.node,
+        revision: result.record.revision,
+        plans: result.plans,
+        chunkRevisions: result.chunkRevisions,
+        chunkCount: result.chunkCount,
+        storedUpdatedAt: result.record.updatedAt
+      });
+      persistenceStats.restoredRoots.push(pathString);
+      return result.record;
+    });
+  }
+
   restore(pathString: string): Promise<PersistedRecord | null> {
     if (this.disposed_) {
       return Promise.resolve(null);
@@ -979,57 +1128,58 @@ export class PersistenceManager {
     if (this.disposed_) {
       return Promise.resolve(null);
     }
-    // Deepest first: the path itself, then each ancestor up to the root.
     const candidates: string[] = [];
     let path: Path | null = new Path(pathString);
     while (path !== null) {
       candidates.push(path.toString());
       path = pathParent(path);
     }
-    const read = this.withStore_<Array<{ updatedAt: number } | undefined>>(
-      'readonly',
-      [],
-      (store, done) => {
-        const results: Array<{ updatedAt: number } | undefined> = new Array(
-          candidates.length
+    return this.raceRestoreTimeout_(onProgress =>
+      this.withStore_<Array<{ updatedAt: number } | undefined>>(
+        'readonly',
+        [],
+        (store, done) => {
+          const results: Array<{ updatedAt: number } | undefined> = new Array(
+            candidates.length
+          );
+          let remaining = candidates.length;
+          candidates.forEach((candidate, i) => {
+            const req = store.get(this.key_(candidate));
+            req.onsuccess = () => {
+              results[i] = req.result as { updatedAt: number } | undefined;
+              onProgress();
+              if (--remaining === 0) {
+                done(results);
+              }
+            };
+          });
+        }
+      ).then(results => {
+        const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+        let best: number | null = null;
+        for (let i = 0; i < results.length; i++) {
+          const record = results[i];
+          if (!record || typeof record.updatedAt !== 'number') {
+            continue;
+          }
+          if (record.updatedAt < cutoff) {
+            persistenceStats.evictions++;
+            void this.deleteRecord_(candidates[i]);
+            continue;
+          }
+          if (best === null || record.updatedAt > results[best]!.updatedAt) {
+            best = i;
+          }
+        }
+        if (best === null) {
+          return null;
+        }
+        const root = candidates[best];
+        return this.readRecord_(root, onProgress).then(result =>
+          result === null ? null : { root, record: result.record }
         );
-        let remaining = candidates.length;
-        candidates.forEach((candidate, i) => {
-          const req = store.get(this.key_(candidate));
-          req.onsuccess = () => {
-            results[i] = req.result as { updatedAt: number } | undefined;
-            if (--remaining === 0) {
-              done(results);
-            }
-          };
-        });
-      }
-    ).then(results => {
-      const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
-      let best: number | null = null;
-      for (let i = 0; i < results.length; i++) {
-        const record = results[i];
-        if (!record || typeof record.updatedAt !== 'number') {
-          continue;
-        }
-        if (record.updatedAt < cutoff) {
-          persistenceStats.evictions++;
-          void this.deleteRecord_(candidates[i]);
-          continue;
-        }
-        if (best === null || record.updatedAt > results[best]!.updatedAt) {
-          best = i;
-        }
-      }
-      if (best === null) {
-        return null;
-      }
-      const root = candidates[best];
-      return this.readRecord_(root).then(result =>
-        result === null ? null : { root, record: result.record }
-      );
-    });
-    return this.raceRestoreTimeout_(read);
+      })
+    );
   }
 
   /**
@@ -1157,6 +1307,7 @@ export class PersistenceManager {
       clearTimeout(this.sweepTimer_);
     }
     this.flushPending_.clear();
+    this.activeReads_.clear();
     this.latest_.clear();
     this.lastFlush_.clear();
   }
@@ -1176,7 +1327,7 @@ export class PersistenceManager {
 
   /**
    * Chains an operation onto the root's queue. One writer per root at a
-   * time: a flush's manifest, chunks, and hash record land as a couple
+   * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
    * before the next flush or delete for that root starts, which is the
    * whole storage consistency argument — no cross-operation races to
    * reason about.
@@ -1243,17 +1394,16 @@ export class PersistenceManager {
     ) {
       // Content-identical to the stored state; only the timestamp is stale.
       // Rewrite the manifest alone, KEEPING the previous revision so the
-      // stored hash record stays joined to it.
-      const manifest: PersistedManifest = {
-        formatVersion: PERSISTENCE_FORMAT_VERSION,
-        revision: prev.revision,
-        updatedAt: now,
-        chunkCount: plans.length,
-        chunkRevisions: prev.chunkRevisions!
-      };
+      // integrated protocol hashes stay joined to it.
       return this.withStore_<boolean>('readwrite', false, (store, done) => {
-        store.put(manifest, key);
-        done(true);
+        const req = store.get(key);
+        req.onsuccess = () => {
+          const current = req.result as PersistedManifest | undefined;
+          if (current && current.revision === prev.revision) {
+            store.put({ ...current, updatedAt: now }, key);
+            done(true);
+          }
+        };
       }).then(ok => {
         if (ok && !this.disposed_) {
           this.lastFlush_.set(pathString, {
@@ -1270,8 +1420,8 @@ export class PersistenceManager {
     // last as the authoritative join. A crash mid-sequence leaves the old
     // manifest or a revision mismatch — a safe restore miss, never a stitched
     // tree. Peak transient memory is one chunk's exported JSON plus its clone.
-    // The hash follows as a small sidecar, conditionally joined to this exact
-    // manifest revision.
+    // Protocol hashes are attached back onto this same manifest after the
+    // idle computation, never stored as a separate current-format sidecar.
     const manifest: PersistedManifest = {
       formatVersion: PERSISTENCE_FORMAT_VERSION,
       revision,
@@ -1339,36 +1489,37 @@ export class PersistenceManager {
         chunkCount: plans.length,
         storedUpdatedAt: now
       });
-      // A compound hash is sufficient for zero-download revalidation:
-      // send an impossible sentinel simple hash and let the server compare ranges. Avoiding
-      // node.hash() is crucial on large roots — it permanently cached one SHA
-      // string on every node, a large retained-memory jump absent on a normal
-      // cold load.
-      return compoundHashFromNodeAsync(node).then(compoundHash => {
-        const hash = COMPOUND_HASH_ONLY_SENTINEL;
+      // Compute protocol hashes once, when server data is persisted. The
+      // canonical traversal is non-retaining (it does not fill every child's
+      // lazyHash_); only this listened root is stamped and stored natively in
+      // its manifest for future tab loads.
+      return Promise.all([
+        canonicalHashFromNodeAsync(node),
+        compoundHashFromNodeAsync(node)
+      ]).then(([hash, compoundHash]) => {
+        node.stampLazyHash(hash);
         if (this.disposed_) {
           return;
         }
         persistenceStats.hashRecomputes++;
-        const hashRecord: PersistedHashRecord = {
-          hash,
-          compoundHash: {
-            hashes: compoundHash.hashes,
-            posts: compoundHash.posts
-          },
-          updatedAt: now,
-          revision
-        };
         return this.withStore_<void>('readwrite', undefined, store => {
           // Another tab may have replaced the manifest while we hashed;
-          // only attach the hash if the manifest still carries OUR token
-          // (the read and the put share one transaction, so this is
-          // atomic).
+          // attach protocol hashes only to the exact cached root revision.
           const dataReq = store.get(key);
           dataReq.onsuccess = () => {
-            const current = dataReq.result as { revision?: string } | undefined;
+            const current = dataReq.result as PersistedManifest | undefined;
             if (current && current.revision === revision) {
-              store.put(hashRecord, key + HASH_KEY_SUFFIX);
+              store.put(
+                {
+                  ...current,
+                  hash,
+                  compoundHash: {
+                    hashes: compoundHash.hashes,
+                    posts: compoundHash.posts
+                  }
+                },
+                key
+              );
             }
           };
         });

@@ -16,9 +16,14 @@
  */
 
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
+import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
 import { LeafNode } from './snap/LeafNode';
 import { Node } from './snap/Node';
-import { hashQuotedString, leafHashValueText } from './snap/snap';
+import {
+  hashQuotedString,
+  leafHashValueText,
+  priorityHashText
+} from './snap/snap';
 import { nameCompare, sha1 } from './util/util';
 
 /**
@@ -402,6 +407,105 @@ export function compoundHashFromNodeAsync(
         }
         builder.finishHashing();
         resolve(new CompoundHash(builder.posts, builder.hashes));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    step();
+  });
+}
+
+/**
+ * Computes the canonical Node hash without populating every subtree's
+ * lazyHash_. Only frames on the current depth-first path are retained; each
+ * child hash is folded into its parent and released. Persistence uses this at
+ * write time, stores the resulting root hash in the manifest, and stamps only
+ * the restored root on the next boot.
+ */
+export function canonicalHashFromNodeAsync(
+  node: Node,
+  sliceMs = 12
+): Promise<string> {
+  if (node.isEmpty()) {
+    return Promise.resolve('');
+  }
+  interface CanonicalFrame {
+    node: Node;
+    key: string | null;
+    children: Array<[string, Node]> | null;
+    nextChild: number;
+    toHash: string;
+  }
+  const stack: CanonicalFrame[] = [
+    { node, key: null, children: null, nextChild: 0, toHash: '' }
+  ];
+  return new Promise((resolve, reject) => {
+    const completeFrame = (hash: string) => {
+      const finished = stack.pop();
+      if (!finished) {
+        resolve(hash);
+        return;
+      }
+      const parent = stack[stack.length - 1];
+      if (!parent) {
+        resolve(hash);
+      } else if (hash !== '' && finished.key !== null) {
+        parent.toHash += ':' + finished.key + ':' + hash;
+      }
+    };
+    const step = (): void => {
+      try {
+        const deadline = Date.now() + sliceMs;
+        while (stack.length > 0) {
+          const frame = stack[stack.length - 1];
+          if (frame.node.isLeafNode()) {
+            const leaf = frame.node as LeafNode;
+            let text = '';
+            const priority = leaf.getPriority();
+            if (!priority.isEmpty()) {
+              text +=
+                'priority:' +
+                priorityHashText(priority.val() as string | number) +
+                ':';
+            }
+            text += leafHashValueText(
+              leaf.val() as string | number | boolean,
+              false
+            );
+            completeFrame(sha1(text));
+          } else {
+            if (frame.children === null) {
+              const priority = frame.node.getPriority();
+              if (!priority.isEmpty()) {
+                frame.toHash =
+                  'priority:' +
+                  priorityHashText(priority.val() as string | number) +
+                  ':';
+              }
+              const children: Array<[string, Node]> = [];
+              frame.children = children;
+              frame.node.forEachChild(PRIORITY_INDEX, (key, child) => {
+                children.push([key, child]);
+              });
+            }
+            if (frame.nextChild < frame.children.length) {
+              const [key, child] = frame.children[frame.nextChild++];
+              stack.push({
+                node: child,
+                key,
+                children: null,
+                nextChild: 0,
+                toHash: ''
+              });
+            } else {
+              completeFrame(frame.toHash === '' ? '' : sha1(frame.toHash));
+            }
+          }
+          if (stack.length > 0 && Date.now() >= deadline) {
+            scheduleSlice(step);
+            return;
+          }
+        }
       } catch (e) {
         reject(e);
       }

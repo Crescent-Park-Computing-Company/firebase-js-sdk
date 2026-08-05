@@ -33,7 +33,8 @@ import {
 } from '../src/core/Repo';
 import {
   computeCanonicalHash,
-  computeCompoundHash
+  computeCompoundHash,
+  ListenHashFn
 } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import {
@@ -60,6 +61,7 @@ function makeFakeIndexedDB(
   options: {
     startWithoutStore?: boolean;
     dbVersion?: number;
+    onGet?: (key: string) => void;
     onPut?: (key: string, value: unknown) => void;
   } = {}
 ): {
@@ -71,7 +73,7 @@ function makeFakeIndexedDB(
   // stores exist only once created in a version-change transaction, and a
   // versioned open above the current version fires onupgradeneeded.
   const state = {
-    version: options.dbVersion ?? 5,
+    version: options.dbVersion ?? 7,
     hasStore: !options.startWithoutStore
   };
   const async = (fn: () => void) => {
@@ -104,7 +106,10 @@ function makeFakeIndexedDB(
     return req;
   };
   const store = {
-    get: (key: string) => makeRequest(data.get(key)),
+    get: (key: string) => {
+      options.onGet?.(key);
+      return makeRequest(data.get(key));
+    },
     put: (value: unknown, key: string) => {
       data.set(key, value);
       if (options.onPut) {
@@ -266,7 +271,7 @@ describe('PersistenceManager', () => {
     )) as PersistedRecord;
     expect(restored).to.not.equal(null);
     expect(restored.node.val(true)).to.deep.equal(json);
-    expect(restored.hash).to.equal('!compound-hash-only');
+    expect(restored.hash).to.equal(computeCanonicalHash(json));
     expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
   });
 
@@ -296,7 +301,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
-    expect(restored.hash).to.equal('!compound-hash-only');
+    expect(restored.hash).to.equal(computeCanonicalHash(json));
   });
 
   it('rewrites only the chunks an update dirtied', async () => {
@@ -341,7 +346,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(v2.val(true));
-    expect(restored.hash).to.equal('!compound-hash-only');
+    expect(restored.hash).to.equal(computeCanonicalHash(v2.val(true)));
   });
 
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
@@ -375,13 +380,52 @@ describe('PersistenceManager', () => {
     );
   });
 
+  it('coalesces an optimistic peek and listener restore onto one decode', async () => {
+    const seeded = makeFakeIndexedDB();
+    const path = new Path('coalesced/root');
+    const writer = new PersistenceManager('test-repo', seeded.factory);
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: { c: 2 } }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    let chunkGets = 0;
+    let hashSidecarGets = 0;
+    const readerFactory = makeFakeIndexedDB({
+      onGet: key => {
+        if (key.startsWith('test-repo|/coalesced/root#c')) {
+          chunkGets++;
+        }
+        if (key === 'test-repo|/coalesced/root#hash') {
+          hashSidecarGets++;
+        }
+      }
+    });
+    for (const [key, value] of seeded.data) {
+      readerFactory.data.set(key, value);
+    }
+    const reader = new PersistenceManager('test-repo', readerFactory.factory);
+
+    const peek = reader.restoreNearest(path.toString());
+    const listen = reader.restore(path.toString());
+    const [peeked, restored] = await Promise.all([peek, listen]);
+
+    expect(peeked).to.not.equal(null);
+    expect(restored).to.not.equal(null);
+    expect(peeked!.record.node).to.equal(restored!.node);
+    expect(chunkGets).to.equal(1);
+    expect(hashSidecarGets).to.equal(0);
+  });
+
   it('an unchanged tree with an aging manifest refreshes the manifest alone', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 2,
+      formatVersion: 4,
       revision: 'ext-1',
+      hash: computeCanonicalHash(json),
+      compoundHash: computeCompoundHash(json),
       updatedAt: oldUpdatedAt,
       chunkCount: 1,
       chunkRevisions: ['ext-1']
@@ -390,29 +434,21 @@ describe('PersistenceManager', () => {
       revision: 'ext-1',
       entries: [['', json]]
     });
-    data.set('test-repo|/aging/root#hash', {
-      hash: computeCanonicalHash(json),
-      compoundHash: computeCompoundHash(json),
-      updatedAt: oldUpdatedAt,
-      revision: 'ext-1'
-    });
 
     const manager = new PersistenceManager('test-repo', factory);
     const restored = (await manager.restore(
       new Path('aging/root').toString()
     )) as PersistedRecord;
     const chunkBefore = data.get('test-repo|/aging/root#c000000');
-    const hashBefore = data.get('test-repo|/aging/root#hash');
 
     manager.track(new Path('aging/root').toString());
     manager.serverCacheUpdated(new Path('aging/root'), restored.node);
     await manager.flushNow(new Path('aging/root').toString());
     await flushAsync();
 
-    // Chunks and hash untouched — and still joined, because the refreshed
-    // manifest kept its revision.
+    // Chunk and integrated protocol hashes stay joined while only the
+    // manifest timestamp refreshes.
     expect(data.get('test-repo|/aging/root#c000000')).to.equal(chunkBefore);
-    expect(data.get('test-repo|/aging/root#hash')).to.equal(hashBefore);
     const manifest = data.get('test-repo|/aging/root') as {
       revision: string;
       updatedAt: number;
@@ -526,7 +562,7 @@ describe('PersistenceManager', () => {
     // Manifest expects two chunks of revision ext-2, but chunk 1 still
     // carries an older write's token (interrupted mid-write).
     data.set('test-repo|/torn/root', {
-      formatVersion: 2,
+      formatVersion: 4,
       revision: 'ext-2',
       updatedAt: Date.now(),
       chunkCount: 2,
@@ -575,14 +611,14 @@ describe('PersistenceManager', () => {
     // bled into it.
     const mid = (await manager.restore(path.toString())) as PersistedRecord;
     expect(mid.node.val(true)).to.deep.equal({ v: 1 });
-    expect(mid.hash).to.equal('!compound-hash-only');
+    expect(mid.hash).to.equal(computeCanonicalHash({ v: 1 }));
 
     // And flush #2 (still throttled) then writes the v2 pair.
     await manager.flushNow(path.toString());
     await flushAsync();
     const final = (await manager.restore(path.toString())) as PersistedRecord;
     expect(final.node.val(true)).to.deep.equal({ v: 2 });
-    expect(final.hash).to.equal('!compound-hash-only');
+    expect(final.hash).to.equal(computeCanonicalHash({ v: 2 }));
   });
 
   it('a surviving hash sidecar from another session never pairs with new data', async () => {
@@ -612,7 +648,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ fresh: true });
-    expect(restored.hash).to.equal('!compound-hash-only');
+    expect(restored.hash).to.equal(computeCanonicalHash({ fresh: true }));
   });
 
   it('a burst within the throttle window flushes the newest tree', async () => {
@@ -630,7 +666,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ n: 2 });
-    expect(restored.hash).to.equal('!compound-hash-only');
+    expect(restored.hash).to.equal(computeCanonicalHash({ n: 2 }));
   });
 
   it('a throttle firing into a busy queue coalesces to one trailing flush', async () => {
@@ -824,7 +860,7 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 2,
+      formatVersion: 4,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
@@ -840,13 +876,13 @@ describe('PersistenceManager', () => {
       updatedAt: expired,
       revision: 'ext-1'
     });
-    // A fresh chunked root: everything stays — including the hash record,
-    // whose expiry FOLLOWS THE MANIFEST (it carries no authority of its
-    // own), and even when its own updatedAt is ancient (a refreshed
-    // manifest keeps its couple alive).
+    // A fresh chunked root stays, with protocol hashes integrated into its
+    // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 2,
+      formatVersion: 4,
       revision: 'ext-2',
+      hash: 'h',
+      compoundHash: { hashes: [''], posts: [] },
       updatedAt: Date.now(),
       chunkCount: 1,
       chunkRevisions: ['ext-2']
@@ -855,10 +891,12 @@ describe('PersistenceManager', () => {
       revision: 'ext-2',
       entries: [['', { fresh: true }]]
     });
+    // Current manifests own their protocol hashes; a surviving legacy
+    // sidecar under the same base is an orphan and must be swept.
     data.set('test-repo|/fresh/root#hash', {
-      hash: 'h',
+      hash: 'legacy',
       compoundHash: { hashes: [''], posts: [] },
-      updatedAt: expired,
+      updatedAt: Date.now(),
       revision: 'ext-2'
     });
     // Orphans under the fresh root: a chunk beyond the manifest's count and
@@ -891,8 +929,7 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/old/root').length).to.equal(0);
     expect(keysFor(data, 'test-repo|/fresh/root')).to.deep.equal([
       'test-repo|/fresh/root',
-      'test-repo|/fresh/root#c000000',
-      'test-repo|/fresh/root#hash'
+      'test-repo|/fresh/root#c000000'
     ]);
     expect(data.has('test-repo|/vanished/root#c000000')).to.equal(false);
     expect(data.has('test-repo|/legacy/root')).to.equal(true);
@@ -909,6 +946,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const { factory, data } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
     const calls: string[] = [];
+    const hashFns: ListenHashFn[] = [];
     const serverCallbacks: Array<(status: string) => void> = [];
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
@@ -925,11 +963,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       server_: {
         listen: (
           _query: unknown,
-          _hashFn: unknown,
+          hashFn: ListenHashFn,
           _tag: unknown,
           onListen: (status: string) => void
         ) => {
           calls.push('listen');
+          hashFns.push(hashFn);
           serverCallbacks.push(onListen);
         },
         unlisten: (...args: unknown[]) => calls.push('unlisten')
@@ -949,6 +988,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       hashFn,
       onComplete,
       calls,
+      hashFns,
       serverCallbacks,
       data
     };
@@ -1153,6 +1193,75 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
     ).to.equal(null);
+  });
+
+  it('sends precomputed hashes before cache chunks finish and buffers completion', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, hashFns, serverCallbacks } =
+      makeListenHarness();
+    let resolveRecord: (record: PersistedRecord | null) => void = () => {};
+    const recordPromise = new Promise<PersistedRecord | null>(resolve => {
+      resolveRecord = resolve;
+    });
+    const node = nodeFromJSON({ cached: true });
+    const compoundHash = computeCompoundHash(node.val(true));
+    repo.persistence_ = {
+      track: () => {},
+      restoreListenMetadata: () =>
+        Promise.resolve({ hash: 'stored-hash', compoundHash, revision: 'r1' }),
+      restoreForListen: () => recordPromise,
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(hashFns[0]()).to.equal('stored-hash');
+
+    let completed = false;
+    void repoWhenListenComplete(repo, path.toString()).then(() => {
+      completed = true;
+    });
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    expect(completed).to.equal(false);
+
+    resolveRecord({
+      node,
+      hash: 'stored-hash',
+      compoundHash,
+      updatedAt: Date.now(),
+      revision: 'r1'
+    });
+    await flushAsync();
+    expect(completed).to.equal(true);
+    expect(calls).to.deep.equal(['listen']);
+  });
+
+  it('restarts seeded reconciliation only when the persisted base fails validation', async () => {
+    const { repo, query, hashFn, onComplete, calls, hashFns } =
+      makeListenHarness();
+    const compoundHash = computeCompoundHash({ cached: true });
+    repo.persistence_ = {
+      track: () => {},
+      restoreListenMetadata: () =>
+        Promise.resolve({ hash: 'stored-hash', compoundHash, revision: 'r1' }),
+      // Null after valid metadata means missing/mismatched/malformed chunks or
+      // storage failure — not a latency timeout (restoreForListen has none).
+      restoreForListen: () => Promise.resolve(null),
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
+    expect(hashFns[0]()).to.equal('stored-hash');
+    expect(hashFns[1]()).to.equal('');
   });
 
   it('whenListenComplete resolves on the server response, not the restore', async () => {
