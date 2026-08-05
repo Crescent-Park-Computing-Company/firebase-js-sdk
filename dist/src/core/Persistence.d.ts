@@ -30,9 +30,10 @@ export declare const PERSISTENCE_MAX_AGE_MS: number;
  */
 export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 /**
- * A restore that hasn't settled by this budget attaches the listen unseeded
- * — persistence may add at most this much latency to a root's FIRST listen,
- * and only when IndexedDB is pathologically slow.
+ * Maximum gap with NO restore progress before the listen attaches unseeded.
+ * Every completed metadata/chunk read resets this budget: a large Safari
+ * restore that is steadily advancing must not be abandoned into a much slower
+ * full network load merely because its total wall time exceeded the budget.
  */
 export declare const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /**
@@ -221,9 +222,9 @@ export declare class PersistenceManager {
         record: PersistedRecord;
     } | null>;
     /**
-     * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
-     * soon as the read settles first (the common case — otherwise every
-     * restore would pin its Repo in memory for the full budget).
+     * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
+     * chunked restores reset the timer after every completed chunk; callers
+     * that pass an already-started Promise retain the old total-time bound.
      */
     private raceRestoreTimeout_;
     /**

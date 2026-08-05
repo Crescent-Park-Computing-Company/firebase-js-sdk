@@ -4251,9 +4251,10 @@ const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
  */
 const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 /**
- * A restore that hasn't settled by this budget attaches the listen unseeded
- * — persistence may add at most this much latency to a root's FIRST listen,
- * and only when IndexedDB is pathologically slow.
+ * Maximum gap with NO restore progress before the listen attaches unseeded.
+ * Every completed metadata/chunk read resets this budget: a large Safari
+ * restore that is steadily advancing must not be abandoned into a much slower
+ * full network load merely because its total wall time exceeded the budget.
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /**
@@ -4749,7 +4750,7 @@ class PersistenceManager {
      * resolves null, and the leftovers are deleted best-effort. Expired
      * records also resolve null (and are deleted best-effort).
      */
-    readRecord_(pathString) {
+    readRecord_(pathString, onProgress = () => { }) {
         const key = this.key_(pathString);
         // Metadata first, in a short transaction. Each chunk then gets its OWN
         // transaction: WebKit may retain every IDBRequest result until the
@@ -4775,6 +4776,7 @@ class PersistenceManager {
             if (meta === null) {
                 return null;
             }
+            onProgress();
             const { stored, hashes } = meta;
             const joined = hashes && hashes.revision === stored.revision
                 ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
@@ -4817,6 +4819,7 @@ class PersistenceManager {
                             !Array.isArray(chunk.entries)) {
                             return 'mismatch';
                         }
+                        onProgress();
                         const plan = [];
                         for (const [relPath, json] of chunk.entries) {
                             const node = nodeFromJSON(json);
@@ -4902,7 +4905,7 @@ class PersistenceManager {
         if (this.disposed_) {
             return Promise.resolve(null);
         }
-        const read = this.readRecord_(pathString).then(result => {
+        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
             if (result !== null && !this.disposed_) {
                 this.lastFlush_.set(pathString, {
                     rootNode: result.record.node,
@@ -4914,8 +4917,7 @@ class PersistenceManager {
                 });
             }
             return result === null ? null : result.record;
-        });
-        return this.raceRestoreTimeout_(read).then(record => {
+        })).then(record => {
             if (record) {
                 persistenceStats.restoredRoots.push(pathString);
             }
@@ -4984,16 +4986,28 @@ class PersistenceManager {
         return this.raceRestoreTimeout_(read);
     }
     /**
-     * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
-     * soon as the read settles first (the common case — otherwise every
-     * restore would pin its Repo in memory for the full budget).
+     * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
+     * chunked restores reset the timer after every completed chunk; callers
+     * that pass an already-started Promise retain the old total-time bound.
      */
-    raceRestoreTimeout_(read) {
+    raceRestoreTimeout_(readOrStart, timeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS) {
         let timer;
+        let settled = false;
+        let timeoutResolve = () => { };
         const timeout = new Promise(resolve => {
-            timer = setTimeout(() => resolve(null), PERSISTENCE_RESTORE_TIMEOUT_MS);
+            timeoutResolve = resolve;
         });
+        const arm = () => {
+            if (settled) {
+                return;
+            }
+            clearTimeout(timer);
+            timer = setTimeout(() => timeoutResolve(null), timeoutMs);
+        };
+        const read = typeof readOrStart === 'function' ? readOrStart(arm) : readOrStart;
+        arm();
         return Promise.race([read, timeout]).then(result => {
+            settled = true;
             clearTimeout(timer);
             return result;
         });

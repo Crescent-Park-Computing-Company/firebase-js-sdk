@@ -1986,9 +1986,9 @@ declare class PersistenceManager {
         record: PersistedRecord;
     } | null>;
     /**
-     * Bounds a read by PERSISTENCE_RESTORE_TIMEOUT_MS, clearing the timer as
-     * soon as the read settles first (the common case — otherwise every
-     * restore would pin its Repo in memory for the full budget).
+     * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
+     * chunked restores reset the timer after every completed chunk; callers
+     * that pass an already-started Promise retain the old total-time bound.
      */
     private raceRestoreTimeout_;
     /**
