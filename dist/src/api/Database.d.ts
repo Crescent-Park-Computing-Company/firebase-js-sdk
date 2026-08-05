@@ -111,8 +111,8 @@ export declare function connectDatabaseEmulator(db: Database, host: string, port
  */
 export declare function goOffline(db: Database): void;
 /**
- * Reads the persisted server cache for `path` WITHOUT attaching a listener —
- * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.

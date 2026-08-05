@@ -3621,8 +3621,12 @@ const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * Every completed metadata/chunk read resets this budget: a large Safari
  * restore that is steadily advancing must not be abandoned into a much slower
  * full network load merely because its total wall time exceeded the budget.
+ * The same bound applies to each IndexedDB open/transaction, so a request that
+ * fires neither success nor error can never hold the live listen forever.
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
+/** How long a completed optimistic peek waits for its real listener. */
+const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
 /**
  * Target serialized size of one chunk record. Peak transient memory of a
  * flush or restore is a few multiples of THIS (one chunk's exported JSON
@@ -3741,10 +3745,11 @@ function samePlan(a, b) {
 class PersistenceManager {
     constructor(prefix_, idbFactory_ = util.isIndexedDBAvailable()
         ? indexedDB
-        : null, schemaKnownCurrent_ = readSchemaMarker()) {
+        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
         this.schemaKnownCurrent_ = schemaKnownCurrent_;
+        this.operationTimeoutMs_ = operationTimeoutMs_;
         this.db_ = null;
         /**
          * Roots that flow through persistence (complete default listens).
@@ -3800,7 +3805,7 @@ class PersistenceManager {
      */
     rebindTo(prefix) {
         this.dispose();
-        return new PersistenceManager(prefix, this.idbFactory_);
+        return new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_);
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -4046,6 +4051,24 @@ class PersistenceManager {
                 resolve(null);
                 return;
             }
+            let settled = false;
+            const finish = (db, failed = false) => {
+                if (settled) {
+                    db?.close();
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                if (failed) {
+                    persistenceStats.storageFailures++;
+                }
+                resolve(db);
+            };
+            const timer = setTimeout(() => {
+                // Some WebKit IndexedDB requests fire neither success nor error. A
+                // cache miss is always safer than blocking the network listen.
+                finish(null, true);
+            }, this.operationTimeoutMs_);
             try {
                 const req = version === undefined
                     ? this.idbFactory_.open('firebase-database-persistence')
@@ -4060,39 +4083,22 @@ class PersistenceManager {
                         req.transaction.objectStore(STORE).clear();
                     }
                 };
-                let settled = false;
                 req.onsuccess = () => {
                     const db = req.result;
                     if (settled) {
-                        // An upgrade that was initially blocked may succeed after we
-                        // already degraded this manager to a cold load. Do not leak that
-                        // late connection — it would block the next schema upgrade.
+                        // An open that completed after the timeout must not leak a
+                        // connection or block a future schema upgrade.
                         db.close();
                         return;
                     }
-                    settled = true;
-                    // Cooperate with a newer tab's future upgrade instead of blocking
-                    // it for the lifetime of this page.
                     db.onversionchange = () => db.close();
-                    resolve(db);
+                    finish(db);
                 };
-                req.onerror = () => {
-                    if (!settled) {
-                        settled = true;
-                        persistenceStats.storageFailures++;
-                        resolve(null);
-                    }
-                };
-                req.onblocked = () => {
-                    if (!settled) {
-                        settled = true;
-                        resolve(null);
-                    }
-                };
+                req.onerror = () => finish(null, true);
+                req.onblocked = () => finish(null);
             }
             catch (e) {
-                persistenceStats.storageFailures++;
-                resolve(null);
+                finish(null, true);
             }
         });
     }
@@ -4113,21 +4119,44 @@ class PersistenceManager {
                 resolve(fallback);
                 return;
             }
+            let settled = false;
+            let timer = null;
+            const finish = (value, failed = false) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                if (timer !== null) {
+                    clearTimeout(timer);
+                }
+                if (failed) {
+                    persistenceStats.storageFailures++;
+                }
+                resolve(value);
+            };
             try {
                 const tx = db.transaction(STORE, mode);
                 let value = fallback;
                 body(tx.objectStore(STORE), v => {
                     value = v;
                 });
-                tx.oncomplete = () => resolve(value);
-                tx.onabort = tx.onerror = () => {
-                    persistenceStats.storageFailures++;
-                    resolve(fallback);
-                };
+                timer = setTimeout(() => {
+                    // Abort the one stalled transaction so an abandoned cache read
+                    // cannot continue assembling a large tree beside the cold
+                    // network fallback.
+                    try {
+                        tx.abort();
+                    }
+                    catch (e) {
+                        // It may have completed between the timer firing and abort().
+                    }
+                    finish(fallback, true);
+                }, this.operationTimeoutMs_);
+                tx.oncomplete = () => finish(value);
+                tx.onabort = tx.onerror = () => finish(fallback, true);
             }
             catch (e) {
-                persistenceStats.storageFailures++;
-                resolve(fallback);
+                finish(fallback, true);
             }
         }));
     }
@@ -4141,13 +4170,26 @@ class PersistenceManager {
      * resolves null, and the leftovers are deleted best-effort. Expired
      * records also resolve null (and are deleted best-effort).
      */
-    readRecord_(pathString, onProgress = () => { }) {
+    readRecord_(pathString, onProgress = () => { }, retainAfterResolve = false) {
         const active = this.activeReads_.get(pathString);
         if (active) {
             active.progress.add(onProgress);
             // Joining an already-progressing read is itself progress for this
             // caller's idle timeout.
             onProgress();
+            if (retainAfterResolve) {
+                active.retainAfterResolve = true;
+            }
+            else if (active.retainAfterResolve) {
+                // A real listener consumes the optimistic peek's completed read. The
+                // returned promise still owns the result; the manager no longer needs
+                // a second retained handle to it.
+                active.retainAfterResolve = false;
+                if (active.cleanupTimer !== null) {
+                    clearTimeout(active.cleanupTimer);
+                    this.activeReads_.delete(pathString);
+                }
+            }
             return active.promise;
         }
         const progress = new Set([onProgress]);
@@ -4157,17 +4199,29 @@ class PersistenceManager {
             }
         };
         const promise = this.readRecordOnce_(pathString, emitProgress);
-        const entry = { promise, progress };
+        const entry = {
+            promise,
+            progress,
+            retainAfterResolve,
+            cleanupTimer: null
+        };
         this.activeReads_.set(pathString, entry);
-        void promise.then(() => {
-            if (this.activeReads_.get(pathString) === entry) {
-                this.activeReads_.delete(pathString);
+        const release = () => {
+            entry.progress.clear();
+            if (this.activeReads_.get(pathString) !== entry) {
+                return;
             }
-        }, () => {
-            if (this.activeReads_.get(pathString) === entry) {
+            if (!entry.retainAfterResolve) {
                 this.activeReads_.delete(pathString);
+                return;
             }
-        });
+            entry.cleanupTimer = setTimeout(() => {
+                if (this.activeReads_.get(pathString) === entry) {
+                    this.activeReads_.delete(pathString);
+                }
+            }, PERSISTENCE_PEEK_HANDOFF_MS);
+        };
+        void promise.then(release, release);
         return promise;
     }
     readRecordOnce_(pathString, onProgress) {
@@ -4375,10 +4429,21 @@ class PersistenceManager {
         });
     }
     /**
-     * Listener restore with no wall/idle fallback: once valid hash metadata has
-     * been sent, a slow local decode must keep progressing rather than restart
-     * the listen unseeded. Null means the persisted base failed validation or a
-     * storage operation failed, not merely that it was slow.
+     * Exact-root optimistic peek. The completed decode is retained briefly so
+     * the authenticated listener can consume the same immutable Node instead of
+     * decoding a large IndexedDB record twice during boot.
+     */
+    peek(pathString) {
+        if (this.disposed_ || !this.schemaKnownCurrent_) {
+            return Promise.resolve(null);
+        }
+        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true).then(result => result === null ? null : result.record));
+    }
+    /**
+     * Listener restore with an idle (no-progress) bound. Healthy chunked reads
+     * can take arbitrarily long in total as long as each chunk advances; a stuck
+     * IndexedDB request returns null so Repo cancels the seeded listen and
+     * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString) {
         if (this.disposed_) {
@@ -4387,7 +4452,7 @@ class PersistenceManager {
         if (!this.schemaKnownCurrent_) {
             return Promise.resolve(null);
         }
-        return this.readRecord_(pathString).then(result => {
+        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
             if (result === null ||
                 this.disposed_ ||
                 !this.trackedRoots_.has(pathString)) {
@@ -4403,7 +4468,7 @@ class PersistenceManager {
             });
             persistenceStats.restoredRoots.push(pathString);
             return result.record;
-        });
+        }));
     }
     restore(pathString) {
         if (this.disposed_) {
@@ -4435,71 +4500,11 @@ class PersistenceManager {
         });
     }
     /**
-     * The boot-peek read (see getPersistedValue): resolves the record of the
-     * FRESHEST persisted ancestor of `pathString` (or of the path itself; ties
-     * go to the deepest). Freshness decides because ancestors keep flushing
-     * after a covered child's record froze — the deepest record is not
-     * necessarily the current one. Reads the ancestor chain's manifests in one
-     * transaction, then assembles only the chosen root. Expired ancestors are
-     * skipped. Does not touch the restore counters or the flush-skip state —
-     * a peek is not a listen restore.
-     */
-    restoreNearest(pathString) {
-        if (this.disposed_) {
-            return Promise.resolve(null);
-        }
-        if (!this.schemaKnownCurrent_) {
-            return Promise.resolve(null);
-        }
-        const candidates = [];
-        let path = new Path(pathString);
-        while (path !== null) {
-            candidates.push(path.toString());
-            path = pathParent(path);
-        }
-        return this.raceRestoreTimeout_(onProgress => this.withStore_('readonly', [], (store, done) => {
-            const results = new Array(candidates.length);
-            let remaining = candidates.length;
-            candidates.forEach((candidate, i) => {
-                const req = store.get(this.key_(candidate));
-                req.onsuccess = () => {
-                    results[i] = req.result;
-                    onProgress();
-                    if (--remaining === 0) {
-                        done(results);
-                    }
-                };
-            });
-        }).then(results => {
-            const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
-            let best = null;
-            for (let i = 0; i < results.length; i++) {
-                const record = results[i];
-                if (!record || typeof record.updatedAt !== 'number') {
-                    continue;
-                }
-                if (record.updatedAt < cutoff) {
-                    persistenceStats.evictions++;
-                    void this.deleteRecord_(candidates[i]);
-                    continue;
-                }
-                if (best === null || record.updatedAt > results[best].updatedAt) {
-                    best = i;
-                }
-            }
-            if (best === null) {
-                return null;
-            }
-            const root = candidates[best];
-            return this.readRecord_(root, onProgress).then(result => result === null ? null : { root, record: result.record });
-        }));
-    }
-    /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
      * that pass an already-started Promise retain the old total-time bound.
      */
-    raceRestoreTimeout_(readOrStart, timeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS) {
+    raceRestoreTimeout_(readOrStart, timeoutMs = this.operationTimeoutMs_) {
         let timer;
         let settled = false;
         let timeoutResolve = () => { };
@@ -4604,9 +4609,15 @@ class PersistenceManager {
             clearTimeout(this.sweepTimer_);
         }
         this.flushPending_.clear();
+        for (const read of this.activeReads_.values()) {
+            if (read.cleanupTimer !== null) {
+                clearTimeout(read.cleanupTimer);
+            }
+        }
         this.activeReads_.clear();
         this.latest_.clear();
         this.lastFlush_.clear();
+        void this.db_?.then(db => db?.close());
     }
     /**
      * Test seam: forces a pending throttled flush to run now.
@@ -4780,10 +4791,12 @@ class PersistenceManager {
             // canonical traversal is non-retaining (it does not fill every child's
             // lazyHash_); only this listened root is stamped and stored natively in
             // its manifest for future tab loads.
-            return Promise.all([
-                canonicalHashFromNodeAsync(node),
-                compoundHashFromNodeAsync(node)
-            ]).then(([hash, compoundHash]) => {
+            return canonicalHashFromNodeAsync(node)
+                .then(hash => compoundHashFromNodeAsync(node).then(compoundHash => ({
+                hash,
+                compoundHash
+            })))
+                .then(({ hash, compoundHash }) => {
                 node.stampLazyHash(hash);
                 if (this.disposed_) {
                     return;
@@ -16381,8 +16394,8 @@ function goOffline(db) {
     repoInterrupt(db._repo);
 }
 /**
- * Reads the persisted server cache for `path` WITHOUT attaching a listener —
- * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
@@ -16401,19 +16414,13 @@ function getPersistedValue(db, pathString) {
     if (persistence === null) {
         return Promise.resolve(null);
     }
-    // Records are stored per listened ROOT; a peek at a subpath restores the
-    // freshest stored ancestor (one IndexedDB read over the whole chain) and
-    // drills into its assembled tree along the remaining segments — restored
-    // records hold EXPORT format, and the node model is what maps it back to
-    // the values snapshot.val() semantics promise.
-    const path = new Path(pathString);
-    return persistence.restoreNearest(path.toString()).then(result => {
-        if (result === null) {
-            return null;
-        }
-        const relativePath = newRelativePath(new Path(result.root), path);
-        return result.record.node.getChild(relativePath).val();
-    });
+    // Exact-root by design: callers peek the same path they are about to
+    // listen to. This lets the authenticated listener consume the same decoded
+    // Node and prevents a fresher ancestor record from being mistaken for the
+    // exact listener's initial replay.
+    return persistence
+        .peek(new Path(pathString).toString())
+        .then(record => (record === null ? null : record.node.val()));
 }
 /**
  * Enables client-side persistence of the server cache for this Database

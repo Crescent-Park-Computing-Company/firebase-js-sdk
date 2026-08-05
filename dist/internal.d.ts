@@ -612,8 +612,8 @@ export declare function get(query: Query): Promise<DataSnapshot>;
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
 
 /**
- * Reads the persisted server cache for `path` WITHOUT attaching a listener —
- * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
@@ -1926,6 +1926,7 @@ declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
     private schemaKnownCurrent_;
+    private operationTimeoutMs_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1967,7 +1968,7 @@ declare class PersistenceManager {
     private activeReads_;
     private sweepTimer_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but
@@ -2054,27 +2055,19 @@ declare class PersistenceManager {
      */
     restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
     /**
-     * Listener restore with no wall/idle fallback: once valid hash metadata has
-     * been sent, a slow local decode must keep progressing rather than restart
-     * the listen unseeded. Null means the persisted base failed validation or a
-     * storage operation failed, not merely that it was slow.
+     * Exact-root optimistic peek. The completed decode is retained briefly so
+     * the authenticated listener can consume the same immutable Node instead of
+     * decoding a large IndexedDB record twice during boot.
+     */
+    peek(pathString: string): Promise<PersistedRecord | null>;
+    /**
+     * Listener restore with an idle (no-progress) bound. Healthy chunked reads
+     * can take arbitrarily long in total as long as each chunk advances; a stuck
+     * IndexedDB request returns null so Repo cancels the seeded listen and
+     * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString: string): Promise<PersistedRecord | null>;
     restore(pathString: string): Promise<PersistedRecord | null>;
-    /**
-     * The boot-peek read (see getPersistedValue): resolves the record of the
-     * FRESHEST persisted ancestor of `pathString` (or of the path itself; ties
-     * go to the deepest). Freshness decides because ancestors keep flushing
-     * after a covered child's record froze — the deepest record is not
-     * necessarily the current one. Reads the ancestor chain's manifests in one
-     * transaction, then assembles only the chosen root. Expired ancestors are
-     * skipped. Does not touch the restore counters or the flush-skip state —
-     * a peek is not a listen restore.
-     */
-    restoreNearest(pathString: string): Promise<{
-        root: string;
-        record: PersistedRecord;
-    } | null>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers

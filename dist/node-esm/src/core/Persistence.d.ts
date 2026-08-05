@@ -34,6 +34,8 @@ export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * Every completed metadata/chunk read resets this budget: a large Safari
  * restore that is steadily advancing must not be abandoned into a much slower
  * full network load merely because its total wall time exceeded the budget.
+ * The same bound applies to each IndexedDB open/transaction, so a request that
+ * fires neither success nor error can never hold the live listen forever.
  */
 export declare const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /**
@@ -100,6 +102,7 @@ export declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
     private schemaKnownCurrent_;
+    private operationTimeoutMs_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -141,7 +144,7 @@ export declare class PersistenceManager {
     private activeReads_;
     private sweepTimer_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
      * configuration changes the RepoInfo after persistence was enabled but
@@ -228,27 +231,19 @@ export declare class PersistenceManager {
      */
     restoreListenMetadata(pathString: string): Promise<PersistedListenMetadata | null>;
     /**
-     * Listener restore with no wall/idle fallback: once valid hash metadata has
-     * been sent, a slow local decode must keep progressing rather than restart
-     * the listen unseeded. Null means the persisted base failed validation or a
-     * storage operation failed, not merely that it was slow.
+     * Exact-root optimistic peek. The completed decode is retained briefly so
+     * the authenticated listener can consume the same immutable Node instead of
+     * decoding a large IndexedDB record twice during boot.
+     */
+    peek(pathString: string): Promise<PersistedRecord | null>;
+    /**
+     * Listener restore with an idle (no-progress) bound. Healthy chunked reads
+     * can take arbitrarily long in total as long as each chunk advances; a stuck
+     * IndexedDB request returns null so Repo cancels the seeded listen and
+     * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString: string): Promise<PersistedRecord | null>;
     restore(pathString: string): Promise<PersistedRecord | null>;
-    /**
-     * The boot-peek read (see getPersistedValue): resolves the record of the
-     * FRESHEST persisted ancestor of `pathString` (or of the path itself; ties
-     * go to the deepest). Freshness decides because ancestors keep flushing
-     * after a covered child's record froze — the deepest record is not
-     * necessarily the current one. Reads the ancestor chain's manifests in one
-     * transaction, then assembles only the chosen root. Expired ancestors are
-     * skipped. Does not touch the restore counters or the flush-skip state —
-     * a peek is not a listen restore.
-     */
-    restoreNearest(pathString: string): Promise<{
-        root: string;
-        record: PersistedRecord;
-    } | null>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
