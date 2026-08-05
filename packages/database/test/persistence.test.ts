@@ -19,11 +19,7 @@ import { expect } from 'chai';
 
 import { getPersistedValue } from '../src/api/Database';
 import { QueryImpl } from '../src/api/Reference_impl';
-import {
-  PersistenceManager,
-  PersistedRecord,
-  persistenceStats
-} from '../src/core/Persistence';
+import { PersistenceManager, PersistedRecord } from '../src/core/Persistence';
 import {
   repoStartServerListen,
   repoStopServerListen,
@@ -233,28 +229,62 @@ describe('PersistenceManager', () => {
     expect(data.has('test-repo|/old/root')).to.equal(false);
   });
 
-  it('a newer write-through discards the stale hash recompute', async () => {
+  it('a superseding update never leaves the stored pair uncoupled', async () => {
     const { factory } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
     const path = new Path('busy/root');
     manager.track(path.toString());
-    const before = persistenceStats.staleHashDiscards;
 
     manager.serverCacheUpdated(path, nodeFromJSON({ v: 1 }));
-    const flushing = manager.flushNow(path.toString());
-    // Supersede while the first flush's hash recompute is in flight.
+    const first = manager.flushNow(path.toString());
+    // Supersede while the first flush's hash recompute is in flight; its
+    // flush queues behind the first (one writer per root).
     manager.serverCacheUpdated(path, nodeFromJSON({ v: 2 }));
-    await flushing;
-    await manager.flushNow(path.toString());
+    const second = manager.flushNow(path.toString());
+    await first;
+    await second;
     await flushAsync();
 
-    expect(persistenceStats.staleHashDiscards).to.be.greaterThan(before);
     const restored = (await manager.restore(
       path.toString()
     )) as PersistedRecord;
     // The stored record is the SECOND tree with the SECOND tree's hash.
     expect(restored.json).to.deep.equal({ v: 2 });
     expect(restored.hash).to.equal(computeCanonicalHash({ v: 2 }));
+  });
+
+  it('a burst within the debounce flushes the newest tree', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    const path = new Path('hot/root');
+    manager.track(path.toString());
+    // Two updates back-to-back — the flush reads latest_ when it runs, so a
+    // single flush persists the second tree.
+    manager.serverCacheUpdated(path, nodeFromJSON({ n: 1 }));
+    manager.serverCacheUpdated(path, nodeFromJSON({ n: 2 }));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const restored = (await manager.restore(
+      path.toString()
+    )) as PersistedRecord;
+    expect(restored.json).to.deep.equal({ n: 2 });
+    expect(restored.hash).to.equal(computeCanonicalHash({ n: 2 }));
+  });
+
+  it('evict during an in-flight flush deletes both records', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    const path = new Path('gone/racing');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ secret: 1 }));
+    const flushing = manager.flushNow(path.toString());
+    // Evict before the flush's hash record lands: the delete queues behind
+    // the flush, so nothing survives.
+    manager.evict(path);
+    await flushing;
+    await flushAsync();
+    expect(data.has('test-repo|/gone/racing')).to.equal(false);
+    expect(data.has('test-repo|/gone/racing#hash')).to.equal(false);
   });
 
   it('evict removes the stored record', async () => {
@@ -374,7 +404,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
    * restore resolution is controlled by the manager's fake IndexedDB.
    */
   function makeListenHarness() {
-    const { factory } = makeFakeIndexedDB();
+    const { factory, data } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
     const calls: string[] = [];
     const serverCallbacks: Array<(status: string) => void> = [];
@@ -410,7 +440,16 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     } as never;
     const hashFn = (() => '') as never;
     const onComplete = (() => []) as never;
-    return { repo, query, path, hashFn, onComplete, calls, serverCallbacks };
+    return {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      calls,
+      serverCallbacks,
+      data
+    };
   }
 
   it('sends the listen after the restore resolves', async () => {
@@ -445,6 +484,21 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(calls).to.deep.equal(['listen', 'unlisten']);
     // Untracked: a subsequent server update no longer flows to storage.
     expect(repo.persistence_!.trackedRootFor(path.toString())).to.equal(null);
+  });
+
+  it('a hashless record is hash-primed and still sends the listen', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, data } =
+      makeListenHarness();
+    // A record persisted before its hash landed (no #hash sibling).
+    data.set('test-repo|' + path.toString(), {
+      json: { a: 1 },
+      updatedAt: Date.now(),
+      revision: 1
+    });
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
   it('whenListenComplete resolves on the server response, not the restore', async () => {

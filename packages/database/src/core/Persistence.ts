@@ -111,7 +111,6 @@ export const persistenceStats: {
   restoreMisses: string[];
   writeThroughs: number;
   hashRecomputes: number;
-  staleHashDiscards: number;
   evictions: number;
   storageFailures: number;
 } = {
@@ -119,7 +118,6 @@ export const persistenceStats: {
   restoreMisses: [],
   writeThroughs: 0,
   hashRecomputes: 0,
-  staleHashDiscards: 0,
   evictions: 0,
   storageFailures: 0
 };
@@ -146,6 +144,8 @@ export class PersistenceManager {
   private latest_ = new Map<string, { node: Node; revision: number }>();
   private revisionCounter_ = 0;
   private writeTimers_ = new Map<string, ReturnType<typeof setTimeout>>();
+  /** In-flight storage operations per root (see enqueue_). */
+  private queues_ = new Map<string, Promise<void>>();
   private disposed_ = false;
 
   constructor(
@@ -173,10 +173,9 @@ export class PersistenceManager {
       return;
     }
     this.trackedRoots_.delete(pathString);
-    // Release the tree only after the flush settles: flush_'s hash recompute
-    // re-reads latest_ to couple hashes to trees, so deleting synchronously
-    // would store the final record hashless. Skip the delete if the root was
-    // re-tracked meanwhile — the new listen owns the entry now.
+    // Release the tree only after the final flush settles (flush_ reads
+    // latest_ when it runs). Skip the delete if the root was re-tracked
+    // meanwhile — the new listen owns the entry now.
     void this.flushNow(pathString).then(() => {
       if (!this.trackedRoots_.has(pathString)) {
         this.latest_.delete(pathString);
@@ -504,17 +503,20 @@ export class PersistenceManager {
       return;
     }
     this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
-    const existing = this.writeTimers_.get(pathString);
-    if (existing) {
-      clearTimeout(existing);
+    // Trailing throttle, NOT a resetting debounce: the timer set by the first
+    // update in a burst survives later updates, so a root that churns faster
+    // than the interval (a chat streaming, an editing session) still flushes
+    // every interval instead of never. The flush reads latest_ when it runs,
+    // so it always writes the newest tree.
+    if (!this.writeTimers_.has(pathString)) {
+      this.writeTimers_.set(
+        pathString,
+        setTimeout(() => {
+          this.writeTimers_.delete(pathString);
+          this.enqueue_(pathString, () => this.flush_(pathString));
+        }, PERSISTENCE_WRITE_DEBOUNCE_MS)
+      );
     }
-    this.writeTimers_.set(
-      pathString,
-      setTimeout(() => {
-        this.writeTimers_.delete(pathString);
-        void this.flush_(pathString);
-      }, PERSISTENCE_WRITE_DEBOUNCE_MS)
-    );
   }
 
   /**
@@ -530,7 +532,9 @@ export class PersistenceManager {
       this.writeTimers_.delete(pathString);
     }
     persistenceStats.evictions++;
-    void this.deleteRecord_(pathString);
+    // Through the queue: a flush already running for this root finishes its
+    // writes first, then the delete removes them — never the reverse.
+    this.enqueue_(pathString, () => this.deleteRecord_(pathString));
   }
 
   dispose(): void {
@@ -551,7 +555,27 @@ export class PersistenceManager {
       clearTimeout(timer);
       this.writeTimers_.delete(pathString);
     }
-    return this.flush_(pathString);
+    return this.enqueue_(pathString, () => this.flush_(pathString));
+  }
+
+  /**
+   * Chains an operation onto the root's queue. One writer per root at a
+   * time: a flush's data and hash records land as a couple before the next
+   * flush or delete for that root starts, which is the whole storage
+   * consistency argument — no cross-operation races to reason about.
+   */
+  private enqueue_(pathString: string, op: () => Promise<void>): Promise<void> {
+    const next = (this.queues_.get(pathString) ?? Promise.resolve()).then(op);
+    // Settle-or-not, the chain must continue; storage failures are already
+    // absorbed (and counted) inside withStore_.
+    const settled = next.catch(() => {});
+    this.queues_.set(pathString, settled);
+    void settled.then(() => {
+      if (this.queues_.get(pathString) === settled) {
+        this.queues_.delete(pathString);
+      }
+    });
+    return next;
   }
 
   private flush_(pathString: string): Promise<void> {
@@ -563,7 +587,10 @@ export class PersistenceManager {
     persistenceStats.writeThroughs++;
     // The tree is serialized and written exactly once, hashless — a crash
     // before the recompute leaves a restorable tree that seeds without a
-    // hash instead of nothing. The hashes follow as a small separate record.
+    // hash instead of nothing. The hashes follow as a small separate record,
+    // and because flushes for a root are serialized (enqueue_), the pair is
+    // always coupled: the hash written here describes the data written here,
+    // even if newer updates arrived while hashing.
     const record: PersistedRecord = {
       json: node.val(true),
       updatedAt: Date.now(),
@@ -577,12 +604,7 @@ export class PersistenceManager {
         hashFromNodeAsync(node),
         compoundHashFromNodeAsync(node)
       ]).then(([hash, compoundHash]) => {
-        const current = this.latest_.get(pathString);
-        if (!current || current.revision !== revision || this.disposed_) {
-          // A newer server update superseded this tree while it hashed; its
-          // own flush persists fresh hashes. Discarding keeps stored hashes
-          // coupled to stored trees.
-          persistenceStats.staleHashDiscards++;
+        if (this.disposed_) {
           return;
         }
         persistenceStats.hashRecomputes++;

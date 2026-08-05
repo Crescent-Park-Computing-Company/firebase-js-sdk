@@ -28,6 +28,7 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
+import { hashFromNodeAsync } from './CompoundHash';
 import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
@@ -524,37 +525,59 @@ export function repoStartServerListen(
   // orphaned server subscription with no view to ever stop it.
   const token = { cancelled: false };
   repo.pendingSeedRestores_.set(pathString, token);
+  // The token stays registered until the listen is actually sent: every
+  // deferred stage below re-checks it, so a stop arriving anywhere in the
+  // restore-or-hash window cancels cleanly instead of orphaning the listen.
+  const sendSeededListen = () => {
+    repo.pendingSeedRestores_.delete(pathString);
+    sendListen();
+  };
   void persistence.restore(pathString).then(record => {
     if (token.cancelled) {
       return;
     }
-    repo.pendingSeedRestores_.delete(pathString);
     // If the server certified this path while the restore was in flight (an
     // overlapping listen, a get()), the live data wins — applying the stored
     // tree now would clobber fresher server state with stale bytes.
     const alreadyCertified =
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
       null;
-    if (record !== null && !alreadyCertified) {
-      try {
-        const node = buildSeedNode(record);
-        if (!node.isEmpty()) {
-          const events = syncTreeApplyServerOverwrite(
-            repo.serverSyncTree_,
-            query._path,
-            node
-          );
-          eventQueueRaiseEventsForChangedPath(
-            repo.eventQueue_,
-            query._path,
-            events
-          );
-        }
-      } catch (e) {
-        // A malformed record must never break the listen.
-      }
+    if (record === null || alreadyCertified) {
+      sendSeededListen();
+      return;
     }
-    sendListen();
+    let node: Node | null = null;
+    try {
+      node = buildSeedNode(record);
+    } catch (e) {
+      // A malformed record must never break the listen.
+    }
+    if (node === null || node.isEmpty()) {
+      sendSeededListen();
+      return;
+    }
+    const seeded = node;
+    const events = syncTreeApplyServerOverwrite(
+      repo.serverSyncTree_,
+      query._path,
+      seeded
+    );
+    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+    // A record persisted before its hash landed restores hashless. Priming
+    // the hash here — in idle slices, before the listen goes out — keeps the
+    // two invariants of the seeded path: the listen carries a real hash
+    // (zero download when the tree is unchanged), and hashFn never runs a
+    // synchronous O(tree) walk on the main thread at listen time.
+    if (typeof record.hash === 'string') {
+      sendSeededListen();
+      return;
+    }
+    const proceed = () => {
+      if (!token.cancelled) {
+        sendSeededListen();
+      }
+    };
+    void hashFromNodeAsync(seeded).then(proceed, proceed);
   });
 }
 
