@@ -52,12 +52,7 @@ import {
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { SeedCompoundHash } from '../core/ServerCacheSeed';
 import { parseRepoInfo } from '../core/util/libs/parser';
-import {
-  newEmptyPath,
-  newRelativePath,
-  Path,
-  pathIsEmpty
-} from '../core/util/Path';
+import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
   warn,
   fatal,
@@ -460,8 +455,8 @@ export function goOffline(db: Database): void {
 }
 
 /**
- * Reads the persisted server cache for `path` WITHOUT attaching a listener —
- * the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
@@ -483,19 +478,13 @@ export function getPersistedValue(
   if (persistence === null) {
     return Promise.resolve(null);
   }
-  // Records are stored per listened ROOT; a peek at a subpath restores the
-  // freshest stored ancestor (one IndexedDB read over the whole chain) and
-  // drills into its assembled tree along the remaining segments — restored
-  // records hold EXPORT format, and the node model is what maps it back to
-  // the values snapshot.val() semantics promise.
-  const path = new Path(pathString);
-  return persistence.restoreNearest(path.toString()).then(result => {
-    if (result === null) {
-      return null;
-    }
-    const relativePath = newRelativePath(new Path(result.root), path);
-    return result.record.node.getChild(relativePath).val();
-  });
+  // Exact-root by design: callers peek the same path they are about to
+  // listen to. This lets the authenticated listener consume the same decoded
+  // Node and prevents a fresher ancestor record from being mistaken for the
+  // exact listener's initial replay.
+  return persistence
+    .peek(new Path(pathString).toString())
+    .then(record => (record === null ? null : record.node.val()));
 }
 
 /**

@@ -406,13 +406,15 @@ describe('PersistenceManager', () => {
     }
     const reader = new PersistenceManager('test-repo', readerFactory.factory);
 
-    const peek = reader.restoreNearest(path.toString());
-    const listen = reader.restore(path.toString());
-    const [peeked, restored] = await Promise.all([peek, listen]);
+    // Finish the optimistic paint first, then start the authenticated listen:
+    // the handoff must still reuse the completed physical decode.
+    const peeked = await reader.peek(path.toString());
+    reader.track(path.toString());
+    const restored = await reader.restoreForListen(path.toString());
 
     expect(peeked).to.not.equal(null);
     expect(restored).to.not.equal(null);
-    expect(peeked!.record.node).to.equal(restored!.node);
+    expect(peeked!.node).to.equal(restored!.node);
     expect(chunkGets).to.equal(1);
     expect(hashSidecarGets).to.equal(0);
   });
@@ -567,6 +569,35 @@ describe('PersistenceManager', () => {
     );
     // Total wall time (~30ms) exceeded the budget, but neither idle gap did.
     expect(result).to.equal('done');
+  });
+
+  it('listener restore degrades to a miss when cache progress stalls', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory, true, 10);
+    const path = new Path('stalled/root');
+    manager.track(path.toString());
+    // Model an IndexedDB request that fires neither success nor error. The
+    // production read still has its transaction-level bound; this seam pins
+    // the listener-level invariant independently.
+    (manager as unknown as { readRecord_: () => Promise<never> }).readRecord_ =
+      () => new Promise(() => {});
+
+    expect(await manager.restoreForListen(path.toString())).to.equal(null);
+  });
+
+  it('a stalled IndexedDB open degrades to a cache miss', async () => {
+    const request = {
+      onupgradeneeded: null,
+      onsuccess: null,
+      onerror: null,
+      onblocked: null
+    };
+    const factory = {
+      open: () => request
+    } as unknown as IDBFactory;
+    const manager = new PersistenceManager('test-repo', factory, true, 10);
+
+    expect(await manager.restoreListenMetadata('/stalled/open')).to.equal(null);
   });
 
   it('resolves null for a root never persisted', async () => {
@@ -860,30 +891,6 @@ describe('PersistenceManager', () => {
     manager.untrack(child.toString());
     await flushAsync();
     expect(keysFor(data, 'test-repo|/users/alice/inbox').length).to.equal(0);
-  });
-
-  it('restoreNearest prefers the freshest containing record', async () => {
-    const { factory, data } = makeFakeIndexedDB();
-    const hourAgo = Date.now() - 60 * 60 * 1000;
-    // A child record frozen an hour ago (its listen stopped)…
-    data.set('test-repo|/users/alice/inbox', {
-      json: { msg: 'stale' },
-      updatedAt: hourAgo,
-      revision: 'ext-1'
-    });
-    // …and the still-flushing ancestor's fresher tree.
-    data.set('test-repo|/users/alice', {
-      json: { inbox: { msg: 'fresh' }, name: 'alice' },
-      updatedAt: Date.now(),
-      revision: 'ext-2'
-    });
-    const manager = new PersistenceManager('test-repo', factory);
-    const result = await manager.restoreNearest('/users/alice/inbox');
-    expect(result).to.not.equal(null);
-    expect(result!.root).to.equal('/users/alice');
-    expect(result!.record.node.getChild(new Path('inbox/msg')).val()).to.equal(
-      'fresh'
-    );
   });
 
   it('sweeps expired and orphaned records for its own prefix', async () => {
@@ -1306,8 +1313,8 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       track: () => {},
       restoreListenMetadata: () =>
         Promise.resolve({ hash: 'stored-hash', compoundHash, revision: 'r1' }),
-      // Null after valid metadata means missing/mismatched/malformed chunks or
-      // storage failure — not a latency timeout (restoreForListen has none).
+      // Null after valid metadata means missing/mismatched/malformed chunks,
+      // storage failure, or an idle timeout; every case restarts cold.
       restoreForListen: () => Promise.resolve(null),
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
@@ -1467,7 +1474,7 @@ describe('getPersistedValue', () => {
     return { db, manager };
   }
 
-  it('drills a subpath out of the nearest persisted root', async () => {
+  it('reads only the exact persisted listener root', async () => {
     const { db, manager } = makeDatabaseWithPersistence();
     const root = new Path('users/alice');
     manager.track(root.toString());
@@ -1478,15 +1485,14 @@ describe('getPersistedValue', () => {
     await manager.flushNow(root.toString());
     await flushAsync();
 
-    expect(
-      await getPersistedValue(db as never, '/users/alice/settings/theme')
-    ).to.equal('dark');
     expect(await getPersistedValue(db as never, '/users/alice')).to.deep.equal({
       settings: { theme: 'dark' },
       name: 'alice'
     });
+    // A caller must peek the same root it is about to listen to. Ancestor
+    // fallback made optimistic data impossible to hand off safely.
     expect(
-      await getPersistedValue(db as never, '/users/alice/missing/deep')
+      await getPersistedValue(db as never, '/users/alice/settings/theme')
     ).to.equal(null);
     expect(await getPersistedValue(db as never, '/users/bob')).to.equal(null);
   });
@@ -1502,7 +1508,6 @@ describe('getPersistedValue', () => {
     await manager.flushNow(root.toString());
     await flushAsync();
 
-    expect(await getPersistedValue(db as never, '/prio/root/a')).to.equal(42);
     expect(await getPersistedValue(db as never, '/prio/root')).to.deep.equal({
       a: 42,
       b: 'x'

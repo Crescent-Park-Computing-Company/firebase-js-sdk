@@ -48,10 +48,6 @@ jobs:
             'test/syncpoint.test.ts' \
             --file src/index.node.ts --config ../../config/mocharc.node.js
 
-      - name: Lint changed database sources
+      - name: Lint database package
         working-directory: packages/database
-        run: |
-          npx eslint -c .eslintrc.js \
-            src/core/CompoundHash.ts src/core/ServerCacheSeed.ts \
-            src/core/snap/RangeMerge.ts test/compoundhash.test.ts \
-            test/rangemerge.test.ts test/servercacheseed.test.ts
+        run: yarn lint
