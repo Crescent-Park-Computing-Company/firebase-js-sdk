@@ -3699,7 +3699,8 @@ function planChunks(root) {
         }
     };
     const emit = (relPath, node, size) => {
-        if (currentSize > 0 && currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES) {
+        if (currentSize > 0 &&
+            currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES) {
             flushBin();
         }
         current.push({ relPath, node });
@@ -3882,7 +3883,8 @@ class PersistenceManager {
         if (this.db_) {
             return this.db_;
         }
-        this.db_ = this.openAtVersion_(undefined).then(db => {
+        this.db_ = this.openAtVersion_(undefined)
+            .then(db => {
             if (db === null) {
                 return null;
             }
@@ -3901,7 +3903,8 @@ class PersistenceManager {
             const nextVersion = db.version + 1;
             db.close();
             return this.openAtVersion_(nextVersion);
-        }).then(db => {
+        })
+            .then(db => {
             if (db !== null && !db.objectStoreNames.contains(STORE)) {
                 persistenceStats.storageFailures++;
                 db.close();
@@ -4214,7 +4217,7 @@ class PersistenceManager {
             for (const callback of progress)
                 callback();
         };
-        entry.promise = this.readRecordOnce_(pathString, emitProgress, () => !entry.cancelled);
+        entry.promise = this.readRecordOnce_(pathString, emitProgress, () => !entry.cancelled, expectedAuthScope);
         const promise = entry.promise;
         this.activeReads_.set(pathString, entry);
         const release = () => {
@@ -4459,7 +4462,7 @@ class PersistenceManager {
         if (this.disposed_ || !this.schemaKnownCurrent_) {
             return Promise.resolve(null);
         }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => result === null ? null : result.record), this.operationTimeoutMs_, PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS, () => {
+        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => (result === null ? null : result.record)), this.operationTimeoutMs_, PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS, () => {
             const active = this.activeReads_.get(pathString);
             if (active)
                 active.cancelled = true;
@@ -11801,8 +11804,7 @@ function syncTreeGetDescendantServerCacheStates(syncTree, path) {
     const states = [];
     syncTree.syncPointTree_.subtree(path).foreach((relativePath, syncPoint) => {
         for (const view of syncPoint.views.values()) {
-            if (pathIsEmpty(relativePath) &&
-                view.query._queryParams.loadsAllData()) {
+            if (pathIsEmpty(relativePath) && view.query._queryParams.loadsAllData()) {
                 // The default view at `path` is the one being restored into; the
                 // caller checks its state separately.
                 continue;
@@ -11813,7 +11815,8 @@ function syncTreeGetDescendantServerCacheStates(syncTree, path) {
             }
             else {
                 const raw = viewGetServerCache(view);
-                if (raw !== null && (!raw.isEmpty() || !view.query._queryParams.loadsAllData())) {
+                if (raw !== null &&
+                    (!raw.isEmpty() || !view.query._queryParams.loadsAllData())) {
                     states.push({
                         path: relativePath,
                         complete: null,
@@ -13401,8 +13404,7 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
     };
     pendingToken = token;
     repo.pendingSeedRestores_.set(pathString, token);
-    const isCurrent = () => !token.cancelled &&
-        repo.pendingSeedRestores_.get(pathString) === token;
+    const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
     /**
      * Restart against the current in-memory view ONLY when the persisted base
      * failed validation (or became incompatible with fresher local server
@@ -16463,6 +16465,11 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
     if (persistence === null) {
         return Promise.resolve(null);
     }
+    // Prime the manager with the trusted expected identity so the later auth
+    // callback for that same user can reuse this physical decode. A different
+    // real auth uid changes scope and cancels it before any listener consumes it.
+    if (expectedAuthScope !== null)
+        persistence.setAuthScope(expectedAuthScope);
     // Exact-root by design: callers peek the same path they are about to
     // listen to. This lets the authenticated listener consume the same decoded
     // Node and prevents a fresher ancestor record from being mistaken for the
