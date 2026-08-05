@@ -1884,7 +1884,11 @@ declare interface PersistedRecord {
     hash?: string;
     compoundHash?: SeedCompoundHash;
     updatedAt: number;
-    revision: number;
+    /**
+     * Write token unique ACROSS manager instances (tabs, reloads) — the join
+     * key coupling a hash record to the exact data write it describes.
+     */
+    revision: string;
 }
 
 /**
@@ -1903,6 +1907,7 @@ export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
+    private maxRootBytes_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1915,12 +1920,24 @@ declare class PersistenceManager {
      * and re-tracked.
      */
     private latest_;
-    private revisionCounter_;
+    /**
+     * Distinguishes this manager's write tokens from every other tab's and
+     * session's — numeric counters restart at zero on reload, which let a new
+     * data write pair up with a surviving old hash sidecar.
+     */
+    private instanceId_;
+    private writeCounter_;
     private writeTimers_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, maxRootBytes_?: number);
+    /**
+     * A replacement manager for a different key prefix — used when emulator
+     * configuration changes the RepoInfo after persistence was enabled but
+     * before the repo started (no queues or tracked roots exist yet).
+     */
+    rebindTo(prefix: string): PersistenceManager;
     /**
      * Marks a root as persistence-managed; write-throughs only run for
      * tracked roots (and their descendants' updates).
@@ -2788,7 +2805,15 @@ export declare function set(ref: DatabaseReference, value: unknown): Promise<voi
  *
  * @internal
  */
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+export declare function _setPersistenceEnabled(db: Database, enabled: boolean, options?: {
+    /**
+     * Roots whose estimated serialized size exceeds this stay unpersisted:
+     * persisting costs a transient serialize/clone/parse of the whole root —
+     * multiples of its size in peak memory — which memory-constrained
+     * devices cannot afford for very large trees.
+     */
+    maxRootBytes?: number;
+}): void;
 
 /**
  * Sets a priority for the data at this Database location.

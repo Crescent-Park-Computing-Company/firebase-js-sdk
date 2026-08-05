@@ -4218,9 +4218,10 @@ const HASH_KEY_SUFFIX = '#hash';
 class PersistenceManager {
     constructor(prefix_, idbFactory_ = util.isIndexedDBAvailable()
         ? indexedDB
-        : null) {
+        : null, maxRootBytes_ = Infinity) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
+        this.maxRootBytes_ = maxRootBytes_;
         this.db_ = null;
         /**
          * Roots that flow through persistence (complete default listens).
@@ -4233,11 +4234,26 @@ class PersistenceManager {
          * and re-tracked.
          */
         this.latest_ = new Map();
-        this.revisionCounter_ = 0;
+        /**
+         * Distinguishes this manager's write tokens from every other tab's and
+         * session's — numeric counters restart at zero on reload, which let a new
+         * data write pair up with a surviving old hash sidecar.
+         */
+        this.instanceId_ = Math.random().toString(36).slice(2, 10);
+        this.writeCounter_ = 0;
         this.writeTimers_ = new Map();
         /** In-flight storage operations per root (see enqueue_). */
         this.queues_ = new Map();
         this.disposed_ = false;
+    }
+    /**
+     * A replacement manager for a different key prefix — used when emulator
+     * configuration changes the RepoInfo after persistence was enabled but
+     * before the repo started (no queues or tracked roots exist yet).
+     */
+    rebindTo(prefix) {
+        this.dispose();
+        return new PersistenceManager(prefix, this.idbFactory_, this.maxRootBytes_);
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -4553,7 +4569,10 @@ class PersistenceManager {
         if (!this.trackedRoots_.has(pathString)) {
             return;
         }
-        this.latest_.set(pathString, { node, revision: ++this.revisionCounter_ });
+        this.latest_.set(pathString, {
+            node,
+            revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36)
+        });
         // Trailing throttle, NOT a resetting debounce: the timer set by the first
         // update in a burst survives later updates, so a root that churns faster
         // than the interval (a chat streaming, an editing session) still flushes
@@ -4627,6 +4646,14 @@ class PersistenceManager {
             return Promise.resolve();
         }
         const { node, revision } = entry;
+        if (this.maxRootBytes_ !== Infinity &&
+            estimateSerializedNodeSize(node) > this.maxRootBytes_) {
+            // Persisting costs a transient serialize + structured-clone + restore
+            // parse of the whole root — multiples of its size in peak memory. On
+            // constrained devices that is a crash, so oversized roots simply stay
+            // unpersisted (their boot is a normal cold load).
+            return Promise.resolve();
+        }
         persistenceStats.writeThroughs++;
         // The tree is serialized and written exactly once, hashless — a crash
         // before the recompute leaves a restorable tree that seeds without a
@@ -4641,6 +4668,10 @@ class PersistenceManager {
         };
         const put = this.withStore_('readwrite', undefined, store => {
             store.put(record, this.key_(pathString));
+            // Atomically invalidate the previous hash sidecar: between this write
+            // and the recompute below, the stored state is "data, hashless" — never
+            // "new data, old hash".
+            store.delete(this.key_(pathString) + HASH_KEY_SUFFIX);
         });
         return put.then(() => Promise.all([
             hashFromNodeAsync(node),
@@ -4660,7 +4691,16 @@ class PersistenceManager {
                 revision
             };
             return this.withStore_('readwrite', undefined, store => {
-                store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
+                // Another tab may have replaced the data record while we hashed;
+                // only attach the hash if the record still carries OUR token (the
+                // read and the put share one transaction, so this is atomic).
+                const dataReq = store.get(this.key_(pathString));
+                dataReq.onsuccess = () => {
+                    const current = dataReq.result;
+                    if (current && current.revision === revision) {
+                        store.put(hashRecord, this.key_(pathString) + HASH_KEY_SUFFIX);
+                    }
+                };
             });
         }));
     }
@@ -12452,6 +12492,14 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         const seeded = node;
         const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, seeded);
         eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        // The replay runs user callbacks synchronously — one may have
+        // unsubscribed (stopListening saw a pending token and cancelled) or even
+        // re-subscribed (a NEW token now owns the path). Only the uncancelled,
+        // still-current token may send.
+        if (token.cancelled ||
+            repo.pendingSeedRestores_.get(pathString) !== token) {
+            return;
+        }
         // A record persisted before its hash landed restores hashless. Priming
         // the hash here — in idle slices, before the listen goes out — keeps the
         // two invariants of the seeded path: the listen carries a real hash
@@ -15264,6 +15312,14 @@ function connectDatabaseEmulator(db, host, port, options = {}) {
     }
     // Modify the repo to apply emulator settings
     repoManagerApplyEmulatorSettings(repo, hostAndPort, options, tokenProvider);
+    // Persistence enabled before this call captured the production URL as its
+    // storage prefix; rebind it to the emulator's so emulator sessions never
+    // restore production records or write emulator data under the production
+    // namespace. (Emulator config only happens pre-start, so no listens or
+    // tracked roots exist yet.)
+    if (repo.persistence_ !== null) {
+        repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toURLString());
+    }
 }
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -15339,7 +15395,7 @@ function getPersistedValue(db, pathString) {
  *
  * @internal
  */
-function setPersistenceEnabled(db, enabled) {
+function setPersistenceEnabled(db, enabled, options) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceEnabled');
     // _repoInternal, not the _repo getter: configuration must not start the
@@ -15347,7 +15403,7 @@ function setPersistenceEnabled(db, enabled) {
     const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
-            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString(), undefined, options?.maxRootBytes ?? Infinity);
         }
     }
     else {

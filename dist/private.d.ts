@@ -1843,7 +1843,11 @@ declare interface PersistedRecord {
     hash?: string;
     compoundHash?: SeedCompoundHash;
     updatedAt: number;
-    revision: number;
+    /**
+     * Write token unique ACROSS manager instances (tabs, reloads) — the join
+     * key coupling a hash record to the exact data write it describes.
+     */
+    revision: string;
 }
 
 /* Excluded from this release type: _PERSISTENCE_WRITE_DEBOUNCE_MS */
@@ -1856,6 +1860,7 @@ declare interface PersistedRecord {
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
+    private maxRootBytes_;
     private db_;
     /**
      * Roots that flow through persistence (complete default listens).
@@ -1868,12 +1873,24 @@ declare class PersistenceManager {
      * and re-tracked.
      */
     private latest_;
-    private revisionCounter_;
+    /**
+     * Distinguishes this manager's write tokens from every other tab's and
+     * session's — numeric counters restart at zero on reload, which let a new
+     * data write pair up with a surviving old hash sidecar.
+     */
+    private instanceId_;
+    private writeCounter_;
     private writeTimers_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
     private disposed_;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, maxRootBytes_?: number);
+    /**
+     * A replacement manager for a different key prefix — used when emulator
+     * configuration changes the RepoInfo after persistence was enabled but
+     * before the repo started (no queues or tracked roots exist yet).
+     */
+    rebindTo(prefix: string): PersistenceManager;
     /**
      * Marks a root as persistence-managed; write-throughs only run for
      * tracked roots (and their descendants' updates).
