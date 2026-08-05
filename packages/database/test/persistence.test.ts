@@ -73,7 +73,7 @@ function makeFakeIndexedDB(
   // stores exist only once created in a version-change transaction, and a
   // versioned open above the current version fires onupgradeneeded.
   const state = {
-    version: options.dbVersion ?? 7,
+    version: options.dbVersion ?? 8,
     hasStore: !options.startWithoutStore
   };
   const async = (fn: () => void) => {
@@ -444,7 +444,7 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 4,
+      formatVersion: 5,
       revision: 'ext-1',
       hash: computeCanonicalHash(json),
       compoundHash: computeCompoundHash(json),
@@ -503,6 +503,15 @@ describe('PersistenceManager', () => {
     const restored = (await manager.restore('/legacy/root')) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(json);
     expect(restored.hash).to.equal(computeCanonicalHash(json));
+  });
+
+  it('skips restore immediately when the browser schema marker is stale', async () => {
+    const { factory } = makeFakeIndexedDB({ dbVersion: 7 });
+    const manager = new PersistenceManager('test-repo', factory, false);
+    expect(await manager.restoreListenMetadata('/cold/root')).to.equal(null);
+    expect(await manager.restoreForListen('/cold/root')).to.equal(null);
+    // The v8 migration continues in the background for the later live flush.
+    await flushAsync();
   });
 
   it('clears pre-chunk cache formats without reading their values', async () => {
@@ -584,7 +593,7 @@ describe('PersistenceManager', () => {
     // Manifest expects two chunks of revision ext-2, but chunk 1 still
     // carries an older write's token (interrupted mid-write).
     data.set('test-repo|/torn/root', {
-      formatVersion: 4,
+      formatVersion: 5,
       revision: 'ext-2',
       updatedAt: Date.now(),
       chunkCount: 2,
@@ -882,7 +891,7 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 4,
+      formatVersion: 5,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
@@ -901,7 +910,7 @@ describe('PersistenceManager', () => {
     // A fresh chunked root stays, with protocol hashes integrated into its
     // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 4,
+      formatVersion: 5,
       revision: 'ext-2',
       hash: 'h',
       compoundHash: { hashes: [''], posts: [] },
