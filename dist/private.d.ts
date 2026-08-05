@@ -1921,6 +1921,8 @@ declare class PersistenceManager {
     private activeReads_;
     private sweepTimer_;
     private disposed_;
+    private authScope_;
+    setAuthScope(scope: string | null): void;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
@@ -2008,7 +2010,7 @@ declare class PersistenceManager {
      * the authenticated listener can consume the same immutable Node instead of
      * decoding a large IndexedDB record twice during boot.
      */
-    peek(pathString: string): Promise<PersistedRecord | null>;
+    peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
      * Listener restore with an idle (no-progress) bound. Healthy chunked reads
      * can take arbitrarily long in total as long as each chunk advances; a stuck
@@ -2649,6 +2651,8 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
+
+/* Excluded from this release type: _setPersistenceAuthScope */
 
 /* Excluded from this release type: _setPersistenceEnabled */
 

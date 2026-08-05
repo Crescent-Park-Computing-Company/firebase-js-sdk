@@ -1262,6 +1262,7 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
+/* Excluded from this release type: _setPersistenceAuthScope */
 /* Excluded from this release type: _setPersistenceEnabled */
 /**
  * Sets a priority for the data at this Database location.

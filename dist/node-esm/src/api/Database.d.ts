@@ -119,7 +119,7 @@ export declare function goOffline(db: Database): void;
  *
  * @internal
  */
-export declare function getPersistedValue(db: Database, pathString: string): Promise<unknown | null>;
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
  * Enables client-side persistence of the server cache for this Database
  * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
@@ -134,6 +134,8 @@ export declare function getPersistedValue(db: Database, pathString: string): Pro
  * @internal
  */
 export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
+/** Sets the identity scope used to read and write persisted cache records. @internal */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
 /**
  * Registers cached JSON as the initial server cache for `path` on this
  * Database instance. Must be called before the listener for that exact path

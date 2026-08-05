@@ -620,7 +620,7 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  *
  * @internal
  */
-export declare function _getPersistedValue(db: Database, pathString: string): Promise<unknown | null>;
+export declare function _getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -1968,6 +1968,8 @@ declare class PersistenceManager {
     private activeReads_;
     private sweepTimer_;
     private disposed_;
+    private authScope_;
+    setAuthScope(scope: string | null): void;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
@@ -2059,7 +2061,7 @@ declare class PersistenceManager {
      * the authenticated listener can consume the same immutable Node instead of
      * decoding a large IndexedDB record twice during boot.
      */
-    peek(pathString: string): Promise<PersistedRecord | null>;
+    peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
      * Listener restore with an idle (no-progress) bound. Healthy chunked reads
      * can take arbitrarily long in total as long as each chunk advances; a stuck
@@ -2874,6 +2876,9 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
+
+/** Sets the identity scope used to read and write persisted cache records. @internal */
+export declare function _setPersistenceAuthScope(db: Database, scope: string | null): void;
 
 /**
  * Enables client-side persistence of the server cache for this Database

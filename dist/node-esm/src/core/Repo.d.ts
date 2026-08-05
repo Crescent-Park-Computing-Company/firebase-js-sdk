@@ -160,6 +160,7 @@ export declare function repoWhenListenComplete(repo: Repo, pathString: string): 
  * listens can never respond again, and an unsettleable waiter would hang
  * its caller and retain the Repo forever.
  */
+export declare function repoCancelPendingSeedRestores(repo: Repo): void;
 export declare function repoSettleListenCompletions(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**
