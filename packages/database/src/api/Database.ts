@@ -44,9 +44,9 @@ import { PersistenceManager } from '../core/Persistence';
 import {
   Repo,
   repoCancelPendingSeedRestores,
+  repoDispose,
   repoInterrupt,
   repoResume,
-  repoSettleListenCompletions,
   repoStart,
   repoWhenListenComplete
 } from '../core/Repo';
@@ -196,13 +196,7 @@ function repoManagerDeleteRepo(repo: Repo, appName: string): void {
   if (!appRepos || appRepos[repo.key] !== repo) {
     fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
   }
-  repoInterrupt(repo);
-  repoCancelPendingSeedRestores(repo);
-  // The repo's listens can never respond after this: settle any
-  // whenListenComplete waiters (they would otherwise hang forever and
-  // retain the repo), and stop the persistence timers.
-  repoSettleListenCompletions(repo);
-  repo.persistence_?.dispose();
+  repoDispose(repo);
   delete appRepos[repo.key];
 }
 
@@ -481,7 +475,9 @@ export function getPersistedValue(
   // Prime the manager with the trusted expected identity so the later auth
   // callback for that same user can reuse this physical decode. A different
   // real auth uid changes scope and cancels it before any listener consumes it.
-  if (expectedAuthScope !== null) persistence.setAuthScope(expectedAuthScope);
+  if (expectedAuthScope !== null) {
+    persistence.setAuthScope(expectedAuthScope);
+  }
   // Exact-root by design: callers peek the same path they are about to
   // listen to. This lets the authenticated listener consume the same decoded
   // Node and prevents a fresher ancestor record from being mistaken for the
@@ -507,6 +503,11 @@ export function getPersistedValue(
 export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceEnabled');
+  if (db._instanceStarted) {
+    fatal(
+      'setPersistenceEnabled() must be called before the first Database operation.'
+    );
+  }
   // _repoInternal, not the _repo getter: configuration must not start the
   // instance, or a later connectDatabaseEmulator() would refuse to run.
   const repo = db._repoInternal;

@@ -132,6 +132,10 @@ function writeSchemaMarker(): void {
  */
 export const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
+export const PERSISTENCE_MAX_CACHE_BYTES = 100 * 1024 * 1024;
+const PERSISTENCE_MAX_PRUNABLE_ROOTS = 1000;
+const PERSISTENCE_PRUNE_TARGET_RATIO = 0.8;
+
 /**
  * How long after the last server update a root's write-through runs. The
  * flush re-serializes the chunks the update dirtied, so it is deliberately
@@ -149,11 +153,6 @@ export const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * fires neither success nor error can never hold the live listen forever.
  */
 export const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
-
-/** Hard wall-clock cap for a warm restore. Slow progress still yields to the
- * live path before a constrained phone spends tens of seconds rebuilding a
- * cache and retaining its partial tree. */
-export const PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS = 12000;
 
 /** How long a completed optimistic peek waits for its real listener. */
 const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
@@ -197,13 +196,6 @@ export interface PersistedRecord {
   revision: string;
 }
 
-/** Precomputed listen state readable without decoding the cached tree. */
-export interface PersistedListenMetadata {
-  hash: string;
-  compoundHash: SeedCompoundHash;
-  revision: string;
-}
-
 /** The manifest record stored at a root's main key. */
 interface PersistedManifest {
   formatVersion: number;
@@ -213,6 +205,7 @@ interface PersistedManifest {
   compoundHash?: SeedCompoundHash;
   updatedAt: number;
   authScope: string | null;
+  estimatedBytes?: number;
   chunkCount: number;
   /**
    * The write token each chunk record must carry to belong to this
@@ -271,6 +264,23 @@ interface FlushedState {
  * Counters for observing persistence effectiveness.
  * @internal
  */
+const persistenceEventListeners = new Set<
+  (event: { at: number; path: string; event: string; detail?: string }) => void
+>();
+
+/** @internal */
+export function onPersistenceEvent(
+  listener: (event: {
+    at: number;
+    path: string;
+    event: string;
+    detail?: string;
+  }) => void
+): () => void {
+  persistenceEventListeners.add(listener);
+  return () => persistenceEventListeners.delete(listener);
+}
+
 export const persistenceStats: {
   restoredRoots: string[];
   restoreMisses: string[];
@@ -280,6 +290,7 @@ export const persistenceStats: {
   hashRecomputes: number;
   evictions: number;
   storageFailures: number;
+  events: Array<{ at: number; path: string; event: string; detail?: string }>;
 } = {
   restoredRoots: [],
   restoreMisses: [],
@@ -288,8 +299,24 @@ export const persistenceStats: {
   chunksSkipped: 0,
   hashRecomputes: 0,
   evictions: 0,
-  storageFailures: 0
+  storageFailures: 0,
+  events: []
 };
+
+function recordPersistenceEvent(
+  path: string,
+  event: string,
+  detail?: string
+): void {
+  const item = { at: Date.now(), path, event, detail };
+  persistenceStats.events.push(item);
+  for (const listener of persistenceEventListeners) {
+    listener(item);
+  }
+  if (persistenceStats.events.length > 100) {
+    persistenceStats.events.splice(0, persistenceStats.events.length - 100);
+  }
+}
 
 const HASH_KEY_SUFFIX = '#hash';
 const CHUNK_KEY_INFIX = '#c';
@@ -405,7 +432,10 @@ export class PersistenceManager {
    * can never collide with a tree that arrived after its root was evicted
    * and re-tracked.
    */
-  private latest_ = new Map<string, { node: Node; revision: string }>();
+  private latest_ = new Map<
+    string,
+    { node: Node; revision: string; authScope: string | null }
+  >();
   /**
    * What IndexedDB currently holds per root (see FlushedState) — the basis
    * for skipping clean chunks and no-op flushes.
@@ -438,7 +468,6 @@ export class PersistenceManager {
       promise: Promise<ReadResult | null>;
       progress: Set<() => void>;
       retainAfterResolve: boolean;
-      cancelled: boolean;
       cleanupTimer: ReturnType<typeof setTimeout> | null;
     }
   >();
@@ -447,11 +476,23 @@ export class PersistenceManager {
   private authScope_: string | null = null;
 
   setAuthScope(scope: string | null): void {
-    if (scope === this.authScope_) return;
-    this.authScope_ = scope;
-    // A decode started under one identity must never be handed to another.
-    for (const read of this.activeReads_.values()) read.cancelled = true;
+    if (scope === this.authScope_) {
+      return;
+    }
+    for (const timer of this.writeTimers_.values()) {
+      clearTimeout(timer);
+    }
+    this.writeTimers_.clear();
+    this.flushPending_.clear();
+    this.latest_.clear();
+    this.lastFlush_.clear();
     this.activeReads_.clear();
+    this.authScope_ = scope;
+    recordPersistenceEvent(
+      '*',
+      'auth-scope-change',
+      scope ? 'signed-in' : 'signed-out'
+    );
   }
 
   constructor(
@@ -460,7 +501,8 @@ export class PersistenceManager {
       ? indexedDB
       : null,
     private schemaKnownCurrent_: boolean = readSchemaMarker(),
-    private operationTimeoutMs_: number = PERSISTENCE_RESTORE_TIMEOUT_MS
+    private operationTimeoutMs_: number = PERSISTENCE_RESTORE_TIMEOUT_MS,
+    private cacheMaxBytes_: number = PERSISTENCE_MAX_CACHE_BYTES
   ) {
     if (!this.schemaKnownCurrent_) {
       // Do not put the cold server listen behind a potentially slow Safari
@@ -476,13 +518,17 @@ export class PersistenceManager {
    * before the repo started (no queues or tracked roots exist yet).
    */
   rebindTo(prefix: string): PersistenceManager {
+    const scope = this.authScope_;
     this.dispose();
-    return new PersistenceManager(
+    const rebound = new PersistenceManager(
       prefix,
       this.idbFactory_,
       this.schemaKnownCurrent_,
-      this.operationTimeoutMs_
+      this.operationTimeoutMs_,
+      this.cacheMaxBytes_
     );
+    rebound.setAuthScope(scope);
+    return rebound;
   }
 
   /**
@@ -676,9 +722,49 @@ export class PersistenceManager {
         // cannot interleave between the read and the delete.
         const decisions = new Map<
           string,
-          { expired: boolean; chunkCount: number; currentFormat: boolean }
+          {
+            expired: boolean;
+            chunkCount: number;
+            currentFormat: boolean;
+            updatedAt: number;
+            estimatedBytes: number;
+          }
         >();
         let index = 0;
+        const pruneLru = () => {
+          const activeKeys = new Set(
+            [...this.trackedRoots_].map(path => this.key_(path))
+          );
+          const live = [...decisions.entries()].filter(([, d]) => !d.expired);
+          let totalBytes = live.reduce(
+            (sum, [, d]) => sum + d.estimatedBytes,
+            0
+          );
+          if (
+            totalBytes <= this.cacheMaxBytes_ &&
+            live.length <= PERSISTENCE_MAX_PRUNABLE_ROOTS
+          ) {
+            return;
+          }
+          const targetBytes =
+            this.cacheMaxBytes_ * PERSISTENCE_PRUNE_TARGET_RATIO;
+          const targetRoots = Math.floor(
+            PERSISTENCE_MAX_PRUNABLE_ROOTS * PERSISTENCE_PRUNE_TARGET_RATIO
+          );
+          const candidates = live
+            .filter(([key]) => !activeKeys.has(key))
+            .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+          let liveRoots = live.length;
+          for (const [, decision] of candidates) {
+            if (totalBytes <= targetBytes && liveRoots <= targetRoots) {
+              break;
+            }
+            decision.expired = true;
+            totalBytes -= decision.estimatedBytes;
+            liveRoots--;
+          }
+        };
+
         const settleSuffixed = () => {
           for (const key of suffixedKeys) {
             const base = key.slice(0, key.indexOf('#', prefix.length));
@@ -710,6 +796,13 @@ export class PersistenceManager {
         };
         const step = () => {
           if (index >= baseKeys.length) {
+            pruneLru();
+            for (const [key, decision] of decisions) {
+              if (decision.expired) {
+                persistenceStats.evictions++;
+                store.delete(key);
+              }
+            }
             settleSuffixed();
             return;
           }
@@ -717,7 +810,11 @@ export class PersistenceManager {
           const req = store.get(key);
           req.onsuccess = () => {
             const record = req.result as
-              | { updatedAt?: unknown; chunkCount?: unknown }
+              | {
+                  updatedAt?: unknown;
+                  chunkCount?: unknown;
+                  estimatedBytes?: unknown;
+                }
               | undefined;
             const expired =
               !record ||
@@ -735,12 +832,18 @@ export class PersistenceManager {
               currentFormat:
                 typeof record?.chunkCount === 'number' &&
                 (record as { formatVersion?: number }).formatVersion ===
-                  PERSISTENCE_FORMAT_VERSION
+                  PERSISTENCE_FORMAT_VERSION,
+              updatedAt:
+                record && typeof record.updatedAt === 'number'
+                  ? record.updatedAt
+                  : 0,
+              estimatedBytes:
+                record && typeof record.estimatedBytes === 'number'
+                  ? record.estimatedBytes
+                  : typeof record?.chunkCount === 'number'
+                  ? record.chunkCount * PERSISTENCE_CHUNK_TARGET_BYTES
+                  : 0
             });
-            if (expired) {
-              persistenceStats.evictions++;
-              store.delete(key);
-            }
             step();
           };
         };
@@ -910,23 +1013,22 @@ export class PersistenceManager {
       return active.promise;
     }
     const progress = new Set<() => void>([onProgress]);
-    const entry = {
-      promise: null as unknown as Promise<ReadResult | null>,
-      progress,
-      retainAfterResolve,
-      cancelled: false,
-      cleanupTimer: null as ReturnType<typeof setTimeout> | null
-    };
     const emitProgress = () => {
-      for (const callback of progress) callback();
+      for (const callback of progress) {
+        callback();
+      }
     };
-    entry.promise = this.readRecordOnce_(
+    const promise = this.readRecordOnce_(
       pathString,
       emitProgress,
-      () => !entry.cancelled,
       expectedAuthScope
     );
-    const promise = entry.promise;
+    const entry = {
+      promise,
+      progress,
+      retainAfterResolve,
+      cleanupTimer: null as ReturnType<typeof setTimeout> | null
+    };
     this.activeReads_.set(pathString, entry);
     const release = () => {
       entry.progress.clear();
@@ -950,7 +1052,6 @@ export class PersistenceManager {
   private readRecordOnce_(
     pathString: string,
     onProgress: () => void,
-    shouldContinue: () => boolean = () => true,
     expectedAuthScope: string | null = this.authScope_
   ): Promise<ReadResult | null> {
     const key = this.key_(pathString);
@@ -994,8 +1095,9 @@ export class PersistenceManager {
         onProgress();
         const { stored, hashes } = meta;
         // Pre-scope records cannot be attributed to an authenticated user.
-        if (isLegacyRecord(stored) && expectedAuthScope !== null)
+        if (isLegacyRecord(stored) && expectedAuthScope !== null) {
           return 'mismatch' as const;
+        }
         const joined = isLegacyRecord(stored)
           ? hashes && hashes.revision === stored.revision
             ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
@@ -1026,14 +1128,17 @@ export class PersistenceManager {
         ) {
           return 'mismatch' as const;
         }
-        if (manifest.authScope !== expectedAuthScope) return null;
+        if (manifest.authScope !== expectedAuthScope) {
+          return null;
+        }
         let assembled: Node = ChildrenNode.EMPTY_NODE;
         const plans: ChunkPlan[] = [];
-        let chain = Promise.resolve<true | 'mismatch' | 'cancelled'>(true);
+        let chain = Promise.resolve<true | 'mismatch'>(true);
         for (let index = 0; index < manifest.chunkCount; index++) {
           chain = chain.then(status => {
-            if (status === 'mismatch' || status === 'cancelled') return status;
-            if (!shouldContinue()) return 'cancelled' as const;
+            if (status === 'mismatch') {
+              return status;
+            }
             return this.withStore_<PersistedChunk | null>(
               'readonly',
               null,
@@ -1043,7 +1148,6 @@ export class PersistenceManager {
                   done((req.result as PersistedChunk | undefined) ?? null);
               }
             ).then(chunk => {
-              if (!shouldContinue()) return 'cancelled' as const;
               if (
                 !chunk ||
                 chunk.revision !== manifest.chunkRevisions[index] ||
@@ -1063,27 +1167,52 @@ export class PersistenceManager {
             });
           });
         }
-        return chain.then(status =>
-          status === 'mismatch' || status === 'cancelled'
-            ? status
-            : ({
-                record: {
-                  node: assembled,
-                  ...joined,
-                  updatedAt: manifest.updatedAt,
-                  revision: manifest.revision
-                },
-                plans,
-                chunkRevisions: manifest.chunkRevisions,
-                chunkCount: manifest.chunkCount
-              } as ReadResult)
-        );
+        return chain
+          .then(status =>
+            status === 'mismatch'
+              ? status
+              : ({
+                  record: {
+                    node: assembled,
+                    ...joined,
+                    updatedAt: manifest.updatedAt,
+                    revision: manifest.revision
+                  },
+                  plans,
+                  chunkRevisions: manifest.chunkRevisions,
+                  chunkCount: manifest.chunkCount
+                } as ReadResult)
+          )
+          .then(async result => {
+            if (result === 'mismatch') {
+              return result;
+            }
+            const actualHash = await canonicalHashFromNodeAsync(
+              result.record.node
+            );
+            if (
+              typeof result.record.hash === 'string' &&
+              actualHash !== result.record.hash
+            ) {
+              return 'mismatch' as const;
+            }
+            result.record.hash = actualHash;
+            if (!result.record.compoundHash) {
+              const compound = await compoundHashFromNodeAsync(
+                result.record.node
+              );
+              result.record.compoundHash = {
+                hashes: compound.hashes,
+                posts: compound.posts
+              };
+            }
+            return result;
+          });
       })
       .then(result => {
         if (result === null) {
           return null;
         }
-        if (result === 'cancelled') return null;
         if (result === 'mismatch') {
           persistenceStats.evictions++;
           void this.deleteRecord_(pathString);
@@ -1144,59 +1273,6 @@ export class PersistenceManager {
    * boot), the follow-up write-through skips without serializing anything.
    */
   /**
-   * Reads only the tiny manifest with its integrated protocol hashes. This lets Repo send the
-   * precomputed hash listen immediately while the shared chunk restore runs
-   * in parallel. A result is returned only when the manifest and its integrated protocol hashes
-   * are structurally valid and coupled to the same revision.
-   */
-  restoreListenMetadata(
-    pathString: string
-  ): Promise<PersistedListenMetadata | null> {
-    if (this.disposed_) {
-      return Promise.resolve(null);
-    }
-    if (!this.schemaKnownCurrent_) {
-      return Promise.resolve(null);
-    }
-    const key = this.key_(pathString);
-    return this.withStore_<PersistedListenMetadata | null>(
-      'readonly',
-      null,
-      (store, done) => {
-        const req = store.get(key);
-        req.onsuccess = () => {
-          const manifest = req.result as PersistedManifest | undefined;
-          if (
-            !manifest ||
-            isLegacyRecord(manifest) ||
-            manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-            manifest.authScope !== this.authScope_ ||
-            typeof manifest.chunkCount !== 'number' ||
-            manifest.chunkCount <= 0 ||
-            !Array.isArray(manifest.chunkRevisions) ||
-            manifest.chunkRevisions.length !== manifest.chunkCount ||
-            Date.now() - manifest.updatedAt > PERSISTENCE_MAX_AGE_MS ||
-            typeof manifest.hash !== 'string' ||
-            !manifest.compoundHash ||
-            !Array.isArray(manifest.compoundHash.hashes) ||
-            !Array.isArray(manifest.compoundHash.posts) ||
-            manifest.compoundHash.hashes.length !==
-              manifest.compoundHash.posts.length + 1
-          ) {
-            done(null);
-            return;
-          }
-          done({
-            hash: manifest.hash,
-            compoundHash: manifest.compoundHash,
-            revision: manifest.revision
-          });
-        };
-      }
-    );
-  }
-
-  /**
    * Exact-root optimistic peek. The completed decode is retained briefly so
    * the authenticated listener can consume the same immutable Node instead of
    * decoding a large IndexedDB record twice during boot.
@@ -1206,19 +1282,26 @@ export class PersistenceManager {
     expectedAuthScope: string | null = this.authScope_
   ): Promise<PersistedRecord | null> {
     if (this.disposed_ || !this.schemaKnownCurrent_) {
+      recordPersistenceEvent(
+        pathString,
+        'peek-miss',
+        this.disposed_ ? 'disposed' : 'schema-migration'
+      );
       return Promise.resolve(null);
     }
     return this.raceRestoreTimeout_(
       onProgress =>
         this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(
-          result => (result === null ? null : result.record)
+          result => {
+            recordPersistenceEvent(
+              pathString,
+              result ? 'peek-hit' : 'peek-miss'
+            );
+            return result === null ? null : result.record;
+          }
         ),
       this.operationTimeoutMs_,
-      PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
-      () => {
-        const active = this.activeReads_.get(pathString);
-        if (active) active.cancelled = true;
-      }
+      () => recordPersistenceEvent(pathString, 'peek-idle-timeout')
     );
   }
 
@@ -1229,10 +1312,12 @@ export class PersistenceManager {
    * restarts once against the live in-memory cache.
    */
   restoreForListen(pathString: string): Promise<PersistedRecord | null> {
-    if (this.disposed_) {
-      return Promise.resolve(null);
-    }
-    if (!this.schemaKnownCurrent_) {
+    if (this.disposed_ || !this.schemaKnownCurrent_) {
+      recordPersistenceEvent(
+        pathString,
+        'restore-miss',
+        this.disposed_ ? 'disposed' : 'schema-migration'
+      );
       return Promise.resolve(null);
     }
     return this.raceRestoreTimeout_(
@@ -1257,12 +1342,14 @@ export class PersistenceManager {
           return result.record;
         }),
       this.operationTimeoutMs_,
-      PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
-      () => {
-        const active = this.activeReads_.get(pathString);
-        if (active) active.cancelled = true;
-      }
-    );
+      () => recordPersistenceEvent(pathString, 'restore-idle-timeout')
+    ).then(record => {
+      recordPersistenceEvent(
+        pathString,
+        record ? 'restore-hit' : 'restore-miss'
+      );
+      return record;
+    });
   }
 
   restore(pathString: string): Promise<PersistedRecord | null> {
@@ -1306,34 +1393,30 @@ export class PersistenceManager {
       | Promise<T | null>
       | ((onProgress: () => void) => Promise<T | null>),
     timeoutMs = this.operationTimeoutMs_,
-    totalTimeoutMs = PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
     onTimeout: () => void = () => {}
   ): Promise<T | null> {
     let timer: ReturnType<typeof setTimeout>;
-    let totalTimer: ReturnType<typeof setTimeout>;
     let settled = false;
     let timeoutResolve: (value: null) => void = () => {};
     const timeout = new Promise<null>(resolve => {
       timeoutResolve = resolve;
     });
-    const expire = () => {
-      if (settled) return;
-      onTimeout();
-      timeoutResolve(null);
-    };
     const arm = () => {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
       clearTimeout(timer);
-      timer = setTimeout(expire, timeoutMs);
+      timer = setTimeout(() => {
+        onTimeout();
+        timeoutResolve(null);
+      }, timeoutMs);
     };
     const read =
       typeof readOrStart === 'function' ? readOrStart(arm) : readOrStart;
     arm();
-    totalTimer = setTimeout(expire, totalTimeoutMs);
     return Promise.race([read, timeout]).then(result => {
       settled = true;
       clearTimeout(timer);
-      clearTimeout(totalTimer);
       return result;
     });
   }
@@ -1364,8 +1447,16 @@ export class PersistenceManager {
     }
     this.latest_.set(pathString, {
       node,
-      revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36)
+      revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
+      authScope: this.authScope_
     });
+    // Android persists each authoritative server update transactionally. On
+    // web, guarantee the first complete tree immediately, then throttle later
+    // churn so a quick reload never races an arbitrary 10-second empty window.
+    if (!prev && !this.queues_.has(pathString)) {
+      this.scheduleFlush_(pathString);
+      return;
+    }
     // Trailing throttle, NOT a resetting debounce: the timer set by the first
     // update in a burst survives later updates, so a root that churns faster
     // than the interval (a chat streaming, an editing session) still flushes
@@ -1396,6 +1487,15 @@ export class PersistenceManager {
     void this.enqueue_(pathString, () => this.flush_(pathString));
   }
 
+  /** Drop an unusable persisted record but keep the live root tracked. */
+  invalidate(path: Path): void {
+    const pathString = path.toString();
+    this.latest_.delete(pathString);
+    this.lastFlush_.delete(pathString);
+    recordPersistenceEvent(pathString, 'invalidate', 'corrupt-or-incompatible');
+    void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+  }
+
   /**
    * The viewer lost access to a root: a cached copy must not outlive the
    * access that produced it, and the root leaves write-through tracking
@@ -1414,6 +1514,7 @@ export class PersistenceManager {
       this.writeTimers_.delete(pathString);
     }
     persistenceStats.evictions++;
+    recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
     // Through the queue: a flush already running for this root finishes its
     // writes first, then the delete removes them — never the reverse.
     void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
@@ -1430,7 +1531,6 @@ export class PersistenceManager {
     }
     this.flushPending_.clear();
     for (const read of this.activeReads_.values()) {
-      read.cancelled = true;
       if (read.cleanupTimer !== null) {
         clearTimeout(read.cleanupTimer);
       }
@@ -1483,7 +1583,7 @@ export class PersistenceManager {
     if (!entry || this.disposed_) {
       return Promise.resolve();
     }
-    const { node, revision } = entry;
+    const { node, revision, authScope } = entry;
     const prev = this.lastFlush_.get(pathString);
     const now = Date.now();
     if (
@@ -1555,7 +1655,8 @@ export class PersistenceManager {
       formatVersion: PERSISTENCE_FORMAT_VERSION,
       revision,
       updatedAt: now,
-      authScope: this.authScope_,
+      authScope,
+      estimatedBytes: estimateSerializedNodeSize(node),
       chunkCount: plans.length,
       chunkRevisions
     };
@@ -1619,6 +1720,7 @@ export class PersistenceManager {
         chunkCount: plans.length,
         storedUpdatedAt: now
       });
+      recordPersistenceEvent(pathString, 'stored', `${plans.length} chunks`);
       // Compute protocol hashes once, when server data is persisted. The
       // canonical traversal is non-retaining (it does not fill every child's
       // lazyHash_); only this listened root is stamped and stored natively in
