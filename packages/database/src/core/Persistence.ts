@@ -94,9 +94,8 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 5;
-const PERSISTENCE_SCHEMA_MARKER_KEY =
-  'firebase-database-persistence-schema';
+const PERSISTENCE_FORMAT_VERSION = 6;
+const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 
 function readSchemaMarker(): boolean {
   if (typeof localStorage === 'undefined') {
@@ -150,6 +149,11 @@ export const PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
  * fires neither success nor error can never hold the live listen forever.
  */
 export const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
+
+/** Hard wall-clock cap for a warm restore. Slow progress still yields to the
+ * live path before a constrained phone spends tens of seconds rebuilding a
+ * cache and retaining its partial tree. */
+export const PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS = 12000;
 
 /** How long a completed optimistic peek waits for its real listener. */
 const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
@@ -208,6 +212,7 @@ interface PersistedManifest {
   hash?: string;
   compoundHash?: SeedCompoundHash;
   updatedAt: number;
+  authScope: string | null;
   chunkCount: number;
   /**
    * The write token each chunk record must carry to belong to this
@@ -326,7 +331,10 @@ function planChunks(root: Node): ChunkPlan[] {
     }
   };
   const emit = (relPath: string, node: Node, size: number) => {
-    if (currentSize > 0 && currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES) {
+    if (
+      currentSize > 0 &&
+      currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES
+    ) {
       flushBin();
     }
     current.push({ relPath, node });
@@ -430,11 +438,21 @@ export class PersistenceManager {
       promise: Promise<ReadResult | null>;
       progress: Set<() => void>;
       retainAfterResolve: boolean;
+      cancelled: boolean;
       cleanupTimer: ReturnType<typeof setTimeout> | null;
     }
   >();
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
   private disposed_ = false;
+  private authScope_: string | null = null;
+
+  setAuthScope(scope: string | null): void {
+    if (scope === this.authScope_) return;
+    this.authScope_ = scope;
+    // A decode started under one identity must never be handed to another.
+    for (const read of this.activeReads_.values()) read.cancelled = true;
+    this.activeReads_.clear();
+  }
 
   constructor(
     private prefix_: string,
@@ -537,37 +555,39 @@ export class PersistenceManager {
     if (this.db_) {
       return this.db_;
     }
-    this.db_ = this.openAtVersion_(undefined).then(db => {
-      if (db === null) {
-        return null;
-      }
-      // One-time migration away from monolithic / shared-transaction cache
-      // formats. Close and upgrade BEFORE any get(): clearing in the version
-      // change transaction drops the old values inside IndexedDB, without
-      // structured-cloning them into the WebKit heap (which is exactly what
-      // crashed large legacy accounts during restore).
-      if (db.version < PERSISTENCE_DB_VERSION) {
+    this.db_ = this.openAtVersion_(undefined)
+      .then(db => {
+        if (db === null) {
+          return null;
+        }
+        // One-time migration away from monolithic / shared-transaction cache
+        // formats. Close and upgrade BEFORE any get(): clearing in the version
+        // change transaction drops the old values inside IndexedDB, without
+        // structured-cloning them into the WebKit heap (which is exactly what
+        // crashed large legacy accounts during restore).
+        if (db.version < PERSISTENCE_DB_VERSION) {
+          db.close();
+          return this.openAtVersion_(PERSISTENCE_DB_VERSION);
+        }
+        if (db.objectStoreNames.contains(STORE)) {
+          return db;
+        }
+        const nextVersion = db.version + 1;
         db.close();
-        return this.openAtVersion_(PERSISTENCE_DB_VERSION);
-      }
-      if (db.objectStoreNames.contains(STORE)) {
+        return this.openAtVersion_(nextVersion);
+      })
+      .then(db => {
+        if (db !== null && !db.objectStoreNames.contains(STORE)) {
+          persistenceStats.storageFailures++;
+          db.close();
+          return null;
+        }
+        if (db !== null) {
+          this.schemaKnownCurrent_ = true;
+          writeSchemaMarker();
+        }
         return db;
-      }
-      const nextVersion = db.version + 1;
-      db.close();
-      return this.openAtVersion_(nextVersion);
-    }).then(db => {
-      if (db !== null && !db.objectStoreNames.contains(STORE)) {
-        persistenceStats.storageFailures++;
-        db.close();
-        return null;
-      }
-      if (db !== null) {
-        this.schemaKnownCurrent_ = true;
-        writeSchemaMarker();
-      }
-      return db;
-    });
+      });
     void this.db_.then(db => {
       if (db !== null && !this.disposed_ && this.sweepTimer_ === null) {
         this.sweepTimer_ = setTimeout(() => {
@@ -866,7 +886,8 @@ export class PersistenceManager {
   private readRecord_(
     pathString: string,
     onProgress: () => void = () => {},
-    retainAfterResolve = false
+    retainAfterResolve = false,
+    expectedAuthScope: string | null = this.authScope_
   ): Promise<ReadResult | null> {
     const active = this.activeReads_.get(pathString);
     if (active) {
@@ -889,18 +910,23 @@ export class PersistenceManager {
       return active.promise;
     }
     const progress = new Set<() => void>([onProgress]);
-    const emitProgress = () => {
-      for (const callback of progress) {
-        callback();
-      }
-    };
-    const promise = this.readRecordOnce_(pathString, emitProgress);
     const entry = {
-      promise,
+      promise: null as unknown as Promise<ReadResult | null>,
       progress,
       retainAfterResolve,
+      cancelled: false,
       cleanupTimer: null as ReturnType<typeof setTimeout> | null
     };
+    const emitProgress = () => {
+      for (const callback of progress) callback();
+    };
+    entry.promise = this.readRecordOnce_(
+      pathString,
+      emitProgress,
+      () => !entry.cancelled,
+      expectedAuthScope
+    );
+    const promise = entry.promise;
     this.activeReads_.set(pathString, entry);
     const release = () => {
       entry.progress.clear();
@@ -923,7 +949,9 @@ export class PersistenceManager {
 
   private readRecordOnce_(
     pathString: string,
-    onProgress: () => void
+    onProgress: () => void,
+    shouldContinue: () => boolean = () => true,
+    expectedAuthScope: string | null = this.authScope_
   ): Promise<ReadResult | null> {
     const key = this.key_(pathString);
     // Metadata first, in a short transaction. Each chunk then gets its OWN
@@ -965,13 +993,16 @@ export class PersistenceManager {
         }
         onProgress();
         const { stored, hashes } = meta;
+        // Pre-scope records cannot be attributed to an authenticated user.
+        if (isLegacyRecord(stored) && expectedAuthScope !== null)
+          return 'mismatch' as const;
         const joined = isLegacyRecord(stored)
           ? hashes && hashes.revision === stored.revision
             ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
             : {}
           : typeof stored.hash === 'string' && stored.compoundHash
-            ? { hash: stored.hash, compoundHash: stored.compoundHash }
-            : {};
+          ? { hash: stored.hash, compoundHash: stored.compoundHash }
+          : {};
         if (isLegacyRecord(stored)) {
           return {
             record: {
@@ -995,14 +1026,14 @@ export class PersistenceManager {
         ) {
           return 'mismatch' as const;
         }
+        if (manifest.authScope !== expectedAuthScope) return null;
         let assembled: Node = ChildrenNode.EMPTY_NODE;
         const plans: ChunkPlan[] = [];
-        let chain = Promise.resolve<true | 'mismatch'>(true);
+        let chain = Promise.resolve<true | 'mismatch' | 'cancelled'>(true);
         for (let index = 0; index < manifest.chunkCount; index++) {
           chain = chain.then(status => {
-            if (status === 'mismatch') {
-              return status;
-            }
+            if (status === 'mismatch' || status === 'cancelled') return status;
+            if (!shouldContinue()) return 'cancelled' as const;
             return this.withStore_<PersistedChunk | null>(
               'readonly',
               null,
@@ -1012,6 +1043,7 @@ export class PersistenceManager {
                   done((req.result as PersistedChunk | undefined) ?? null);
               }
             ).then(chunk => {
+              if (!shouldContinue()) return 'cancelled' as const;
               if (
                 !chunk ||
                 chunk.revision !== manifest.chunkRevisions[index] ||
@@ -1032,7 +1064,7 @@ export class PersistenceManager {
           });
         }
         return chain.then(status =>
-          status === 'mismatch'
+          status === 'mismatch' || status === 'cancelled'
             ? status
             : ({
                 record: {
@@ -1051,6 +1083,7 @@ export class PersistenceManager {
         if (result === null) {
           return null;
         }
+        if (result === 'cancelled') return null;
         if (result === 'mismatch') {
           persistenceStats.evictions++;
           void this.deleteRecord_(pathString);
@@ -1137,6 +1170,7 @@ export class PersistenceManager {
             !manifest ||
             isLegacyRecord(manifest) ||
             manifest.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+            manifest.authScope !== this.authScope_ ||
             typeof manifest.chunkCount !== 'number' ||
             manifest.chunkCount <= 0 ||
             !Array.isArray(manifest.chunkRevisions) ||
@@ -1167,14 +1201,24 @@ export class PersistenceManager {
    * the authenticated listener can consume the same immutable Node instead of
    * decoding a large IndexedDB record twice during boot.
    */
-  peek(pathString: string): Promise<PersistedRecord | null> {
+  peek(
+    pathString: string,
+    expectedAuthScope: string | null = this.authScope_
+  ): Promise<PersistedRecord | null> {
     if (this.disposed_ || !this.schemaKnownCurrent_) {
       return Promise.resolve(null);
     }
-    return this.raceRestoreTimeout_(onProgress =>
-      this.readRecord_(pathString, onProgress, true).then(result =>
-        result === null ? null : result.record
-      )
+    return this.raceRestoreTimeout_(
+      onProgress =>
+        this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(
+          result => (result === null ? null : result.record)
+        ),
+      this.operationTimeoutMs_,
+      PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
+      () => {
+        const active = this.activeReads_.get(pathString);
+        if (active) active.cancelled = true;
+      }
     );
   }
 
@@ -1191,26 +1235,33 @@ export class PersistenceManager {
     if (!this.schemaKnownCurrent_) {
       return Promise.resolve(null);
     }
-    return this.raceRestoreTimeout_(onProgress =>
-      this.readRecord_(pathString, onProgress).then(result => {
-        if (
-          result === null ||
-          this.disposed_ ||
-          !this.trackedRoots_.has(pathString)
-        ) {
-          return null;
-        }
-        this.lastFlush_.set(pathString, {
-          rootNode: result.record.node,
-          revision: result.record.revision,
-          plans: result.plans,
-          chunkRevisions: result.chunkRevisions,
-          chunkCount: result.chunkCount,
-          storedUpdatedAt: result.record.updatedAt
-        });
-        persistenceStats.restoredRoots.push(pathString);
-        return result.record;
-      })
+    return this.raceRestoreTimeout_(
+      onProgress =>
+        this.readRecord_(pathString, onProgress).then(result => {
+          if (
+            result === null ||
+            this.disposed_ ||
+            !this.trackedRoots_.has(pathString)
+          ) {
+            return null;
+          }
+          this.lastFlush_.set(pathString, {
+            rootNode: result.record.node,
+            revision: result.record.revision,
+            plans: result.plans,
+            chunkRevisions: result.chunkRevisions,
+            chunkCount: result.chunkCount,
+            storedUpdatedAt: result.record.updatedAt
+          });
+          persistenceStats.restoredRoots.push(pathString);
+          return result.record;
+        }),
+      this.operationTimeoutMs_,
+      PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
+      () => {
+        const active = this.activeReads_.get(pathString);
+        if (active) active.cancelled = true;
+      }
     );
   }
 
@@ -1254,27 +1305,35 @@ export class PersistenceManager {
     readOrStart:
       | Promise<T | null>
       | ((onProgress: () => void) => Promise<T | null>),
-    timeoutMs = this.operationTimeoutMs_
+    timeoutMs = this.operationTimeoutMs_,
+    totalTimeoutMs = PERSISTENCE_RESTORE_TOTAL_TIMEOUT_MS,
+    onTimeout: () => void = () => {}
   ): Promise<T | null> {
     let timer: ReturnType<typeof setTimeout>;
+    let totalTimer: ReturnType<typeof setTimeout>;
     let settled = false;
     let timeoutResolve: (value: null) => void = () => {};
     const timeout = new Promise<null>(resolve => {
       timeoutResolve = resolve;
     });
+    const expire = () => {
+      if (settled) return;
+      onTimeout();
+      timeoutResolve(null);
+    };
     const arm = () => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       clearTimeout(timer);
-      timer = setTimeout(() => timeoutResolve(null), timeoutMs);
+      timer = setTimeout(expire, timeoutMs);
     };
     const read =
       typeof readOrStart === 'function' ? readOrStart(arm) : readOrStart;
     arm();
+    totalTimer = setTimeout(expire, totalTimeoutMs);
     return Promise.race([read, timeout]).then(result => {
       settled = true;
       clearTimeout(timer);
+      clearTimeout(totalTimer);
       return result;
     });
   }
@@ -1371,6 +1430,7 @@ export class PersistenceManager {
     }
     this.flushPending_.clear();
     for (const read of this.activeReads_.values()) {
+      read.cancelled = true;
       if (read.cleanupTimer !== null) {
         clearTimeout(read.cleanupTimer);
       }
@@ -1495,6 +1555,7 @@ export class PersistenceManager {
       formatVersion: PERSISTENCE_FORMAT_VERSION,
       revision,
       updatedAt: now,
+      authScope: this.authScope_,
       chunkCount: plans.length,
       chunkRevisions
     };

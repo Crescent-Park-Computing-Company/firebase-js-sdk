@@ -82,6 +82,7 @@ export { setSDKVersion as _setSDKVersion } from './core/version';
 export {
   getPersistedValue as _getPersistedValue,
   setPersistenceEnabled as _setPersistenceEnabled,
+  setPersistenceAuthScope as _setPersistenceAuthScope,
   whenListenComplete as _whenListenComplete,
   seedServerCache as _seedServerCache,
   clearServerCacheSeeds as _clearServerCacheSeeds

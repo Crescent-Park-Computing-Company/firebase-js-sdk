@@ -25,6 +25,7 @@ import {
   PERSISTENCE_CHUNK_TARGET_BYTES
 } from '../src/core/Persistence';
 import {
+  repoCancelPendingSeedRestores,
   repoSettleListenCompletions,
   repoStartServerListen,
   repoStopServerListen,
@@ -375,9 +376,7 @@ describe('PersistenceManager', () => {
     for (const [key, value] of before) {
       expect(data.get(key)).to.equal(value);
     }
-    expect(keysFor(data, 'test-repo|/warm/root').length).to.equal(
-      before.size
-    );
+    expect(keysFor(data, 'test-repo|/warm/root').length).to.equal(before.size);
   });
 
   it('coalesces an optimistic peek and listener restore onto one decode', async () => {
@@ -446,7 +445,8 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 5,
+      formatVersion: 6,
+      authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(json),
       compoundHash: computeCompoundHash(json),
@@ -556,7 +556,10 @@ describe('PersistenceManager', () => {
       ): Promise<T | null>;
     }
     const { factory } = makeFakeIndexedDB();
-    const seam = new PersistenceManager('test-repo', factory) as unknown as TimeoutSeam;
+    const seam = new PersistenceManager(
+      'test-repo',
+      factory
+    ) as unknown as TimeoutSeam;
     const result = await seam.raceRestoreTimeout_(
       progress =>
         new Promise(resolve => {
@@ -569,6 +572,37 @@ describe('PersistenceManager', () => {
     );
     // Total wall time (~30ms) exceeded the budget, but neither idle gap did.
     expect(result).to.equal('done');
+  });
+
+  it('bounds a continuously progressing restore by total wall time', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory, true, 50);
+    const seam = manager as unknown as {
+      raceRestoreTimeout_: <T>(
+        start: (progress: () => void) => Promise<T>,
+        idleMs: number,
+        totalMs: number,
+        onTimeout: () => void
+      ) => Promise<T | null>;
+    };
+    let timedOut = false;
+    const result = await seam.raceRestoreTimeout_(
+      progress =>
+        new Promise(resolve => {
+          const id = setInterval(progress, 2);
+          setTimeout(() => {
+            clearInterval(id);
+            resolve('late');
+          }, 100);
+        }),
+      20,
+      15,
+      () => {
+        timedOut = true;
+      }
+    );
+    expect(result).to.equal(null);
+    expect(timedOut).to.equal(true);
   });
 
   it('listener restore degrades to a miss when cache progress stalls', async () => {
@@ -624,7 +658,8 @@ describe('PersistenceManager', () => {
     // Manifest expects two chunks of revision ext-2, but chunk 1 still
     // carries an older write's token (interrupted mid-write).
     data.set('test-repo|/torn/root', {
-      formatVersion: 5,
+      formatVersion: 6,
+      authScope: null,
       revision: 'ext-2',
       updatedAt: Date.now(),
       chunkCount: 2,
@@ -867,9 +902,9 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     await flushAsync();
     expect(
-      (
-        (await manager.restore(path.toString())) as PersistedRecord
-      ).node.val(true)
+      ((await manager.restore(path.toString())) as PersistedRecord).node.val(
+        true
+      )
     ).to.deep.equal({ kept: true });
   });
 
@@ -898,7 +933,8 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 5,
+      formatVersion: 6,
+      authScope: null,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
@@ -917,7 +953,8 @@ describe('PersistenceManager', () => {
     // A fresh chunked root stays, with protocol hashes integrated into its
     // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 5,
+      formatVersion: 6,
+      authScope: null,
       revision: 'ext-2',
       hash: 'h',
       compoundHash: { hashes: [''], posts: [] },
@@ -1193,6 +1230,39 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     });
   });
 
+  it('an empty filtered descendant still blocks a stale parent restore', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, data } =
+      makeListenHarness();
+    data.set('test-repo|' + path.toString(), {
+      json: { inbox: { stale: true } },
+      updatedAt: Date.now(),
+      revision: 'ext-1'
+    });
+    const childPath = new Path('users/alice/inbox');
+    const filteredQuery = new QueryImpl(
+      null as any,
+      childPath,
+      queryParamsLimitToFirst(new QueryParams(), 1),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      filteredQuery,
+      stubRegistration()
+    );
+    syncTreeApplyServerOverwrite(
+      repo.serverSyncTree_,
+      childPath,
+      nodeFromJSON(null)
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
+      null
+    );
+  });
+
   it('partial server data below the root skips the seed instead of clobbering it', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
@@ -1228,14 +1298,22 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // The listen went out, but unseeded: applying the stale tree would have
     // replaced the filtered view's live server data.
     expect(calls).to.deep.equal(['listen']);
-    expect(
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
-    ).to.equal(null);
+    expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
+      null
+    );
   });
 
   it('sends precomputed hashes before cache chunks finish and buffers completion', async () => {
-    const { repo, query, path, hashFn, onComplete, calls, hashFns, serverCallbacks } =
-      makeListenHarness();
+    const {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      calls,
+      hashFns,
+      serverCallbacks
+    } = makeListenHarness();
     let resolveRecord: (record: PersistedRecord | null) => void = () => {};
     const recordPromise = new Promise<PersistedRecord | null>(resolve => {
       resolveRecord = resolve;
@@ -1285,7 +1363,11 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       restoreListenMetadata: () =>
-        Promise.resolve({ hash: 'hash-b', compoundHash, revision: 'revision-b' }),
+        Promise.resolve({
+          hash: 'hash-b',
+          compoundHash,
+          revision: 'revision-b'
+        }),
       restoreForListen: () =>
         Promise.resolve({
           node,
@@ -1362,6 +1444,22 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStopServerListen(repo, query, null);
     await flushAsync();
     expect(settled).to.equal(true);
+  });
+
+  it('repo deletion cancels every pending persisted restore', () => {
+    const { repo } = makeListenHarness();
+    const pending = {
+      cancelled: false,
+      listenSent: true,
+      buffering: true,
+      bufferedActions: [() => {}]
+    };
+    repo.pendingSeedRestores_.set('/large/root', pending);
+    repoCancelPendingSeedRestores(repo);
+    expect(pending.cancelled).to.equal(true);
+    expect(pending.buffering).to.equal(false);
+    expect(pending.bufferedActions).to.deep.equal([]);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
   it('whenListenComplete resolves when the repo is deleted', async () => {
@@ -1455,6 +1553,27 @@ describe('stale restore vs live server data', () => {
     const cache = syncTreeGetCompleteServerCache(syncTree, path);
     expect(cache).to.not.equal(null);
     expect(cache!.val(true)).to.deep.equal({ live: true });
+  });
+});
+
+describe('persistence auth scope', () => {
+  it('never restores a cache written by another authenticated user', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('private/root');
+    const writer = new PersistenceManager('test-repo', shared.factory);
+    writer.setAuthScope('user-a');
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ secret: 'a' }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    const reader = new PersistenceManager('test-repo', shared.factory);
+    reader.setAuthScope('user-b');
+    expect(await reader.restore(path.toString())).to.equal(null);
+    reader.setAuthScope('user-a');
+    expect((await reader.restore(path.toString()))!.node.val()).to.deep.equal({
+      secret: 'a'
+    });
   });
 });
 

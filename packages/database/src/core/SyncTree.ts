@@ -383,10 +383,7 @@ export function syncTreeGetDescendantServerCacheStates(
   }> = [];
   syncTree.syncPointTree_.subtree(path).foreach((relativePath, syncPoint) => {
     for (const view of syncPoint.views.values()) {
-      if (
-        pathIsEmpty(relativePath) &&
-        view.query._queryParams.loadsAllData()
-      ) {
+      if (pathIsEmpty(relativePath) && view.query._queryParams.loadsAllData()) {
         // The default view at `path` is the one being restored into; the
         // caller checks its state separately.
         continue;
@@ -396,7 +393,10 @@ export function syncTreeGetDescendantServerCacheStates(
         states.push({ path: relativePath, complete, hasPartialData: false });
       } else {
         const raw = viewGetServerCache(view);
-        if (raw !== null && !raw.isEmpty()) {
+        if (
+          raw !== null &&
+          (!raw.isEmpty() || !view.query._queryParams.loadsAllData())
+        ) {
           states.push({
             path: relativePath,
             complete: null,

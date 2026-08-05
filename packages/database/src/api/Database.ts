@@ -43,6 +43,7 @@ import {
 import { PersistenceManager } from '../core/Persistence';
 import {
   Repo,
+  repoCancelPendingSeedRestores,
   repoInterrupt,
   repoResume,
   repoSettleListenCompletions,
@@ -59,10 +60,7 @@ import {
   log,
   enableLogging as enableLoggingImpl
 } from '../core/util/util';
-import {
-  validateRootPathString,
-  validateUrl
-} from '../core/util/validation';
+import { validateRootPathString, validateUrl } from '../core/util/validation';
 import { BrowserPollConnection } from '../realtime/BrowserPollConnection';
 import { TransportManager } from '../realtime/TransportManager';
 import { WebSocketConnection } from '../realtime/WebSocketConnection';
@@ -199,6 +197,7 @@ function repoManagerDeleteRepo(repo: Repo, appName: string): void {
     fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
   }
   repoInterrupt(repo);
+  repoCancelPendingSeedRestores(repo);
   // The repo's listens can never respond after this: settle any
   // whenListenComplete waiters (they would otherwise hang forever and
   // retain the repo), and stop the persistence timers.
@@ -465,7 +464,8 @@ export function goOffline(db: Database): void {
  */
 export function getPersistedValue(
   db: Database,
-  pathString: string
+  pathString: string,
+  expectedAuthScope: string | null = null
 ): Promise<unknown | null> {
   db = getModularInstance(db);
   db._checkNotDeleted('getPersistedValue');
@@ -483,7 +483,7 @@ export function getPersistedValue(
   // Node and prevents a fresher ancestor record from being mistaken for the
   // exact listener's initial replay.
   return persistence
-    .peek(new Path(pathString).toString())
+    .peek(new Path(pathString).toString(), expectedAuthScope)
     .then(record => (record === null ? null : record.node.val()));
 }
 
@@ -508,16 +508,25 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   const repo = db._repoInternal;
   if (enabled) {
     if (repo.persistence_ === null) {
-      repo.persistence_ = new PersistenceManager(
-        repo.repoInfo_.toURLString()
-      );
+      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
     }
   } else {
     if (repo.persistence_ !== null) {
+      repoCancelPendingSeedRestores(repo);
       repo.persistence_.dispose();
       repo.persistence_ = null;
     }
   }
+}
+
+/** Sets the identity scope used to read and write persisted cache records. @internal */
+export function setPersistenceAuthScope(
+  db: Database,
+  scope: string | null
+): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceAuthScope');
+  db._repoInternal.persistence_?.setAuthScope(scope);
 }
 
 /**

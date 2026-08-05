@@ -29,9 +29,7 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { canonicalHashFromNodeAsync } from './CompoundHash';
-import {
-  PersistenceManager
-} from './Persistence';
+import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
@@ -521,11 +519,7 @@ export function repoStartServerListen(
   let pendingToken: PendingSeedRestore | null = null;
   const processListenResponse = (status: string, data?: unknown) => {
     const events = onComplete(status, data);
-    eventQueueRaiseEventsForChangedPath(
-      repo.eventQueue_,
-      query._path,
-      events
-    );
+    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
     if (isDefaultComplete) {
       const completion = repo.listenCompletions_.get(pathString);
       if (completion && !completion.complete) {
@@ -595,8 +589,7 @@ export function repoStartServerListen(
   repo.pendingSeedRestores_.set(pathString, token);
 
   const isCurrent = () =>
-    !token.cancelled &&
-    repo.pendingSeedRestores_.get(pathString) === token;
+    !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
 
   /**
    * Restart against the current in-memory view ONLY when the persisted base
@@ -710,11 +703,7 @@ export function repoStartServerListen(
       let applied = false;
       try {
         if (!grafted) {
-          seeded = stampSeedHashes(
-            seeded,
-            record.hash,
-            record.compoundHash
-          );
+          seeded = stampSeedHashes(seeded, record.hash, record.compoundHash);
         }
         const events = syncTreeApplyServerOverwrite(
           repo.serverSyncTree_,
@@ -754,19 +743,16 @@ export function repoStartServerListen(
         sendListen(currentHashFn, null);
         return;
       }
-      void canonicalHashFromNodeAsync(seeded).then(
-        hash => {
-          if (!isCurrent()) {
-            return;
-          }
-          seeded.stampLazyHash(hash);
-          token.buffering = false;
-          repo.pendingSeedRestores_.delete(pathString);
-          pendingToken = null;
-          sendListen(currentHashFn, null);
-        },
-        restartCurrentListen
-      );
+      void canonicalHashFromNodeAsync(seeded).then(hash => {
+        if (!isCurrent()) {
+          return;
+        }
+        seeded.stampLazyHash(hash);
+        token.buffering = false;
+        repo.pendingSeedRestores_.delete(pathString);
+        pendingToken = null;
+        sendListen(currentHashFn, null);
+      }, restartCurrentListen);
     },
     () => {
       // IndexedDB/storage failure is a validation failure; latency is not.
@@ -841,6 +827,15 @@ export function repoWhenListenComplete(
  * listens can never respond again, and an unsettleable waiter would hang
  * its caller and retain the Repo forever.
  */
+export function repoCancelPendingSeedRestores(repo: Repo): void {
+  for (const pending of repo.pendingSeedRestores_.values()) {
+    pending.cancelled = true;
+    pending.buffering = false;
+    pending.bufferedActions = [];
+  }
+  repo.pendingSeedRestores_.clear();
+}
+
 export function repoSettleListenCompletions(repo: Repo): void {
   for (const completion of repo.listenCompletions_.values()) {
     completion.complete = true;
