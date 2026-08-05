@@ -88,7 +88,6 @@ export {
   clearServerCacheSeeds as _clearServerCacheSeeds
 } from './api/Database';
 export {
-  persistenceStats as _persistenceStats,
   onPersistenceEvent as _onPersistenceEvent,
   PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS
 } from './core/Persistence';

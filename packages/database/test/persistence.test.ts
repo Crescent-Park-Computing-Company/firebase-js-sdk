@@ -19,6 +19,7 @@ import { expect } from 'chai';
 
 import { getPersistedValue, setPersistenceEnabled } from '../src/api/Database';
 import { QueryImpl } from '../src/api/Reference_impl';
+import { canonicalHashFromNodeAsync } from '../src/core/CompoundHash';
 import {
   PersistenceManager,
   PersistedRecord,
@@ -548,6 +549,19 @@ describe('PersistenceManager', () => {
     expect(await manager.restore('/old-format/root')).to.equal(null);
     await flushAsync();
     expect(keysFor(data, 'test-repo|/old-format/root')).to.deep.equal([]);
+  });
+
+  it('reports progress while a large cache hash is sliced', async () => {
+    const json: Record<string, string> = {};
+    for (let i = 0; i < 50; i++) {
+      json[String(i)] = 'x'.repeat(100);
+    }
+    let pulses = 0;
+    const hash = await canonicalHashFromNodeAsync(nodeFromJSON(json), 0, () => {
+      pulses++;
+    });
+    expect(hash).to.equal(computeCanonicalHash(json));
+    expect(pulses).to.be.greaterThan(0);
   });
 
   it('restore timeout resets while chunks keep making progress', async () => {

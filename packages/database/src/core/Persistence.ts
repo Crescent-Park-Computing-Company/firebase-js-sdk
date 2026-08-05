@@ -1188,7 +1188,9 @@ export class PersistenceManager {
               return result;
             }
             const actualHash = await canonicalHashFromNodeAsync(
-              result.record.node
+              result.record.node,
+              12,
+              onProgress
             );
             if (
               typeof result.record.hash === 'string' &&
@@ -1199,7 +1201,10 @@ export class PersistenceManager {
             result.record.hash = actualHash;
             if (!result.record.compoundHash) {
               const compound = await compoundHashFromNodeAsync(
-                result.record.node
+                result.record.node,
+                undefined,
+                12,
+                onProgress
               );
               result.record.compoundHash = {
                 hashes: compound.hashes,

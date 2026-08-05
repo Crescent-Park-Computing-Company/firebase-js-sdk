@@ -390,7 +390,8 @@ function scheduleSlice(fn: () => void): void {
 export function compoundHashFromNodeAsync(
   node: Node,
   splitStrategy?: CompoundHashSplitStrategy,
-  sliceMs = 12
+  sliceMs = 12,
+  onProgress: () => void = () => {}
 ): Promise<CompoundHash> {
   if (node.isEmpty()) {
     return Promise.resolve(new CompoundHash([], ['']));
@@ -402,6 +403,7 @@ export function compoundHashFromNodeAsync(
     const step = (): void => {
       try {
         if (!walker.drainUntil(Date.now() + sliceMs)) {
+          onProgress();
           scheduleSlice(step);
           return;
         }
@@ -424,7 +426,8 @@ export function compoundHashFromNodeAsync(
  */
 export function canonicalHashFromNodeAsync(
   node: Node,
-  sliceMs = 12
+  sliceMs = 12,
+  onProgress: () => void = () => {}
 ): Promise<string> {
   if (node.isEmpty()) {
     return Promise.resolve('');
@@ -502,6 +505,7 @@ export function canonicalHashFromNodeAsync(
             }
           }
           if (stack.length > 0 && Date.now() >= deadline) {
+            onProgress();
             scheduleSlice(step);
             return;
           }
