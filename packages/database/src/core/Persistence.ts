@@ -19,8 +19,7 @@ import { isIndexedDBAvailable } from '@firebase/util';
 
 import {
   compoundHashFromNodeAsync,
-  estimateSerializedNodeSize,
-  hashFromNodeAsync
+  estimateSerializedNodeSize
 } from './CompoundHash';
 import { SeedCompoundHash } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
@@ -720,67 +719,86 @@ export class PersistenceManager {
    */
   private readRecord_(pathString: string): Promise<ReadResult | null> {
     const key = this.key_(pathString);
-    return this.withStore_<ReadResult | 'mismatch' | null>(
-      'readonly',
-      null,
-      (store, done) => {
-        const dataReq = store.get(key);
-        const hashReq = store.get(key + HASH_KEY_SUFFIX);
-        // Same store, same transaction: requests complete in issue order, so
-        // when hashReq's success fires, dataReq.result is safe to read.
-        // (Reading a request's result before IT completes throws.)
-        hashReq.onsuccess = () => {
-          const record = dataReq.result as
-            | PersistedManifest
-            | LegacyPersistedRecord
-            | undefined;
-          if (!record) {
-            done(null);
-            return;
-          }
-          const hashes = hashReq.result as PersistedHashRecord | undefined;
-          const joined =
-            hashes && hashes.revision === record.revision
-              ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
-              : {};
-          if (isLegacyRecord(record)) {
-            done({
-              record: {
-                node: nodeFromJSON(record.json),
-                ...joined,
-                updatedAt: record.updatedAt,
-                revision: record.revision
-              },
-              plans: null,
-              chunkRevisions: null,
-              chunkCount: null
-            });
-            return;
-          }
-          const manifest = record;
-          if (
-            typeof manifest.chunkCount !== 'number' ||
-            manifest.chunkCount <= 0 ||
-            !Array.isArray(manifest.chunkRevisions) ||
-            manifest.chunkRevisions.length !== manifest.chunkCount
-          ) {
-            done('mismatch');
-            return;
-          }
-          let assembled: Node = ChildrenNode.EMPTY_NODE;
-          const plans: ChunkPlan[] = [];
-          let index = 0;
-          const readChunk = () => {
-            const chunkReq = store.get(key + chunkKeySuffix(index));
-            chunkReq.onsuccess = () => {
-              const chunk = chunkReq.result as PersistedChunk | undefined;
+    // Metadata first, in a short transaction. Each chunk then gets its OWN
+    // transaction: WebKit may retain every IDBRequest result until the
+    // transaction closes, so issuing all chunk reads in one transaction
+    // recreates the root-sized memory spike despite the chunked records.
+    const metadata = this.withStore_<{
+      stored: PersistedManifest | LegacyPersistedRecord;
+      hashes?: PersistedHashRecord;
+    } | null>('readonly', null, (store, done) => {
+      const dataReq = store.get(key);
+      const hashReq = store.get(key + HASH_KEY_SUFFIX);
+      hashReq.onsuccess = () => {
+        const stored = dataReq.result as
+          | PersistedManifest
+          | LegacyPersistedRecord
+          | undefined;
+        if (!stored) {
+          done(null);
+          return;
+        }
+        done({
+          stored,
+          hashes: hashReq.result as PersistedHashRecord | undefined
+        });
+      };
+    });
+    return metadata
+      .then(meta => {
+        if (meta === null) {
+          return null;
+        }
+        const { stored, hashes } = meta;
+        const joined =
+          hashes && hashes.revision === stored.revision
+            ? { hash: hashes.hash, compoundHash: hashes.compoundHash }
+            : {};
+        if (isLegacyRecord(stored)) {
+          return {
+            record: {
+              node: nodeFromJSON(stored.json),
+              ...joined,
+              updatedAt: stored.updatedAt,
+              revision: stored.revision
+            },
+            plans: null,
+            chunkRevisions: null,
+            chunkCount: null
+          } as ReadResult;
+        }
+        const manifest = stored;
+        if (
+          typeof manifest.chunkCount !== 'number' ||
+          manifest.chunkCount <= 0 ||
+          !Array.isArray(manifest.chunkRevisions) ||
+          manifest.chunkRevisions.length !== manifest.chunkCount
+        ) {
+          return 'mismatch' as const;
+        }
+        let assembled: Node = ChildrenNode.EMPTY_NODE;
+        const plans: ChunkPlan[] = [];
+        let chain = Promise.resolve<true | 'mismatch'>(true);
+        for (let index = 0; index < manifest.chunkCount; index++) {
+          chain = chain.then(status => {
+            if (status === 'mismatch') {
+              return status;
+            }
+            return this.withStore_<PersistedChunk | null>(
+              'readonly',
+              null,
+              (store, done) => {
+                const req = store.get(key + chunkKeySuffix(index));
+                req.onsuccess = () =>
+                  done((req.result as PersistedChunk | undefined) ?? null);
+              }
+            ).then(chunk => {
               if (
                 !chunk ||
                 chunk.revision !== manifest.chunkRevisions[index] ||
                 !Array.isArray(chunk.entries)
               ) {
-                done('mismatch');
-                return;
+                return 'mismatch' as const;
               }
               const plan: ChunkPlan = [];
               for (const [relPath, json] of chunk.entries) {
@@ -789,43 +807,42 @@ export class PersistenceManager {
                 plan.push({ relPath, node });
               }
               plans.push(plan);
-              index++;
-              if (index < manifest.chunkCount) {
-                readChunk();
-              } else {
-                done({
-                  record: {
-                    node: assembled,
-                    ...joined,
-                    updatedAt: manifest.updatedAt,
-                    revision: manifest.revision
-                  },
-                  plans,
-                  chunkRevisions: manifest.chunkRevisions,
-                  chunkCount: manifest.chunkCount
-                });
-              }
-            };
-          };
-          readChunk();
-        };
-      }
-    ).then(result => {
-      if (result === null) {
-        return null;
-      }
-      if (result === 'mismatch') {
-        persistenceStats.evictions++;
-        void this.deleteRecord_(pathString);
-        return null;
-      }
-      if (Date.now() - result.record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
-        persistenceStats.evictions++;
-        void this.deleteRecord_(pathString);
-        return null;
-      }
-      return result;
-    });
+              return true as const;
+            });
+          });
+        }
+        return chain.then(status =>
+          status === 'mismatch'
+            ? status
+            : ({
+                record: {
+                  node: assembled,
+                  ...joined,
+                  updatedAt: manifest.updatedAt,
+                  revision: manifest.revision
+                },
+                plans,
+                chunkRevisions: manifest.chunkRevisions,
+                chunkCount: manifest.chunkCount
+              } as ReadResult)
+        );
+      })
+      .then(result => {
+        if (result === null) {
+          return null;
+        }
+        if (result === 'mismatch') {
+          persistenceStats.evictions++;
+          void this.deleteRecord_(pathString);
+          return null;
+        }
+        if (Date.now() - result.record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+          persistenceStats.evictions++;
+          void this.deleteRecord_(pathString);
+          return null;
+        }
+        return result;
+      });
   }
 
   /**
@@ -1200,39 +1217,52 @@ export class PersistenceManager {
       chunkRevisions
     };
     const prevChunkCount = prev !== undefined ? prev.chunkCount : null;
-    const put = this.withStore_<boolean>('readwrite', false, (store, done) => {
-      for (const i of dirtyIndexes) {
+    // One transaction PER dirty chunk. WebKit may retain every put's
+    // structured-clone input until its transaction closes; one transaction
+    // for all chunks therefore retained a root-sized exported JSON graph and
+    // defeated chunking. The manifest is committed last in a tiny transaction
+    // and is the authoritative join, so a crash between chunks is a safe miss.
+    let put = Promise.resolve(true);
+    for (const i of dirtyIndexes) {
+      put = put.then(ok => {
+        if (!ok) {
+          return false;
+        }
         const chunk: PersistedChunk = {
           revision,
           entries: plans[i].map(e => [e.relPath, e.node.val(true)])
         };
-        store.put(chunk, key + chunkKeySuffix(i));
+        return this.withStore_<boolean>('readwrite', false, (store, done) => {
+          store.put(chunk, key + chunkKeySuffix(i));
+          done(true);
+        });
+      });
+    }
+    put = put.then(ok => {
+      if (!ok) {
+        return false;
       }
-      store.put(manifest, key);
-      if (prevChunkCount !== null) {
-        for (let i = plans.length; i < prevChunkCount; i++) {
-          store.delete(key + chunkKeySuffix(i));
+      return this.withStore_<boolean>('readwrite', false, (store, done) => {
+        store.put(manifest, key);
+        if (prevChunkCount !== null) {
+          for (let i = plans.length; i < prevChunkCount; i++) {
+            store.delete(key + chunkKeySuffix(i));
+          }
+        } else if (typeof IDBKeyRange !== 'undefined') {
+          try {
+            store.delete(
+              IDBKeyRange.bound(
+                key + chunkKeySuffix(plans.length),
+                key + CHUNK_KEY_INFIX + '\uffff'
+              )
+            );
+          } catch (e) {
+            // Key-range deletes are an optimization, never a requirement.
+          }
         }
-      } else if (typeof IDBKeyRange !== 'undefined') {
-        try {
-          // First write over unknown prior state: drop any chunk tail an
-          // earlier session may have left beyond the new count. (Without
-          // key ranges the sweep reclaims such orphans instead.)
-          store.delete(
-            IDBKeyRange.bound(
-              key + chunkKeySuffix(plans.length),
-              key + CHUNK_KEY_INFIX + '\uffff'
-            )
-          );
-        } catch (e) {
-          // Key-range deletes are an optimization, never a requirement.
-        }
-      }
-      // Atomically invalidate the previous hash sidecar: between this write
-      // and the recompute below, the stored state is "data, hashless" — never
-      // "new data, old hash".
-      store.delete(key + HASH_KEY_SUFFIX);
-      done(true);
+        store.delete(key + HASH_KEY_SUFFIX);
+        done(true);
+      });
     });
     return put.then(ok => {
       if (!ok || this.disposed_) {
@@ -1246,10 +1276,13 @@ export class PersistenceManager {
         chunkCount: plans.length,
         storedUpdatedAt: now
       });
-      return Promise.all([
-        hashFromNodeAsync(node),
-        compoundHashFromNodeAsync(node)
-      ]).then(([hash, compoundHash]) => {
+      // A compound hash is sufficient for zero-download revalidation:
+      // send an empty simple hash and let the server compare ranges. Avoiding
+      // node.hash() is crucial on large roots — it permanently cached one SHA
+      // string on every node, a large retained-memory jump absent on a normal
+      // cold load.
+      return compoundHashFromNodeAsync(node).then(compoundHash => {
+        const hash = '';
         if (this.disposed_) {
           return;
         }

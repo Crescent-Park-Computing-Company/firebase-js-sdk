@@ -31,6 +31,7 @@ import {
 import { Overwrite } from './operation/Overwrite';
 import {
   buildSeedNode,
+  getNodeCanonicalHash,
   getNodeCompoundHash,
   ListenHashFn,
   ServerCacheSeed,
@@ -978,7 +979,7 @@ function syncTreeCreateListenerForView_(
   const tag = syncTreeTagForQuery(syncTree, query);
   const hashFn: ListenHashFn = () => {
     const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-    return cache.hash();
+    return getNodeCanonicalHash(cache) ?? cache.hash();
   };
   // The compound hash rides as a property on hashFn so it threads through
   // the existing listen-provider chain untouched. Only a seeded node carries

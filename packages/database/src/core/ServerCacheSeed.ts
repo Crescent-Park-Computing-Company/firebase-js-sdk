@@ -141,8 +141,11 @@ export function stampSeedHashes(
   if (node.isEmpty()) {
     return node;
   }
-  if (typeof hash === 'string' && hash.length > 0) {
-    node.stampLazyHash(hash);
+  if (typeof hash === 'string') {
+    nodeCanonicalHashes.set(node, hash);
+    if (hash.length > 0) {
+      node.stampLazyHash(hash);
+    }
   }
   if (
     compoundHash &&
@@ -161,6 +164,7 @@ export function stampSeedHashes(
  * arrived send only the simple hash (which is then correct by construction).
  */
 const nodeCompoundHashes = new WeakMap<object, SeedCompoundHash>();
+const nodeCanonicalHashes = new WeakMap<object, string>();
 
 function setNodeCompoundHash(node: Node, compoundHash: SeedCompoundHash): void {
   nodeCompoundHashes.set(node, compoundHash);
@@ -168,6 +172,17 @@ function setNodeCompoundHash(node: Node, compoundHash: SeedCompoundHash): void {
 
 export function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined {
   return nodeCompoundHashes.get(node);
+}
+
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+export function getNodeCanonicalHash(node: Node): string | undefined {
+  return nodeCanonicalHashes.get(node);
 }
 
 /**
