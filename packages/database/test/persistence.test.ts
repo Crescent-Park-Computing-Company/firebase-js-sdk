@@ -479,6 +479,29 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/old-format/root')).to.deep.equal([]);
   });
 
+  it('restore timeout resets while chunks keep making progress', async () => {
+    interface TimeoutSeam {
+      raceRestoreTimeout_<T>(
+        start: (progress: () => void) => Promise<T | null>,
+        timeoutMs: number
+      ): Promise<T | null>;
+    }
+    const { factory } = makeFakeIndexedDB();
+    const seam = new PersistenceManager('test-repo', factory) as unknown as TimeoutSeam;
+    const result = await seam.raceRestoreTimeout_(
+      progress =>
+        new Promise(resolve => {
+          setTimeout(() => {
+            progress();
+            setTimeout(() => resolve('done'), 15);
+          }, 15);
+        }),
+      20
+    );
+    // Total wall time (~30ms) exceeded the budget, but neither idle gap did.
+    expect(result).to.equal('done');
+  });
+
   it('resolves null for a root never persisted', async () => {
     const { factory } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
