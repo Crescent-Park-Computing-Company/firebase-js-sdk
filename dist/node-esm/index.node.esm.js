@@ -2560,96 +2560,6 @@ function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12, onProgress
         step();
     });
 }
-/**
- * Computes the canonical Node hash without populating every subtree's
- * lazyHash_. Only frames on the current depth-first path are retained; each
- * child hash is folded into its parent and released. Persistence uses this at
- * write time, stores the resulting root hash in the manifest, and stamps only
- * the restored root on the next boot.
- */
-function canonicalHashFromNodeAsync(node, sliceMs = 12, onProgress = () => { }) {
-    if (node.isEmpty()) {
-        return Promise.resolve('');
-    }
-    const stack = [
-        { node, key: null, children: null, nextChild: 0, toHash: '' }
-    ];
-    return new Promise((resolve, reject) => {
-        const completeFrame = (hash) => {
-            const finished = stack.pop();
-            if (!finished) {
-                resolve(hash);
-                return;
-            }
-            const parent = stack[stack.length - 1];
-            if (!parent) {
-                resolve(hash);
-            }
-            else if (hash !== '' && finished.key !== null) {
-                parent.toHash += ':' + finished.key + ':' + hash;
-            }
-        };
-        const step = () => {
-            try {
-                const deadline = Date.now() + sliceMs;
-                while (stack.length > 0) {
-                    const frame = stack[stack.length - 1];
-                    if (frame.node.isLeafNode()) {
-                        const leaf = frame.node;
-                        let text = '';
-                        const priority = leaf.getPriority();
-                        if (!priority.isEmpty()) {
-                            text +=
-                                'priority:' +
-                                    priorityHashText(priority.val()) +
-                                    ':';
-                        }
-                        text += leafHashValueText(leaf.val(), false);
-                        completeFrame(sha1(text));
-                    }
-                    else {
-                        if (frame.children === null) {
-                            const priority = frame.node.getPriority();
-                            if (!priority.isEmpty()) {
-                                frame.toHash =
-                                    'priority:' +
-                                        priorityHashText(priority.val()) +
-                                        ':';
-                            }
-                            const children = [];
-                            frame.children = children;
-                            frame.node.forEachChild(PRIORITY_INDEX, (key, child) => {
-                                children.push([key, child]);
-                            });
-                        }
-                        if (frame.nextChild < frame.children.length) {
-                            const [key, child] = frame.children[frame.nextChild++];
-                            stack.push({
-                                node: child,
-                                key,
-                                children: null,
-                                nextChild: 0,
-                                toHash: ''
-                            });
-                        }
-                        else {
-                            completeFrame(frame.toHash === '' ? '' : sha1(frame.toHash));
-                        }
-                    }
-                    if (stack.length > 0 && Date.now() >= deadline) {
-                        onProgress();
-                        scheduleSlice(step);
-                        return;
-                    }
-                }
-            }
-            catch (e) {
-                reject(e);
-            }
-        };
-        step();
-    });
-}
 
 /**
  * @license
@@ -4313,8 +4223,9 @@ function samePlan(a, b) {
 class PersistenceManager {
     setAuthScope(scope) {
         if (scope === this.authScope_) {
-            return;
+            return false;
         }
+        this.authGeneration_++;
         for (const timer of this.writeTimers_.values()) {
             clearTimeout(timer);
         }
@@ -4327,6 +4238,7 @@ class PersistenceManager {
         this.restoreReasons_.clear();
         this.authScope_ = scope;
         recordPersistenceEvent('*', 'auth-scope-change', scope ? 'signed-in' : 'signed-out');
+        return true;
     }
     constructor(prefix_, idbFactory_ = isIndexedDBAvailable()
         ? indexedDB
@@ -4382,6 +4294,7 @@ class PersistenceManager {
         this.sweepTimer_ = null;
         this.disposed_ = false;
         this.authScope_ = null;
+        this.authGeneration_ = 0;
         if (!this.schemaKnownCurrent_) {
             // Do not put the cold server listen behind a potentially slow Safari
             // version-change transaction. Migration runs in the background; restore
@@ -4934,6 +4847,10 @@ class PersistenceManager {
                     ? { hash: stored.hash, compoundHash: stored.compoundHash }
                     : {};
             if (isLegacyRecord(stored)) {
+                if (typeof joined.hash !== 'string' || !joined.compoundHash) {
+                    this.restoreReasons_.set(pathString, 'corrupt');
+                    return 'mismatch';
+                }
                 return {
                     record: {
                         node: nodeFromJSON(stored.json),
@@ -5008,22 +4925,14 @@ class PersistenceManager {
                 if (result === 'mismatch') {
                     return result;
                 }
-                // Current chunks have already been verified independently. Trust
-                // the root protocol hashes committed by the same atomic manifest;
-                // only the rare crash window before those hashes landed needs a
-                // one-time full recomputation.
-                if (typeof result.record.hash === 'string' &&
-                    result.record.compoundHash) {
-                    return result;
-                }
-                const actualHash = await canonicalHashFromNodeAsync(result.record.node, 12, onProgress);
-                result.record.hash = actualHash;
-                const compound = await compoundHashFromNodeAsync(result.record.node, undefined, 12, onProgress);
-                result.record.compoundHash = {
-                    hashes: compound.hashes,
-                    posts: compound.posts
-                };
-                return result;
+                // A crash before the manifest's protocol hashes landed leaves a
+                // valid but hashless generation. Do not spend an unbounded full
+                // traversal delaying both paint and network; fail cold and let the
+                // authoritative server write a complete generation.
+                return typeof result.record.hash === 'string' &&
+                    result.record.compoundHash
+                    ? result
+                    : 'mismatch';
             });
         })
             .then(result => {
@@ -5126,10 +5035,14 @@ class PersistenceManager {
             recordPersistenceEvent(pathString, 'peek-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve(null);
         }
+        const authGeneration = this.authGeneration_;
         return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
             recordPersistenceEvent(pathString, result ? 'peek-hit' : 'peek-miss');
             return result === null ? null : result.record;
-        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout')));
+        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout'))).then(record => authGeneration === this.authGeneration_ &&
+            expectedAuthScope === this.authScope_
+            ? record
+            : null);
     }
     /**
      * Listener restore with an idle (no-progress) bound. Healthy chunked reads
@@ -5139,14 +5052,18 @@ class PersistenceManager {
      */
     restoreForListen(pathString) {
         this.restoreReasons_.delete(pathString);
+        const authGeneration = this.authGeneration_;
+        const expectedAuthScope = this.authScope_;
         if (this.disposed_ || !this.schemaKnownCurrent_) {
             const reason = 'missing';
             this.restoreReasons_.set(pathString, reason);
             recordPersistenceEvent(pathString, 'restore-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve({ record: null, reason });
         }
-        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
+        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, false, expectedAuthScope).then(result => {
             if (result === null ||
+                authGeneration !== this.authGeneration_ ||
+                expectedAuthScope !== this.authScope_ ||
                 this.disposed_ ||
                 !this.trackedRoots_.has(pathString)) {
                 return null;
@@ -5165,6 +5082,11 @@ class PersistenceManager {
             this.restoreReasons_.set(pathString, 'timeout');
             recordPersistenceEvent(pathString, 'restore-idle-timeout');
         })).then(record => {
+            if (authGeneration !== this.authGeneration_ ||
+                expectedAuthScope !== this.authScope_) {
+                this.restoreReasons_.set(pathString, 'auth');
+                record = null;
+            }
             const reason = record
                 ? undefined
                 : this.restoreReasons_.get(pathString) ?? 'missing';
@@ -13456,16 +13378,16 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             finish(fallback ? 'fallback' : 'cold', reason);
             return;
         }
-        let restored = record.node;
-        for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)) {
-            if (state.complete === null) {
-                finish('cold');
-                return;
-            }
-            restored = restored.updateChild(state.path, state.complete);
+        const descendantStates = syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path);
+        if (descendantStates.length > 0) {
+            // A graft changes the exact tree the persisted hashes describe. Use a
+            // normal authoritative listen instead of certifying/delta-merging
+            // against stale root hashes.
+            finish('cold');
+            return;
         }
         try {
-            restored = stampSeedHashes(restored, record.hash, record.compoundHash);
+            const restored = stampSeedHashes(record.node, record.hash, record.compoundHash);
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             finish('restored');
@@ -16405,7 +16327,10 @@ function setPersistenceEnabled(db, enabled) {
 function setPersistenceAuthScope(db, scope) {
     db = getModularInstance(db);
     db._checkNotDeleted('setPersistenceAuthScope');
-    db._repoInternal.persistence_?.setAuthScope(scope);
+    const repo = db._repoInternal;
+    if (repo.persistence_?.setAuthScope(scope)) {
+        repoCancelPendingSeedRestores(repo);
+    }
 }
 /** Selects an exact default-listen root for persistence. @internal */
 function setPersistencePath(db, pathString, enabled) {

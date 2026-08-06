@@ -156,7 +156,8 @@ export declare class PersistenceManager {
     private sweepTimer_;
     private disposed_;
     private authScope_;
-    setAuthScope(scope: string | null): void;
+    private authGeneration_;
+    setAuthScope(scope: string | null): boolean;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number);
     /**
      * A replacement manager for a different key prefix — used when emulator
