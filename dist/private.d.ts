@@ -1928,6 +1928,7 @@ declare class PersistenceManager {
     private restoreReasons_;
     private activeRestoreCount_;
     private restoreQueue_;
+    private writesDeferredUntilRestores_;
     private sweepTimer_;
     private disposed_;
     private authScope_;
@@ -2037,6 +2038,7 @@ declare class PersistenceManager {
      * unchanged — is skipped outright unless its stored timestamp needs a
      * refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
+    private flushWritesDeferredUntilRestores_;
     serverCacheUpdated(path: Path, node: Node_2): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
