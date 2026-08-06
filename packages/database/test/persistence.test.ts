@@ -331,13 +331,15 @@ describe('PersistenceManager', () => {
       k.includes('#c')
     );
     expect(chunkKeys.length).to.be.greaterThan(1);
-
     const restored = (await restoreForTest(
       manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
     expect(restored.hash).to.equal('');
+    expect(restored.compoundHash).to.deep.equal(
+      computeCompoundHash(node.val(true))
+    );
   });
 
   it('rewrites only the chunks an update dirtied', async () => {

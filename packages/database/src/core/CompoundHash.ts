@@ -119,22 +119,28 @@ export function compoundHashFromNode(
  * after '.priority'. A priority that sorts after every child is dropped, as
  * it is on Android and iOS — both ends of the protocol must agree.
  */
-function forEachChildWithPriority(
+export function forEachChildWithPriority(
   node: Node,
-  action: (key: string, child: Node) => void
+  action: (key: string, child: Node, includedInHash: boolean) => void,
+  includeTrailingPriority = false
 ): void {
   if (node.getPriority().isEmpty()) {
-    node.forEachChild(KEY_INDEX, action);
+    node.forEachChild(KEY_INDEX, (key, child) => action(key, child, true));
     return;
   }
   let passedPriority = false;
   node.forEachChild(KEY_INDEX, (key, child) => {
     if (!passedPriority && nameCompare(key, '.priority') > 0) {
       passedPriority = true;
-      action('.priority', node.getPriority());
+      action('.priority', node.getPriority(), true);
     }
-    action(key, child);
+    action(key, child, true);
   });
+  if (!passedPriority && includeTrailingPriority) {
+    // Android's compound grammar omits a priority that sorts after every
+    // child, but export-format persistence must still serialize it.
+    action('.priority', node.getPriority(), false);
+  }
 }
 
 /**
@@ -293,6 +299,85 @@ class CompoundHashBuilder {
     this.posts.push(post === '' ? '/' : post);
     this.currentHash_ = null;
     this.needsComma_ = true;
+  }
+}
+
+/**
+ * Builds the protocol compound hash while serializing disjoint persistence
+ * entries in traversal order. The first full cache write therefore walks each
+ * Node once: the returned JSON is stored in the chunk and the same visit feeds
+ * the wire hash builder.
+ */
+export class CompoundHashAccumulator {
+  private readonly builder_: CompoundHashBuilder;
+  private openPath_: string[] = [];
+
+  constructor(root: Node) {
+    this.builder_ = new CompoundHashBuilder(simpleSizeSplitStrategy(root));
+  }
+
+  serializeEntry(path: string[], node: Node, includedInHash = true): unknown {
+    if (!includedInHash) {
+      return node.val(true);
+    }
+    this.moveToPath_(path);
+    return this.serializeNode_(node);
+  }
+
+  finish(): CompoundHash {
+    this.moveToPath_([]);
+    this.builder_.finishHashing();
+    return new CompoundHash(this.builder_.posts, this.builder_.hashes);
+  }
+
+  private moveToPath_(next: string[]): void {
+    let common = 0;
+    while (
+      common < this.openPath_.length &&
+      common < next.length &&
+      this.openPath_[common] === next[common]
+    ) {
+      common++;
+    }
+    for (let i = this.openPath_.length; i > common; i--) {
+      this.builder_.endChild();
+    }
+    for (let i = common; i < next.length; i++) {
+      this.builder_.startChild(next[i]);
+    }
+    this.openPath_ = next.slice();
+  }
+
+  private serializeNode_(node: Node): unknown {
+    if (node.isEmpty()) {
+      return null;
+    }
+    if (node.isLeafNode()) {
+      this.builder_.processLeaf(node as LeafNode);
+      if (!node.getPriority().isEmpty()) {
+        return {
+          '.value': node.val(),
+          '.priority': node.getPriority().val()
+        };
+      }
+      return node.val();
+    }
+
+    const out: Record<string, unknown> = {};
+    forEachChildWithPriority(
+      node,
+      (key, child, included) => {
+        if (included) {
+          this.builder_.startChild(key);
+          out[key] = this.serializeNode_(child);
+          this.builder_.endChild();
+        } else {
+          out[key] = child.val(true);
+        }
+      },
+      true
+    );
+    return out;
   }
 }
 
