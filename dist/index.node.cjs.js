@@ -4048,7 +4048,7 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 8;
+const PERSISTENCE_FORMAT_VERSION = 9;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 function readSchemaMarker() {
     if (typeof localStorage === 'undefined') {
@@ -4156,8 +4156,8 @@ const CHUNK_KEY_INFIX = '#c';
 function chunkKeySuffix(index, revision) {
     return `${CHUNK_KEY_INFIX}${String(index).padStart(6, '0')}@${revision}`;
 }
-function persistedChunkHash(entries) {
-    return sha1(util.stringify(entries));
+function persistedChunkHash(payload) {
+    return sha1(payload);
 }
 function isLegacyRecord(record) {
     return record.json !== undefined;
@@ -4898,14 +4898,24 @@ class PersistenceManager {
                     }).then(chunk => {
                         if (!chunk ||
                             chunk.revision !== manifest.chunkRevisions[index] ||
-                            !Array.isArray(chunk.entries) ||
+                            typeof chunk.payload !== 'string' ||
                             typeof chunk.contentHash !== 'string' ||
-                            persistedChunkHash(chunk.entries) !== chunk.contentHash) {
+                            persistedChunkHash(chunk.payload) !== chunk.contentHash) {
+                            return 'mismatch';
+                        }
+                        let entries;
+                        try {
+                            entries = JSON.parse(chunk.payload);
+                        }
+                        catch {
+                            return 'mismatch';
+                        }
+                        if (!Array.isArray(entries)) {
                             return 'mismatch';
                         }
                         onProgress();
                         const plan = [];
-                        for (const [relPath, json] of chunk.entries) {
+                        for (const [relPath, json] of entries) {
                             const node = nodeFromJSON(json);
                             assembled = assembled.updateChild(new Path(relPath), node);
                             plan.push({ relPath, node });
@@ -5392,10 +5402,11 @@ class PersistenceManager {
                     e.relPath,
                     e.node.val(true)
                 ]);
+                const payload = util.stringify(entries);
                 const chunk = {
                     revision,
-                    contentHash: persistedChunkHash(entries),
-                    entries
+                    contentHash: persistedChunkHash(payload),
+                    payload
                 };
                 return this.withStore_('readwrite', false, (store, done) => {
                     store.put(chunk, key + chunkKeySuffix(i, revision));
