@@ -197,6 +197,18 @@ export interface PersistedRecord {
   revision: string;
 }
 
+export type PersistenceRestoreReason =
+  | 'missing'
+  | 'expired'
+  | 'auth'
+  | 'corrupt'
+  | 'timeout';
+
+export interface PersistenceRestoreResult {
+  record: PersistedRecord | null;
+  reason?: PersistenceRestoreReason;
+}
+
 /** The manifest record stored at a root's main key. */
 interface PersistedManifest {
   formatVersion: number;
@@ -265,23 +277,6 @@ interface FlushedState {
  * Counters for observing persistence effectiveness.
  * @internal
  */
-const persistenceEventListeners = new Set<
-  (event: { at: number; path: string; event: string; detail?: string }) => void
->();
-
-/** @internal */
-export function onPersistenceEvent(
-  listener: (event: {
-    at: number;
-    path: string;
-    event: string;
-    detail?: string;
-  }) => void
-): () => void {
-  persistenceEventListeners.add(listener);
-  return () => persistenceEventListeners.delete(listener);
-}
-
 export const persistenceStats: {
   restoredRoots: string[];
   restoreMisses: string[];
@@ -309,11 +304,7 @@ function recordPersistenceEvent(
   event: string,
   detail?: string
 ): void {
-  const item = { at: Date.now(), path, event, detail };
-  persistenceStats.events.push(item);
-  for (const listener of persistenceEventListeners) {
-    listener(item);
-  }
+  persistenceStats.events.push({ at: Date.now(), path, event, detail });
   if (persistenceStats.events.length > 100) {
     persistenceStats.events.splice(0, persistenceStats.events.length - 100);
   }
@@ -472,6 +463,7 @@ export class PersistenceManager {
       cleanupTimer: ReturnType<typeof setTimeout> | null;
     }
   >();
+  private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
   private activeRestoreCount_ = 0;
   private restoreQueue_: Array<() => void> = [];
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
@@ -490,6 +482,7 @@ export class PersistenceManager {
     this.latest_.clear();
     this.lastFlush_.clear();
     this.activeReads_.clear();
+    this.restoreReasons_.clear();
     this.authScope_ = scope;
     recordPersistenceEvent(
       '*',
@@ -1120,13 +1113,15 @@ export class PersistenceManager {
     return metadata
       .then(meta => {
         if (meta === null) {
+          this.restoreReasons_.set(pathString, 'missing');
           return null;
         }
         onProgress();
         const { stored, hashes } = meta;
         // Pre-scope records cannot be attributed to an authenticated user.
         if (isLegacyRecord(stored) && expectedAuthScope !== null) {
-          return 'mismatch' as const;
+          this.restoreReasons_.set(pathString, 'auth');
+          return null;
         }
         const joined = isLegacyRecord(stored)
           ? hashes && hashes.revision === stored.revision
@@ -1156,9 +1151,11 @@ export class PersistenceManager {
           !Array.isArray(manifest.chunkRevisions) ||
           manifest.chunkRevisions.length !== manifest.chunkCount
         ) {
+          this.restoreReasons_.set(pathString, 'corrupt');
           return 'mismatch' as const;
         }
         if (manifest.authScope !== expectedAuthScope) {
+          this.restoreReasons_.set(pathString, 'auth');
           return null;
         }
         let assembled: Node = ChildrenNode.EMPTY_NODE;
@@ -1251,11 +1248,13 @@ export class PersistenceManager {
           return null;
         }
         if (result === 'mismatch') {
+          this.restoreReasons_.set(pathString, 'corrupt');
           persistenceStats.evictions++;
           void this.deleteRecord_(pathString);
           return null;
         }
         if (Date.now() - result.record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+          this.restoreReasons_.set(pathString, 'expired');
           persistenceStats.evictions++;
           void this.deleteRecord_(pathString);
           return null;
@@ -1383,14 +1382,17 @@ export class PersistenceManager {
    * IndexedDB request returns null so Repo cancels the seeded listen and
    * restarts once against the live in-memory cache.
    */
-  restoreForListen(pathString: string): Promise<PersistedRecord | null> {
+  restoreForListen(pathString: string): Promise<PersistenceRestoreResult> {
+    this.restoreReasons_.delete(pathString);
     if (this.disposed_ || !this.schemaKnownCurrent_) {
+      const reason: PersistenceRestoreReason = 'missing';
+      this.restoreReasons_.set(pathString, reason);
       recordPersistenceEvent(
         pathString,
         'restore-miss',
         this.disposed_ ? 'disposed' : 'schema-migration'
       );
-      return Promise.resolve(null);
+      return Promise.resolve({ record: null, reason });
     }
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
@@ -1415,14 +1417,21 @@ export class PersistenceManager {
             return result.record;
           }),
         this.operationTimeoutMs_,
-        () => recordPersistenceEvent(pathString, 'restore-idle-timeout')
+        () => {
+          this.restoreReasons_.set(pathString, 'timeout');
+          recordPersistenceEvent(pathString, 'restore-idle-timeout');
+        }
       )
     ).then(record => {
+      const reason = record
+        ? undefined
+        : this.restoreReasons_.get(pathString) ?? 'missing';
       recordPersistenceEvent(
         pathString,
-        record ? 'restore-hit' : 'restore-miss'
+        record ? 'restore-hit' : 'restore-miss',
+        reason
       );
-      return record;
+      return record ? { record } : { record: null, reason };
     });
   }
 

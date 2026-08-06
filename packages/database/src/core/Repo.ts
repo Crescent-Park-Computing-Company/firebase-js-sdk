@@ -173,6 +173,26 @@ interface PendingSeedRestore {
   cancelled: boolean;
 }
 
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+export type ListenOutcomeReason =
+  | 'missing'
+  | 'expired'
+  | 'auth'
+  | 'corrupt'
+  | 'timeout';
+
+export interface ListenOutcome {
+  mode: ListenOutcomeMode;
+  certified: boolean;
+  bytes: number;
+  reason?: ListenOutcomeReason;
+}
+
+interface ListenOutcomeState {
+  outcome: ListenOutcome | null;
+  subscribers: Set<(outcome: ListenOutcome) => void>;
+}
+
 export class Repo {
   /** Key for uniquely identifying this repo, used in RepoManager */
   readonly key: string;
@@ -215,12 +235,9 @@ export class Repo {
   /**
    * Listen-complete state per default complete listen, keyed by path: whether
    * the current listen has received its initial server response, and waiters
-   * to resolve when it does (see whenListenComplete in api/Database.ts).
+   * to publish its certification outcome (see onListenOutcome in api/Database.ts).
    */
-  listenCompletions_ = new Map<
-    string,
-    { complete: boolean; waiters: Array<() => void> }
-  >();
+  listenOutcomes_ = new Map<string, ListenOutcomeState>();
 
   constructor(
     public repoInfo_: RepoInfo,
@@ -455,6 +472,21 @@ function repoOnDataUpdate(
  * carrying the restored tree's hashes. Roots that were never persisted
  * resolve null instantly and attach exactly as before.
  */
+function repoPublishListenOutcome(
+  repo: Repo,
+  pathString: string,
+  outcome: ListenOutcome
+): void {
+  const state = repo.listenOutcomes_.get(pathString);
+  if (!state) {
+    return;
+  }
+  state.outcome = outcome;
+  for (const subscriber of state.subscribers) {
+    subscriber(outcome);
+  }
+}
+
 export function repoStartServerListen(
   repo: Repo,
   query: QueryContext,
@@ -465,41 +497,76 @@ export function repoStartServerListen(
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
   if (isDefaultComplete) {
-    const prior = repo.listenCompletions_.get(pathString);
-    repo.listenCompletions_.set(pathString, {
-      complete: false,
-      waiters: prior ? prior.waiters : []
+    const prior = repo.listenOutcomes_.get(pathString);
+    repo.listenOutcomes_.set(pathString, {
+      outcome: null,
+      subscribers: prior?.subscribers ?? new Set()
     });
   }
 
-  const sendListen = () => {
-    repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-      const events = onComplete(status, data);
-      eventQueueRaiseEventsForChangedPath(
-        repo.eventQueue_,
-        query._path,
-        events
-      );
-      if (!isDefaultComplete) {
-        return;
-      }
-      const completion = repo.listenCompletions_.get(pathString);
-      if (completion && !completion.complete) {
-        completion.complete = true;
-        const waiters = completion.waiters;
-        completion.waiters = [];
-        for (const waiter of waiters) {
-          waiter();
+  const sendListen = (
+    mode: ListenOutcomeMode,
+    reason?: ListenOutcomeReason
+  ) => {
+    let activeMode = mode;
+    if (isDefaultComplete) {
+      repoPublishListenOutcome(repo, pathString, {
+        mode,
+        certified: false,
+        bytes: 0,
+        reason
+      });
+    }
+    repo.server_.listen(
+      query,
+      currentHashFn,
+      tag,
+      (status, data, wire) => {
+        const events = onComplete(status, data);
+        eventQueueRaiseEventsForChangedPath(
+          repo.eventQueue_,
+          query._path,
+          events
+        );
+        if (!isDefaultComplete) {
+          return;
         }
-      }
-      if (repo.persistence_ !== null) {
-        if (status === 'ok') {
-          repoPersistAfterServerUpdate(repo, query._path);
-        } else {
-          repo.persistence_.evict(query._path);
+        repoPublishListenOutcome(repo, pathString, {
+          mode: activeMode,
+          certified: status === 'ok',
+          bytes: wire.bytes,
+          reason: status === 'ok' ? reason : 'auth'
+        });
+        if (repo.persistence_ !== null) {
+          if (status === 'ok') {
+            repoPersistAfterServerUpdate(repo, query._path);
+          } else {
+            repo.persistence_.evict(query._path);
+          }
         }
+      },
+      wire => {
+        if (!isDefaultComplete) {
+          return;
+        }
+        // Range merges preserve the restored base (incremental/cyan). A normal
+        // data push replaces it, so expose a full authoritative fallback
+        // (amber) before the listen response arrives.
+        if (
+          activeMode === 'restored' &&
+          wire.dataReceived &&
+          !wire.rangeMerged
+        ) {
+          activeMode = 'fallback';
+        }
+        repoPublishListenOutcome(repo, pathString, {
+          mode: activeMode,
+          certified: false,
+          bytes: wire.bytes,
+          reason
+        });
       }
-    });
+    );
   };
 
   const persistence = repo.persistence_;
@@ -508,54 +575,51 @@ export function repoStartServerListen(
     !isDefaultComplete ||
     !persistence.isPersistentPath(pathString)
   ) {
-    sendListen();
+    sendListen('cold');
     return;
   }
 
-  // Android's battle-tested order: synchronously hydrate the SyncTree from
-  // persistence, then create the wire listen from that exact in-memory view.
-  // IndexedDB is async, so we hold only this root's first listen behind an
-  // idle-progress timeout; on miss/corruption/stall we attach cold.
   persistence.track(pathString);
   const token: PendingSeedRestore = { cancelled: false };
   repo.pendingSeedRestores_.set(pathString, token);
   const isCurrent = () =>
     !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
-  const finish = () => {
+  const finish = (mode: ListenOutcomeMode, reason?: ListenOutcomeReason) => {
     if (!isCurrent()) {
       return;
     }
     repo.pendingSeedRestores_.delete(pathString);
-    sendListen();
+    sendListen(mode, reason);
   };
 
-  void persistence.restoreForListen(pathString).then(record => {
-    if (!isCurrent()) {
-      return;
-    }
-    if (
-      record === null ||
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null
-    ) {
-      finish();
-      return;
-    }
-
-    let restored = record.node;
-    for (const state of syncTreeGetDescendantServerCacheStates(
-      repo.serverSyncTree_,
-      query._path
-    )) {
-      if (state.complete === null) {
-        // A live partial/filtered descendant cannot be safely merged with a
-        // persisted ancestor. Fail closed to the normal full server load.
-        finish();
+  void persistence.restoreForListen(pathString).then(
+    result => {
+      if (!isCurrent()) {
         return;
       }
-      restored = restored.updateChild(state.path, state.complete);
-    }
+      const { record, reason } = result;
+      if (
+        record === null ||
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+          null
+      ) {
+        const fallback = reason === 'corrupt' || reason === 'timeout';
+        finish(fallback ? 'fallback' : 'cold', reason);
+        return;
+      }
 
-    if (!restored.isEmpty()) {
+      let restored = record.node;
+      for (const state of syncTreeGetDescendantServerCacheStates(
+        repo.serverSyncTree_,
+        query._path
+      )) {
+        if (state.complete === null) {
+          finish('cold');
+          return;
+        }
+        restored = restored.updateChild(state.path, state.complete);
+      }
+
       try {
         restored = stampSeedHashes(restored, record.hash, record.compoundHash);
         const events = syncTreeApplyServerOverwrite(
@@ -568,15 +632,14 @@ export function repoStartServerListen(
           query._path,
           events
         );
+        finish('restored');
       } catch {
-        // Corrupt or incompatible persisted state is a cache miss. Delete the
-        // record but keep tracking so the full server reload replaces it.
         persistence.invalidate(query._path);
+        finish('fallback', 'corrupt');
       }
-    }
-    // User callbacks above may synchronously remove this listener.
-    finish();
-  }, finish);
+    },
+    () => finish('fallback', 'corrupt')
+  );
 }
 
 /**
@@ -602,44 +665,27 @@ export function repoStopServerListen(
   } else {
     repo.server_.unlisten(query, tag);
   }
-  // Resolve outstanding completion waiters — the listen they were watching is
-  // gone, and a promise that can never settle would leak its callers.
-  const completion = repo.listenCompletions_.get(pathString);
-  if (completion) {
-    repo.listenCompletions_.delete(pathString);
-    for (const waiter of completion.waiters) {
-      waiter();
-    }
-  }
+  repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
 }
 
-/**
- * Resolves when the current default complete listen at `pathString` has
- * received its initial response from the server — the moment a restored
- * cache is certified (unchanged tree) or replaced (changed tree). Resolves
- * immediately if that already happened, or if no such listen exists; also
- * resolves if the listen stops first, so callers never hang.
- */
-export function repoWhenListenComplete(
+/** Observe the outcome of one exact default listen. @internal */
+export function repoOnListenOutcome(
   repo: Repo,
-  pathString: string
-): Promise<void> {
-  const completion = repo.listenCompletions_.get(pathString);
-  if (!completion || completion.complete) {
-    return Promise.resolve();
+  pathString: string,
+  subscriber: (outcome: ListenOutcome) => void
+): () => void {
+  const state = repo.listenOutcomes_.get(pathString);
+  if (!state) {
+    return () => {};
   }
-  return new Promise(resolve => {
-    completion.waiters.push(resolve);
-  });
+  state.subscribers.add(subscriber);
+  if (state.outcome) {
+    subscriber(state.outcome);
+  }
+  return () => state.subscribers.delete(subscriber);
 }
 
-/**
- * Settles every outstanding whenListenComplete waiter and clears the
- * completion registry. Called when the repo is deleted (deleteApp): its
- * listens can never respond again, and an unsettleable waiter would hang
- * its caller and retain the Repo forever.
- */
 export function repoCancelPendingSeedRestores(repo: Repo): void {
   for (const pending of repo.pendingSeedRestores_.values()) {
     pending.cancelled = true;
@@ -647,22 +693,14 @@ export function repoCancelPendingSeedRestores(repo: Repo): void {
   repo.pendingSeedRestores_.clear();
 }
 
-export function repoSettleListenCompletions(repo: Repo): void {
-  for (const completion of repo.listenCompletions_.values()) {
-    completion.complete = true;
-    const waiters = completion.waiters;
-    completion.waiters = [];
-    for (const waiter of waiters) {
-      waiter();
-    }
-  }
-  repo.listenCompletions_.clear();
+export function repoClearListenOutcomes(repo: Repo): void {
+  repo.listenOutcomes_.clear();
 }
 
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo);
-  repoSettleListenCompletions(repo);
+  repoClearListenOutcomes(repo);
   repo.persistence_?.dispose();
 }
 

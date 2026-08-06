@@ -18,7 +18,6 @@
 import { base64Encode, isNodeSdk, stringify } from '@firebase/util';
 
 import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
-import { serverCacheSeedStats } from '../core/ServerCacheSeed';
 import { StatsCollection } from '../core/stats/StatsCollection';
 import { statsManagerGetCollection } from '../core/stats/StatsManager';
 import {
@@ -135,7 +134,10 @@ export class BrowserPollConnection implements Transport {
    * @param onMessage - Callback when messages arrive
    * @param onDisconnect - Callback with connection lost.
    */
-  open(onMessage: (msg: {}) => void, onDisconnect: (a?: boolean) => void) {
+  open(
+    onMessage: (msg: {}, bytes?: number) => void,
+    onDisconnect: (a?: boolean) => void
+  ) {
     this.curSegmentNum = 0;
     this.onDisconnect_ = onDisconnect;
     this.myPacketOrderer = new PacketReceiver(onMessage);
@@ -193,8 +195,12 @@ export class BrowserPollConnection implements Transport {
         },
         (...args) => {
           const [pN, data] = args;
-          this.incrementIncomingBytes_(args);
-          this.myPacketOrderer.handleResponse(pN as number, data as unknown[]);
+          const bytes = this.incrementIncomingBytes_(args);
+          this.myPacketOrderer.handleResponse(
+            pN as number,
+            data as unknown[],
+            bytes
+          );
         },
         () => {
           this.onClosed_();
@@ -392,12 +398,12 @@ export class BrowserPollConnection implements Transport {
   /**
    * Used to track the bytes received by this client
    */
-  private incrementIncomingBytes_(args: unknown) {
+  private incrementIncomingBytes_(args: unknown): number {
     // TODO: This is an annoying perf hit just to track the number of incoming bytes.  Maybe it should be opt-in.
     const bytesReceived = stringify(args).length;
     this.bytesReceived += bytesReceived;
     this.stats_.incrementCounter('bytes_received', bytesReceived);
-    serverCacheSeedStats.bytesReceived += bytesReceived;
+    return bytesReceived;
   }
 }
 

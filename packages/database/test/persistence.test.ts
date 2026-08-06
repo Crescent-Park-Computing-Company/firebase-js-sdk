@@ -26,19 +26,21 @@ import {
 import {
   PersistenceManager,
   PersistedRecord,
+  PersistenceRestoreResult,
   persistenceStats,
-  onPersistenceEvent,
   PERSISTENCE_CHUNK_TARGET_BYTES
 } from '../src/core/Persistence';
 import {
   repoCancelPendingSeedRestores,
+  repoClearListenOutcomes,
   repoDispose,
-  repoSettleListenCompletions,
+  repoOnListenOutcome,
   repoStartServerListen,
   repoStopServerListen,
-  repoWhenListenComplete,
+  ListenOutcome,
   Repo
 } from '../src/core/Repo';
+import { ListenWireResult } from '../src/core/ServerActions';
 import { ListenHashFn } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import {
@@ -68,7 +70,7 @@ async function restoreForTest(
   pathString: string
 ): Promise<PersistedRecord | null> {
   manager.track(pathString);
-  return manager.restoreForListen(pathString);
+  return (await manager.restoreForListen(pathString)).record;
 }
 
 /**
@@ -437,7 +439,7 @@ describe('PersistenceManager', () => {
 
     expect(peeked).to.not.equal(null);
     expect(restored).to.not.equal(null);
-    expect(peeked!.node).to.equal(restored!.node);
+    expect(peeked!.node).to.equal(restored.record!.node);
     expect(chunkGets).to.equal(1);
     expect(hashSidecarGets).to.equal(0);
   });
@@ -460,7 +462,7 @@ describe('PersistenceManager', () => {
     const restoring = reader.restoreForListen(path.toString());
     reader.untrack(path.toString());
 
-    expect(await restoring).to.equal(null);
+    expect((await restoring).record).to.equal(null);
     expect(reader.trackedRootFor(path.toString())).to.equal(null);
   });
 
@@ -541,7 +543,9 @@ describe('PersistenceManager', () => {
   it('skips restore immediately when the browser schema marker is stale', async () => {
     const { factory } = makeFakeIndexedDB({ dbVersion: 7 });
     const manager = new PersistenceManager('test-repo', factory, false);
-    expect(await manager.restoreForListen('/cold/root')).to.equal(null);
+    expect((await manager.restoreForListen('/cold/root')).record).to.equal(
+      null
+    );
     // The v8 migration continues in the background for the later live flush.
     await flushAsync();
   });
@@ -628,7 +632,9 @@ describe('PersistenceManager', () => {
     (manager as unknown as { readRecord_: () => Promise<never> }).readRecord_ =
       () => new Promise(() => {});
 
-    expect(await manager.restoreForListen(path.toString())).to.equal(null);
+    expect((await manager.restoreForListen(path.toString())).record).to.equal(
+      null
+    );
   });
 
   it('a stalled IndexedDB open degrades to a cache miss', async () => {
@@ -644,7 +650,9 @@ describe('PersistenceManager', () => {
     const manager = new PersistenceManager('test-repo', factory, true, 10);
 
     manager.track('/stalled/open');
-    expect(await manager.restoreForListen('/stalled/open')).to.equal(null);
+    expect((await manager.restoreForListen('/stalled/open')).record).to.equal(
+      null
+    );
   });
 
   it('resolves null for a root never persisted', async () => {
@@ -683,7 +691,9 @@ describe('PersistenceManager', () => {
 
     const reader = new PersistenceManager('test-repo', factory);
     reader.track(path.toString());
-    expect(await reader.restoreForListen(path.toString())).to.equal(null);
+    expect((await reader.restoreForListen(path.toString())).record).to.equal(
+      null
+    );
     await flushAsync();
     expect(keysFor(data, 'test-repo|/corrupt/root')).to.deep.equal([]);
   });
@@ -1148,13 +1158,13 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const manager = new PersistenceManager('test-repo', factory);
     const calls: string[] = [];
     const hashFns: ListenHashFn[] = [];
-    const serverCallbacks: Array<(status: string) => void> = [];
+    const serverCallbacks: Array<
+      (status: string, wire?: Partial<ListenWireResult>) => void
+    > = [];
+    const serverProgress: Array<(wire: ListenWireResult) => void> = [];
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
-      listenCompletions_: new Map<
-        string,
-        { complete: boolean; waiters: Array<() => void> }
-      >(),
+      listenOutcomes_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: new SyncTree({
@@ -1166,11 +1176,26 @@ describe('repoStartServerListen / repoStopServerListen', () => {
           _query: unknown,
           hashFn: ListenHashFn,
           _tag: unknown,
-          onListen: (status: string) => void
+          onListen: (
+            status: string,
+            data: unknown,
+            wire: ListenWireResult
+          ) => void,
+          onProgress?: (wire: ListenWireResult) => void
         ) => {
           calls.push('listen');
           hashFns.push(hashFn);
-          serverCallbacks.push(onListen);
+          serverCallbacks.push((status, overrides = {}) =>
+            onListen(status, null, {
+              bytes: 0,
+              hadHash: hashFn() !== '',
+              hadCompoundHash: hashFn.compoundHash?.() !== undefined,
+              dataReceived: false,
+              rangeMerged: false,
+              ...overrides
+            })
+          );
+          serverProgress.push(onProgress ?? (() => {}));
         },
         unlisten: (...args: unknown[]) => calls.push('unlisten')
       }
@@ -1192,6 +1217,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       calls,
       hashFns,
       serverCallbacks,
+      serverProgress,
       data
     };
   }
@@ -1432,8 +1458,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const { repo, query, path, hashFn, onComplete, calls, serverCallbacks } =
       makeListenHarness();
     let resolveRecord: (record: PersistedRecord | null) => void = () => {};
-    const recordPromise = new Promise<PersistedRecord | null>(resolve => {
-      resolveRecord = resolve;
+    const recordPromise = new Promise<PersistenceRestoreResult>(resolve => {
+      resolveRecord = record =>
+        resolve({
+          record,
+          reason: record ? undefined : 'missing'
+        });
     });
     const node = nodeFromJSON({ cached: true });
     const compoundHash = computeCompoundHash(node.val(true));
@@ -1462,13 +1492,13 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
 
-    let completed = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      completed = true;
-    });
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     serverCallbacks[0]('ok');
     await flushAsync();
-    expect(completed).to.equal(true);
+    expect(outcomes.at(-1)?.certified).to.equal(true);
   });
 
   it('a validation miss attaches exactly one cold listen', async () => {
@@ -1479,7 +1509,8 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       isPersistentPath: () => true,
       // Missing/mismatched/malformed chunks, storage failure, or an idle
       // timeout all take the same cold-listen fallback.
-      restoreForListen: () => Promise.resolve(null),
+      restoreForListen: () =>
+        Promise.resolve({ record: null, reason: 'missing' }),
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
       evict: () => {},
@@ -1492,60 +1523,165 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(hashFns[0]()).to.equal('');
   });
 
-  it('whenListenComplete resolves on the server response, not the restore', async () => {
+  it('publishes one restored outcome through certification', async () => {
     const { repo, query, path, hashFn, onComplete, serverCallbacks } =
       makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: true });
     repoStartServerListen(repo, query, null, hashFn, onComplete);
-    let settled = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      settled = true;
-    });
-    // The restore resolves and the listen goes out — still not complete.
-    await flushAsync();
-    expect(settled).to.equal(false);
-    serverCallbacks[0]('ok');
-    await flushAsync();
-    expect(settled).to.equal(true);
-    // Already complete: a late waiter resolves immediately.
-    let late = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      late = true;
+    const outcomes: ListenOutcome[] = [];
+    const unsubscribe = repoOnListenOutcome(repo, path.toString(), outcome => {
+      outcomes.push(outcome);
     });
     await flushAsync();
-    expect(late).to.equal(true);
+    expect(outcomes[0]).to.deep.equal({
+      mode: 'restored',
+      certified: false,
+      bytes: 0,
+      reason: undefined
+    });
+    serverCallbacks[0]('ok', { bytes: 321, dataReceived: false });
+    await flushAsync();
+    expect(outcomes[1]).to.deep.equal({
+      mode: 'restored',
+      certified: true,
+      bytes: 321,
+      reason: undefined
+    });
+    unsubscribe();
   });
 
-  it('whenListenComplete resolves when the listen stops first', async () => {
+  it('switches restored cyan to fallback amber on a full server replacement', async () => {
+    const {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      serverCallbacks,
+      serverProgress
+    } = makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: true });
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
+    await flushAsync();
+    expect(outcomes.at(-1)?.mode).to.equal('restored');
+
+    serverProgress[0]({
+      bytes: 500,
+      hadHash: true,
+      hadCompoundHash: true,
+      dataReceived: true,
+      rangeMerged: false
+    });
+    expect(outcomes.at(-1)).to.deep.equal({
+      mode: 'fallback',
+      certified: false,
+      bytes: 500,
+      reason: undefined
+    });
+
+    serverCallbacks[0]('ok', {
+      bytes: 507,
+      dataReceived: true,
+      rangeMerged: false
+    });
+    expect(outcomes.at(-1)?.mode).to.equal('fallback');
+    expect(outcomes.at(-1)?.certified).to.equal(true);
+  });
+
+  it('keeps restored cyan while range merges arrive incrementally', async () => {
+    const { repo, query, path, hashFn, onComplete, serverProgress } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: true });
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
+    await flushAsync();
+    serverProgress[0]({
+      bytes: 123,
+      hadHash: true,
+      hadCompoundHash: true,
+      dataReceived: true,
+      rangeMerged: true
+    });
+    expect(outcomes.at(-1)).to.deep.equal({
+      mode: 'restored',
+      certified: false,
+      bytes: 123,
+      reason: undefined
+    });
+  });
+
+  it('publishes corruption as a full fallback, not a normal cold miss', async () => {
+    const { repo, query, path, hashFn, onComplete } = makeListenHarness();
+    repo.persistence_ = {
+      track: () => {},
+      restoreForListen: () =>
+        Promise.resolve({ record: null, reason: 'corrupt' }),
+      isPersistentPath: () => true,
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      invalidate: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
+    await flushAsync();
+    expect(outcomes[0]).to.deep.equal({
+      mode: 'fallback',
+      certified: false,
+      bytes: 0,
+      reason: 'corrupt'
+    });
+  });
+
+  it('publishes a cold miss with its reason', async () => {
     const { repo, query, path, hashFn, onComplete } = makeListenHarness();
     repoStartServerListen(repo, query, null, hashFn, onComplete);
-    let settled = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      settled = true;
-    });
-    repoStopServerListen(repo, query, null);
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     await flushAsync();
-    expect(settled).to.equal(true);
+    expect(outcomes[0]).to.deep.equal({
+      mode: 'cold',
+      certified: false,
+      bytes: 0,
+      reason: 'missing'
+    });
+  });
+
+  it('removes the outcome when the listen stops', async () => {
+    const { repo, query, path, hashFn, onComplete } = makeListenHarness();
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(repo.listenOutcomes_.has(path.toString())).to.equal(true);
+    repoStopServerListen(repo, query, null);
+    expect(repo.listenOutcomes_.has(path.toString())).to.equal(false);
   });
 
   it('repo deletion cancels every pending persisted restore', () => {
     const { repo } = makeListenHarness();
-    const pending = {
-      cancelled: false
-    };
+    const pending = { cancelled: false };
     repo.pendingSeedRestores_.set('/large/root', pending);
     repoCancelPendingSeedRestores(repo);
     expect(pending.cancelled).to.equal(true);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
-  it('repo disposal cancels restores, waiters, and persistence together', async () => {
+  it('repo disposal cancels restores and clears outcomes together', async () => {
     const { repo, query, path, hashFn, onComplete } = makeListenHarness();
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     const pending = repo.pendingSeedRestores_.get(path.toString())!;
-    let completed = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      completed = true;
-    });
     let disposed = false;
     repo.persistence_ = {
       dispose: () => {
@@ -1556,35 +1692,17 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(pending.cancelled).to.equal(true);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.listenCompletions_.size).to.equal(0);
-    expect(completed).to.equal(true);
+    expect(repo.listenOutcomes_.size).to.equal(0);
     expect(disposed).to.equal(true);
   });
 
-  it('whenListenComplete resolves when the repo is deleted', async () => {
+  it('clears active outcome observers on repo deletion', async () => {
     const { repo, query, path, hashFn, onComplete } = makeListenHarness();
     repoStartServerListen(repo, query, null, hashFn, onComplete);
-    let settled = false;
-    void repoWhenListenComplete(repo, path.toString()).then(() => {
-      settled = true;
-    });
     await flushAsync();
-    expect(settled).to.equal(false);
-    // deleteApp: the listen can never respond — the waiter must not hang.
-    repoSettleListenCompletions(repo);
-    await flushAsync();
-    expect(settled).to.equal(true);
-    expect(repo.listenCompletions_.size).to.equal(0);
-  });
-
-  it('whenListenComplete resolves immediately with no listen at all', async () => {
-    const { repo } = makeListenHarness();
-    let settled = false;
-    void repoWhenListenComplete(repo, '/nowhere').then(() => {
-      settled = true;
-    });
-    await flushAsync();
-    expect(settled).to.equal(true);
+    expect(repo.listenOutcomes_.size).to.equal(1);
+    repoClearListenOutcomes(repo);
+    expect(repo.listenOutcomes_.size).to.equal(0);
   });
 });
 
@@ -1607,10 +1725,7 @@ describe('stale restore vs live server data', () => {
     });
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
-      listenCompletions_: new Map<
-        string,
-        { complete: boolean; waiters: Array<() => void> }
-      >(),
+      listenOutcomes_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,
@@ -1731,8 +1846,6 @@ describe('persistence restore scheduling', () => {
 describe('persistence diagnostics', () => {
   it('records bounded store/restore outcomes for debugging cache misses', async () => {
     persistenceStats.events.length = 0;
-    const observed: string[] = [];
-    const unsubscribe = onPersistenceEvent(event => observed.push(event.event));
     const shared = makeFakeIndexedDB();
     const path = new Path('diag/root');
     const writer = new PersistenceManager('test-repo', shared.factory);
@@ -1746,8 +1859,6 @@ describe('persistence diagnostics', () => {
       persistenceStats.events.map(event => event.event)
     ).to.include.members(['stored', 'restore-hit']);
     expect(persistenceStats.events.length).to.be.at.most(100);
-    expect(observed).to.include.members(['stored', 'restore-hit']);
-    unsubscribe();
   });
 });
 

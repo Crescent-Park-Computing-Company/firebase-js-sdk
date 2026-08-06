@@ -34,8 +34,8 @@ import { Connection } from '../realtime/Connection';
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
-import { ListenHashFn, serverCacheSeedStats } from './ServerCacheSeed';
+import { ListenWireResult, ServerActions } from './ServerActions';
+import { ListenHashFn } from './ServerCacheSeed';
 import { OnlineMonitor } from './util/OnlineMonitor';
 import { Path } from './util/Path';
 import { error, log, logWrapper, warn, ObjectToUniqueKey } from './util/util';
@@ -54,9 +54,13 @@ const SERVER_KILL_INTERRUPT_REASON = 'server_kill';
 const INVALID_TOKEN_THRESHOLD = 3;
 
 interface ListenSpec {
-  onComplete(s: string, p?: unknown): void;
+  onComplete(s: string, p: unknown, result: ListenWireResult): void;
+  onProgress?: (result: ListenWireResult) => void;
 
   hashFn: ListenHashFn;
+  bytes: number;
+  dataReceived: boolean;
+  rangeMerged: boolean;
 
   query: QueryContext;
   tag: number | null;
@@ -97,13 +101,6 @@ export class PersistentConnection extends ServerActions {
     /* path */ string,
     Map</* queryId */ string, ListenSpec>
   > = new Map();
-  /**
-   * Data pushes received per ACTIVE listen path (see hashMatches in
-   * serverCacheSeedStats): entries live only while a listen exists at the
-   * path — created on the first push, dropped in removeListen_ — so the map
-   * is bounded by the number of active listens.
-   */
-  private dataPushes_: Map<string, number> = new Map();
   private outstandingPuts_: OutstandingPut[] = [];
   private outstandingGets_: OutstandingGet[] = [];
   private outstandingPutCount_ = 0;
@@ -120,7 +117,9 @@ export class PersistentConnection extends ServerActions {
   private visible_: boolean = false;
 
   // Before we get connected, we keep a queue of pending messages to send.
-  private requestCBHash_: { [k: number]: (a: unknown) => void } = {};
+  private requestCBHash_: {
+    [k: number]: (a: unknown, bytes?: number) => void;
+  } = {};
   private requestNumber_ = 0;
 
   private realtime_: {
@@ -188,7 +187,7 @@ export class PersistentConnection extends ServerActions {
   protected sendRequest(
     action: string,
     body: unknown,
-    onResponse?: (a: unknown) => void
+    onResponse?: (a: unknown, bytes?: number) => void
   ) {
     const curReqNum = ++this.requestNumber_;
 
@@ -239,7 +238,8 @@ export class PersistentConnection extends ServerActions {
     query: QueryContext,
     currentHashFn: ListenHashFn,
     tag: number | null,
-    onComplete: (a: string, b: unknown) => void
+    onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
+    onProgress?: (result: ListenWireResult) => void
   ) {
     this.initConnection_();
 
@@ -259,9 +259,13 @@ export class PersistentConnection extends ServerActions {
     );
     const listenSpec: ListenSpec = {
       onComplete,
+      onProgress,
       hashFn: currentHashFn,
       query,
-      tag
+      tag,
+      bytes: 0,
+      dataReceived: false,
+      rangeMerged: false
     };
     this.listens.get(pathString)!.set(queryId, listenSpec);
 
@@ -308,49 +312,47 @@ export class PersistentConnection extends ServerActions {
     const compoundHash = listenSpec.hashFn.compoundHash?.();
     if (compoundHash) {
       req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
-      serverCacheSeedStats.listensSentWithCompoundHash++;
     }
     if (req['h'] !== '') {
-      serverCacheSeedStats.listensSentWithHash++;
     }
     const hadHash = req['h'] !== '';
-    const pushesBefore = this.dataPushes_.get(pathString) || 0;
+    const hadCompoundHash = compoundHash !== undefined;
+    listenSpec.bytes = 0;
+    listenSpec.dataReceived = false;
+    listenSpec.rangeMerged = false;
 
-    this.sendRequest(action, req, (message: { [k: string]: unknown }) => {
-      const payload: unknown = message[/*data*/ 'd'];
-      const status = message[/*status*/ 's'] as string;
+    this.sendRequest(
+      action,
+      req,
+      (message: { [k: string]: unknown }, responseBytes = 0) => {
+        const payload: unknown = message[/*data*/ 'd'];
+        const status = message[/*status*/ 's'] as string;
 
-      if (status === 'ok') {
-        serverCacheSeedStats.listenOks++;
-        // An 'ok' with no data pushed for this path since the listen went
-        // out means the server accepted our hash as current.
-        if (
-          hadHash &&
-          (this.dataPushes_.get(pathString) || 0) === pushesBefore
-        ) {
-          serverCacheSeedStats.hashMatches++;
+        // print warnings in any case...
+        PersistentConnection.warnOnListenWarnings_(payload, query);
+
+        const currentListenSpec =
+          this.listens.get(pathString) &&
+          this.listens.get(pathString)!.get(queryId);
+        // only trigger actions if the listen hasn't been removed and readded
+        if (currentListenSpec === listenSpec) {
+          this.log_('listen response', message);
+
+          if (status !== 'ok') {
+            this.removeListen_(pathString, queryId);
+          }
+
+          if (listenSpec.onComplete) {
+            listenSpec.onComplete(status, payload, {
+              ...this.listenWireResult_(listenSpec),
+              bytes: listenSpec.bytes + responseBytes,
+              hadHash,
+              hadCompoundHash
+            });
+          }
         }
       }
-
-      // print warnings in any case...
-      PersistentConnection.warnOnListenWarnings_(payload, query);
-
-      const currentListenSpec =
-        this.listens.get(pathString) &&
-        this.listens.get(pathString)!.get(queryId);
-      // only trigger actions if the listen hasn't been removed and readded
-      if (currentListenSpec === listenSpec) {
-        this.log_('listen response', message);
-
-        if (status !== 'ok') {
-          this.removeListen_(pathString, queryId);
-        }
-
-        if (listenSpec.onComplete) {
-          listenSpec.onComplete(status, payload);
-        }
-      }
-    });
+    );
   }
 
   private static warnOnListenWarnings_(payload: unknown, query: QueryContext) {
@@ -679,7 +681,7 @@ export class PersistentConnection extends ServerActions {
     }
   }
 
-  private onDataMessage_(message: { [k: string]: unknown }) {
+  private onDataMessage_(message: { [k: string]: unknown }, bytes = 0) {
     if ('r' in message) {
       // this is a response
       this.log_('from server: ' + stringify(message));
@@ -687,17 +689,31 @@ export class PersistentConnection extends ServerActions {
       const onResponse = this.requestCBHash_[reqNum];
       if (onResponse) {
         delete this.requestCBHash_[reqNum];
-        onResponse(message[/*body*/ 'b']);
+        onResponse(message[/*body*/ 'b'], bytes);
       }
     } else if ('error' in message) {
       throw 'A server-side error has occurred: ' + message['error'];
     } else if ('a' in message) {
       // a and b are action and body, respectively
-      this.onDataPush_(message['a'] as string, message['b'] as {});
+      this.onDataPush_(message['a'] as string, message['b'] as {}, bytes);
     }
   }
 
-  private onDataPush_(action: string, body: { [k: string]: unknown }) {
+  private listenWireResult_(listen: ListenSpec): ListenWireResult {
+    return {
+      bytes: listen.bytes,
+      hadHash: listen.hashFn() !== '',
+      hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+      dataReceived: listen.dataReceived,
+      rangeMerged: listen.rangeMerged
+    };
+  }
+
+  private onDataPush_(
+    action: string,
+    body: { [k: string]: unknown },
+    bytes: number
+  ) {
     this.log_('handleServerMessage', action, body);
     if (
       (action === 'd' || action === 'm' || action === 'rm') &&
@@ -705,11 +721,16 @@ export class PersistentConnection extends ServerActions {
       body['p'] !== undefined
     ) {
       const pushPath = new Path(body['p'] as string).toString();
-      if (this.listens.has(pushPath)) {
-        this.dataPushes_.set(
-          pushPath,
-          (this.dataPushes_.get(pushPath) || 0) + 1
-        );
+      const listensAtPath = this.listens.get(pushPath);
+      if (listensAtPath) {
+        for (const listen of listensAtPath.values()) {
+          listen.bytes += bytes;
+          listen.dataReceived = true;
+          if (action === 'rm') {
+            listen.rangeMerged = true;
+          }
+          listen.onProgress?.(this.listenWireResult_(listen));
+        }
       }
     }
     if (action === 'd') {
@@ -729,7 +750,6 @@ export class PersistentConnection extends ServerActions {
     } else if (action === 'rm') {
       // Range merge: the listen carried a compound hash and only some of its
       // ranges differed — the server resends just those ranges.
-      serverCacheSeedStats.rangeMergesReceived++;
       this.onRangeMergeUpdate_?.(
         body[/*path*/ 'p'] as string,
         body[/*ranges*/ 'd'] as Array<{ s?: string; e?: string; m: unknown }>,
@@ -1023,7 +1043,13 @@ export class PersistentConnection extends ServerActions {
     }
     const listen = this.removeListen_(pathString, queryId);
     if (listen && listen.onComplete) {
-      listen.onComplete('permission_denied');
+      listen.onComplete('permission_denied', null, {
+        bytes: listen.bytes,
+        hadHash: listen.hashFn() !== '',
+        hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+        dataReceived: listen.dataReceived,
+        rangeMerged: listen.rangeMerged
+      });
     }
   }
 
@@ -1036,7 +1062,6 @@ export class PersistentConnection extends ServerActions {
       map.delete(queryId);
       if (map.size === 0) {
         this.listens.delete(normalizedPathString);
-        this.dataPushes_.delete(normalizedPathString);
       }
     } else {
       // all listens for this path has already been removed

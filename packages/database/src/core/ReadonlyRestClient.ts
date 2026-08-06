@@ -26,7 +26,7 @@ import {
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
 import { logWrapper, warn } from './util/util';
 import { QueryContext } from './view/EventRegistration';
 import { queryParamsToRestQueryStringParameters } from './view/QueryParams';
@@ -85,7 +85,8 @@ export class ReadonlyRestClient extends ServerActions {
     query: QueryContext,
     currentHashFn: () => string,
     tag: number | null,
-    onComplete: (a: string, b: unknown) => void
+    onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
+    onProgress?: (result: ListenWireResult) => void
   ) {
     const pathString = query._path.toString();
     this.log_('Listen called for ' + pathString + ' ' + query._queryIdentifier);
@@ -124,7 +125,17 @@ export class ReadonlyRestClient extends ServerActions {
             status = 'rest_error:' + error;
           }
 
-          onComplete(status, null);
+          const wire: ListenWireResult = {
+            bytes: 0,
+            hadHash: false,
+            hadCompoundHash: false,
+            dataReceived: error === null,
+            rangeMerged: false
+          };
+          if (wire.dataReceived) {
+            onProgress?.(wire);
+          }
+          onComplete(status, null, wire);
         }
       }
     );

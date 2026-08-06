@@ -112,7 +112,10 @@ describe('PersistentConnection compound-hash wire protocol', () => {
       onComplete: () => [],
       hashFn,
       query: defaultQueryAt('some/path'),
-      tag: null
+      tag: null,
+      bytes: 0,
+      dataReceived: false,
+      rangeMerged: false
     });
 
     expect(sent).to.have.length(1);
@@ -133,7 +136,10 @@ describe('PersistentConnection compound-hash wire protocol', () => {
       onComplete: () => [],
       hashFn: (() => '') as ListenHashFn,
       query: defaultQueryAt('some/path'),
-      tag: null
+      tag: null,
+      bytes: 0,
+      dataReceived: false,
+      rangeMerged: false
     });
 
     expect(sent).to.have.length(1);
@@ -146,8 +152,50 @@ describe('PersistentConnection compound-hash wire protocol', () => {
     const connection = makeConnection(rmCalls);
     const ranges = [{ s: 'a/b', e: 'a/z', m: { c: 1 } }];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (connection as any).onDataPush_('rm', { p: 'some/path', d: ranges, t: 42 });
+    (connection as any).onDataPush_(
+      'rm',
+      { p: 'some/path', d: ranges, t: 42 },
+      17
+    );
     expect(rmCalls).to.deep.equal([['some/path', ranges, 42]]);
+  });
+
+  it('attributes raw push and response bytes to one listen outcome', () => {
+    const connection = makeConnection([]);
+    let respond: ((message: unknown, bytes?: number) => void) | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (connection as any).connected_ = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (connection as any).sendRequest = (
+      _action: string,
+      _body: unknown,
+      callback: (message: unknown, bytes?: number) => void
+    ) => {
+      respond = callback;
+    };
+    let result: unknown;
+    connection.listen(
+      defaultQueryAt('some/path'),
+      (() => 'hash') as ListenHashFn,
+      null,
+      (_status, _payload, wire) => {
+        result = wire;
+      }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (connection as any).onDataPush_(
+      'd',
+      { p: 'some/path', d: { cached: false }, t: null },
+      123
+    );
+    respond!({ s: 'ok', d: null }, 7);
+    expect(result).to.deep.equal({
+      bytes: 130,
+      hadHash: true,
+      hadCompoundHash: false,
+      dataReceived: true,
+      rangeMerged: false
+    });
   });
 
   it('onDataPush_ ignores rm when no callback is registered', () => {

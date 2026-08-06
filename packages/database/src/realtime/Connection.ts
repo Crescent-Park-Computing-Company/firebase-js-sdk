@@ -67,7 +67,7 @@ const SERVER_HELLO = 'h';
  */
 export class Connection {
   connectionCount = 0;
-  pendingDataMessages: unknown[] = [];
+  pendingDataMessages: Array<{ data: unknown; bytes: number }> = [];
   sessionId: string;
 
   private conn_: Transport;
@@ -100,7 +100,7 @@ export class Connection {
     private applicationId_: string | undefined,
     private appCheckToken_: string | undefined,
     private authToken_: string | undefined,
-    private onMessage_: (a: {}) => void,
+    private onMessage_: (a: {}, bytes?: number) => void,
     private onReady_: (a: number, b: string) => void,
     private onDisconnect_: () => void,
     private onKill_: (a: string) => void,
@@ -204,12 +204,12 @@ export class Connection {
   }
 
   private connReceiver_(conn: Transport) {
-    return (message: Indexable) => {
+    return (message: Indexable, bytes = 0) => {
       if (this.state_ !== RealtimeState.DISCONNECTED) {
         if (conn === this.rx_) {
-          this.onPrimaryMessageReceived_(message);
+          this.onPrimaryMessageReceived_(message, bytes);
         } else if (conn === this.secondaryConn_) {
-          this.onSecondaryMessageReceived_(message);
+          this.onSecondaryMessageReceived_(message, bytes);
         } else {
           this.log_('message on old connection');
         }
@@ -261,14 +261,14 @@ export class Connection {
     }
   }
 
-  private onSecondaryMessageReceived_(parsedData: Indexable) {
+  private onSecondaryMessageReceived_(parsedData: Indexable, bytes: number) {
     const layer: string = requireKey('t', parsedData) as string;
     const data: unknown = requireKey('d', parsedData);
     if (layer === 'c') {
       this.onSecondaryControl_(data as Indexable);
     } else if (layer === 'd') {
       // got a data message, but we're still second connection. Need to buffer it up
-      this.pendingDataMessages.push(data);
+      this.pendingDataMessages.push({ data, bytes });
     } else {
       throw new Error('Unknown protocol layer: ' + layer);
     }
@@ -303,22 +303,25 @@ export class Connection {
     this.tryCleanupConnection();
   }
 
-  private onPrimaryMessageReceived_(parsedData: { [k: string]: unknown }) {
+  private onPrimaryMessageReceived_(
+    parsedData: { [k: string]: unknown },
+    bytes: number
+  ) {
     // Must refer to parsedData properties in quotes, so closure doesn't touch them.
     const layer: string = requireKey('t', parsedData) as string;
     const data: unknown = requireKey('d', parsedData);
     if (layer === 'c') {
       this.onControl_(data as { [k: string]: unknown });
     } else if (layer === 'd') {
-      this.onDataMessage_(data);
+      this.onDataMessage_(data, bytes);
     }
   }
 
-  private onDataMessage_(message: unknown) {
+  private onDataMessage_(message: unknown, bytes = 0) {
     this.onPrimaryResponse_();
 
     // We don't do anything with data messages, just kick them up a level
-    this.onMessage_(message);
+    this.onMessage_(message as {}, bytes);
   }
 
   private onPrimaryResponse_() {
@@ -353,8 +356,8 @@ export class Connection {
       } else if (cmd === END_TRANSMISSION) {
         this.log_('recvd end transmission on primary');
         this.rx_ = this.secondaryConn_;
-        for (let i = 0; i < this.pendingDataMessages.length; ++i) {
-          this.onDataMessage_(this.pendingDataMessages[i]);
+        for (const pending of this.pendingDataMessages) {
+          this.onDataMessage_(pending.data, pending.bytes);
         }
         this.pendingDataMessages = [];
         this.tryCleanupConnection();

@@ -46,9 +46,10 @@ import {
   repoCancelPendingSeedRestores,
   repoDispose,
   repoInterrupt,
+  ListenOutcome,
+  repoOnListenOutcome,
   repoResume,
-  repoStart,
-  repoWhenListenComplete
+  repoStart
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { parseRepoInfo } from '../core/util/libs/parser';
@@ -549,25 +550,24 @@ export function setPersistencePath(
 }
 
 /**
- * Resolves when the default complete listen at `pathString` has received its
- * initial response from the server. With persistence, listeners may fire
- * first with the restored cache; this is the signal that the server has since
- * certified that data as current (unchanged tree) or replaced it (changed
- * tree). Resolves immediately when that already happened or no such listen
- * exists, and when the listen stops before completing — it never hangs.
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
  *
  * @internal
  */
-export function whenListenComplete(
+export function onListenOutcome(
   db: Database,
-  pathString: string
-): Promise<void> {
+  pathString: string,
+  callback: (outcome: ListenOutcome) => void
+): () => void {
   db = getModularInstance(db);
-  db._checkNotDeleted('whenListenComplete');
-  validateRootPathString('whenListenComplete', 'path', pathString, false);
-  return repoWhenListenComplete(
+  db._checkNotDeleted('onListenOutcome');
+  validateRootPathString('onListenOutcome', 'path', pathString, false);
+  return repoOnListenOutcome(
     db._repoInternal,
-    new Path(pathString).toString()
+    new Path(pathString).toString(),
+    callback
   );
 }
 

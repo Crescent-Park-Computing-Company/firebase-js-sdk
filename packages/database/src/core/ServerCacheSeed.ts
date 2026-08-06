@@ -104,26 +104,3 @@ export function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined {
 export function getNodeCanonicalHash(node: Node): string | undefined {
   return nodeCanonicalHashes.get(node);
 }
-
-/**
- * Counters for observing seeding effectiveness (listens sent with a real
- * hash, server-side hash matches, range merges received, wire bytes).
- * @internal
- */
-export const serverCacheSeedStats: {
-  listensSentWithHash: number;
-  listensSentWithCompoundHash: number;
-  listenOks: number;
-  hashMatches: number;
-  rangeMergesReceived: number;
-  seededPaths: string[];
-  bytesReceived: number;
-} = {
-  listensSentWithHash: 0,
-  listensSentWithCompoundHash: 0,
-  listenOks: 0,
-  hashMatches: 0,
-  rangeMergesReceived: 0,
-  seededPaths: [],
-  bytesReceived: 0
-};

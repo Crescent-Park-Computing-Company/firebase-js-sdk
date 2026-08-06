@@ -81,19 +81,13 @@ export {
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export {
   getPersistedValue as _getPersistedValue,
+  onListenOutcome as _onListenOutcome,
   setPersistenceEnabled as _setPersistenceEnabled,
   setPersistenceAuthScope as _setPersistenceAuthScope,
-  setPersistencePath as _setPersistencePath,
-  whenListenComplete as _whenListenComplete
+  setPersistencePath as _setPersistencePath
 } from './api/Database';
-export {
-  onPersistenceEvent as _onPersistenceEvent,
-  PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS
-} from './core/Persistence';
-export {
-  serverCacheSeedStats as _serverCacheSeedStats,
-  SeedCompoundHash
-} from './core/ServerCacheSeed';
+export { PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';
+export { SeedCompoundHash } from './core/ServerCacheSeed';
 export {
   ReferenceImpl as _ReferenceImpl,
   QueryImpl as _QueryImpl
