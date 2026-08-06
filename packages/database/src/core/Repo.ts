@@ -608,20 +608,24 @@ export function repoStartServerListen(
         return;
       }
 
-      let restored = record.node;
-      for (const state of syncTreeGetDescendantServerCacheStates(
+      const descendantStates = syncTreeGetDescendantServerCacheStates(
         repo.serverSyncTree_,
         query._path
-      )) {
-        if (state.complete === null) {
-          finish('cold');
-          return;
-        }
-        restored = restored.updateChild(state.path, state.complete);
+      );
+      if (descendantStates.length > 0) {
+        // A graft changes the exact tree the persisted hashes describe. Use a
+        // normal authoritative listen instead of certifying/delta-merging
+        // against stale root hashes.
+        finish('cold');
+        return;
       }
 
       try {
-        restored = stampSeedHashes(restored, record.hash, record.compoundHash);
+        const restored = stampSeedHashes(
+          record.node,
+          record.hash,
+          record.compoundHash
+        );
         const events = syncTreeApplyServerOverwrite(
           repo.serverSyncTree_,
           query._path,

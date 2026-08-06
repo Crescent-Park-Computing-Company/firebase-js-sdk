@@ -1347,7 +1347,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(calls).to.deep.equal([]);
   });
 
-  it('a hashless record recomputes hashes and still resumes', async () => {
+  it('a hashless record falls back cold without blocking on rehash', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
     // A record persisted before its hash landed (no #hash sibling).
@@ -1362,7 +1362,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
-  it('a certified descendant is grafted over the restored tree', async () => {
+  it('a certified descendant makes the parent restore go cold', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
     await persistHarnessRoot(repo, path, {
@@ -1406,14 +1406,13 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
 
     expect(calls).to.deep.equal(['listen']);
-    // The stored siblings painted, but the certified child was grafted —
-    // never regressed to the stale bytes.
-    const cache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
-    expect(cache).to.not.equal(null);
-    expect(cache!.val(true)).to.deep.equal({
-      sibling: 'stale',
-      inbox: { msg: 'fresh' }
-    });
+    // The persisted parent was not applied with hashes for a different tree.
+    // The independently certified child remains current.
+    const childCache = syncTreeGetCompleteServerCache(
+      repo.serverSyncTree_,
+      childPath
+    );
+    expect(childCache?.val(true)).to.deep.equal({ msg: 'fresh' });
   });
 
   it('an empty filtered descendant still blocks a stale parent restore', async () => {
@@ -1820,6 +1819,26 @@ describe('persistence auth scope', () => {
     ).to.deep.equal({
       secret: 'a'
     });
+  });
+
+  it('drops an in-flight restore when the authenticated user changes', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('private/restore-switch');
+    const writer = new PersistenceManager('test-repo', shared.factory);
+    writer.setAuthScope('user-a');
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ secret: 'a' }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    const reader = new PersistenceManager('test-repo', shared.factory);
+    reader.setAuthScope('user-a');
+    reader.track(path.toString());
+    const restoring = reader.restoreForListen(path.toString());
+    reader.setAuthScope('user-b');
+    const result = await restoring;
+    expect(result.record).to.equal(null);
+    expect(result.reason).to.equal('auth');
   });
 
   it('never relabels an in-flight write after the auth scope changes', async () => {

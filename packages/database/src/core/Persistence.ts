@@ -18,7 +18,6 @@
 import { isIndexedDBAvailable, stringify } from '@firebase/util';
 
 import {
-  canonicalHashFromNodeAsync,
   compoundHashFromNodeAsync,
   estimateSerializedNodeSize
 } from './CompoundHash';
@@ -477,11 +476,13 @@ export class PersistenceManager {
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
   private disposed_ = false;
   private authScope_: string | null = null;
+  private authGeneration_ = 0;
 
-  setAuthScope(scope: string | null): void {
+  setAuthScope(scope: string | null): boolean {
     if (scope === this.authScope_) {
-      return;
+      return false;
     }
+    this.authGeneration_++;
     for (const timer of this.writeTimers_.values()) {
       clearTimeout(timer);
     }
@@ -498,6 +499,7 @@ export class PersistenceManager {
       'auth-scope-change',
       scope ? 'signed-in' : 'signed-out'
     );
+    return true;
   }
 
   constructor(
@@ -1150,6 +1152,10 @@ export class PersistenceManager {
           ? { hash: stored.hash, compoundHash: stored.compoundHash }
           : {};
         if (isLegacyRecord(stored)) {
+          if (typeof joined.hash !== 'string' || !joined.compoundHash) {
+            this.restoreReasons_.set(pathString, 'corrupt');
+            return 'mismatch' as const;
+          }
           return {
             record: {
               node: nodeFromJSON(stored.json),
@@ -1237,33 +1243,14 @@ export class PersistenceManager {
             if (result === 'mismatch') {
               return result;
             }
-            // Current chunks have already been verified independently. Trust
-            // the root protocol hashes committed by the same atomic manifest;
-            // only the rare crash window before those hashes landed needs a
-            // one-time full recomputation.
-            if (
-              typeof result.record.hash === 'string' &&
+            // A crash before the manifest's protocol hashes landed leaves a
+            // valid but hashless generation. Do not spend an unbounded full
+            // traversal delaying both paint and network; fail cold and let the
+            // authoritative server write a complete generation.
+            return typeof result.record.hash === 'string' &&
               result.record.compoundHash
-            ) {
-              return result;
-            }
-            const actualHash = await canonicalHashFromNodeAsync(
-              result.record.node,
-              12,
-              onProgress
-            );
-            result.record.hash = actualHash;
-            const compound = await compoundHashFromNodeAsync(
-              result.record.node,
-              undefined,
-              12,
-              onProgress
-            );
-            result.record.compoundHash = {
-              hashes: compound.hashes,
-              posts: compound.posts
-            };
-            return result;
+              ? result
+              : ('mismatch' as const);
           });
       })
       .then(result => {
@@ -1383,6 +1370,7 @@ export class PersistenceManager {
       );
       return Promise.resolve(null);
     }
+    const authGeneration = this.authGeneration_;
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
         onProgress =>
@@ -1401,6 +1389,11 @@ export class PersistenceManager {
         this.operationTimeoutMs_,
         () => recordPersistenceEvent(pathString, 'peek-idle-timeout')
       )
+    ).then(record =>
+      authGeneration === this.authGeneration_ &&
+      expectedAuthScope === this.authScope_
+        ? record
+        : null
     );
   }
 
@@ -1412,6 +1405,8 @@ export class PersistenceManager {
    */
   restoreForListen(pathString: string): Promise<PersistenceRestoreResult> {
     this.restoreReasons_.delete(pathString);
+    const authGeneration = this.authGeneration_;
+    const expectedAuthScope = this.authScope_;
     if (this.disposed_ || !this.schemaKnownCurrent_) {
       const reason: PersistenceRestoreReason = 'missing';
       this.restoreReasons_.set(pathString, reason);
@@ -1425,9 +1420,16 @@ export class PersistenceManager {
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
         onProgress =>
-          this.readRecord_(pathString, onProgress).then(result => {
+          this.readRecord_(
+            pathString,
+            onProgress,
+            false,
+            expectedAuthScope
+          ).then(result => {
             if (
               result === null ||
+              authGeneration !== this.authGeneration_ ||
+              expectedAuthScope !== this.authScope_ ||
               this.disposed_ ||
               !this.trackedRoots_.has(pathString)
             ) {
@@ -1451,6 +1453,13 @@ export class PersistenceManager {
         }
       )
     ).then(record => {
+      if (
+        authGeneration !== this.authGeneration_ ||
+        expectedAuthScope !== this.authScope_
+      ) {
+        this.restoreReasons_.set(pathString, 'auth');
+        record = null;
+      }
       const reason = record
         ? undefined
         : this.restoreReasons_.get(pathString) ?? 'missing';

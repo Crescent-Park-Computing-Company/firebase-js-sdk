@@ -531,7 +531,10 @@ export function setPersistenceAuthScope(
 ): void {
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceAuthScope');
-  db._repoInternal.persistence_?.setAuthScope(scope);
+  const repo = db._repoInternal;
+  if (repo.persistence_?.setAuthScope(scope)) {
+    repoCancelPendingSeedRestores(repo);
+  }
 }
 
 /** Selects an exact default-listen root for persistence. @internal */
