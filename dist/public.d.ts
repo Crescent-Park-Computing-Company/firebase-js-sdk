@@ -871,7 +871,7 @@ export declare class OnDisconnect {
  * @param ref - The reference to add OnDisconnect triggers for.
  */
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
-/* Excluded from this release type: _onPersistenceEvent */
+/* Excluded from this release type: _onListenOutcome */
 /**
  * Listens for data changes at a particular location.
  *
@@ -1209,7 +1209,6 @@ export declare function remove(ref: DatabaseReference): Promise<void>;
  * callback to handle success and failure.
  */
 export declare function runTransaction(ref: DatabaseReference, transactionUpdate: (currentData: any) => unknown, options?: TransactionOptions): Promise<TransactionResult>;
-/* Excluded from this release type: _serverCacheSeedStats */
 /**
  * @license
  * Copyright 2020 Google LLC

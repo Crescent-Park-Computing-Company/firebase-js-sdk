@@ -58,17 +58,3 @@ export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | unde
  * permanently retain one SHA string per node.
  */
 export declare function getNodeCanonicalHash(node: Node): string | undefined;
-/**
- * Counters for observing seeding effectiveness (listens sent with a real
- * hash, server-side hash matches, range merges received, wire bytes).
- * @internal
- */
-export declare const serverCacheSeedStats: {
-    listensSentWithHash: number;
-    listensSentWithCompoundHash: number;
-    listenOks: number;
-    hashMatches: number;
-    rangeMergesReceived: number;
-    seededPaths: string[];
-    bytesReceived: number;
-};

@@ -63,6 +63,18 @@ interface Transaction {
 interface PendingSeedRestore {
     cancelled: boolean;
 }
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export interface ListenOutcome {
+    mode: ListenOutcomeMode;
+    certified: boolean;
+    bytes: number;
+    reason?: ListenOutcomeReason;
+}
+interface ListenOutcomeState {
+    outcome: ListenOutcome | null;
+    subscribers: Set<(outcome: ListenOutcome) => void>;
+}
 export declare class Repo {
     repoInfo_: RepoInfo;
     forceRestClient_: boolean;
@@ -100,12 +112,9 @@ export declare class Repo {
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters
-     * to resolve when it does (see whenListenComplete in api/Database.ts).
+     * to publish its certification outcome (see onListenOutcome in api/Database.ts).
      */
-    listenCompletions_: Map<string, {
-        complete: boolean;
-        waiters: Array<() => void>;
-    }>;
+    listenOutcomes_: Map<string, ListenOutcomeState>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -121,15 +130,6 @@ export declare function repoServerTime(repo: Repo): number;
  * Generate ServerValues using some variables from the repo object.
  */
 export declare function repoGenerateServerValues(repo: Repo): Indexable;
-/**
- * Sends a listen for the server sync tree, restoring the persisted server
- * cache first where applicable: a complete default listen on a persisted
- * root is held until the stored tree restores (bounded inside restore()),
- * the restored tree is applied as server data — raising cached events
- * immediately, mobile-persistence semantics — and the listen then goes out
- * carrying the restored tree's hashes. Roots that were never persisted
- * resolve null instantly and attach exactly as before.
- */
 export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[]): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may
@@ -138,22 +138,10 @@ export declare function repoStartServerListen(repo: Repo, query: QueryContext, t
  * releasing the in-memory copy that only live listens need.
  */
 export declare function repoStopServerListen(repo: Repo, query: QueryContext, tag: number | null): void;
-/**
- * Resolves when the current default complete listen at `pathString` has
- * received its initial response from the server — the moment a restored
- * cache is certified (unchanged tree) or replaced (changed tree). Resolves
- * immediately if that already happened, or if no such listen exists; also
- * resolves if the listen stops first, so callers never hang.
- */
-export declare function repoWhenListenComplete(repo: Repo, pathString: string): Promise<void>;
-/**
- * Settles every outstanding whenListenComplete waiter and clears the
- * completion registry. Called when the repo is deleted (deleteApp): its
- * listens can never respond again, and an unsettleable waiter would hang
- * its caller and retain the Repo forever.
- */
+/** Observe the outcome of one exact default listen. @internal */
+export declare function repoOnListenOutcome(repo: Repo, pathString: string, subscriber: (outcome: ListenOutcome) => void): () => void;
 export declare function repoCancelPendingSeedRestores(repo: Repo): void;
-export declare function repoSettleListenCompletions(repo: Repo): void;
+export declare function repoClearListenOutcomes(repo: Repo): void;
 export declare function repoDispose(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**

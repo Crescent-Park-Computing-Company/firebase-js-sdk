@@ -74,13 +74,15 @@ export interface PersistedRecord {
     /** The write token of the manifest this record was assembled from. */
     revision: string;
 }
-/** @internal */
-export declare function onPersistenceEvent(listener: (event: {
-    at: number;
-    path: string;
-    event: string;
-    detail?: string;
-}) => void): () => void;
+export type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export interface PersistenceRestoreResult {
+    record: PersistedRecord | null;
+    reason?: PersistenceRestoreReason;
+}
+/**
+ * Counters for observing persistence effectiveness.
+ * @internal
+ */
 export declare const persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
@@ -147,6 +149,7 @@ export declare class PersistenceManager {
      * every chunk and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
+    private restoreReasons_;
     private activeRestoreCount_;
     private restoreQueue_;
     private sweepTimer_;
@@ -247,7 +250,7 @@ export declare class PersistenceManager {
      * IndexedDB request returns null so Repo cancels the seeded listen and
      * restarts once against the live in-memory cache.
      */
-    restoreForListen(pathString: string): Promise<PersistedRecord | null>;
+    restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers

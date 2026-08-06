@@ -31,7 +31,10 @@ export declare class Connection {
     private onKill_;
     lastSessionId?: string;
     connectionCount: number;
-    pendingDataMessages: unknown[];
+    pendingDataMessages: Array<{
+        data: unknown;
+        bytes: number;
+    }>;
     sessionId: string;
     private conn_;
     private healthyTimeout_;
@@ -56,7 +59,7 @@ export declare class Connection {
      * @param onKill_ - the callback to be triggered when this connection has permanently shut down.
      * @param lastSessionId - last session id in persistent connection. is used to clean up old session in real-time server
      */
-    constructor(id: string, repoInfo_: RepoInfo, applicationId_: string | undefined, appCheckToken_: string | undefined, authToken_: string | undefined, onMessage_: (a: {}) => void, onReady_: (a: number, b: string) => void, onDisconnect_: () => void, onKill_: (a: string) => void, lastSessionId?: string);
+    constructor(id: string, repoInfo_: RepoInfo, applicationId_: string | undefined, appCheckToken_: string | undefined, authToken_: string | undefined, onMessage_: (a: {}, bytes?: number) => void, onReady_: (a: number, b: string) => void, onDisconnect_: () => void, onKill_: (a: string) => void, lastSessionId?: string);
     /**
      * Starts a connection attempt
      */

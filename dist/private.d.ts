@@ -836,9 +836,33 @@ export declare interface ListenOptions {
     readonly onlyOnce?: boolean;
 }
 
+declare interface ListenOutcome {
+    mode: ListenOutcomeMode;
+    certified: boolean;
+    bytes: number;
+    reason?: ListenOutcomeReason;
+}
+
+declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+
+declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+
+declare interface ListenOutcomeState {
+    outcome: ListenOutcome | null;
+    subscribers: Set<(outcome: ListenOutcome) => void>;
+}
+
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
+}
+
+declare interface ListenWireResult {
+    bytes: number;
+    hadHash: boolean;
+    hadCompoundHash: boolean;
+    dataReceived: boolean;
+    rangeMerged: boolean;
 }
 
 /**
@@ -1662,7 +1686,7 @@ export declare class OnDisconnect {
  */
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
 
-/* Excluded from this release type: _onPersistenceEvent */
+/* Excluded from this release type: _onListenOutcome */
 
 /**
  * Listens for data changes at a particular location.
@@ -1901,6 +1925,7 @@ declare class PersistenceManager {
      * every chunk and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
+    private restoreReasons_;
     private activeRestoreCount_;
     private restoreQueue_;
     private sweepTimer_;
@@ -1997,7 +2022,7 @@ declare class PersistenceManager {
      * IndexedDB request returns null so Repo cancels the seeded listen and
      * restarts once against the live in-memory cache.
      */
-    restoreForListen(pathString: string): Promise<PersistedRecord | null>;
+    restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -2045,6 +2070,13 @@ declare class PersistenceManager {
     private flush_;
 }
 
+declare type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+
+declare interface PersistenceRestoreResult {
+    record: PersistedRecord | null;
+    reason?: PersistenceRestoreReason;
+}
+
 /**
  * Firebase connection.  Abstracts wire protocol and handles reconnecting.
  *
@@ -2065,13 +2097,6 @@ declare class PersistentConnection extends ServerActions {
     private log_;
     private interruptReasons_;
     private readonly listens;
-    /**
-     * Data pushes received per ACTIVE listen path (see hashMatches in
-     * serverCacheSeedStats): entries live only while a listen exists at the
-     * path — created on the first push, dropped in removeListen_ — so the map
-     * is bounded by the number of active listens.
-     */
-    private dataPushes_;
     private outstandingPuts_;
     private outstandingGets_;
     private outstandingPutCount_;
@@ -2110,9 +2135,9 @@ declare class PersistentConnection extends ServerActions {
         e?: string;
         m: unknown;
     }>, tag: number | null) => void);
-    protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown) => void): void;
+    protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown, bytes?: number) => void): void;
     get(query: QueryContext): Promise<string>;
-    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown) => void): void;
+    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
     private sendGet_;
     private sendListen_;
     private static warnOnListenWarnings_;
@@ -2147,6 +2172,7 @@ declare class PersistentConnection extends ServerActions {
         [k: string]: unknown;
     }): void;
     private onDataMessage_;
+    private listenWireResult_;
     private onDataPush_;
     private onReady_;
     private scheduleConnect_;
@@ -2418,12 +2444,9 @@ declare class Repo {
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters
-     * to resolve when it does (see whenListenComplete in api/Database.ts).
+     * to publish its certification outcome (see onListenOutcome in api/Database.ts).
      */
-    listenCompletions_: Map<string, {
-        complete: boolean;
-        waiters: Array<() => void>;
-    }>;
+    listenOutcomes_: Map<string, ListenOutcomeState>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -2517,7 +2540,7 @@ export declare function runTransaction(ref: DatabaseReference, transactionUpdate
  * @interface
  */
 declare abstract class ServerActions {
-    abstract listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown) => void): void;
+    abstract listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
     /**
      * Remove a listen.
      */
@@ -2545,8 +2568,6 @@ declare abstract class ServerActions {
         [k: string]: unknown;
     }): void;
 }
-
-/* Excluded from this release type: _serverCacheSeedStats */
 
 /**
  * @license
@@ -3092,8 +3113,6 @@ declare interface ViewCache {
 declare interface ViewProcessor {
     readonly filter: NodeFilter_2;
 }
-
-/* Excluded from this release type: _whenListenComplete */
 
 /**
  * Defines a single user-initiated write operation. May be the result of a set(), transaction(), or update() call. In

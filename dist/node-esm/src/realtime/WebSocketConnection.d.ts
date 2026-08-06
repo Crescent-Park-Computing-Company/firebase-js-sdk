@@ -32,7 +32,8 @@ export declare class WebSocketConnection implements Transport {
     bytesReceived: number;
     connURL: string;
     onDisconnect: (a?: boolean) => void;
-    onMessage: (msg: {}) => void;
+    onMessage: (msg: {}, bytes?: number) => void;
+    private pendingMessageBytes_;
     mySock: WebSocket | null;
     private log_;
     private stats_;
@@ -63,7 +64,7 @@ export declare class WebSocketConnection implements Transport {
      * @param onMessage - Callback when messages arrive
      * @param onDisconnect - Callback with connection lost.
      */
-    open(onMessage: (msg: {}) => void, onDisconnect: (a?: boolean) => void): void;
+    open(onMessage: (msg: {}, bytes?: number) => void, onDisconnect: (a?: boolean) => void): void;
     /**
      * No-op for websockets, we don't need to do anything once the connection is confirmed as open
      */

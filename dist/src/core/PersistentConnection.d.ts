@@ -17,7 +17,7 @@
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
 import { ListenHashFn } from './ServerCacheSeed';
 import { QueryContext } from './view/EventRegistration';
 /**
@@ -40,13 +40,6 @@ export declare class PersistentConnection extends ServerActions {
     private log_;
     private interruptReasons_;
     private readonly listens;
-    /**
-     * Data pushes received per ACTIVE listen path (see hashMatches in
-     * serverCacheSeedStats): entries live only while a listen exists at the
-     * path — created on the first push, dropped in removeListen_ — so the map
-     * is bounded by the number of active listens.
-     */
-    private dataPushes_;
     private outstandingPuts_;
     private outstandingGets_;
     private outstandingPutCount_;
@@ -85,9 +78,9 @@ export declare class PersistentConnection extends ServerActions {
         e?: string;
         m: unknown;
     }>, tag: number | null) => void);
-    protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown) => void): void;
+    protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown, bytes?: number) => void): void;
     get(query: QueryContext): Promise<string>;
-    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown) => void): void;
+    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
     private sendGet_;
     private sendListen_;
     private static warnOnListenWarnings_;
@@ -122,6 +115,7 @@ export declare class PersistentConnection extends ServerActions {
         [k: string]: unknown;
     }): void;
     private onDataMessage_;
+    private listenWireResult_;
     private onDataPush_;
     private onReady_;
     private scheduleConnect_;

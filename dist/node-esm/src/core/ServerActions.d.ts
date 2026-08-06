@@ -16,6 +16,13 @@
  */
 import { ListenHashFn } from './ServerCacheSeed';
 import { QueryContext } from './view/EventRegistration';
+export interface ListenWireResult {
+    bytes: number;
+    hadHash: boolean;
+    hadCompoundHash: boolean;
+    dataReceived: boolean;
+    rangeMerged: boolean;
+}
 /**
  * Interface defining the set of actions that can be performed against the Firebase server
  * (basically corresponds to our wire protocol).
@@ -23,7 +30,7 @@ import { QueryContext } from './view/EventRegistration';
  * @interface
  */
 export declare abstract class ServerActions {
-    abstract listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown) => void): void;
+    abstract listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
     /**
      * Remove a listen.
      */

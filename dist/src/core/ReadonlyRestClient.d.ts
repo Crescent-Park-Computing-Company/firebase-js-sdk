@@ -17,7 +17,7 @@
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
 import { QueryContext } from './view/EventRegistration';
 /**
  * An implementation of ServerActions that communicates with the server via REST requests.
@@ -46,7 +46,7 @@ export declare class ReadonlyRestClient extends ServerActions {
      */
     constructor(repoInfo_: RepoInfo, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider);
     /** @inheritDoc */
-    listen(query: QueryContext, currentHashFn: () => string, tag: number | null, onComplete: (a: string, b: unknown) => void): void;
+    listen(query: QueryContext, currentHashFn: () => string, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
     /** @inheritDoc */
     unlisten(query: QueryContext, tag: number | null): void;
     get(query: QueryContext): Promise<string>;

@@ -72,7 +72,7 @@ export declare class BrowserPollConnection implements Transport {
      * @param onMessage - Callback when messages arrive
      * @param onDisconnect - Callback with connection lost.
      */
-    open(onMessage: (msg: {}) => void, onDisconnect: (a?: boolean) => void): void;
+    open(onMessage: (msg: {}, bytes?: number) => void, onDisconnect: (a?: boolean) => void): void;
     /**
      * Call this when a handshake has completed successfully and we want to consider the connection established
      */

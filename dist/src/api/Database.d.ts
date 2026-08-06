@@ -19,7 +19,7 @@ import { AppCheckInternalComponentName } from '@firebase/app-check-interop-types
 import { FirebaseAuthInternalName } from '@firebase/auth-interop-types';
 import { Provider } from '@firebase/component';
 import { EmulatorMockTokenOptions } from '@firebase/util';
-import { Repo } from '../core/Repo';
+import { Repo, ListenOutcome } from '../core/Repo';
 import { ReferenceImpl } from './Reference_impl';
 export { EmulatorMockTokenOptions } from '@firebase/util';
 /**
@@ -138,16 +138,13 @@ export declare function setPersistenceAuthScope(db: Database, scope: string | nu
 /** Selects an exact default-listen root for persistence. @internal */
 export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 /**
- * Resolves when the default complete listen at `pathString` has received its
- * initial response from the server. With persistence, listeners may fire
- * first with the restored cache; this is the signal that the server has since
- * certified that data as current (unchanged tree) or replaced it (changed
- * tree). Resolves immediately when that already happened or no such listen
- * exists, and when the listen stops before completing — it never hangs.
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
  *
  * @internal
  */
-export declare function whenListenComplete(db: Database, pathString: string): Promise<void>;
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
  * Reconnects to the server and synchronizes the offline Database state
  * with the server state.

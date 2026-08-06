@@ -809,88 +809,6 @@ function repoInfoConnectionURL(repoInfo, type, params) {
 
 /**
  * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
- * hash() returns it without an O(tree) walk) and attaches the precomputed
- * compound hash for the listen to send. Both must describe exactly this
- * tree — the server certifies whatever the listen carries.
- *
- * An empty tree is returned unstamped: an empty node is the shared
- * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
- * empty node in the app.
- */
-function stampSeedHashes(node, hash, compoundHash) {
-    if (node.isEmpty()) {
-        return node;
-    }
-    if (typeof hash === 'string') {
-        nodeCanonicalHashes.set(node, hash);
-        if (hash.length > 0) {
-            node.stampLazyHash(hash);
-        }
-    }
-    if (compoundHash &&
-        Array.isArray(compoundHash.hashes) &&
-        Array.isArray(compoundHash.posts) &&
-        compoundHash.hashes.length === compoundHash.posts.length + 1) {
-        setNodeCompoundHash(node, compoundHash);
-    }
-    return node;
-}
-/**
- * The compound hash rides on the seeded node itself: once a server update
- * replaces the cached node the stamp is gone, so re-listens after real data
- * arrived send only the simple hash (which is then correct by construction).
- */
-const nodeCompoundHashes = new WeakMap();
-const nodeCanonicalHashes = new WeakMap();
-function setNodeCompoundHash(node, compoundHash) {
-    nodeCompoundHashes.set(node, compoundHash);
-}
-function getNodeCompoundHash(node) {
-    return nodeCompoundHashes.get(node);
-}
-/**
- * The persisted canonical hash associated with a seeded node. This rides in
- * a WeakMap instead of being stamped into every subtree by node.hash(): a
- * compound-hash-only seed deliberately stores the empty simple hash, letting
- * the server validate its ranges without a full-tree hash pass that would
- * permanently retain one SHA string per node.
- */
-function getNodeCanonicalHash(node) {
-    return nodeCanonicalHashes.get(node);
-}
-/**
- * Counters for observing seeding effectiveness (listens sent with a real
- * hash, server-side hash matches, range merges received, wire bytes).
- * @internal
- */
-const serverCacheSeedStats = {
-    listensSentWithHash: 0,
-    listensSentWithCompoundHash: 0,
-    listenOks: 0,
-    hashMatches: 0,
-    rangeMergesReceived: 0,
-    seededPaths: [],
-    bytesReceived: 0
-};
-
-/**
- * @license
  * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1035,6 +953,7 @@ class WebSocketConnection {
         this.totalFrames = 0;
         this.bytesSent = 0;
         this.bytesReceived = 0;
+        this.pendingMessageBytes_ = 0;
         this.log_ = logWrapper(this.connId);
         this.stats_ = statsManagerGetCollection(repoInfo);
         this.connURL = WebSocketConnection.connectionURL_(repoInfo, transportSessionId, lastSessionId, appCheckToken, applicationId);
@@ -1185,8 +1104,12 @@ class WebSocketConnection {
             const fullMess = this.frames.join('');
             this.frames = null;
             const jsonMess = jsonEval(fullMess);
-            //handle the message
-            this.onMessage(jsonMess);
+            // Deliver the parsed message with its original frame bytes. Keeping the
+            // byte count beside the message avoids re-stringifying large payloads
+            // solely for diagnostics.
+            const bytes = this.pendingMessageBytes_;
+            this.pendingMessageBytes_ = 0;
+            this.onMessage(jsonMess, bytes);
         }
     }
     /**
@@ -1223,9 +1146,9 @@ class WebSocketConnection {
             return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
         }
         const data = mess['data'];
+        this.pendingMessageBytes_ += data.length;
         this.bytesReceived += data.length;
         this.stats_.incrementCounter('bytes_received', data.length);
-        serverCacheSeedStats.bytesReceived += data.length;
         this.resetKeepAlive();
         if (this.frames !== null) {
             // we're buffering
@@ -4288,12 +4211,6 @@ const PERSISTENCE_SWEEP_DELAY_MS = 15000;
  * Counters for observing persistence effectiveness.
  * @internal
  */
-const persistenceEventListeners = new Set();
-/** @internal */
-function onPersistenceEvent(listener) {
-    persistenceEventListeners.add(listener);
-    return () => persistenceEventListeners.delete(listener);
-}
 const persistenceStats = {
     restoredRoots: [],
     restoreMisses: [],
@@ -4306,11 +4223,7 @@ const persistenceStats = {
     events: []
 };
 function recordPersistenceEvent(path, event, detail) {
-    const item = { at: Date.now(), path, event, detail };
-    persistenceStats.events.push(item);
-    for (const listener of persistenceEventListeners) {
-        listener(item);
-    }
+    persistenceStats.events.push({ at: Date.now(), path, event, detail });
     if (persistenceStats.events.length > 100) {
         persistenceStats.events.splice(0, persistenceStats.events.length - 100);
     }
@@ -4407,6 +4320,7 @@ class PersistenceManager {
         this.latest_.clear();
         this.lastFlush_.clear();
         this.activeReads_.clear();
+        this.restoreReasons_.clear();
         this.authScope_ = scope;
         recordPersistenceEvent('*', 'auth-scope-change', scope ? 'signed-in' : 'signed-out');
     }
@@ -4457,6 +4371,7 @@ class PersistenceManager {
          * every chunk and rebuilt the same large Node tree concurrently.
          */
         this.activeReads_ = new Map();
+        this.restoreReasons_ = new Map();
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
         this.sweepTimer_ = null;
@@ -4634,7 +4549,7 @@ class PersistenceManager {
             // cursor walks the whole store and filters by prefix in JS.
             range =
                 typeof IDBKeyRange !== 'undefined'
-                    ? IDBKeyRange.bound(prefix, prefix + '\uffff')
+                    ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
                     : undefined;
         }
         catch (e) {
@@ -4986,13 +4901,15 @@ class PersistenceManager {
         return metadata
             .then(meta => {
             if (meta === null) {
+                this.restoreReasons_.set(pathString, 'missing');
                 return null;
             }
             onProgress();
             const { stored, hashes } = meta;
             // Pre-scope records cannot be attributed to an authenticated user.
             if (isLegacyRecord(stored) && expectedAuthScope !== null) {
-                return 'mismatch';
+                this.restoreReasons_.set(pathString, 'auth');
+                return null;
             }
             const joined = isLegacyRecord(stored)
                 ? hashes && hashes.revision === stored.revision
@@ -5020,9 +4937,11 @@ class PersistenceManager {
                 manifest.chunkCount <= 0 ||
                 !Array.isArray(manifest.chunkRevisions) ||
                 manifest.chunkRevisions.length !== manifest.chunkCount) {
+                this.restoreReasons_.set(pathString, 'corrupt');
                 return 'mismatch';
             }
             if (manifest.authScope !== expectedAuthScope) {
+                this.restoreReasons_.set(pathString, 'auth');
                 return null;
             }
             let assembled = ChildrenNode.EMPTY_NODE;
@@ -5093,11 +5012,13 @@ class PersistenceManager {
                 return null;
             }
             if (result === 'mismatch') {
+                this.restoreReasons_.set(pathString, 'corrupt');
                 persistenceStats.evictions++;
                 void this.deleteRecord_(pathString);
                 return null;
             }
             if (Date.now() - result.record.updatedAt > PERSISTENCE_MAX_AGE_MS) {
+                this.restoreReasons_.set(pathString, 'expired');
                 persistenceStats.evictions++;
                 void this.deleteRecord_(pathString);
                 return null;
@@ -5133,7 +5054,7 @@ class PersistenceManager {
                     try {
                         // Orphans beyond the manifest's count (interrupted older
                         // writes); the sweep also reclaims these eventually.
-                        store.delete(IDBKeyRange.bound(key + CHUNK_KEY_INFIX, key + CHUNK_KEY_INFIX + '\uffff'));
+                        store.delete(IDBKeyRange.bound(key + CHUNK_KEY_INFIX, key + CHUNK_KEY_INFIX + String.fromCharCode(0xffff)));
                     }
                     catch (e) {
                         // Key-range deletes are an optimization, never a requirement.
@@ -5192,9 +5113,12 @@ class PersistenceManager {
      * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString) {
+        this.restoreReasons_.delete(pathString);
         if (this.disposed_ || !this.schemaKnownCurrent_) {
+            const reason = 'missing';
+            this.restoreReasons_.set(pathString, reason);
             recordPersistenceEvent(pathString, 'restore-miss', this.disposed_ ? 'disposed' : 'schema-migration');
-            return Promise.resolve(null);
+            return Promise.resolve({ record: null, reason });
         }
         return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
             if (result === null ||
@@ -5212,9 +5136,15 @@ class PersistenceManager {
             });
             persistenceStats.restoredRoots.push(pathString);
             return result.record;
-        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'restore-idle-timeout'))).then(record => {
-            recordPersistenceEvent(pathString, record ? 'restore-hit' : 'restore-miss');
-            return record;
+        }), this.operationTimeoutMs_, () => {
+            this.restoreReasons_.set(pathString, 'timeout');
+            recordPersistenceEvent(pathString, 'restore-idle-timeout');
+        })).then(record => {
+            const reason = record
+                ? undefined
+                : this.restoreReasons_.get(pathString) ?? 'missing';
+            recordPersistenceEvent(pathString, record ? 'restore-hit' : 'restore-miss', reason);
+            return record ? { record } : { record: null, reason };
         });
     }
     /**
@@ -5610,15 +5540,19 @@ class PacketReceiver {
      * allows us to ensure that we process them in the right order, since we can't be guaranteed that all
      * browsers will respond in the same order as the requests we sent
      */
-    handleResponse(requestNum, data) {
-        this.pendingResponses[requestNum] = data;
+    handleResponse(requestNum, data, bytes = 0) {
+        this.pendingResponses[requestNum] = { data, bytes };
         while (this.pendingResponses[this.currentResponseNum]) {
-            const toProcess = this.pendingResponses[this.currentResponseNum];
+            const pending = this.pendingResponses[this.currentResponseNum];
+            const toProcess = pending.data;
             delete this.pendingResponses[this.currentResponseNum];
             for (let i = 0; i < toProcess.length; ++i) {
                 if (toProcess[i]) {
                     exceptionGuard(() => {
-                        this.onMessage_(toProcess[i]);
+                        // The long-poll callback receives a batch. Attribute its measured
+                        // bytes once, to the first message, rather than serializing every
+                        // parsed item again.
+                        this.onMessage_(toProcess[i], i === 0 ? pending.bytes : 0);
                     });
                 }
             }
@@ -5773,8 +5707,8 @@ class BrowserPollConnection {
                 }
             }, (...args) => {
                 const [pN, data] = args;
-                this.incrementIncomingBytes_(args);
-                this.myPacketOrderer.handleResponse(pN, data);
+                const bytes = this.incrementIncomingBytes_(args);
+                this.myPacketOrderer.handleResponse(pN, data, bytes);
             }, () => {
                 this.onClosed_();
             }, this.urlFn);
@@ -5942,7 +5876,7 @@ class BrowserPollConnection {
         const bytesReceived = stringify(args).length;
         this.bytesReceived += bytesReceived;
         this.stats_.incrementCounter('bytes_received', bytesReceived);
-        serverCacheSeedStats.bytesReceived += bytesReceived;
+        return bytesReceived;
     }
 }
 /*********************************************************************************************
@@ -6480,13 +6414,13 @@ class Connection {
         };
     }
     connReceiver_(conn) {
-        return (message) => {
+        return (message, bytes = 0) => {
             if (this.state_ !== 2 /* RealtimeState.DISCONNECTED */) {
                 if (conn === this.rx_) {
-                    this.onPrimaryMessageReceived_(message);
+                    this.onPrimaryMessageReceived_(message, bytes);
                 }
                 else if (conn === this.secondaryConn_) {
-                    this.onSecondaryMessageReceived_(message);
+                    this.onSecondaryMessageReceived_(message, bytes);
                 }
                 else {
                     this.log_('message on old connection');
@@ -6533,7 +6467,7 @@ class Connection {
             }
         }
     }
-    onSecondaryMessageReceived_(parsedData) {
+    onSecondaryMessageReceived_(parsedData, bytes) {
         const layer = requireKey('t', parsedData);
         const data = requireKey('d', parsedData);
         if (layer === 'c') {
@@ -6541,7 +6475,7 @@ class Connection {
         }
         else if (layer === 'd') {
             // got a data message, but we're still second connection. Need to buffer it up
-            this.pendingDataMessages.push(data);
+            this.pendingDataMessages.push({ data, bytes });
         }
         else {
             throw new Error('Unknown protocol layer: ' + layer);
@@ -6573,7 +6507,7 @@ class Connection {
         this.tx_ = this.secondaryConn_;
         this.tryCleanupConnection();
     }
-    onPrimaryMessageReceived_(parsedData) {
+    onPrimaryMessageReceived_(parsedData, bytes) {
         // Must refer to parsedData properties in quotes, so closure doesn't touch them.
         const layer = requireKey('t', parsedData);
         const data = requireKey('d', parsedData);
@@ -6581,13 +6515,13 @@ class Connection {
             this.onControl_(data);
         }
         else if (layer === 'd') {
-            this.onDataMessage_(data);
+            this.onDataMessage_(data, bytes);
         }
     }
-    onDataMessage_(message) {
+    onDataMessage_(message, bytes = 0) {
         this.onPrimaryResponse_();
         // We don't do anything with data messages, just kick them up a level
-        this.onMessage_(message);
+        this.onMessage_(message, bytes);
     }
     onPrimaryResponse_() {
         if (!this.isHealthy_) {
@@ -6616,8 +6550,8 @@ class Connection {
             else if (cmd === END_TRANSMISSION) {
                 this.log_('recvd end transmission on primary');
                 this.rx_ = this.secondaryConn_;
-                for (let i = 0; i < this.pendingDataMessages.length; ++i) {
-                    this.onDataMessage_(this.pendingDataMessages[i]);
+                for (const pending of this.pendingDataMessages) {
+                    this.onDataMessage_(pending.data, pending.bytes);
                 }
                 this.pendingDataMessages = [];
                 this.tryCleanupConnection();
@@ -7091,13 +7025,6 @@ class PersistentConnection extends ServerActions {
         this.log_ = logWrapper('p:' + this.id + ':');
         this.interruptReasons_ = {};
         this.listens = new Map();
-        /**
-         * Data pushes received per ACTIVE listen path (see hashMatches in
-         * serverCacheSeedStats): entries live only while a listen exists at the
-         * path — created on the first push, dropped in removeListen_ — so the map
-         * is bounded by the number of active listens.
-         */
-        this.dataPushes_ = new Map();
         this.outstandingPuts_ = [];
         this.outstandingGets_ = [];
         this.outstandingPutCount_ = 0;
@@ -7168,7 +7095,7 @@ class PersistentConnection extends ServerActions {
         }
         return deferred.promise;
     }
-    listen(query, currentHashFn, tag, onComplete) {
+    listen(query, currentHashFn, tag, onComplete, onProgress) {
         this.initConnection_();
         const queryId = query._queryIdentifier;
         const pathString = query._path.toString();
@@ -7180,9 +7107,13 @@ class PersistentConnection extends ServerActions {
         assert(!this.listens.get(pathString).has(queryId), `listen() called twice for same path/queryId.`);
         const listenSpec = {
             onComplete,
+            onProgress,
             hashFn: currentHashFn,
             query,
-            tag
+            tag,
+            bytes: 0,
+            dataReceived: false,
+            rangeMerged: false
         };
         this.listens.get(pathString).set(queryId, listenSpec);
         if (this.connected_) {
@@ -7222,25 +7153,16 @@ class PersistentConnection extends ServerActions {
         const compoundHash = listenSpec.hashFn.compoundHash?.();
         if (compoundHash) {
             req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
-            serverCacheSeedStats.listensSentWithCompoundHash++;
         }
-        if (req['h'] !== '') {
-            serverCacheSeedStats.listensSentWithHash++;
-        }
+        if (req['h'] !== '') ;
         const hadHash = req['h'] !== '';
-        const pushesBefore = this.dataPushes_.get(pathString) || 0;
-        this.sendRequest(action, req, (message) => {
+        const hadCompoundHash = compoundHash !== undefined;
+        listenSpec.bytes = 0;
+        listenSpec.dataReceived = false;
+        listenSpec.rangeMerged = false;
+        this.sendRequest(action, req, (message, responseBytes = 0) => {
             const payload = message[ /*data*/'d'];
             const status = message[ /*status*/'s'];
-            if (status === 'ok') {
-                serverCacheSeedStats.listenOks++;
-                // An 'ok' with no data pushed for this path since the listen went
-                // out means the server accepted our hash as current.
-                if (hadHash &&
-                    (this.dataPushes_.get(pathString) || 0) === pushesBefore) {
-                    serverCacheSeedStats.hashMatches++;
-                }
-            }
             // print warnings in any case...
             PersistentConnection.warnOnListenWarnings_(payload, query);
             const currentListenSpec = this.listens.get(pathString) &&
@@ -7252,7 +7174,12 @@ class PersistentConnection extends ServerActions {
                     this.removeListen_(pathString, queryId);
                 }
                 if (listenSpec.onComplete) {
-                    listenSpec.onComplete(status, payload);
+                    listenSpec.onComplete(status, payload, {
+                        ...this.listenWireResult_(listenSpec),
+                        bytes: listenSpec.bytes + responseBytes,
+                        hadHash,
+                        hadCompoundHash
+                    });
                 }
             }
         });
@@ -7497,7 +7424,7 @@ class PersistentConnection extends ServerActions {
             });
         }
     }
-    onDataMessage_(message) {
+    onDataMessage_(message, bytes = 0) {
         if ('r' in message) {
             // this is a response
             this.log_('from server: ' + stringify(message));
@@ -7505,7 +7432,7 @@ class PersistentConnection extends ServerActions {
             const onResponse = this.requestCBHash_[reqNum];
             if (onResponse) {
                 delete this.requestCBHash_[reqNum];
-                onResponse(message[ /*body*/'b']);
+                onResponse(message[ /*body*/'b'], bytes);
             }
         }
         else if ('error' in message) {
@@ -7513,17 +7440,34 @@ class PersistentConnection extends ServerActions {
         }
         else if ('a' in message) {
             // a and b are action and body, respectively
-            this.onDataPush_(message['a'], message['b']);
+            this.onDataPush_(message['a'], message['b'], bytes);
         }
     }
-    onDataPush_(action, body) {
+    listenWireResult_(listen) {
+        return {
+            bytes: listen.bytes,
+            hadHash: listen.hashFn() !== '',
+            hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+            dataReceived: listen.dataReceived,
+            rangeMerged: listen.rangeMerged
+        };
+    }
+    onDataPush_(action, body, bytes) {
         this.log_('handleServerMessage', action, body);
         if ((action === 'd' || action === 'm' || action === 'rm') &&
             body &&
             body['p'] !== undefined) {
             const pushPath = new Path(body['p']).toString();
-            if (this.listens.has(pushPath)) {
-                this.dataPushes_.set(pushPath, (this.dataPushes_.get(pushPath) || 0) + 1);
+            const listensAtPath = this.listens.get(pushPath);
+            if (listensAtPath) {
+                for (const listen of listensAtPath.values()) {
+                    listen.bytes += bytes;
+                    listen.dataReceived = true;
+                    if (action === 'rm') {
+                        listen.rangeMerged = true;
+                    }
+                    listen.onProgress?.(this.listenWireResult_(listen));
+                }
             }
         }
         if (action === 'd') {
@@ -7537,7 +7481,6 @@ class PersistentConnection extends ServerActions {
         else if (action === 'rm') {
             // Range merge: the listen carried a compound hash and only some of its
             // ranges differed — the server resends just those ranges.
-            serverCacheSeedStats.rangeMergesReceived++;
             this.onRangeMergeUpdate_?.(body[ /*path*/'p'], body[ /*ranges*/'d'], body['t']);
         }
         else if (action === 'c') {
@@ -7772,7 +7715,13 @@ class PersistentConnection extends ServerActions {
         }
         const listen = this.removeListen_(pathString, queryId);
         if (listen && listen.onComplete) {
-            listen.onComplete('permission_denied');
+            listen.onComplete('permission_denied', null, {
+                bytes: listen.bytes,
+                hadHash: listen.hashFn() !== '',
+                hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+                dataReceived: listen.dataReceived,
+                rangeMerged: listen.rangeMerged
+            });
         }
     }
     removeListen_(pathString, queryId) {
@@ -7784,7 +7733,6 @@ class PersistentConnection extends ServerActions {
             map.delete(queryId);
             if (map.size === 0) {
                 this.listens.delete(normalizedPathString);
-                this.dataPushes_.delete(normalizedPathString);
             }
         }
         else {
@@ -8833,7 +8781,7 @@ class ReadonlyRestClient extends ServerActions {
         this.listens_ = {};
     }
     /** @inheritDoc */
-    listen(query, currentHashFn, tag, onComplete) {
+    listen(query, currentHashFn, tag, onComplete, onProgress) {
         const pathString = query._path.toString();
         this.log_('Listen called for ' + pathString + ' ' + query._queryIdentifier);
         // Mark this listener so we can tell if it's removed.
@@ -8861,7 +8809,17 @@ class ReadonlyRestClient extends ServerActions {
                 else {
                     status = 'rest_error:' + error;
                 }
-                onComplete(status, null);
+                const wire = {
+                    bytes: 0,
+                    hadHash: false,
+                    hadCompoundHash: false,
+                    dataReceived: error === null,
+                    rangeMerged: false
+                };
+                if (wire.dataReceived) {
+                    onProgress?.(wire);
+                }
+                onComplete(status, null, wire);
             }
         });
     }
@@ -8954,6 +8912,74 @@ class ReadonlyRestClient extends ServerActions {
             xhr.send();
         });
     }
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
+ *
+ * An empty tree is returned unstamped: an empty node is the shared
+ * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
+ * empty node in the app.
+ */
+function stampSeedHashes(node, hash, compoundHash) {
+    if (node.isEmpty()) {
+        return node;
+    }
+    if (typeof hash === 'string') {
+        nodeCanonicalHashes.set(node, hash);
+        if (hash.length > 0) {
+            node.stampLazyHash(hash);
+        }
+    }
+    if (compoundHash &&
+        Array.isArray(compoundHash.hashes) &&
+        Array.isArray(compoundHash.posts) &&
+        compoundHash.hashes.length === compoundHash.posts.length + 1) {
+        setNodeCompoundHash(node, compoundHash);
+    }
+    return node;
+}
+/**
+ * The compound hash rides on the seeded node itself: once a server update
+ * replaces the cached node the stamp is gone, so re-listens after real data
+ * arrived send only the simple hash (which is then correct by construction).
+ */
+const nodeCompoundHashes = new WeakMap();
+const nodeCanonicalHashes = new WeakMap();
+function setNodeCompoundHash(node, compoundHash) {
+    nodeCompoundHashes.set(node, compoundHash);
+}
+function getNodeCompoundHash(node) {
+    return nodeCompoundHashes.get(node);
+}
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+function getNodeCanonicalHash(node) {
+    return nodeCanonicalHashes.get(node);
 }
 
 /**
@@ -13133,9 +13159,9 @@ class Repo {
         /**
          * Listen-complete state per default complete listen, keyed by path: whether
          * the current listen has received its initial server response, and waiters
-         * to resolve when it does (see whenListenComplete in api/Database.ts).
+         * to publish its certification outcome (see onListenOutcome in api/Database.ts).
          */
-        this.listenCompletions_ = new Map();
+        this.listenOutcomes_ = new Map();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
         this.key = this.repoInfo_.toURLString();
     }
@@ -13283,32 +13309,48 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
  * carrying the restored tree's hashes. Roots that were never persisted
  * resolve null instantly and attach exactly as before.
  */
+function repoPublishListenOutcome(repo, pathString, outcome) {
+    const state = repo.listenOutcomes_.get(pathString);
+    if (!state) {
+        return;
+    }
+    state.outcome = outcome;
+    for (const subscriber of state.subscribers) {
+        subscriber(outcome);
+    }
+}
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
     if (isDefaultComplete) {
-        const prior = repo.listenCompletions_.get(pathString);
-        repo.listenCompletions_.set(pathString, {
-            complete: false,
-            waiters: prior ? prior.waiters : []
+        const prior = repo.listenOutcomes_.get(pathString);
+        repo.listenOutcomes_.set(pathString, {
+            outcome: null,
+            subscribers: prior?.subscribers ?? new Set()
         });
     }
-    const sendListen = () => {
-        repo.server_.listen(query, currentHashFn, tag, (status, data) => {
+    const sendListen = (mode, reason) => {
+        let activeMode = mode;
+        if (isDefaultComplete) {
+            repoPublishListenOutcome(repo, pathString, {
+                mode,
+                certified: false,
+                bytes: 0,
+                reason
+            });
+        }
+        repo.server_.listen(query, currentHashFn, tag, (status, data, wire) => {
             const events = onComplete(status, data);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isDefaultComplete) {
                 return;
             }
-            const completion = repo.listenCompletions_.get(pathString);
-            if (completion && !completion.complete) {
-                completion.complete = true;
-                const waiters = completion.waiters;
-                completion.waiters = [];
-                for (const waiter of waiters) {
-                    waiter();
-                }
-            }
+            repoPublishListenOutcome(repo, pathString, {
+                mode: activeMode,
+                certified: status === 'ok',
+                bytes: wire.bytes,
+                reason: status === 'ok' ? reason : 'auth'
+            });
             if (repo.persistence_ !== null) {
                 if (status === 'ok') {
                     repoPersistAfterServerUpdate(repo, query._path);
@@ -13317,64 +13359,75 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
                     repo.persistence_.evict(query._path);
                 }
             }
+        }, wire => {
+            if (!isDefaultComplete) {
+                return;
+            }
+            // Range merges preserve the restored base (incremental/cyan). A normal
+            // data push replaces it, so expose a full authoritative fallback
+            // (amber) before the listen response arrives.
+            if (activeMode === 'restored' &&
+                wire.dataReceived &&
+                !wire.rangeMerged) {
+                activeMode = 'fallback';
+            }
+            repoPublishListenOutcome(repo, pathString, {
+                mode: activeMode,
+                certified: false,
+                bytes: wire.bytes,
+                reason
+            });
         });
     };
     const persistence = repo.persistence_;
     if (persistence === null ||
         !isDefaultComplete ||
         !persistence.isPersistentPath(pathString)) {
-        sendListen();
+        sendListen('cold');
         return;
     }
-    // Android's battle-tested order: synchronously hydrate the SyncTree from
-    // persistence, then create the wire listen from that exact in-memory view.
-    // IndexedDB is async, so we hold only this root's first listen behind an
-    // idle-progress timeout; on miss/corruption/stall we attach cold.
     persistence.track(pathString);
     const token = { cancelled: false };
     repo.pendingSeedRestores_.set(pathString, token);
     const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
-    const finish = () => {
+    const finish = (mode, reason) => {
         if (!isCurrent()) {
             return;
         }
         repo.pendingSeedRestores_.delete(pathString);
-        sendListen();
+        sendListen(mode, reason);
     };
-    void persistence.restoreForListen(pathString).then(record => {
+    void persistence.restoreForListen(pathString).then(result => {
         if (!isCurrent()) {
             return;
         }
+        const { record, reason } = result;
         if (record === null ||
-            syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
-            finish();
+            syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+                null) {
+            const fallback = reason === 'corrupt' || reason === 'timeout';
+            finish(fallback ? 'fallback' : 'cold', reason);
             return;
         }
         let restored = record.node;
         for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)) {
             if (state.complete === null) {
-                // A live partial/filtered descendant cannot be safely merged with a
-                // persisted ancestor. Fail closed to the normal full server load.
-                finish();
+                finish('cold');
                 return;
             }
             restored = restored.updateChild(state.path, state.complete);
         }
-        if (!restored.isEmpty()) {
-            try {
-                restored = stampSeedHashes(restored, record.hash, record.compoundHash);
-                const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
-                eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-            }
-            catch {
-                // Corrupt or incompatible persisted state is a cache miss. Delete the
-                // record but keep tracking so the full server reload replaces it.
-                persistence.invalidate(query._path);
-            }
+        try {
+            restored = stampSeedHashes(restored, record.hash, record.compoundHash);
+            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
+            eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+            finish('restored');
         }
-        // User callbacks above may synchronously remove this listener.
-        finish();
-    }, finish);
+        catch {
+            persistence.invalidate(query._path);
+            finish('fallback', 'corrupt');
+        }
+    }, () => finish('fallback', 'corrupt'));
 }
 /**
  * Stops a server listen. With persistence, a complete default listen may
@@ -13396,60 +13449,34 @@ function repoStopServerListen(repo, query, tag) {
     else {
         repo.server_.unlisten(query, tag);
     }
-    // Resolve outstanding completion waiters — the listen they were watching is
-    // gone, and a promise that can never settle would leak its callers.
-    const completion = repo.listenCompletions_.get(pathString);
-    if (completion) {
-        repo.listenCompletions_.delete(pathString);
-        for (const waiter of completion.waiters) {
-            waiter();
-        }
-    }
+    repo.listenOutcomes_.delete(pathString);
     repo.persistence_?.untrack(pathString);
 }
-/**
- * Resolves when the current default complete listen at `pathString` has
- * received its initial response from the server — the moment a restored
- * cache is certified (unchanged tree) or replaced (changed tree). Resolves
- * immediately if that already happened, or if no such listen exists; also
- * resolves if the listen stops first, so callers never hang.
- */
-function repoWhenListenComplete(repo, pathString) {
-    const completion = repo.listenCompletions_.get(pathString);
-    if (!completion || completion.complete) {
-        return Promise.resolve();
+/** Observe the outcome of one exact default listen. @internal */
+function repoOnListenOutcome(repo, pathString, subscriber) {
+    const state = repo.listenOutcomes_.get(pathString);
+    if (!state) {
+        return () => { };
     }
-    return new Promise(resolve => {
-        completion.waiters.push(resolve);
-    });
+    state.subscribers.add(subscriber);
+    if (state.outcome) {
+        subscriber(state.outcome);
+    }
+    return () => state.subscribers.delete(subscriber);
 }
-/**
- * Settles every outstanding whenListenComplete waiter and clears the
- * completion registry. Called when the repo is deleted (deleteApp): its
- * listens can never respond again, and an unsettleable waiter would hang
- * its caller and retain the Repo forever.
- */
 function repoCancelPendingSeedRestores(repo) {
     for (const pending of repo.pendingSeedRestores_.values()) {
         pending.cancelled = true;
     }
     repo.pendingSeedRestores_.clear();
 }
-function repoSettleListenCompletions(repo) {
-    for (const completion of repo.listenCompletions_.values()) {
-        completion.complete = true;
-        const waiters = completion.waiters;
-        completion.waiters = [];
-        for (const waiter of waiters) {
-            waiter();
-        }
-    }
-    repo.listenCompletions_.clear();
+function repoClearListenOutcomes(repo) {
+    repo.listenOutcomes_.clear();
 }
 function repoDispose(repo) {
     repoInterrupt(repo);
     repoCancelPendingSeedRestores(repo);
-    repoSettleListenCompletions(repo);
+    repoClearListenOutcomes(repo);
     repo.persistence_?.dispose();
 }
 /**
@@ -16341,20 +16368,17 @@ function setPersistencePath(db, pathString, enabled) {
     db._repoInternal.persistence_?.setPersistentPath(new Path(pathString).toString(), enabled);
 }
 /**
- * Resolves when the default complete listen at `pathString` has received its
- * initial response from the server. With persistence, listeners may fire
- * first with the restored cache; this is the signal that the server has since
- * certified that data as current (unchanged tree) or replaced it (changed
- * tree). Resolves immediately when that already happened or no such listen
- * exists, and when the listen stops before completing — it never hangs.
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
  *
  * @internal
  */
-function whenListenComplete(db, pathString) {
+function onListenOutcome(db, pathString, callback) {
     db = getModularInstance(db);
-    db._checkNotDeleted('whenListenComplete');
-    validateRootPathString('whenListenComplete', 'path', pathString, false);
-    return repoWhenListenComplete(db._repoInternal, new Path(pathString).toString());
+    db._checkNotDeleted('onListenOutcome');
+    validateRootPathString('onListenOutcome', 'path', pathString, false);
+    return repoOnListenOutcome(db._repoInternal, new Path(pathString).toString(), callback);
 }
 /**
  * Reconnects to the server and synchronizes the offline Database state
@@ -16657,5 +16681,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
 setWebSocketImpl(Websocket.Client);
 registerDatabase('node');
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setPersistencePath as _setPersistencePath, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, getPersistedValue as _getPersistedValue, _initStandalone, onListenOutcome as _onListenOutcome, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setPersistencePath as _setPersistencePath, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.node.esm.js.map
