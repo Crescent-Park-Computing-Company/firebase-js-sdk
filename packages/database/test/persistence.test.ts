@@ -68,10 +68,11 @@ function computeCompoundHash(json: unknown) {
 }
 
 function makeChunk(revision: string, entries: Array<[string, unknown]>) {
+  const payload = stringify(entries);
   return {
     revision,
-    contentHash: sha1(stringify(entries)),
-    entries
+    contentHash: sha1(payload),
+    payload
   };
 }
 
@@ -481,7 +482,7 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 8,
+      formatVersion: 9,
       authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(json),
@@ -697,7 +698,10 @@ describe('PersistenceManager', () => {
       key.includes('#c')
     )!;
     const chunk = data.get(chunkKey) as any;
-    data.set(chunkKey, { ...chunk, entries: [['', { corrupted: true }]] });
+    data.set(chunkKey, {
+      ...chunk,
+      payload: stringify([['', { corrupted: true }]])
+    });
 
     const reader = new PersistenceManager('test-repo', factory);
     reader.track(path.toString());
@@ -712,7 +716,7 @@ describe('PersistenceManager', () => {
     const { factory, data } = makeFakeIndexedDB();
     const old = { a: 1 };
     data.set('test-repo|/torn/root', {
-      formatVersion: 8,
+      formatVersion: 9,
       authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(old),
@@ -1025,7 +1029,7 @@ describe('PersistenceManager', () => {
     const mb = PERSISTENCE_CHUNK_TARGET_BYTES;
     const add = (name: string, updatedAt: number) => {
       data.set(`test-repo|/${name}`, {
-        formatVersion: 8,
+        formatVersion: 9,
         authScope: null,
         revision: name,
         hash: computeCanonicalHash({ name }),
@@ -1085,7 +1089,7 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 8,
+      formatVersion: 9,
       authScope: null,
       revision: 'ext-1',
       updatedAt: expired,
@@ -1105,7 +1109,7 @@ describe('PersistenceManager', () => {
     // A fresh chunked root stays, with protocol hashes integrated into its
     // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 8,
+      formatVersion: 9,
       authScope: null,
       revision: 'ext-2',
       hash: 'h',

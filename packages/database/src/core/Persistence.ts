@@ -94,7 +94,7 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 8;
+const PERSISTENCE_FORMAT_VERSION = 9;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 
 function readSchemaMarker(): boolean {
@@ -238,10 +238,10 @@ interface LegacyPersistedRecord {
 /** One chunk record: disjoint subtrees, in assembly order. */
 interface PersistedChunk {
   revision: string;
-  /** Hash of the exported entries below; verified before Node reconstruction. */
+  /** Hash of payload; verified before JSON parse / Node reconstruction. */
   contentHash: string;
-  /** [path relative to the root, exported JSON of the subtree there]. */
-  entries: Array<[string, unknown]>;
+  /** JSON-encoded Array<[relative path, exported subtree]>. */
+  payload: string;
 }
 
 /** The hash follow-up record stored next to a manifest. */
@@ -324,8 +324,8 @@ function chunkKeySuffix(index: number, revision: string): string {
   return `${CHUNK_KEY_INFIX}${String(index).padStart(6, '0')}@${revision}`;
 }
 
-function persistedChunkHash(entries: Array<[string, unknown]>): string {
-  return sha1(stringify(entries));
+function persistedChunkHash(payload: string): string {
+  return sha1(payload);
 }
 
 function isLegacyRecord(
@@ -1205,15 +1205,24 @@ export class PersistenceManager {
               if (
                 !chunk ||
                 chunk.revision !== manifest.chunkRevisions[index] ||
-                !Array.isArray(chunk.entries) ||
+                typeof chunk.payload !== 'string' ||
                 typeof chunk.contentHash !== 'string' ||
-                persistedChunkHash(chunk.entries) !== chunk.contentHash
+                persistedChunkHash(chunk.payload) !== chunk.contentHash
               ) {
+                return 'mismatch' as const;
+              }
+              let entries: Array<[string, unknown]>;
+              try {
+                entries = JSON.parse(chunk.payload);
+              } catch {
+                return 'mismatch' as const;
+              }
+              if (!Array.isArray(entries)) {
                 return 'mismatch' as const;
               }
               onProgress();
               const plan: ChunkPlan = [];
-              for (const [relPath, json] of chunk.entries) {
+              for (const [relPath, json] of entries) {
                 const node = nodeFromJSON(json);
                 assembled = assembled.updateChild(new Path(relPath), node);
                 plan.push({ relPath, node });
@@ -1787,10 +1796,11 @@ export class PersistenceManager {
           e.relPath,
           e.node.val(true)
         ]);
+        const payload = stringify(entries);
         const chunk: PersistedChunk = {
           revision,
-          contentHash: persistedChunkHash(entries),
-          entries
+          contentHash: persistedChunkHash(payload),
+          payload
         };
         return this.withStore_<boolean>('readwrite', false, (store, done) => {
           store.put(chunk, key + chunkKeySuffix(i, revision));
