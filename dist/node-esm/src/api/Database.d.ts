@@ -20,7 +20,6 @@ import { FirebaseAuthInternalName } from '@firebase/auth-interop-types';
 import { Provider } from '@firebase/component';
 import { EmulatorMockTokenOptions } from '@firebase/util';
 import { Repo } from '../core/Repo';
-import { SeedCompoundHash } from '../core/ServerCacheSeed';
 import { ReferenceImpl } from './Reference_impl';
 export { EmulatorMockTokenOptions } from '@firebase/util';
 /**
@@ -136,30 +135,8 @@ export declare function getPersistedValue(db: Database, pathString: string, expe
 export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 /** Sets the identity scope used to read and write persisted cache records. @internal */
 export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
-/**
- * Registers cached JSON as the initial server cache for `path` on this
- * Database instance. Must be called before the listener for that exact path
- * attaches — the seed is consumed (once) at listener registration, and only
- * by a default (complete, unfiltered) query: a filtered query's listen hash
- * is computed over the filtered subset, which raw cached JSON is not. See
- * core/ServerCacheSeed.ts.
- *
- * @param db - The instance whose next listen at `path` should be seeded.
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined seeds nothing (an empty
- * tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
- */
-export declare function seedServerCache(db: Database, path: string, json: unknown, hash?: string, compoundHash?: SeedCompoundHash): void;
-/**
- * Removes all seeds registered on this Database instance.
- * @internal
- */
-export declare function clearServerCacheSeeds(db: Database): void;
+/** Selects an exact default-listen root for persistence. @internal */
+export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 /**
  * Resolves when the default complete listen at `pathString` has received its
  * initial response from the server. With persistence, listeners may fire

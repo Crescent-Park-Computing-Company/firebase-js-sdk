@@ -119,12 +119,6 @@ declare class ChildChangeAccumulator {
 }
 
 /**
- * Removes all seeds registered on this Database instance.
- * @internal
- */
-export declare function _clearServerCacheSeeds(db: Database): void;
-
-/**
  * @license
  * Copyright 2017 Google LLC
  *
@@ -179,22 +173,6 @@ declare class CompoundWrite {
     constructor(writeTree_: ImmutableTree<Node_2>);
     static empty(): CompoundWrite;
 }
-
-/**
- * The canonical listen hash of a JSON value — exactly what an unseeded
- * client would send for this tree. Exposed so apps can precompute seeds'
- * hashes off the main thread with the SDK's own canonicalization.
- * @internal
- */
-export declare function _computeCanonicalHash(json: unknown): string;
-
-/**
- * The compound hash of a JSON value, in wire shape. Exposed so apps can
- * precompute seeds' compound hashes off the main thread with the SDK's own
- * canonicalization.
- * @internal
- */
-export declare function _computeCompoundHash(json: unknown): SeedCompoundHash;
 
 /**
  * Modify the provided instance to communicate with the Realtime Database
@@ -886,11 +864,6 @@ export declare interface ListenOptions {
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
-    /**
-     * Consumes the server-cache seed registered for `pathString`, if any (see
-     * ServerCacheSeedStore). Absent for providers without seeding (.info).
-     */
-    takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 
 /**
@@ -1927,9 +1900,9 @@ declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private db_;
-    /**
-     * Roots that flow through persistence (complete default listens).
-     */
+    /** Roots explicitly selected by the application (keepSynced semantics). */
+    private persistentRoots_;
+    /** Active selected roots currently flowing through persistence. */
     private trackedRoots_;
     /**
      * Latest server tree per root. Revisions come from a single manager-wide
@@ -1978,6 +1951,8 @@ declare class PersistenceManager {
      * before the repo started (no queues or tracked roots exist yet).
      */
     rebindTo(prefix: string): PersistenceManager;
+    setPersistentPath(pathString: string, enabled: boolean): void;
+    isPersistentPath(pathString: string): boolean;
     /**
      * Marks a root as persistence-managed; write-throughs only run for
      * tracked roots (and their descendants' updates).
@@ -2064,7 +2039,6 @@ declare class PersistenceManager {
      * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString: string): Promise<PersistedRecord | null>;
-    restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -2566,11 +2540,6 @@ declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
-     * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-     * by serverSyncTree_ via its listen provider.
-     */
-    serverCacheSeeds_: ServerCacheSeedStore;
-    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
@@ -2674,34 +2643,9 @@ export declare function _repoManagerDatabaseFromApp(app: FirebaseApp, authProvid
 export declare function runTransaction(ref: DatabaseReference, transactionUpdate: (currentData: any) => unknown, options?: TransactionOptions): Promise<TransactionResult>;
 
 /**
- * Server-cache seeding: apps that persist a copy of their data (e.g. in
- * IndexedDB) can install it as the SDK's initial server cache BEFORE the
- * listener for that path attaches. The first listen then carries the seeded
- * tree's hash (and, when provided, its compound hash) instead of the
- * empty-node hash:
- *
- * - If the server's data still matches, the listen completes with no data
- *   download at all.
- * - If it doesn't and a compound hash was seeded, the server responds with
- *   range merges covering only the parts that changed.
- * - Otherwise the server sends the full tree, exactly as an unseeded listen
- *   would.
- *
- * A seed is installed as an INCOMPLETE server cache, so no value event is
- * raised from it: only a server message (a listen 'ok', a range merge, or a
- * full overwrite) promotes it to complete, server-certified state. Wrong or
- * stale seeded data therefore costs at most a missed hash — it is never
- * surfaced to the app as current data.
- *
- * Seeds are scoped to one Database instance (one Repo): each Repo owns a
- * ServerCacheSeedStore, and its SyncTree consumes from that store only —
- * two instances listening to the same path never steal each other's seeds.
- *
- * The optional precomputed hashes exist so callers can compute them off the
- * main thread (e.g. in a worker, via computeCanonicalHash /
- * computeCompoundHash) and stamp them at boot in O(1). Both must be computed
- * from exactly the seeded JSON: the server certifies whatever the listen
- * carries, and on a match the seeded tree is promoted as server state.
+ * Internal listen-hash protocol types shared by persistence, SyncTree, and
+ * PersistentConnection. Application-level manual seeding was removed; the SDK
+ * persistence manager is the only source of restored server cache state.
  */
 /**
  * A compound hash in wire shape: `ch: { hs: hashes, ps: posts }`.
@@ -2711,26 +2655,6 @@ export declare interface SeedCompoundHash {
     hashes: string[];
     posts: string[];
 }
-
-/**
- * Registers cached JSON as the initial server cache for `path` on this
- * Database instance. Must be called before the listener for that exact path
- * attaches — the seed is consumed (once) at listener registration, and only
- * by a default (complete, unfiltered) query: a filtered query's listen hash
- * is computed over the filtered subset, which raw cached JSON is not. See
- * core/ServerCacheSeed.ts.
- *
- * @param db - The instance whose next listen at `path` should be seeded.
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined seeds nothing (an empty
- * tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
- */
-export declare function _seedServerCache(db: Database, path: string, json: unknown, hash?: string, compoundHash?: SeedCompoundHash): void;
 
 /**
  * Interface defining the set of actions that can be performed against the Firebase server
@@ -2768,12 +2692,6 @@ declare abstract class ServerActions {
     }): void;
 }
 
-declare interface ServerCacheSeed {
-    json: unknown;
-    hash?: string;
-    compoundHash?: SeedCompoundHash;
-}
-
 /**
  * Counters for observing seeding effectiveness (listens sent with a real
  * hash, server-side hash matches, range merges received, wire bytes).
@@ -2788,22 +2706,6 @@ export declare const _serverCacheSeedStats: {
     seededPaths: string[];
     bytesReceived: number;
 };
-
-/**
- * The seeds registered for one Repo, keyed by canonical path string
- * (Path.toString() — the same canonicalization the consumer uses, so a seed
- * for 'a//b/' and a listen at '/a/b' cannot drift apart).
- */
-declare class ServerCacheSeedStore {
-    private seeds_;
-    set(path: string, json: unknown, hash?: string, compoundHash?: SeedCompoundHash): void;
-    /**
-     * Consumes (at most once) the seed registered for exactly `pathString`.
-     * Returns undefined when no seed matches.
-     */
-    take(pathString: string): ServerCacheSeed | undefined;
-    clear(): void;
-}
 
 /**
  * @license
@@ -2876,6 +2778,9 @@ export declare function _setPersistenceAuthScope(db: Database, scope: string | n
  * @internal
  */
 export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+
+/** Selects an exact default-listen root for persistence. @internal */
+export declare function _setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.

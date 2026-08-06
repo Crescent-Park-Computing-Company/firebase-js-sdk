@@ -817,6 +817,726 @@ function repoInfoConnectionURL(repoInfo, type, params) {
 
 /**
  * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
+ *
+ * An empty tree is returned unstamped: an empty node is the shared
+ * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
+ * empty node in the app.
+ */
+function stampSeedHashes(node, hash, compoundHash) {
+    if (node.isEmpty()) {
+        return node;
+    }
+    if (typeof hash === 'string') {
+        nodeCanonicalHashes.set(node, hash);
+        if (hash.length > 0) {
+            node.stampLazyHash(hash);
+        }
+    }
+    if (compoundHash &&
+        Array.isArray(compoundHash.hashes) &&
+        Array.isArray(compoundHash.posts) &&
+        compoundHash.hashes.length === compoundHash.posts.length + 1) {
+        setNodeCompoundHash(node, compoundHash);
+    }
+    return node;
+}
+/**
+ * The compound hash rides on the seeded node itself: once a server update
+ * replaces the cached node the stamp is gone, so re-listens after real data
+ * arrived send only the simple hash (which is then correct by construction).
+ */
+const nodeCompoundHashes = new WeakMap();
+const nodeCanonicalHashes = new WeakMap();
+function setNodeCompoundHash(node, compoundHash) {
+    nodeCompoundHashes.set(node, compoundHash);
+}
+function getNodeCompoundHash(node) {
+    return nodeCompoundHashes.get(node);
+}
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+function getNodeCanonicalHash(node) {
+    return nodeCanonicalHashes.get(node);
+}
+/**
+ * Counters for observing seeding effectiveness (listens sent with a real
+ * hash, server-side hash matches, range merges received, wire bytes).
+ * @internal
+ */
+const serverCacheSeedStats = {
+    listensSentWithHash: 0,
+    listensSentWithCompoundHash: 0,
+    listenOks: 0,
+    hashMatches: 0,
+    rangeMergesReceived: 0,
+    seededPaths: [],
+    bytesReceived: 0
+};
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Tracks a collection of stats.
+ */
+class StatsCollection {
+    constructor() {
+        this.counters_ = {};
+    }
+    incrementCounter(name, amount = 1) {
+        if (!util.contains(this.counters_, name)) {
+            this.counters_[name] = 0;
+        }
+        this.counters_[name] += amount;
+    }
+    get() {
+        return util.deepCopy(this.counters_);
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const collections = {};
+const reporters = {};
+function statsManagerGetCollection(repoInfo) {
+    const hashString = repoInfo.toString();
+    if (!collections[hashString]) {
+        collections[hashString] = new StatsCollection();
+    }
+    return collections[hashString];
+}
+function statsManagerGetOrCreateReporter(repoInfo, creatorFunction) {
+    const hashString = repoInfo.toString();
+    if (!reporters[hashString]) {
+        reporters[hashString] = creatorFunction();
+    }
+    return reporters[hashString];
+}
+
+/**
+ * @license
+ * Copyright 2019 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/** The semver (www.semver.org) version of the SDK. */
+let SDK_VERSION = '';
+/**
+ * SDK_VERSION should be set before any database instance is created
+ * @internal
+ */
+function setSDKVersion(version) {
+    SDK_VERSION = version;
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const WEBSOCKET_MAX_FRAME_SIZE = 16384;
+const WEBSOCKET_KEEPALIVE_INTERVAL = 45000;
+let WebSocketImpl = null;
+if (typeof MozWebSocket !== 'undefined') {
+    WebSocketImpl = MozWebSocket;
+}
+else if (typeof WebSocket !== 'undefined') {
+    WebSocketImpl = WebSocket;
+}
+function setWebSocketImpl(impl) {
+    WebSocketImpl = impl;
+}
+/**
+ * Create a new websocket connection with the given callbacks.
+ */
+class WebSocketConnection {
+    /**
+     * @param connId identifier for this transport
+     * @param repoInfo The info for the websocket endpoint.
+     * @param applicationId The Firebase App ID for this project.
+     * @param appCheckToken The App Check Token for this client.
+     * @param authToken The Auth Token for this client.
+     * @param transportSessionId Optional transportSessionId if this is connecting
+     * to an existing transport session
+     * @param lastSessionId Optional lastSessionId if there was a previous
+     * connection
+     */
+    constructor(connId, repoInfo, applicationId, appCheckToken, authToken, transportSessionId, lastSessionId) {
+        this.connId = connId;
+        this.applicationId = applicationId;
+        this.appCheckToken = appCheckToken;
+        this.authToken = authToken;
+        this.keepaliveTimer = null;
+        this.frames = null;
+        this.totalFrames = 0;
+        this.bytesSent = 0;
+        this.bytesReceived = 0;
+        this.log_ = logWrapper(this.connId);
+        this.stats_ = statsManagerGetCollection(repoInfo);
+        this.connURL = WebSocketConnection.connectionURL_(repoInfo, transportSessionId, lastSessionId, appCheckToken, applicationId);
+        this.nodeAdmin = repoInfo.nodeAdmin;
+    }
+    /**
+     * @param repoInfo - The info for the websocket endpoint.
+     * @param transportSessionId - Optional transportSessionId if this is connecting to an existing transport
+     *                                         session
+     * @param lastSessionId - Optional lastSessionId if there was a previous connection
+     * @returns connection url
+     */
+    static connectionURL_(repoInfo, transportSessionId, lastSessionId, appCheckToken, applicationId) {
+        const urlParams = {};
+        urlParams[VERSION_PARAM] = PROTOCOL_VERSION;
+        if (!util.isNodeSdk() &&
+            typeof location !== 'undefined' &&
+            location.hostname &&
+            FORGE_DOMAIN_RE.test(location.hostname)) {
+            urlParams[REFERER_PARAM] = FORGE_REF;
+        }
+        if (transportSessionId) {
+            urlParams[TRANSPORT_SESSION_PARAM] = transportSessionId;
+        }
+        if (lastSessionId) {
+            urlParams[LAST_SESSION_PARAM] = lastSessionId;
+        }
+        if (appCheckToken) {
+            urlParams[APP_CHECK_TOKEN_PARAM] = appCheckToken;
+        }
+        if (applicationId) {
+            urlParams[APPLICATION_ID_PARAM] = applicationId;
+        }
+        return repoInfoConnectionURL(repoInfo, WEBSOCKET, urlParams);
+    }
+    /**
+     * @param onMessage - Callback when messages arrive
+     * @param onDisconnect - Callback with connection lost.
+     */
+    open(onMessage, onDisconnect) {
+        this.onDisconnect = onDisconnect;
+        this.onMessage = onMessage;
+        this.log_('Websocket connecting to ' + this.connURL);
+        this.everConnected_ = false;
+        // Assume failure until proven otherwise.
+        PersistentStorage.set('previous_websocket_failure', true);
+        try {
+            let options;
+            if (util.isNodeSdk()) {
+                const device = this.nodeAdmin ? 'AdminNode' : 'Node';
+                // UA Format: Firebase/<wire_protocol>/<sdk_version>/<platform>/<device>
+                options = {
+                    headers: {
+                        'User-Agent': `Firebase/${PROTOCOL_VERSION}/${SDK_VERSION}/${process.platform}/${device}`,
+                        'X-Firebase-GMPID': this.applicationId || ''
+                    }
+                };
+                // If using Node with admin creds, AppCheck-related checks are unnecessary.
+                // Note that we send the credentials here even if they aren't admin credentials, which is
+                // not a problem.
+                // Note that this header is just used to bypass appcheck, and the token should still be sent
+                // through the websocket connection once it is established.
+                if (this.authToken) {
+                    options.headers['Authorization'] = `Bearer ${this.authToken}`;
+                }
+                if (this.appCheckToken) {
+                    options.headers['X-Firebase-AppCheck'] = this.appCheckToken;
+                }
+                // Plumb appropriate http_proxy environment variable into faye-websocket if it exists.
+                const env = process['env'];
+                const proxy = this.connURL.indexOf('wss://') === 0
+                    ? env['HTTPS_PROXY'] || env['https_proxy']
+                    : env['HTTP_PROXY'] || env['http_proxy'];
+                if (proxy) {
+                    options['proxy'] = { origin: proxy };
+                }
+            }
+            this.mySock = new WebSocketImpl(this.connURL, [], options);
+        }
+        catch (e) {
+            this.log_('Error instantiating WebSocket.');
+            const error = e.message || e.data;
+            if (error) {
+                this.log_(error);
+            }
+            this.onClosed_();
+            return;
+        }
+        this.mySock.onopen = () => {
+            this.log_('Websocket connected.');
+            this.everConnected_ = true;
+        };
+        this.mySock.onclose = () => {
+            this.log_('Websocket connection was disconnected.');
+            this.mySock = null;
+            this.onClosed_();
+        };
+        this.mySock.onmessage = m => {
+            this.handleIncomingFrame(m);
+        };
+        this.mySock.onerror = e => {
+            this.log_('WebSocket error.  Closing connection.');
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const error = e.message || e.data;
+            if (error) {
+                this.log_(error);
+            }
+            this.onClosed_();
+        };
+    }
+    /**
+     * No-op for websockets, we don't need to do anything once the connection is confirmed as open
+     */
+    start() { }
+    static forceDisallow() {
+        WebSocketConnection.forceDisallow_ = true;
+    }
+    static isAvailable() {
+        let isOldAndroid = false;
+        if (typeof navigator !== 'undefined' && navigator.userAgent) {
+            const oldAndroidRegex = /Android ([0-9]{0,}\.[0-9]{0,})/;
+            const oldAndroidMatch = navigator.userAgent.match(oldAndroidRegex);
+            if (oldAndroidMatch && oldAndroidMatch.length > 1) {
+                if (parseFloat(oldAndroidMatch[1]) < 4.4) {
+                    isOldAndroid = true;
+                }
+            }
+        }
+        return (!isOldAndroid &&
+            WebSocketImpl !== null &&
+            !WebSocketConnection.forceDisallow_);
+    }
+    /**
+     * Returns true if we previously failed to connect with this transport.
+     */
+    static previouslyFailed() {
+        // If our persistent storage is actually only in-memory storage,
+        // we default to assuming that it previously failed to be safe.
+        return (PersistentStorage.isInMemoryStorage ||
+            PersistentStorage.get('previous_websocket_failure') === true);
+    }
+    markConnectionHealthy() {
+        PersistentStorage.remove('previous_websocket_failure');
+    }
+    appendFrame_(data) {
+        this.frames.push(data);
+        if (this.frames.length === this.totalFrames) {
+            const fullMess = this.frames.join('');
+            this.frames = null;
+            const jsonMess = util.jsonEval(fullMess);
+            //handle the message
+            this.onMessage(jsonMess);
+        }
+    }
+    /**
+     * @param frameCount - The number of frames we are expecting from the server
+     */
+    handleNewFrameCount_(frameCount) {
+        this.totalFrames = frameCount;
+        this.frames = [];
+    }
+    /**
+     * Attempts to parse a frame count out of some text. If it can't, assumes a value of 1
+     * @returns Any remaining data to be process, or null if there is none
+     */
+    extractFrameCount_(data) {
+        util.assert(this.frames === null, 'We already have a frame buffer');
+        // TODO: The server is only supposed to send up to 9999 frames (i.e. length <= 4), but that isn't being enforced
+        // currently.  So allowing larger frame counts (length <= 6).  See https://app.asana.com/0/search/8688598998380/8237608042508
+        if (data.length <= 6) {
+            const frameCount = Number(data);
+            if (!isNaN(frameCount)) {
+                this.handleNewFrameCount_(frameCount);
+                return null;
+            }
+        }
+        this.handleNewFrameCount_(1);
+        return data;
+    }
+    /**
+     * Process a websocket frame that has arrived from the server.
+     * @param mess - The frame data
+     */
+    handleIncomingFrame(mess) {
+        if (this.mySock === null) {
+            return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
+        }
+        const data = mess['data'];
+        this.bytesReceived += data.length;
+        this.stats_.incrementCounter('bytes_received', data.length);
+        serverCacheSeedStats.bytesReceived += data.length;
+        this.resetKeepAlive();
+        if (this.frames !== null) {
+            // we're buffering
+            this.appendFrame_(data);
+        }
+        else {
+            // try to parse out a frame count, otherwise, assume 1 and process it
+            const remainingData = this.extractFrameCount_(data);
+            if (remainingData !== null) {
+                this.appendFrame_(remainingData);
+            }
+        }
+    }
+    /**
+     * Send a message to the server
+     * @param data - The JSON object to transmit
+     */
+    send(data) {
+        this.resetKeepAlive();
+        const dataStr = util.stringify(data);
+        this.bytesSent += dataStr.length;
+        this.stats_.incrementCounter('bytes_sent', dataStr.length);
+        //We can only fit a certain amount in each websocket frame, so we need to split this request
+        //up into multiple pieces if it doesn't fit in one request.
+        const dataSegs = splitStringBySize(dataStr, WEBSOCKET_MAX_FRAME_SIZE);
+        //Send the length header
+        if (dataSegs.length > 1) {
+            this.sendString_(String(dataSegs.length));
+        }
+        //Send the actual data in segments.
+        for (let i = 0; i < dataSegs.length; i++) {
+            this.sendString_(dataSegs[i]);
+        }
+    }
+    shutdown_() {
+        this.isClosed_ = true;
+        if (this.keepaliveTimer) {
+            clearInterval(this.keepaliveTimer);
+            this.keepaliveTimer = null;
+        }
+        if (this.mySock) {
+            this.mySock.close();
+            this.mySock = null;
+        }
+    }
+    onClosed_() {
+        if (!this.isClosed_) {
+            this.log_('WebSocket is closing itself');
+            this.shutdown_();
+            // since this is an internal close, trigger the close listener
+            if (this.onDisconnect) {
+                this.onDisconnect(this.everConnected_);
+                this.onDisconnect = null;
+            }
+        }
+    }
+    /**
+     * External-facing close handler.
+     * Close the websocket and kill the connection.
+     */
+    close() {
+        if (!this.isClosed_) {
+            this.log_('WebSocket is being closed');
+            this.shutdown_();
+        }
+    }
+    /**
+     * Kill the current keepalive timer and start a new one, to ensure that it always fires N seconds after
+     * the last activity.
+     */
+    resetKeepAlive() {
+        clearInterval(this.keepaliveTimer);
+        this.keepaliveTimer = setInterval(() => {
+            //If there has been no websocket activity for a while, send a no-op
+            if (this.mySock) {
+                this.sendString_('0');
+            }
+            this.resetKeepAlive();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        }, Math.floor(WEBSOCKET_KEEPALIVE_INTERVAL));
+    }
+    /**
+     * Send a string over the websocket.
+     *
+     * @param str - String to send.
+     */
+    sendString_(str) {
+        // Firefox seems to sometimes throw exceptions (NS_ERROR_UNEXPECTED) from websocket .send()
+        // calls for some unknown reason.  We treat these as an error and disconnect.
+        // See https://app.asana.com/0/58926111402292/68021340250410
+        try {
+            this.mySock.send(str);
+        }
+        catch (e) {
+            this.log_('Exception thrown from WebSocket.send():', e.message || e.data, 'Closing connection.');
+            setTimeout(this.onClosed_.bind(this), 0);
+        }
+    }
+}
+/**
+ * Number of response before we consider the connection "healthy."
+ */
+WebSocketConnection.responsesRequiredToBeHealthy = 2;
+/**
+ * Time to wait for the connection te become healthy before giving up.
+ */
+WebSocketConnection.healthyTimeout = 30000;
+
+const name = "@firebase/database";
+const version = "1.1.3";
+
+/**
+ * @license
+ * Copyright 2021 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Abstraction around AppCheck's token fetching capabilities.
+ */
+class AppCheckTokenProvider {
+    constructor(app$1, appCheckProvider) {
+        this.appCheckProvider = appCheckProvider;
+        this.appName = app$1.name;
+        if (app._isFirebaseServerApp(app$1) && app$1.settings.appCheckToken) {
+            this.serverAppAppCheckToken = app$1.settings.appCheckToken;
+        }
+        this.appCheck = appCheckProvider?.getImmediate({ optional: true });
+        if (!this.appCheck) {
+            appCheckProvider?.get().then(appCheck => (this.appCheck = appCheck));
+        }
+    }
+    getToken(forceRefresh) {
+        if (this.serverAppAppCheckToken) {
+            if (forceRefresh) {
+                throw new Error('Attempted reuse of `FirebaseServerApp.appCheckToken` after previous usage failed.');
+            }
+            return Promise.resolve({ token: this.serverAppAppCheckToken });
+        }
+        if (!this.appCheck) {
+            return new Promise((resolve, reject) => {
+                // Support delayed initialization of FirebaseAppCheck. This allows our
+                // customers to initialize the RTDB SDK before initializing Firebase
+                // AppCheck and ensures that all requests are authenticated if a token
+                // becomes available before the timeout below expires.
+                setTimeout(() => {
+                    if (this.appCheck) {
+                        this.getToken(forceRefresh).then(resolve, reject);
+                    }
+                    else {
+                        resolve(null);
+                    }
+                }, 0);
+            });
+        }
+        return this.appCheck.getToken(forceRefresh);
+    }
+    addTokenChangeListener(listener) {
+        this.appCheckProvider
+            ?.get()
+            .then(appCheck => appCheck.addTokenListener(listener));
+    }
+    notifyForInvalidToken() {
+        warn(`Provided AppCheck credentials for the app named "${this.appName}" ` +
+            'are invalid. This usually indicates your app was not initialized correctly.');
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Abstraction around FirebaseApp's token fetching capabilities.
+ */
+class FirebaseAuthTokenProvider {
+    constructor(appName_, firebaseOptions_, authProvider_) {
+        this.appName_ = appName_;
+        this.firebaseOptions_ = firebaseOptions_;
+        this.authProvider_ = authProvider_;
+        this.auth_ = null;
+        this.auth_ = authProvider_.getImmediate({ optional: true });
+        if (!this.auth_) {
+            authProvider_.onInit(auth => (this.auth_ = auth));
+        }
+    }
+    getToken(forceRefresh) {
+        if (!this.auth_) {
+            return new Promise((resolve, reject) => {
+                // Support delayed initialization of FirebaseAuth. This allows our
+                // customers to initialize the RTDB SDK before initializing Firebase
+                // Auth and ensures that all requests are authenticated if a token
+                // becomes available before the timeout below expires.
+                setTimeout(() => {
+                    if (this.auth_) {
+                        this.getToken(forceRefresh).then(resolve, reject);
+                    }
+                    else {
+                        resolve(null);
+                    }
+                }, 0);
+            });
+        }
+        return this.auth_.getToken(forceRefresh).catch(error => {
+            // TODO: Need to figure out all the cases this is raised and whether
+            // this makes sense.
+            if (error && error.code === 'auth/token-not-initialized') {
+                log('Got auth/token-not-initialized error.  Treating as null token.');
+                return null;
+            }
+            else {
+                return Promise.reject(error);
+            }
+        });
+    }
+    addTokenChangeListener(listener) {
+        // TODO: We might want to wrap the listener and call it with no args to
+        // avoid a leaky abstraction, but that makes removing the listener harder.
+        if (this.auth_) {
+            this.auth_.addAuthTokenListener(listener);
+        }
+        else {
+            this.authProvider_
+                .get()
+                .then(auth => auth.addAuthTokenListener(listener));
+        }
+    }
+    removeTokenChangeListener(listener) {
+        this.authProvider_
+            .get()
+            .then(auth => auth.removeAuthTokenListener(listener));
+    }
+    notifyForInvalidToken() {
+        let errorMessage = 'Provided authentication credentials for the app named "' +
+            this.appName_ +
+            '" are invalid. This usually indicates your app was not ' +
+            'initialized correctly. ';
+        if ('credential' in this.firebaseOptions_) {
+            errorMessage +=
+                'Make sure the "credential" property provided to initializeApp() ' +
+                    'is authorized to access the specified "databaseURL" and is from the correct ' +
+                    'project.';
+        }
+        else if ('serviceAccount' in this.firebaseOptions_) {
+            errorMessage +=
+                'Make sure the "serviceAccount" property provided to initializeApp() ' +
+                    'is authorized to access the specified "databaseURL" and is from the correct ' +
+                    'project.';
+        }
+        else {
+            errorMessage +=
+                'Make sure the "apiKey" and "databaseURL" properties provided to ' +
+                    'initializeApp() match the values provided for your app at ' +
+                    'https://console.firebase.google.com/.';
+        }
+        warn(errorMessage);
+    }
+}
+/* AuthTokenProvider that supplies a constant token. Used by Admin SDK or mockUserToken with emulators. */
+class EmulatorTokenProvider {
+    constructor(accessToken) {
+        this.accessToken = accessToken;
+    }
+    getToken(forceRefresh) {
+        return Promise.resolve({
+            accessToken: this.accessToken
+        });
+    }
+    addTokenChangeListener(listener) {
+        // Invoke the listener immediately to match the behavior in Firebase Auth
+        // (see packages/auth/src/auth.js#L1807)
+        listener(this.accessToken);
+    }
+    removeTokenChangeListener(listener) { }
+    notifyForInvalidToken() { }
+}
+/** A string that is treated as an admin access token by the RTDB emulator. Used by Admin SDK. */
+EmulatorTokenProvider.OWNER = 'owner';
+
+/**
+ * @license
  * Copyright 2017 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1648,20 +2368,6 @@ function simpleSizeSplitStrategy(node) {
     const splitThreshold = Math.max(512, Math.floor(Math.sqrt(estimatedSize * 100)));
     return state => state.hashLength() > splitThreshold &&
         state.currentPath()[state.currentPath().length - 1] !== '.priority';
-}
-/**
- * Computes the compound hash of a node.
- */
-function compoundHashFromNode(node, splitStrategy) {
-    if (node.isEmpty()) {
-        return new CompoundHash([], ['']);
-    }
-    const strategy = splitStrategy || simpleSizeSplitStrategy(node);
-    const builder = new CompoundHashBuilder(strategy);
-    const walker = new CompoundHashWalker(node, builder);
-    walker.drainUntil(Infinity);
-    builder.finishHashing();
-    return new CompoundHash(builder.posts, builder.hashes);
 }
 /**
  * Iterates children in key order with the node's priority interleaved as a
@@ -3446,783 +4152,6 @@ setNodeFromJSON(nodeFromJSON);
  * limitations under the License.
  */
 /**
- * The seeds registered for one Repo, keyed by canonical path string
- * (Path.toString() — the same canonicalization the consumer uses, so a seed
- * for 'a//b/' and a listen at '/a/b' cannot drift apart).
- */
-class ServerCacheSeedStore {
-    constructor() {
-        this.seeds_ = new Map();
-    }
-    set(path, json, hash, compoundHash) {
-        if (json === null || json === undefined) {
-            return;
-        }
-        this.seeds_.set(new Path(path).toString(), { json, hash, compoundHash });
-    }
-    /**
-     * Consumes (at most once) the seed registered for exactly `pathString`.
-     * Returns undefined when no seed matches.
-     */
-    take(pathString) {
-        const key = new Path(pathString).toString();
-        const seed = this.seeds_.get(key);
-        if (seed !== undefined) {
-            this.seeds_.delete(key);
-        }
-        return seed;
-    }
-    clear() {
-        this.seeds_.clear();
-    }
-}
-/**
- * Builds the node for a seed, stamping the precomputed hashes (see
- * stampSeedHashes).
- */
-function buildSeedNode(seed) {
-    return stampSeedHashes(nodeFromJSON(seed.json), seed.hash, seed.compoundHash);
-}
-/**
- * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
- * hash() returns it without an O(tree) walk) and attaches the precomputed
- * compound hash for the listen to send. Both must describe exactly this
- * tree — the server certifies whatever the listen carries.
- *
- * An empty tree is returned unstamped: an empty node is the shared
- * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
- * empty node in the app.
- */
-function stampSeedHashes(node, hash, compoundHash) {
-    if (node.isEmpty()) {
-        return node;
-    }
-    if (typeof hash === 'string') {
-        nodeCanonicalHashes.set(node, hash);
-        if (hash.length > 0) {
-            node.stampLazyHash(hash);
-        }
-    }
-    if (compoundHash &&
-        Array.isArray(compoundHash.hashes) &&
-        Array.isArray(compoundHash.posts) &&
-        compoundHash.hashes.length === compoundHash.posts.length + 1) {
-        setNodeCompoundHash(node, compoundHash);
-    }
-    return node;
-}
-/**
- * The compound hash rides on the seeded node itself: once a server update
- * replaces the cached node the stamp is gone, so re-listens after real data
- * arrived send only the simple hash (which is then correct by construction).
- */
-const nodeCompoundHashes = new WeakMap();
-const nodeCanonicalHashes = new WeakMap();
-function setNodeCompoundHash(node, compoundHash) {
-    nodeCompoundHashes.set(node, compoundHash);
-}
-function getNodeCompoundHash(node) {
-    return nodeCompoundHashes.get(node);
-}
-/**
- * The persisted canonical hash associated with a seeded node. This rides in
- * a WeakMap instead of being stamped into every subtree by node.hash(): a
- * compound-hash-only seed deliberately stores the empty simple hash, letting
- * the server validate its ranges without a full-tree hash pass that would
- * permanently retain one SHA string per node.
- */
-function getNodeCanonicalHash(node) {
-    return nodeCanonicalHashes.get(node);
-}
-/**
- * The canonical listen hash of a JSON value — exactly what an unseeded
- * client would send for this tree. Exposed so apps can precompute seeds'
- * hashes off the main thread with the SDK's own canonicalization.
- * @internal
- */
-function computeCanonicalHash(json) {
-    return nodeFromJSON(json).hash();
-}
-/**
- * The compound hash of a JSON value, in wire shape. Exposed so apps can
- * precompute seeds' compound hashes off the main thread with the SDK's own
- * canonicalization.
- * @internal
- */
-function computeCompoundHash(json) {
-    const compoundHash = compoundHashFromNode(nodeFromJSON(json));
-    return { hashes: compoundHash.hashes, posts: compoundHash.posts };
-}
-/**
- * Counters for observing seeding effectiveness (listens sent with a real
- * hash, server-side hash matches, range merges received, wire bytes).
- * @internal
- */
-const serverCacheSeedStats = {
-    listensSentWithHash: 0,
-    listensSentWithCompoundHash: 0,
-    listenOks: 0,
-    hashMatches: 0,
-    rangeMergesReceived: 0,
-    seededPaths: [],
-    bytesReceived: 0
-};
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Tracks a collection of stats.
- */
-class StatsCollection {
-    constructor() {
-        this.counters_ = {};
-    }
-    incrementCounter(name, amount = 1) {
-        if (!util.contains(this.counters_, name)) {
-            this.counters_[name] = 0;
-        }
-        this.counters_[name] += amount;
-    }
-    get() {
-        return util.deepCopy(this.counters_);
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const collections = {};
-const reporters = {};
-function statsManagerGetCollection(repoInfo) {
-    const hashString = repoInfo.toString();
-    if (!collections[hashString]) {
-        collections[hashString] = new StatsCollection();
-    }
-    return collections[hashString];
-}
-function statsManagerGetOrCreateReporter(repoInfo, creatorFunction) {
-    const hashString = repoInfo.toString();
-    if (!reporters[hashString]) {
-        reporters[hashString] = creatorFunction();
-    }
-    return reporters[hashString];
-}
-
-/**
- * @license
- * Copyright 2019 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/** The semver (www.semver.org) version of the SDK. */
-let SDK_VERSION = '';
-/**
- * SDK_VERSION should be set before any database instance is created
- * @internal
- */
-function setSDKVersion(version) {
-    SDK_VERSION = version;
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const WEBSOCKET_MAX_FRAME_SIZE = 16384;
-const WEBSOCKET_KEEPALIVE_INTERVAL = 45000;
-let WebSocketImpl = null;
-if (typeof MozWebSocket !== 'undefined') {
-    WebSocketImpl = MozWebSocket;
-}
-else if (typeof WebSocket !== 'undefined') {
-    WebSocketImpl = WebSocket;
-}
-function setWebSocketImpl(impl) {
-    WebSocketImpl = impl;
-}
-/**
- * Create a new websocket connection with the given callbacks.
- */
-class WebSocketConnection {
-    /**
-     * @param connId identifier for this transport
-     * @param repoInfo The info for the websocket endpoint.
-     * @param applicationId The Firebase App ID for this project.
-     * @param appCheckToken The App Check Token for this client.
-     * @param authToken The Auth Token for this client.
-     * @param transportSessionId Optional transportSessionId if this is connecting
-     * to an existing transport session
-     * @param lastSessionId Optional lastSessionId if there was a previous
-     * connection
-     */
-    constructor(connId, repoInfo, applicationId, appCheckToken, authToken, transportSessionId, lastSessionId) {
-        this.connId = connId;
-        this.applicationId = applicationId;
-        this.appCheckToken = appCheckToken;
-        this.authToken = authToken;
-        this.keepaliveTimer = null;
-        this.frames = null;
-        this.totalFrames = 0;
-        this.bytesSent = 0;
-        this.bytesReceived = 0;
-        this.log_ = logWrapper(this.connId);
-        this.stats_ = statsManagerGetCollection(repoInfo);
-        this.connURL = WebSocketConnection.connectionURL_(repoInfo, transportSessionId, lastSessionId, appCheckToken, applicationId);
-        this.nodeAdmin = repoInfo.nodeAdmin;
-    }
-    /**
-     * @param repoInfo - The info for the websocket endpoint.
-     * @param transportSessionId - Optional transportSessionId if this is connecting to an existing transport
-     *                                         session
-     * @param lastSessionId - Optional lastSessionId if there was a previous connection
-     * @returns connection url
-     */
-    static connectionURL_(repoInfo, transportSessionId, lastSessionId, appCheckToken, applicationId) {
-        const urlParams = {};
-        urlParams[VERSION_PARAM] = PROTOCOL_VERSION;
-        if (!util.isNodeSdk() &&
-            typeof location !== 'undefined' &&
-            location.hostname &&
-            FORGE_DOMAIN_RE.test(location.hostname)) {
-            urlParams[REFERER_PARAM] = FORGE_REF;
-        }
-        if (transportSessionId) {
-            urlParams[TRANSPORT_SESSION_PARAM] = transportSessionId;
-        }
-        if (lastSessionId) {
-            urlParams[LAST_SESSION_PARAM] = lastSessionId;
-        }
-        if (appCheckToken) {
-            urlParams[APP_CHECK_TOKEN_PARAM] = appCheckToken;
-        }
-        if (applicationId) {
-            urlParams[APPLICATION_ID_PARAM] = applicationId;
-        }
-        return repoInfoConnectionURL(repoInfo, WEBSOCKET, urlParams);
-    }
-    /**
-     * @param onMessage - Callback when messages arrive
-     * @param onDisconnect - Callback with connection lost.
-     */
-    open(onMessage, onDisconnect) {
-        this.onDisconnect = onDisconnect;
-        this.onMessage = onMessage;
-        this.log_('Websocket connecting to ' + this.connURL);
-        this.everConnected_ = false;
-        // Assume failure until proven otherwise.
-        PersistentStorage.set('previous_websocket_failure', true);
-        try {
-            let options;
-            if (util.isNodeSdk()) {
-                const device = this.nodeAdmin ? 'AdminNode' : 'Node';
-                // UA Format: Firebase/<wire_protocol>/<sdk_version>/<platform>/<device>
-                options = {
-                    headers: {
-                        'User-Agent': `Firebase/${PROTOCOL_VERSION}/${SDK_VERSION}/${process.platform}/${device}`,
-                        'X-Firebase-GMPID': this.applicationId || ''
-                    }
-                };
-                // If using Node with admin creds, AppCheck-related checks are unnecessary.
-                // Note that we send the credentials here even if they aren't admin credentials, which is
-                // not a problem.
-                // Note that this header is just used to bypass appcheck, and the token should still be sent
-                // through the websocket connection once it is established.
-                if (this.authToken) {
-                    options.headers['Authorization'] = `Bearer ${this.authToken}`;
-                }
-                if (this.appCheckToken) {
-                    options.headers['X-Firebase-AppCheck'] = this.appCheckToken;
-                }
-                // Plumb appropriate http_proxy environment variable into faye-websocket if it exists.
-                const env = process['env'];
-                const proxy = this.connURL.indexOf('wss://') === 0
-                    ? env['HTTPS_PROXY'] || env['https_proxy']
-                    : env['HTTP_PROXY'] || env['http_proxy'];
-                if (proxy) {
-                    options['proxy'] = { origin: proxy };
-                }
-            }
-            this.mySock = new WebSocketImpl(this.connURL, [], options);
-        }
-        catch (e) {
-            this.log_('Error instantiating WebSocket.');
-            const error = e.message || e.data;
-            if (error) {
-                this.log_(error);
-            }
-            this.onClosed_();
-            return;
-        }
-        this.mySock.onopen = () => {
-            this.log_('Websocket connected.');
-            this.everConnected_ = true;
-        };
-        this.mySock.onclose = () => {
-            this.log_('Websocket connection was disconnected.');
-            this.mySock = null;
-            this.onClosed_();
-        };
-        this.mySock.onmessage = m => {
-            this.handleIncomingFrame(m);
-        };
-        this.mySock.onerror = e => {
-            this.log_('WebSocket error.  Closing connection.');
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const error = e.message || e.data;
-            if (error) {
-                this.log_(error);
-            }
-            this.onClosed_();
-        };
-    }
-    /**
-     * No-op for websockets, we don't need to do anything once the connection is confirmed as open
-     */
-    start() { }
-    static forceDisallow() {
-        WebSocketConnection.forceDisallow_ = true;
-    }
-    static isAvailable() {
-        let isOldAndroid = false;
-        if (typeof navigator !== 'undefined' && navigator.userAgent) {
-            const oldAndroidRegex = /Android ([0-9]{0,}\.[0-9]{0,})/;
-            const oldAndroidMatch = navigator.userAgent.match(oldAndroidRegex);
-            if (oldAndroidMatch && oldAndroidMatch.length > 1) {
-                if (parseFloat(oldAndroidMatch[1]) < 4.4) {
-                    isOldAndroid = true;
-                }
-            }
-        }
-        return (!isOldAndroid &&
-            WebSocketImpl !== null &&
-            !WebSocketConnection.forceDisallow_);
-    }
-    /**
-     * Returns true if we previously failed to connect with this transport.
-     */
-    static previouslyFailed() {
-        // If our persistent storage is actually only in-memory storage,
-        // we default to assuming that it previously failed to be safe.
-        return (PersistentStorage.isInMemoryStorage ||
-            PersistentStorage.get('previous_websocket_failure') === true);
-    }
-    markConnectionHealthy() {
-        PersistentStorage.remove('previous_websocket_failure');
-    }
-    appendFrame_(data) {
-        this.frames.push(data);
-        if (this.frames.length === this.totalFrames) {
-            const fullMess = this.frames.join('');
-            this.frames = null;
-            const jsonMess = util.jsonEval(fullMess);
-            //handle the message
-            this.onMessage(jsonMess);
-        }
-    }
-    /**
-     * @param frameCount - The number of frames we are expecting from the server
-     */
-    handleNewFrameCount_(frameCount) {
-        this.totalFrames = frameCount;
-        this.frames = [];
-    }
-    /**
-     * Attempts to parse a frame count out of some text. If it can't, assumes a value of 1
-     * @returns Any remaining data to be process, or null if there is none
-     */
-    extractFrameCount_(data) {
-        util.assert(this.frames === null, 'We already have a frame buffer');
-        // TODO: The server is only supposed to send up to 9999 frames (i.e. length <= 4), but that isn't being enforced
-        // currently.  So allowing larger frame counts (length <= 6).  See https://app.asana.com/0/search/8688598998380/8237608042508
-        if (data.length <= 6) {
-            const frameCount = Number(data);
-            if (!isNaN(frameCount)) {
-                this.handleNewFrameCount_(frameCount);
-                return null;
-            }
-        }
-        this.handleNewFrameCount_(1);
-        return data;
-    }
-    /**
-     * Process a websocket frame that has arrived from the server.
-     * @param mess - The frame data
-     */
-    handleIncomingFrame(mess) {
-        if (this.mySock === null) {
-            return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
-        }
-        const data = mess['data'];
-        this.bytesReceived += data.length;
-        this.stats_.incrementCounter('bytes_received', data.length);
-        serverCacheSeedStats.bytesReceived += data.length;
-        this.resetKeepAlive();
-        if (this.frames !== null) {
-            // we're buffering
-            this.appendFrame_(data);
-        }
-        else {
-            // try to parse out a frame count, otherwise, assume 1 and process it
-            const remainingData = this.extractFrameCount_(data);
-            if (remainingData !== null) {
-                this.appendFrame_(remainingData);
-            }
-        }
-    }
-    /**
-     * Send a message to the server
-     * @param data - The JSON object to transmit
-     */
-    send(data) {
-        this.resetKeepAlive();
-        const dataStr = util.stringify(data);
-        this.bytesSent += dataStr.length;
-        this.stats_.incrementCounter('bytes_sent', dataStr.length);
-        //We can only fit a certain amount in each websocket frame, so we need to split this request
-        //up into multiple pieces if it doesn't fit in one request.
-        const dataSegs = splitStringBySize(dataStr, WEBSOCKET_MAX_FRAME_SIZE);
-        //Send the length header
-        if (dataSegs.length > 1) {
-            this.sendString_(String(dataSegs.length));
-        }
-        //Send the actual data in segments.
-        for (let i = 0; i < dataSegs.length; i++) {
-            this.sendString_(dataSegs[i]);
-        }
-    }
-    shutdown_() {
-        this.isClosed_ = true;
-        if (this.keepaliveTimer) {
-            clearInterval(this.keepaliveTimer);
-            this.keepaliveTimer = null;
-        }
-        if (this.mySock) {
-            this.mySock.close();
-            this.mySock = null;
-        }
-    }
-    onClosed_() {
-        if (!this.isClosed_) {
-            this.log_('WebSocket is closing itself');
-            this.shutdown_();
-            // since this is an internal close, trigger the close listener
-            if (this.onDisconnect) {
-                this.onDisconnect(this.everConnected_);
-                this.onDisconnect = null;
-            }
-        }
-    }
-    /**
-     * External-facing close handler.
-     * Close the websocket and kill the connection.
-     */
-    close() {
-        if (!this.isClosed_) {
-            this.log_('WebSocket is being closed');
-            this.shutdown_();
-        }
-    }
-    /**
-     * Kill the current keepalive timer and start a new one, to ensure that it always fires N seconds after
-     * the last activity.
-     */
-    resetKeepAlive() {
-        clearInterval(this.keepaliveTimer);
-        this.keepaliveTimer = setInterval(() => {
-            //If there has been no websocket activity for a while, send a no-op
-            if (this.mySock) {
-                this.sendString_('0');
-            }
-            this.resetKeepAlive();
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        }, Math.floor(WEBSOCKET_KEEPALIVE_INTERVAL));
-    }
-    /**
-     * Send a string over the websocket.
-     *
-     * @param str - String to send.
-     */
-    sendString_(str) {
-        // Firefox seems to sometimes throw exceptions (NS_ERROR_UNEXPECTED) from websocket .send()
-        // calls for some unknown reason.  We treat these as an error and disconnect.
-        // See https://app.asana.com/0/58926111402292/68021340250410
-        try {
-            this.mySock.send(str);
-        }
-        catch (e) {
-            this.log_('Exception thrown from WebSocket.send():', e.message || e.data, 'Closing connection.');
-            setTimeout(this.onClosed_.bind(this), 0);
-        }
-    }
-}
-/**
- * Number of response before we consider the connection "healthy."
- */
-WebSocketConnection.responsesRequiredToBeHealthy = 2;
-/**
- * Time to wait for the connection te become healthy before giving up.
- */
-WebSocketConnection.healthyTimeout = 30000;
-
-const name = "@firebase/database";
-const version = "1.1.3";
-
-/**
- * @license
- * Copyright 2021 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Abstraction around AppCheck's token fetching capabilities.
- */
-class AppCheckTokenProvider {
-    constructor(app$1, appCheckProvider) {
-        this.appCheckProvider = appCheckProvider;
-        this.appName = app$1.name;
-        if (app._isFirebaseServerApp(app$1) && app$1.settings.appCheckToken) {
-            this.serverAppAppCheckToken = app$1.settings.appCheckToken;
-        }
-        this.appCheck = appCheckProvider?.getImmediate({ optional: true });
-        if (!this.appCheck) {
-            appCheckProvider?.get().then(appCheck => (this.appCheck = appCheck));
-        }
-    }
-    getToken(forceRefresh) {
-        if (this.serverAppAppCheckToken) {
-            if (forceRefresh) {
-                throw new Error('Attempted reuse of `FirebaseServerApp.appCheckToken` after previous usage failed.');
-            }
-            return Promise.resolve({ token: this.serverAppAppCheckToken });
-        }
-        if (!this.appCheck) {
-            return new Promise((resolve, reject) => {
-                // Support delayed initialization of FirebaseAppCheck. This allows our
-                // customers to initialize the RTDB SDK before initializing Firebase
-                // AppCheck and ensures that all requests are authenticated if a token
-                // becomes available before the timeout below expires.
-                setTimeout(() => {
-                    if (this.appCheck) {
-                        this.getToken(forceRefresh).then(resolve, reject);
-                    }
-                    else {
-                        resolve(null);
-                    }
-                }, 0);
-            });
-        }
-        return this.appCheck.getToken(forceRefresh);
-    }
-    addTokenChangeListener(listener) {
-        this.appCheckProvider
-            ?.get()
-            .then(appCheck => appCheck.addTokenListener(listener));
-    }
-    notifyForInvalidToken() {
-        warn(`Provided AppCheck credentials for the app named "${this.appName}" ` +
-            'are invalid. This usually indicates your app was not initialized correctly.');
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Abstraction around FirebaseApp's token fetching capabilities.
- */
-class FirebaseAuthTokenProvider {
-    constructor(appName_, firebaseOptions_, authProvider_) {
-        this.appName_ = appName_;
-        this.firebaseOptions_ = firebaseOptions_;
-        this.authProvider_ = authProvider_;
-        this.auth_ = null;
-        this.auth_ = authProvider_.getImmediate({ optional: true });
-        if (!this.auth_) {
-            authProvider_.onInit(auth => (this.auth_ = auth));
-        }
-    }
-    getToken(forceRefresh) {
-        if (!this.auth_) {
-            return new Promise((resolve, reject) => {
-                // Support delayed initialization of FirebaseAuth. This allows our
-                // customers to initialize the RTDB SDK before initializing Firebase
-                // Auth and ensures that all requests are authenticated if a token
-                // becomes available before the timeout below expires.
-                setTimeout(() => {
-                    if (this.auth_) {
-                        this.getToken(forceRefresh).then(resolve, reject);
-                    }
-                    else {
-                        resolve(null);
-                    }
-                }, 0);
-            });
-        }
-        return this.auth_.getToken(forceRefresh).catch(error => {
-            // TODO: Need to figure out all the cases this is raised and whether
-            // this makes sense.
-            if (error && error.code === 'auth/token-not-initialized') {
-                log('Got auth/token-not-initialized error.  Treating as null token.');
-                return null;
-            }
-            else {
-                return Promise.reject(error);
-            }
-        });
-    }
-    addTokenChangeListener(listener) {
-        // TODO: We might want to wrap the listener and call it with no args to
-        // avoid a leaky abstraction, but that makes removing the listener harder.
-        if (this.auth_) {
-            this.auth_.addAuthTokenListener(listener);
-        }
-        else {
-            this.authProvider_
-                .get()
-                .then(auth => auth.addAuthTokenListener(listener));
-        }
-    }
-    removeTokenChangeListener(listener) {
-        this.authProvider_
-            .get()
-            .then(auth => auth.removeAuthTokenListener(listener));
-    }
-    notifyForInvalidToken() {
-        let errorMessage = 'Provided authentication credentials for the app named "' +
-            this.appName_ +
-            '" are invalid. This usually indicates your app was not ' +
-            'initialized correctly. ';
-        if ('credential' in this.firebaseOptions_) {
-            errorMessage +=
-                'Make sure the "credential" property provided to initializeApp() ' +
-                    'is authorized to access the specified "databaseURL" and is from the correct ' +
-                    'project.';
-        }
-        else if ('serviceAccount' in this.firebaseOptions_) {
-            errorMessage +=
-                'Make sure the "serviceAccount" property provided to initializeApp() ' +
-                    'is authorized to access the specified "databaseURL" and is from the correct ' +
-                    'project.';
-        }
-        else {
-            errorMessage +=
-                'Make sure the "apiKey" and "databaseURL" properties provided to ' +
-                    'initializeApp() match the values provided for your app at ' +
-                    'https://console.firebase.google.com/.';
-        }
-        warn(errorMessage);
-    }
-}
-/* AuthTokenProvider that supplies a constant token. Used by Admin SDK or mockUserToken with emulators. */
-class EmulatorTokenProvider {
-    constructor(accessToken) {
-        this.accessToken = accessToken;
-    }
-    getToken(forceRefresh) {
-        return Promise.resolve({
-            accessToken: this.accessToken
-        });
-    }
-    addTokenChangeListener(listener) {
-        // Invoke the listener immediately to match the behavior in Firebase Auth
-        // (see packages/auth/src/auth.js#L1807)
-        listener(this.accessToken);
-    }
-    removeTokenChangeListener(listener) { }
-    notifyForInvalidToken() { }
-}
-/** A string that is treated as an admin access token by the RTDB emulator. Used by Admin SDK. */
-EmulatorTokenProvider.OWNER = 'owner';
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
  * Client-side persistence of the server cache, in the spirit of the mobile
  * SDKs' setPersistenceEnabled(true): the SDK itself stores what the server
  * sent for each listened root and restores it on the next startup, so a
@@ -4498,9 +4427,9 @@ class PersistenceManager {
         this.operationTimeoutMs_ = operationTimeoutMs_;
         this.cacheMaxBytes_ = cacheMaxBytes_;
         this.db_ = null;
-        /**
-         * Roots that flow through persistence (complete default listens).
-         */
+        /** Roots explicitly selected by the application (keepSynced semantics). */
+        this.persistentRoots_ = new Map();
+        /** Active selected roots currently flowing through persistence. */
         this.trackedRoots_ = new Set();
         /**
          * Latest server tree per root. Revisions come from a single manager-wide
@@ -4559,6 +4488,22 @@ class PersistenceManager {
         const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_);
         rebound.setAuthScope(scope);
         return rebound;
+    }
+    setPersistentPath(pathString, enabled) {
+        const current = this.persistentRoots_.get(pathString) ?? 0;
+        if (enabled) {
+            this.persistentRoots_.set(pathString, current + 1);
+        }
+        else if (current <= 1) {
+            this.persistentRoots_.delete(pathString);
+            this.untrack(pathString);
+        }
+        else {
+            this.persistentRoots_.set(pathString, current - 1);
+        }
+    }
+    isPersistentPath(pathString) {
+        return this.persistentRoots_.has(pathString);
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -5280,35 +5225,6 @@ class PersistenceManager {
             return record;
         });
     }
-    restore(pathString) {
-        if (this.disposed_) {
-            return Promise.resolve(null);
-        }
-        if (!this.schemaKnownCurrent_) {
-            return Promise.resolve(null);
-        }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
-            if (result !== null && !this.disposed_) {
-                this.lastFlush_.set(pathString, {
-                    rootNode: result.record.node,
-                    revision: result.record.revision,
-                    plans: result.plans,
-                    chunkRevisions: result.chunkRevisions,
-                    chunkCount: result.chunkCount,
-                    storedUpdatedAt: result.record.updatedAt
-                });
-            }
-            return result === null ? null : result.record;
-        })).then(record => {
-            if (record) {
-                persistenceStats.restoredRoots.push(pathString);
-            }
-            else {
-                persistenceStats.restoreMisses.push(pathString);
-            }
-            return record;
-        });
-    }
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -5450,6 +5366,7 @@ class PersistenceManager {
             }
         }
         this.activeReads_.clear();
+        this.persistentRoots_.clear();
         this.latest_.clear();
         this.lastFlush_.clear();
         void this.db_?.then(db => db?.close());
@@ -12133,23 +12050,7 @@ function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSe
         // INCOMPLETE initial server cache: the listen then carries the seeded
         // tree's hash instead of the empty hash, but no value event is raised
         // until the server certifies it (see ServerCacheSeed).
-        serverCache = null;
-        if (query._queryParams.loadsAllData()) {
-            const seed = syncTree.listenProvider_.takeServerCacheSeed?.(path.toString());
-            if (seed !== undefined) {
-                try {
-                    serverCache = buildSeedNode(seed);
-                    serverCacheSeedStats.seededPaths.push(path.toString());
-                }
-                catch (e) {
-                    // A malformed seed must never break listener registration.
-                    serverCache = null;
-                }
-            }
-        }
-        if (serverCache == null) {
-            serverCache = ChildrenNode.EMPTY_NODE;
-        }
+        serverCache = ChildrenNode.EMPTY_NODE;
         const subtree = syncTree.syncPointTree_.subtree(path);
         subtree.foreachChild((childName, childSyncPoint) => {
             const completeCache = syncPointGetCompleteServerCache(childSyncPoint, newEmptyPath());
@@ -13232,11 +13133,6 @@ class Repo {
          */
         this.persistence_ = null;
         /**
-         * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-         * by serverSyncTree_ via its listen provider.
-         */
-        this.serverCacheSeeds_ = new ServerCacheSeedStore();
-        /**
          * Listens held back while their persisted root restores, keyed by path.
          * stopListening flips the token so a listen whose last registration was
          * removed mid-restore is never sent (see repoStartServerListen).
@@ -13327,8 +13223,7 @@ function repoStart(repo, appId, authOverride) {
         },
         stopListening: (query, tag) => {
             repoStopServerListen(repo, query, tag);
-        },
-        takeServerCacheSeed: pathString => repo.serverCacheSeeds_.take(pathString)
+        }
     });
 }
 /**
@@ -13433,7 +13328,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         });
     };
     const persistence = repo.persistence_;
-    if (persistence === null || !isDefaultComplete) {
+    if (persistence === null ||
+        !isDefaultComplete ||
+        !persistence.isPersistentPath(pathString)) {
         sendListen();
         return;
     }
@@ -16444,40 +16341,12 @@ function setPersistenceAuthScope(db, scope) {
     db._checkNotDeleted('setPersistenceAuthScope');
     db._repoInternal.persistence_?.setAuthScope(scope);
 }
-/**
- * Registers cached JSON as the initial server cache for `path` on this
- * Database instance. Must be called before the listener for that exact path
- * attaches — the seed is consumed (once) at listener registration, and only
- * by a default (complete, unfiltered) query: a filtered query's listen hash
- * is computed over the filtered subset, which raw cached JSON is not. See
- * core/ServerCacheSeed.ts.
- *
- * @param db - The instance whose next listen at `path` should be seeded.
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined seeds nothing (an empty
- * tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
- */
-function seedServerCache(db, path, json, hash, compoundHash) {
+/** Selects an exact default-listen root for persistence. @internal */
+function setPersistencePath(db, pathString, enabled) {
     db = util.getModularInstance(db);
-    db._checkNotDeleted('seedServerCache');
-    validateRootPathString('seedServerCache', 'path', path, false);
-    // _repoInternal: seeding is boot-time configuration and must not start
-    // the instance.
-    db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
-}
-/**
- * Removes all seeds registered on this Database instance.
- * @internal
- */
-function clearServerCacheSeeds(db) {
-    db = util.getModularInstance(db);
-    db._checkNotDeleted('clearServerCacheSeeds');
-    db._repoInternal.serverCacheSeeds_.clear();
+    db._checkNotDeleted('setPersistencePath');
+    validateRootPathString('setPersistencePath', 'path', pathString, false);
+    db._repoInternal.persistence_?.setPersistentPath(new Path(pathString).toString(), enabled);
 }
 /**
  * Resolves when the default complete listen at `pathString` has received its
@@ -16807,17 +16676,14 @@ exports._QueryParams = QueryParams;
 exports._ReferenceImpl = ReferenceImpl;
 exports._TEST_ACCESS_forceRestClient = forceRestClient;
 exports._TEST_ACCESS_hijackHash = hijackHash;
-exports._clearServerCacheSeeds = clearServerCacheSeeds;
-exports._computeCanonicalHash = computeCanonicalHash;
-exports._computeCompoundHash = computeCompoundHash;
 exports._getPersistedValue = getPersistedValue;
 exports._initStandalone = _initStandalone;
 exports._onPersistenceEvent = onPersistenceEvent;
 exports._repoManagerDatabaseFromApp = repoManagerDatabaseFromApp;
-exports._seedServerCache = seedServerCache;
 exports._serverCacheSeedStats = serverCacheSeedStats;
 exports._setPersistenceAuthScope = setPersistenceAuthScope;
 exports._setPersistenceEnabled = setPersistenceEnabled;
+exports._setPersistencePath = setPersistencePath;
 exports._setSDKVersion = setSDKVersion;
 exports._validatePathString = validatePathString;
 exports._validateWritablePath = validateWritablePath;

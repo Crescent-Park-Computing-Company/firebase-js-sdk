@@ -18,8 +18,6 @@ import { EmulatorMockTokenOptions } from '@firebase/util';
  * @returns The specified child location.
  */
 export declare function child(parent: DatabaseReference, path: string): DatabaseReference;
-/* Excluded from this release type: _computeCanonicalHash */
-/* Excluded from this release type: _computeCompoundHash */
 /**
  * Modify the provided instance to communicate with the Realtime Database
  * emulator.
@@ -1211,6 +1209,7 @@ export declare function remove(ref: DatabaseReference): Promise<void>;
  * callback to handle success and failure.
  */
 export declare function runTransaction(ref: DatabaseReference, transactionUpdate: (currentData: any) => unknown, options?: TransactionOptions): Promise<TransactionResult>;
+/* Excluded from this release type: _serverCacheSeedStats */
 /**
  * @license
  * Copyright 2020 Google LLC
@@ -1265,6 +1264,7 @@ export declare function serverTimestamp(): object;
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 /* Excluded from this release type: _setPersistenceAuthScope */
 /* Excluded from this release type: _setPersistenceEnabled */
+/* Excluded from this release type: _setPersistencePath */
 /**
  * Sets a priority for the data at this Database location.
  *

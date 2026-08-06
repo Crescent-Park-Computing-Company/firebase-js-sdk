@@ -117,8 +117,6 @@ declare class ChildChangeAccumulator {
     getChanges(): Change[];
 }
 
-/* Excluded from this release type: _clearServerCacheSeeds */
-
 /**
  * @license
  * Copyright 2017 Google LLC
@@ -174,10 +172,6 @@ declare class CompoundWrite {
     constructor(writeTree_: ImmutableTree<Node_2>);
     static empty(): CompoundWrite;
 }
-
-/* Excluded from this release type: _computeCanonicalHash */
-
-/* Excluded from this release type: _computeCompoundHash */
 
 /**
  * Modify the provided instance to communicate with the Realtime Database
@@ -845,11 +839,6 @@ export declare interface ListenOptions {
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
-    /**
-     * Consumes the server-cache seed registered for `pathString`, if any (see
-     * ServerCacheSeedStore). Absent for providers without seeding (.info).
-     */
-    takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 
 /**
@@ -1874,9 +1863,9 @@ declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private db_;
-    /**
-     * Roots that flow through persistence (complete default listens).
-     */
+    /** Roots explicitly selected by the application (keepSynced semantics). */
+    private persistentRoots_;
+    /** Active selected roots currently flowing through persistence. */
     private trackedRoots_;
     /**
      * Latest server tree per root. Revisions come from a single manager-wide
@@ -1925,6 +1914,8 @@ declare class PersistenceManager {
      * before the repo started (no queues or tracked roots exist yet).
      */
     rebindTo(prefix: string): PersistenceManager;
+    setPersistentPath(pathString: string, enabled: boolean): void;
+    isPersistentPath(pathString: string): boolean;
     /**
      * Marks a root as persistence-managed; write-throughs only run for
      * tracked roots (and their descendants' updates).
@@ -2007,7 +1998,6 @@ declare class PersistenceManager {
      * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString: string): Promise<PersistedRecord | null>;
-    restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -2420,11 +2410,6 @@ declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
-     * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-     * by serverSyncTree_ via its listen provider.
-     */
-    serverCacheSeeds_: ServerCacheSeedStore;
-    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
@@ -2525,8 +2510,6 @@ export declare function runTransaction(ref: DatabaseReference, transactionUpdate
 
 /* Excluded from this release type: SeedCompoundHash */
 
-/* Excluded from this release type: _seedServerCache */
-
 /**
  * Interface defining the set of actions that can be performed against the Firebase server
  * (basically corresponds to our wire protocol).
@@ -2563,29 +2546,7 @@ declare abstract class ServerActions {
     }): void;
 }
 
-declare interface ServerCacheSeed {
-    json: unknown;
-    hash?: string;
-    compoundHash?: SeedCompoundHash;
-}
-
 /* Excluded from this release type: _serverCacheSeedStats */
-
-/**
- * The seeds registered for one Repo, keyed by canonical path string
- * (Path.toString() — the same canonicalization the consumer uses, so a seed
- * for 'a//b/' and a listen at '/a/b' cannot drift apart).
- */
-declare class ServerCacheSeedStore {
-    private seeds_;
-    set(path: string, json: unknown, hash?: string, compoundHash?: SeedCompoundHash): void;
-    /**
-     * Consumes (at most once) the seed registered for exactly `pathString`.
-     * Returns undefined when no seed matches.
-     */
-    take(pathString: string): ServerCacheSeed | undefined;
-    clear(): void;
-}
 
 /**
  * @license
@@ -2644,6 +2605,8 @@ export declare function set(ref: DatabaseReference, value: unknown): Promise<voi
 /* Excluded from this release type: _setPersistenceAuthScope */
 
 /* Excluded from this release type: _setPersistenceEnabled */
+
+/* Excluded from this release type: _setPersistencePath */
 
 /**
  * Sets a priority for the data at this Database location.

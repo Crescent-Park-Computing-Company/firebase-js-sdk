@@ -21,7 +21,7 @@ import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import { ListenHashFn, ServerCacheSeedStore } from './ServerCacheSeed';
+import { ListenHashFn } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { SnapshotHolder } from './SnapshotHolder';
 import { SparseSnapshotTree } from './SparseSnapshotTree';
@@ -91,11 +91,6 @@ export declare class Repo {
      * enabled it before this Repo's first listen.
      */
     persistence_: PersistenceManager | null;
-    /**
-     * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-     * by serverSyncTree_ via its listen provider.
-     */
-    serverCacheSeeds_: ServerCacheSeedStore;
     /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was

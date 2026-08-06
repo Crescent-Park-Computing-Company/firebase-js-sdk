@@ -1,6 +1,6 @@
 import { _isFirebaseServerApp, _getProvider, getApp, SDK_VERSION as SDK_VERSION$1, _registerComponent, registerVersion } from '@firebase/app';
 import { Component, ComponentContainer, Provider } from '@firebase/component';
-import { stringify, jsonEval, contains, assert, stringToByteArray, Sha1, base64, isNodeSdk, assertionError, stringLength, safeGet, map, isIndexedDBAvailable, deepCopy, base64Encode, isMobileCordova, Deferred, isAdmin, isValidFormat, isEmpty, isReactNative, querystring, errorPrefix, getModularInstance, getDefaultEmulatorHostnameAndPort, deepEqual, createMockUserToken, isCloudWorkstation, pingServer } from '@firebase/util';
+import { stringify, jsonEval, contains, assert, isNodeSdk, stringToByteArray, Sha1, base64, assertionError, stringLength, safeGet, map, isIndexedDBAvailable, deepCopy, base64Encode, isMobileCordova, Deferred, isAdmin, isValidFormat, isEmpty, isReactNative, querystring, errorPrefix, getModularInstance, getDefaultEmulatorHostnameAndPort, deepEqual, createMockUserToken, isCloudWorkstation, pingServer } from '@firebase/util';
 import { Logger, LogLevel } from '@firebase/logger';
 
 const name = "@firebase/database";
@@ -1714,20 +1714,6 @@ function simpleSizeSplitStrategy(node) {
     const splitThreshold = Math.max(512, Math.floor(Math.sqrt(estimatedSize * 100)));
     return state => state.hashLength() > splitThreshold &&
         state.currentPath()[state.currentPath().length - 1] !== '.priority';
-}
-/**
- * Computes the compound hash of a node.
- */
-function compoundHashFromNode(node, splitStrategy) {
-    if (node.isEmpty()) {
-        return new CompoundHash([], ['']);
-    }
-    const strategy = splitStrategy || simpleSizeSplitStrategy(node);
-    const builder = new CompoundHashBuilder(strategy);
-    const walker = new CompoundHashWalker(node, builder);
-    walker.drainUntil(Infinity);
-    builder.finishHashing();
-    return new CompoundHash(builder.posts, builder.hashes);
 }
 /**
  * Iterates children in key order with the node's priority interleaved as a
@@ -3787,9 +3773,9 @@ class PersistenceManager {
         this.operationTimeoutMs_ = operationTimeoutMs_;
         this.cacheMaxBytes_ = cacheMaxBytes_;
         this.db_ = null;
-        /**
-         * Roots that flow through persistence (complete default listens).
-         */
+        /** Roots explicitly selected by the application (keepSynced semantics). */
+        this.persistentRoots_ = new Map();
+        /** Active selected roots currently flowing through persistence. */
         this.trackedRoots_ = new Set();
         /**
          * Latest server tree per root. Revisions come from a single manager-wide
@@ -3848,6 +3834,22 @@ class PersistenceManager {
         const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_);
         rebound.setAuthScope(scope);
         return rebound;
+    }
+    setPersistentPath(pathString, enabled) {
+        const current = this.persistentRoots_.get(pathString) ?? 0;
+        if (enabled) {
+            this.persistentRoots_.set(pathString, current + 1);
+        }
+        else if (current <= 1) {
+            this.persistentRoots_.delete(pathString);
+            this.untrack(pathString);
+        }
+        else {
+            this.persistentRoots_.set(pathString, current - 1);
+        }
+    }
+    isPersistentPath(pathString) {
+        return this.persistentRoots_.has(pathString);
     }
     /**
      * Marks a root as persistence-managed; write-throughs only run for
@@ -4569,35 +4571,6 @@ class PersistenceManager {
             return record;
         });
     }
-    restore(pathString) {
-        if (this.disposed_) {
-            return Promise.resolve(null);
-        }
-        if (!this.schemaKnownCurrent_) {
-            return Promise.resolve(null);
-        }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
-            if (result !== null && !this.disposed_) {
-                this.lastFlush_.set(pathString, {
-                    rootNode: result.record.node,
-                    revision: result.record.revision,
-                    plans: result.plans,
-                    chunkRevisions: result.chunkRevisions,
-                    chunkCount: result.chunkCount,
-                    storedUpdatedAt: result.record.updatedAt
-                });
-            }
-            return result === null ? null : result.record;
-        })).then(record => {
-            if (record) {
-                persistenceStats.restoredRoots.push(pathString);
-            }
-            else {
-                persistenceStats.restoreMisses.push(pathString);
-            }
-            return record;
-        });
-    }
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -4739,6 +4712,7 @@ class PersistenceManager {
             }
         }
         this.activeReads_.clear();
+        this.persistentRoots_.clear();
         this.latest_.clear();
         this.lastFlush_.clear();
         void this.db_?.then(db => db?.close());
@@ -5107,44 +5081,6 @@ function repoInfoConnectionURL(repoInfo, type, params) {
  * limitations under the License.
  */
 /**
- * The seeds registered for one Repo, keyed by canonical path string
- * (Path.toString() — the same canonicalization the consumer uses, so a seed
- * for 'a//b/' and a listen at '/a/b' cannot drift apart).
- */
-class ServerCacheSeedStore {
-    constructor() {
-        this.seeds_ = new Map();
-    }
-    set(path, json, hash, compoundHash) {
-        if (json === null || json === undefined) {
-            return;
-        }
-        this.seeds_.set(new Path(path).toString(), { json, hash, compoundHash });
-    }
-    /**
-     * Consumes (at most once) the seed registered for exactly `pathString`.
-     * Returns undefined when no seed matches.
-     */
-    take(pathString) {
-        const key = new Path(pathString).toString();
-        const seed = this.seeds_.get(key);
-        if (seed !== undefined) {
-            this.seeds_.delete(key);
-        }
-        return seed;
-    }
-    clear() {
-        this.seeds_.clear();
-    }
-}
-/**
- * Builds the node for a seed, stamping the precomputed hashes (see
- * stampSeedHashes).
- */
-function buildSeedNode(seed) {
-    return stampSeedHashes(nodeFromJSON(seed.json), seed.hash, seed.compoundHash);
-}
-/**
  * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
  * hash() returns it without an O(tree) walk) and attaches the precomputed
  * compound hash for the listen to send. Both must describe exactly this
@@ -5194,25 +5130,6 @@ function getNodeCompoundHash(node) {
  */
 function getNodeCanonicalHash(node) {
     return nodeCanonicalHashes.get(node);
-}
-/**
- * The canonical listen hash of a JSON value — exactly what an unseeded
- * client would send for this tree. Exposed so apps can precompute seeds'
- * hashes off the main thread with the SDK's own canonicalization.
- * @internal
- */
-function computeCanonicalHash(json) {
-    return nodeFromJSON(json).hash();
-}
-/**
- * The compound hash of a JSON value, in wire shape. Exposed so apps can
- * precompute seeds' compound hashes off the main thread with the SDK's own
- * canonicalization.
- * @internal
- */
-function computeCompoundHash(json) {
-    const compoundHash = compoundHashFromNode(nodeFromJSON(json));
-    return { hashes: compoundHash.hashes, posts: compoundHash.posts };
 }
 /**
  * Counters for observing seeding effectiveness (listens sent with a real
@@ -12121,23 +12038,7 @@ function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSe
         // INCOMPLETE initial server cache: the listen then carries the seeded
         // tree's hash instead of the empty hash, but no value event is raised
         // until the server certifies it (see ServerCacheSeed).
-        serverCache = null;
-        if (query._queryParams.loadsAllData()) {
-            const seed = syncTree.listenProvider_.takeServerCacheSeed?.(path.toString());
-            if (seed !== undefined) {
-                try {
-                    serverCache = buildSeedNode(seed);
-                    serverCacheSeedStats.seededPaths.push(path.toString());
-                }
-                catch (e) {
-                    // A malformed seed must never break listener registration.
-                    serverCache = null;
-                }
-            }
-        }
-        if (serverCache == null) {
-            serverCache = ChildrenNode.EMPTY_NODE;
-        }
+        serverCache = ChildrenNode.EMPTY_NODE;
         const subtree = syncTree.syncPointTree_.subtree(path);
         subtree.foreachChild((childName, childSyncPoint) => {
             const completeCache = syncPointGetCompleteServerCache(childSyncPoint, newEmptyPath());
@@ -13220,11 +13121,6 @@ class Repo {
          */
         this.persistence_ = null;
         /**
-         * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-         * by serverSyncTree_ via its listen provider.
-         */
-        this.serverCacheSeeds_ = new ServerCacheSeedStore();
-        /**
          * Listens held back while their persisted root restores, keyed by path.
          * stopListening flips the token so a listen whose last registration was
          * removed mid-restore is never sent (see repoStartServerListen).
@@ -13315,8 +13211,7 @@ function repoStart(repo, appId, authOverride) {
         },
         stopListening: (query, tag) => {
             repoStopServerListen(repo, query, tag);
-        },
-        takeServerCacheSeed: pathString => repo.serverCacheSeeds_.take(pathString)
+        }
     });
 }
 /**
@@ -13421,7 +13316,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         });
     };
     const persistence = repo.persistence_;
-    if (persistence === null || !isDefaultComplete) {
+    if (persistence === null ||
+        !isDefaultComplete ||
+        !persistence.isPersistentPath(pathString)) {
         sendListen();
         return;
     }
@@ -16432,40 +16329,12 @@ function setPersistenceAuthScope(db, scope) {
     db._checkNotDeleted('setPersistenceAuthScope');
     db._repoInternal.persistence_?.setAuthScope(scope);
 }
-/**
- * Registers cached JSON as the initial server cache for `path` on this
- * Database instance. Must be called before the listener for that exact path
- * attaches — the seed is consumed (once) at listener registration, and only
- * by a default (complete, unfiltered) query: a filtered query's listen hash
- * is computed over the filtered subset, which raw cached JSON is not. See
- * core/ServerCacheSeed.ts.
- *
- * @param db - The instance whose next listen at `path` should be seeded.
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined seeds nothing (an empty
- * tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
- */
-function seedServerCache(db, path, json, hash, compoundHash) {
+/** Selects an exact default-listen root for persistence. @internal */
+function setPersistencePath(db, pathString, enabled) {
     db = getModularInstance(db);
-    db._checkNotDeleted('seedServerCache');
-    validateRootPathString('seedServerCache', 'path', path, false);
-    // _repoInternal: seeding is boot-time configuration and must not start
-    // the instance.
-    db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
-}
-/**
- * Removes all seeds registered on this Database instance.
- * @internal
- */
-function clearServerCacheSeeds(db) {
-    db = getModularInstance(db);
-    db._checkNotDeleted('clearServerCacheSeeds');
-    db._repoInternal.serverCacheSeeds_.clear();
+    db._checkNotDeleted('setPersistencePath');
+    validateRootPathString('setPersistencePath', 'path', pathString, false);
+    db._repoInternal.persistence_?.setPersistentPath(new Path(pathString).toString(), enabled);
 }
 /**
  * Resolves when the default complete listen at `pathString` has received its
@@ -16772,5 +16641,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
  */
 registerDatabase();
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, clearServerCacheSeeds as _clearServerCacheSeeds, computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, seedServerCache as _seedServerCache, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, getPersistedValue as _getPersistedValue, _initStandalone, onPersistenceEvent as _onPersistenceEvent, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, serverCacheSeedStats as _serverCacheSeedStats, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setPersistencePath as _setPersistencePath, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, whenListenComplete as _whenListenComplete, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.esm.js.map

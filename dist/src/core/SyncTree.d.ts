@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
-import { ListenHashFn, ServerCacheSeed } from './ServerCacheSeed';
+import { ListenHashFn } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
 import { SyncPoint } from './SyncPoint';
@@ -28,11 +28,6 @@ export declare function syncTreeSetReferenceConstructor(val: ReferenceConstructo
 export interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event[]): Event[];
     stopListening(a: QueryContext, b: number | null): void;
-    /**
-     * Consumes the server-cache seed registered for `pathString`, if any (see
-     * ServerCacheSeedStore). Absent for providers without seeding (.info).
-     */
-    takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 export declare function resetSyncTreeTag(): void;
 /**

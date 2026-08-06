@@ -21,9 +21,9 @@ export { DataSnapshot, EventType, IteratedDataSnapshot, QueryConstraint, QueryCo
 export { increment, serverTimestamp } from './api/ServerValue';
 export { runTransaction, TransactionOptions, TransactionResult } from './api/Transaction';
 export { setSDKVersion as _setSDKVersion } from './core/version';
-export { getPersistedValue as _getPersistedValue, setPersistenceEnabled as _setPersistenceEnabled, setPersistenceAuthScope as _setPersistenceAuthScope, whenListenComplete as _whenListenComplete, seedServerCache as _seedServerCache, clearServerCacheSeeds as _clearServerCacheSeeds } from './api/Database';
+export { getPersistedValue as _getPersistedValue, setPersistenceEnabled as _setPersistenceEnabled, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistencePath as _setPersistencePath, whenListenComplete as _whenListenComplete } from './api/Database';
 export { onPersistenceEvent as _onPersistenceEvent, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';
-export { computeCanonicalHash as _computeCanonicalHash, computeCompoundHash as _computeCompoundHash, serverCacheSeedStats as _serverCacheSeedStats, SeedCompoundHash } from './core/ServerCacheSeed';
+export { serverCacheSeedStats as _serverCacheSeedStats, SeedCompoundHash } from './core/ServerCacheSeed';
 export { ReferenceImpl as _ReferenceImpl, QueryImpl as _QueryImpl } from './api/Reference_impl';
 export { repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp } from './api/Database';
 export { validatePathString as _validatePathString, validateWritablePath as _validateWritablePath } from './core/util/validation';

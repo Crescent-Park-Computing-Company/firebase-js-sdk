@@ -109,9 +109,9 @@ export declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private db_;
-    /**
-     * Roots that flow through persistence (complete default listens).
-     */
+    /** Roots explicitly selected by the application (keepSynced semantics). */
+    private persistentRoots_;
+    /** Active selected roots currently flowing through persistence. */
     private trackedRoots_;
     /**
      * Latest server tree per root. Revisions come from a single manager-wide
@@ -160,6 +160,8 @@ export declare class PersistenceManager {
      * before the repo started (no queues or tracked roots exist yet).
      */
     rebindTo(prefix: string): PersistenceManager;
+    setPersistentPath(pathString: string, enabled: boolean): void;
+    isPersistentPath(pathString: string): boolean;
     /**
      * Marks a root as persistence-managed; write-throughs only run for
      * tracked roots (and their descendants' updates).
@@ -246,7 +248,6 @@ export declare class PersistenceManager {
      * restarts once against the live in-memory cache.
      */
     restoreForListen(pathString: string): Promise<PersistedRecord | null>;
-    restore(pathString: string): Promise<PersistedRecord | null>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers

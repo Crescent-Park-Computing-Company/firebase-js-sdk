@@ -85,11 +85,3 @@ export declare function compoundHashFromNodeAsync(node: Node, splitStrategy?: Co
  * the restored root on the next boot.
  */
 export declare function canonicalHashFromNodeAsync(node: Node, sliceMs?: number, onProgress?: () => void): Promise<string>;
-/**
- * Computes node.hash() — the canonical listen hash — in bounded slices.
- * Node hashes cache per node (lazyHash_) and nodes are immutable, so the
- * walk primes every subtree's hash bottom-up across slices; the final
- * root hash() then assembles from cached children in one cheap pass, and
- * unchanged subtrees stay primed for the next flush.
- */
-export declare function hashFromNodeAsync(node: Node, sliceMs?: number): Promise<string>;
