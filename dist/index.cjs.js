@@ -3614,6 +3614,7 @@ const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const PERSISTENCE_MAX_CACHE_BYTES = 100 * 1024 * 1024;
 const PERSISTENCE_MAX_PRUNABLE_ROOTS = 1000;
 const PERSISTENCE_PRUNE_TARGET_RATIO = 0.8;
+const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
 /**
  * How long after the last server update a root's write-through runs. The
  * flush re-serializes the chunks the update dirtied, so it is deliberately
@@ -3828,6 +3829,8 @@ class PersistenceManager {
          * every chunk and rebuilt the same large Node tree concurrently.
          */
         this.activeReads_ = new Map();
+        this.activeRestoreCount_ = 0;
+        this.restoreQueue_ = [];
         this.sweepTimer_ = null;
         this.disposed_ = false;
         this.authScope_ = null;
@@ -4502,6 +4505,27 @@ class PersistenceManager {
      * this tree, so when the server certifies it unchanged (the common warm
      * boot), the follow-up write-through skips without serializing anything.
      */
+    withRestoreSlot_(work) {
+        const run = () => {
+            this.activeRestoreCount_++;
+            return work().finally(() => {
+                this.activeRestoreCount_--;
+                this.restoreQueue_.shift()?.();
+            });
+        };
+        if (this.activeRestoreCount_ < PERSISTENCE_MAX_CONCURRENT_RESTORES) {
+            return run();
+        }
+        return new Promise((resolve, reject) => {
+            this.restoreQueue_.push(() => {
+                if (this.disposed_) {
+                    resolve(null);
+                    return;
+                }
+                void run().then(resolve, reject);
+            });
+        });
+    }
     /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
      * the authenticated listener can consume the same immutable Node instead of
@@ -4512,10 +4536,10 @@ class PersistenceManager {
             recordPersistenceEvent(pathString, 'peek-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve(null);
         }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
+        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
             recordPersistenceEvent(pathString, result ? 'peek-hit' : 'peek-miss');
             return result === null ? null : result.record;
-        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout'));
+        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout')));
     }
     /**
      * Listener restore with an idle (no-progress) bound. Healthy chunked reads
@@ -4528,7 +4552,7 @@ class PersistenceManager {
             recordPersistenceEvent(pathString, 'restore-miss', this.disposed_ ? 'disposed' : 'schema-migration');
             return Promise.resolve(null);
         }
-        return this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
+        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress).then(result => {
             if (result === null ||
                 this.disposed_ ||
                 !this.trackedRoots_.has(pathString)) {
@@ -4544,7 +4568,7 @@ class PersistenceManager {
             });
             persistenceStats.restoredRoots.push(pathString);
             return result.record;
-        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'restore-idle-timeout')).then(record => {
+        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'restore-idle-timeout'))).then(record => {
             recordPersistenceEvent(pathString, record ? 'restore-hit' : 'restore-miss');
             return record;
         });
@@ -4708,6 +4732,11 @@ class PersistenceManager {
             clearTimeout(this.sweepTimer_);
         }
         this.flushPending_.clear();
+        const queuedRestores = this.restoreQueue_;
+        this.restoreQueue_ = [];
+        for (const resume of queuedRestores) {
+            resume();
+        }
         for (const read of this.activeReads_.values()) {
             if (read.cleanupTimer !== null) {
                 clearTimeout(read.cleanupTimer);

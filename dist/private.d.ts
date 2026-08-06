@@ -1912,6 +1912,8 @@ declare class PersistenceManager {
      * every chunk and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
+    private activeRestoreCount_;
+    private restoreQueue_;
     private sweepTimer_;
     private disposed_;
     private authScope_;
@@ -1991,6 +1993,7 @@ declare class PersistenceManager {
      * this tree, so when the server certifies it unchanged (the common warm
      * boot), the follow-up write-through skips without serializing anything.
      */
+    private withRestoreSlot_;
     /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
      * the authenticated listener can consume the same immutable Node instead of
