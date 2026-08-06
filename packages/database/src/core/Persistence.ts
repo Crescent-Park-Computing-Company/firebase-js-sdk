@@ -19,7 +19,6 @@ import { isIndexedDBAvailable, stringify } from '@firebase/util';
 
 import {
   CompoundHashAccumulator,
-  compoundHashFromNodeAsync,
   estimateSerializedNodeSize,
   forEachChildWithPriority
 } from './CompoundHash';
@@ -1770,10 +1769,6 @@ export class PersistenceManager {
         dirtyIndexes.push(i);
       }
     }
-    const initialCompoundAccumulator =
-      dirtyIndexes.length === plans.length
-        ? new CompoundHashAccumulator(node)
-        : null;
     persistenceStats.chunksWritten += dirtyIndexes.length;
     persistenceStats.chunksSkipped += plans.length - dirtyIndexes.length;
     if (
@@ -1805,6 +1800,8 @@ export class PersistenceManager {
         }
       });
     }
+    const compoundAccumulator = new CompoundHashAccumulator(node);
+    const dirtyIndexSet = new Set(dirtyIndexes);
     persistenceStats.writeThroughs++;
     // Dirty chunks land in separate short transactions; the manifest commits
     // last as the authoritative join. A crash mid-sequence leaves the old
@@ -1827,20 +1824,28 @@ export class PersistenceManager {
     // defeated chunking. The manifest is committed last in a tiny transaction
     // and is the authoritative join, so a crash between chunks is a safe miss.
     let put = Promise.resolve(true);
-    for (const i of dirtyIndexes) {
+    for (let i = 0; i < plans.length; i++) {
       put = put.then(ok => {
         if (!ok) {
           return false;
         }
-        const entries: Array<[string, unknown]> = plans[i].map(e => [
-          e.relPath,
-          initialCompoundAccumulator
-            ? initialCompoundAccumulator.serializeEntry(
-                e.relPath === '' ? [] : e.relPath.split('/'),
-                e.node,
-                e.includedInCompoundHash
-              )
-            : e.node.val(true)
+        if (!dirtyIndexSet.has(i)) {
+          for (const entry of plans[i]) {
+            compoundAccumulator.hashEntry(
+              entry.relPath === '' ? [] : entry.relPath.split('/'),
+              entry.node,
+              entry.includedInCompoundHash
+            );
+          }
+          return true;
+        }
+        const entries: Array<[string, unknown]> = plans[i].map(entry => [
+          entry.relPath,
+          compoundAccumulator.serializeEntry(
+            entry.relPath === '' ? [] : entry.relPath.split('/'),
+            entry.node,
+            entry.includedInCompoundHash
+          )
         ]);
         const payload = stringify(entries);
         const chunk: PersistedChunk = {
@@ -1858,14 +1863,12 @@ export class PersistenceManager {
       if (!ok) {
         return false;
       }
-      if (initialCompoundAccumulator) {
-        const compound = initialCompoundAccumulator.finish();
-        manifest.hash = '';
-        manifest.compoundHash = {
-          hashes: compound.hashes,
-          posts: compound.posts
-        };
-      }
+      const compound = compoundAccumulator.finish();
+      manifest.hash = '';
+      manifest.compoundHash = {
+        hashes: compound.hashes,
+        posts: compound.posts
+      };
       return this.withStore_<boolean>('readwrite', false, (store, done) => {
         store.put(manifest, key);
         if (prev?.chunkRevisions) {
@@ -1895,44 +1898,9 @@ export class PersistenceManager {
         storedUpdatedAt: now
       });
       recordPersistenceEvent(pathString, 'stored', `${plans.length} chunks`);
-      if (initialCompoundAccumulator) {
-        // The first generation already produced storage bytes + compound hash
-        // in one traversal; it is durable as soon as the manifest commits.
-        return;
-      }
-      // Incremental later writes may reuse clean chunks. Their protocol hash
-      // still runs in the background because a cached compound hash cannot be
-      // patched independently without re-walking the changed tree.
-      return compoundHashFromNodeAsync(node)
-        .then(compoundHash => ({ hash: '', compoundHash }))
-        .then(({ hash, compoundHash }) => {
-          node.stampLazyHash(hash);
-          if (this.disposed_) {
-            return;
-          }
-          persistenceStats.hashRecomputes++;
-          return this.withStore_<void>('readwrite', undefined, store => {
-            // Another tab may have replaced the manifest while we hashed;
-            // attach protocol hashes only to the exact cached root revision.
-            const dataReq = store.get(key);
-            dataReq.onsuccess = () => {
-              const current = dataReq.result as PersistedManifest | undefined;
-              if (current && current.revision === revision) {
-                store.put(
-                  {
-                    ...current,
-                    hash,
-                    compoundHash: {
-                      hashes: compoundHash.hashes,
-                      posts: compoundHash.posts
-                    }
-                  },
-                  key
-                );
-              }
-            };
-          });
-        });
+      // Every generation commits its compound hash with the manifest. There is
+      // no hashless window and no second traversal after storage completes.
+      return;
     });
   }
 }

@@ -324,6 +324,14 @@ export class CompoundHashAccumulator {
     return this.serializeNode_(node);
   }
 
+  hashEntry(path: string[], node: Node, includedInHash = true): void {
+    if (!includedInHash) {
+      return;
+    }
+    this.moveToPath_(path);
+    this.hashNode_(node);
+  }
+
   finish(): CompoundHash {
     this.moveToPath_([]);
     this.builder_.finishHashing();
@@ -346,6 +354,24 @@ export class CompoundHashAccumulator {
       this.builder_.startChild(next[i]);
     }
     this.openPath_ = next.slice();
+  }
+
+  private hashNode_(node: Node): void {
+    if (node.isEmpty()) {
+      return;
+    }
+    if (node.isLeafNode()) {
+      this.builder_.processLeaf(node as LeafNode);
+      return;
+    }
+    forEachChildWithPriority(node, (key, child, included) => {
+      if (!included) {
+        return;
+      }
+      this.builder_.startChild(key);
+      this.hashNode_(child);
+      this.builder_.endChild();
+    });
   }
 
   private serializeNode_(node: Node): unknown {
