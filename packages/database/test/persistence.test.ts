@@ -1647,6 +1647,27 @@ describe('persistence auth scope', () => {
   });
 });
 
+describe('persistence restore scheduling', () => {
+  it('bounds concurrent IndexedDB restores like Androids serialized runloop', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory, true, 100);
+    let active = 0;
+    let peak = 0;
+    (manager as unknown as { readRecord_: () => Promise<null> }).readRecord_ =
+      async () => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        active--;
+        return null;
+      };
+    const paths = Array.from({ length: 20 }, (_, i) => `/queued/${i}`);
+    paths.forEach(path => manager.track(path));
+    await Promise.all(paths.map(path => manager.restoreForListen(path)));
+    expect(peak).to.equal(4);
+  });
+});
+
 describe('persistence diagnostics', () => {
   it('records bounded store/restore outcomes for debugging cache misses', async () => {
     persistenceStats.events.length = 0;

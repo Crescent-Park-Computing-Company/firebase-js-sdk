@@ -135,6 +135,7 @@ export const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 export const PERSISTENCE_MAX_CACHE_BYTES = 100 * 1024 * 1024;
 const PERSISTENCE_MAX_PRUNABLE_ROOTS = 1000;
 const PERSISTENCE_PRUNE_TARGET_RATIO = 0.8;
+const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
 
 /**
  * How long after the last server update a root's write-through runs. The
@@ -471,6 +472,8 @@ export class PersistenceManager {
       cleanupTimer: ReturnType<typeof setTimeout> | null;
     }
   >();
+  private activeRestoreCount_ = 0;
+  private restoreQueue_: Array<() => void> = [];
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
   private disposed_ = false;
   private authScope_: string | null = null;
@@ -1298,6 +1301,28 @@ export class PersistenceManager {
    * this tree, so when the server certifies it unchanged (the common warm
    * boot), the follow-up write-through skips without serializing anything.
    */
+  private withRestoreSlot_<T>(work: () => Promise<T>): Promise<T> {
+    const run = () => {
+      this.activeRestoreCount_++;
+      return work().finally(() => {
+        this.activeRestoreCount_--;
+        this.restoreQueue_.shift()?.();
+      });
+    };
+    if (this.activeRestoreCount_ < PERSISTENCE_MAX_CONCURRENT_RESTORES) {
+      return run();
+    }
+    return new Promise<T>((resolve, reject) => {
+      this.restoreQueue_.push(() => {
+        if (this.disposed_) {
+          resolve(null as T);
+          return;
+        }
+        void run().then(resolve, reject);
+      });
+    });
+  }
+
   /**
    * Exact-root optimistic peek. The completed decode is retained briefly so
    * the authenticated listener can consume the same immutable Node instead of
@@ -1315,19 +1340,24 @@ export class PersistenceManager {
       );
       return Promise.resolve(null);
     }
-    return this.raceRestoreTimeout_(
-      onProgress =>
-        this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(
-          result => {
+    return this.withRestoreSlot_(() =>
+      this.raceRestoreTimeout_(
+        onProgress =>
+          this.readRecord_(
+            pathString,
+            onProgress,
+            true,
+            expectedAuthScope
+          ).then(result => {
             recordPersistenceEvent(
               pathString,
               result ? 'peek-hit' : 'peek-miss'
             );
             return result === null ? null : result.record;
-          }
-        ),
-      this.operationTimeoutMs_,
-      () => recordPersistenceEvent(pathString, 'peek-idle-timeout')
+          }),
+        this.operationTimeoutMs_,
+        () => recordPersistenceEvent(pathString, 'peek-idle-timeout')
+      )
     );
   }
 
@@ -1346,29 +1376,31 @@ export class PersistenceManager {
       );
       return Promise.resolve(null);
     }
-    return this.raceRestoreTimeout_(
-      onProgress =>
-        this.readRecord_(pathString, onProgress).then(result => {
-          if (
-            result === null ||
-            this.disposed_ ||
-            !this.trackedRoots_.has(pathString)
-          ) {
-            return null;
-          }
-          this.lastFlush_.set(pathString, {
-            rootNode: result.record.node,
-            revision: result.record.revision,
-            plans: result.plans,
-            chunkRevisions: result.chunkRevisions,
-            chunkCount: result.chunkCount,
-            storedUpdatedAt: result.record.updatedAt
-          });
-          persistenceStats.restoredRoots.push(pathString);
-          return result.record;
-        }),
-      this.operationTimeoutMs_,
-      () => recordPersistenceEvent(pathString, 'restore-idle-timeout')
+    return this.withRestoreSlot_(() =>
+      this.raceRestoreTimeout_(
+        onProgress =>
+          this.readRecord_(pathString, onProgress).then(result => {
+            if (
+              result === null ||
+              this.disposed_ ||
+              !this.trackedRoots_.has(pathString)
+            ) {
+              return null;
+            }
+            this.lastFlush_.set(pathString, {
+              rootNode: result.record.node,
+              revision: result.record.revision,
+              plans: result.plans,
+              chunkRevisions: result.chunkRevisions,
+              chunkCount: result.chunkCount,
+              storedUpdatedAt: result.record.updatedAt
+            });
+            persistenceStats.restoredRoots.push(pathString);
+            return result.record;
+          }),
+        this.operationTimeoutMs_,
+        () => recordPersistenceEvent(pathString, 'restore-idle-timeout')
+      )
     ).then(record => {
       recordPersistenceEvent(
         pathString,
@@ -1556,6 +1588,11 @@ export class PersistenceManager {
       clearTimeout(this.sweepTimer_);
     }
     this.flushPending_.clear();
+    const queuedRestores = this.restoreQueue_;
+    this.restoreQueue_ = [];
+    for (const resume of queuedRestores) {
+      resume();
+    }
     for (const read of this.activeReads_.values()) {
       if (read.cleanupTimer !== null) {
         clearTimeout(read.cleanupTimer);
