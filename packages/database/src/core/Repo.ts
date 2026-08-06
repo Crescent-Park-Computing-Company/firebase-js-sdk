@@ -33,7 +33,12 @@ import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import { ListenHashFn, stampSeedHashes } from './ServerCacheSeed';
+import {
+  ListenHashFn,
+  clearNextListenHashes,
+  stampNextListenHashes,
+  stampSeedHashes
+} from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
@@ -173,6 +178,42 @@ interface PendingSeedRestore {
   cancelled: boolean;
 }
 
+/** One server operation held during a manifest-first boot window. */
+type BootBufferedOp =
+  | {
+      kind: 'data';
+      pathString: string;
+      data: unknown;
+      isMerge: boolean;
+      tag: number | null;
+    }
+  | {
+      kind: 'rm';
+      pathString: string;
+      ranges: Array<{ s?: string; e?: string; m: unknown }>;
+      tag: number | null;
+    };
+
+/**
+ * The boot-buffer root covering `pathString`, if any: operations at or under
+ * a buffering root are held until its cached base applies.
+ */
+function repoBootBufferRootFor(repo: Repo, pathString: string): string | null {
+  if (repo.bootBuffers_.size === 0) {
+    return null;
+  }
+  for (const root of repo.bootBuffers_.keys()) {
+    if (
+      pathString === root ||
+      root === '/' ||
+      (pathString.length > root.length && pathString.startsWith(root + '/'))
+    ) {
+      return root;
+    }
+  }
+  return null;
+}
+
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 export type ListenOutcomeReason =
   | 'missing'
@@ -231,6 +272,15 @@ export class Repo {
    * removed mid-restore is never sent (see repoStartServerListen).
    */
   pendingSeedRestores_ = new Map<string, PendingSeedRestore>();
+
+  /**
+   * Server operations buffered during a manifest-first boot window: the
+   * range listen is on the wire before the cached base has been applied to
+   * SyncTree, so anything the server sends for that root (range merges —
+   * deltas against the base — or full pushes) is held, in arrival order,
+   * until the base applies, then replayed. Keyed by the listened root path.
+   */
+  bootBuffers_ = new Map<string, BootBufferedOp[]>();
 
   /**
    * Listen-complete state per default complete listen, keyed by path: whether
@@ -402,6 +452,17 @@ export function repoGenerateServerValues(repo: Repo): Indexable {
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: drives a server data push exactly as the connection would. @internal */
+export function repoOnDataUpdateForTest(
+  repo: Repo,
+  pathString: string,
+  data: unknown,
+  isMerge: boolean,
+  tag: number | null
+): void {
+  repoOnDataUpdate(repo, pathString, data, isMerge, tag);
+}
+
 function repoOnDataUpdate(
   repo: Repo,
   pathString: string,
@@ -411,6 +472,19 @@ function repoOnDataUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
+  {
+    // Manifest-first boot window: the listen went out before the cached base
+    // applied. Hold server data for that root — in arrival order with range
+    // merges — until the base is in SyncTree (see repoStartServerListen).
+    const bufferRoot =
+      tag == null ? repoBootBufferRootFor(repo, pathString) : null;
+    if (bufferRoot !== null) {
+      repo.bootBuffers_
+        .get(bufferRoot)!
+        .push({ kind: 'data', pathString, data, isMerge, tag });
+      return;
+    }
+  }
   const path = new Path(pathString);
   data = repo.interceptServerDataCallback_
     ? repo.interceptServerDataCallback_(pathString, data)
@@ -592,58 +666,140 @@ export function repoStartServerListen(
     sendListen(mode, reason);
   };
 
-  void persistence.restoreForListen(pathString).then(
-    result => {
-      if (!isCurrent()) {
-        return;
-      }
-      const { record, reason } = result;
-      if (
-        record === null ||
-        syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
-          null
-      ) {
-        const fallback = reason === 'corrupt' || reason === 'timeout';
-        finish(fallback ? 'fallback' : 'cold', reason);
-        return;
-      }
+  // MANIFEST-FIRST LISTEN. The stored manifest alone carries the protocol
+  // hashes, so the listen goes out the moment it is read (milliseconds) —
+  // the server's round-trip overlaps the tree record's read and Node
+  // construction. Server pushes that arrive before the cached base has been
+  // applied are buffered (repoOnDataUpdate/repoOnRangeMergeUpdate) and
+  // replayed against the base, preserving arrival order. If anything about
+  // the restore then fails, the buffered data is authoritative anyway — it
+  // is applied and the listen simply behaves as an unseeded one.
+  let sentFromManifest = false;
+  const onManifest = () => {
+    if (!isCurrent() || sentFromManifest) {
+      return;
+    }
+    if (
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+        null ||
+      syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)
+        .length > 0
+    ) {
+      // Existing server-cache state changes the exact tree the persisted
+      // hashes describe; let the restore resolution pick the cold path.
+      return;
+    }
+    sentFromManifest = true;
+    repo.bootBuffers_.set(pathString, []);
+    // The listen's hashFn resolves through SyncTree's view of the (not yet
+    // applied) server cache. stampNextListenHashes hands the stored hashes
+    // to the pending listen directly, keyed by path (see ServerCacheSeed).
+    finish('restored');
+  };
 
-      const descendantStates = syncTreeGetDescendantServerCacheStates(
-        repo.serverSyncTree_,
-        query._path
-      );
-      if (descendantStates.length > 0) {
-        // A graft changes the exact tree the persisted hashes describe. Use a
-        // normal authoritative listen instead of certifying/delta-merging
-        // against stale root hashes.
-        finish('cold');
-        return;
+  const drainBootBuffer = () => {
+    const buffered = repo.bootBuffers_.get(pathString);
+    if (buffered === undefined) {
+      return;
+    }
+    repo.bootBuffers_.delete(pathString);
+    for (const op of buffered) {
+      if (op.kind === 'data') {
+        repoOnDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+      } else {
+        repoOnRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
       }
+    }
+  };
 
-      try {
-        const restored = stampSeedHashes(
-          record.node,
-          record.hash,
-          record.compoundHash
-        );
-        const events = syncTreeApplyServerOverwrite(
-          repo.serverSyncTree_,
-          query._path,
-          restored
-        );
-        eventQueueRaiseEventsForChangedPath(
-          repo.eventQueue_,
-          query._path,
-          events
-        );
-        finish('restored');
-      } catch {
-        persistence.invalidate(query._path);
-        finish('fallback', 'corrupt');
+  void persistence
+    .restoreForListen(pathString, hashes => {
+      stampNextListenHashes(pathString, hashes.hash, hashes.compoundHash);
+      onManifest();
+    })
+    .then(
+      result => {
+        if (!isCurrent() && !sentFromManifest) {
+          return;
+        }
+        const { record, reason } = result;
+        if (record === null) {
+          // The manifest may have already sent the listen (a tree-record
+          // failure after a valid manifest): clear the stamp, drain whatever
+          // the server pushed — it is authoritative — and let the listen
+          // response settle the outcome. Without a sent listen this is the
+          // ordinary cold/fallback path.
+          clearNextListenHashes(pathString);
+          if (sentFromManifest) {
+            drainBootBuffer();
+            return;
+          }
+          const fallback = reason === 'corrupt' || reason === 'timeout';
+          finish(fallback ? 'fallback' : 'cold', reason);
+          return;
+        }
+        if (!sentFromManifest) {
+          // Manifest callback never fired usable (pre-existing server cache,
+          // or a race); apply-then-listen, the pre-manifest-first sequence.
+          if (
+            syncTreeGetCompleteServerCache(
+              repo.serverSyncTree_,
+              query._path
+            ) !== null ||
+            syncTreeGetDescendantServerCacheStates(
+              repo.serverSyncTree_,
+              query._path
+            ).length > 0
+          ) {
+            clearNextListenHashes(pathString);
+            finish('cold');
+            return;
+          }
+        }
+        try {
+          const restored = stampSeedHashes(
+            record.node,
+            record.hash,
+            record.compoundHash
+          );
+          const events = syncTreeApplyServerOverwrite(
+            repo.serverSyncTree_,
+            query._path,
+            restored
+          );
+          eventQueueRaiseEventsForChangedPath(
+            repo.eventQueue_,
+            query._path,
+            events
+          );
+          // The hashes ride the seeded node from here on; the pending stamp
+          // must not outlive the boot window (a re-listen after real server
+          // updates must send the CURRENT tree's hashes, not the stored ones).
+          clearNextListenHashes(pathString);
+          if (sentFromManifest) {
+            drainBootBuffer();
+          } else {
+            finish('restored');
+          }
+        } catch {
+          clearNextListenHashes(pathString);
+          persistence.invalidate(query._path);
+          if (sentFromManifest) {
+            drainBootBuffer();
+          } else {
+            finish('fallback', 'corrupt');
+          }
+        }
+      },
+      () => {
+        clearNextListenHashes(pathString);
+        if (sentFromManifest) {
+          drainBootBuffer();
+        } else {
+          finish('fallback', 'corrupt');
+        }
       }
-    },
-    () => finish('fallback', 'corrupt')
-  );
+    );
 }
 
 /**
@@ -663,12 +819,19 @@ export function repoStopServerListen(
     return;
   }
   const pending = repo.pendingSeedRestores_.get(pathString);
-  if (pending) {
+  if (pending && !repo.bootBuffers_.has(pathString)) {
+    // Still waiting on the manifest: the listen was never sent.
     pending.cancelled = true;
     repo.pendingSeedRestores_.delete(pathString);
   } else {
+    if (pending) {
+      pending.cancelled = true;
+      repo.pendingSeedRestores_.delete(pathString);
+    }
     repo.server_.unlisten(query, tag);
   }
+  repo.bootBuffers_.delete(pathString);
+  clearNextListenHashes(pathString);
   repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
 }
@@ -749,6 +912,16 @@ function repoOnRangeMergeUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
+  {
+    const bufferRoot =
+      tag == null ? repoBootBufferRootFor(repo, pathString) : null;
+    if (bufferRoot !== null) {
+      repo.bootBuffers_
+        .get(bufferRoot)!
+        .push({ kind: 'rm', pathString, ranges, tag });
+      return;
+    }
+  }
   const path = new Path(pathString);
   const merges = ranges.map(
     range =>

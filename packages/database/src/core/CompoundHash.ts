@@ -977,7 +977,7 @@ export function estimateSerializedNodeSize(node: Node): number {
  * Schedules the next slice of a background computation: idle time where the
  * platform offers it, a macrotask otherwise.
  */
-function scheduleSlice(fn: () => void): void {
+export function scheduleSlice(fn: () => void): void {
   if (typeof requestIdleCallback === 'function') {
     requestIdleCallback(() => fn(), { timeout: 200 });
   } else {
