@@ -533,6 +533,21 @@ export function setPersistenceAuthScope(
   db._repoInternal.persistence_?.setAuthScope(scope);
 }
 
+/** Selects an exact default-listen root for persistence. @internal */
+export function setPersistencePath(
+  db: Database,
+  pathString: string,
+  enabled: boolean
+): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistencePath');
+  validateRootPathString('setPersistencePath', 'path', pathString, false);
+  db._repoInternal.persistence_?.setPersistentPath(
+    new Path(pathString).toString(),
+    enabled
+  );
+}
+
 /**
  * Resolves when the default complete listen at `pathString` has received its
  * initial response from the server. With persistence, listeners may fire

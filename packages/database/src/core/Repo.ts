@@ -503,7 +503,11 @@ export function repoStartServerListen(
   };
 
   const persistence = repo.persistence_;
-  if (persistence === null || !isDefaultComplete) {
+  if (
+    persistence === null ||
+    !isDefaultComplete ||
+    !persistence.isPersistentPath(pathString)
+  ) {
     sendListen();
     return;
   }

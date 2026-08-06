@@ -1124,6 +1124,20 @@ describe('PersistenceManager', () => {
   });
 });
 
+describe('explicit persistent roots', () => {
+  it('does not retain listeners the application did not select', () => {
+    const manager = new PersistenceManager(
+      'test-repo',
+      makeFakeIndexedDB().factory
+    );
+    expect(manager.isPersistentPath('/transient')).to.equal(false);
+    manager.setPersistentPath('/kept', true);
+    expect(manager.isPersistentPath('/kept')).to.equal(true);
+    manager.setPersistentPath('/kept', false);
+    expect(manager.isPersistentPath('/kept')).to.equal(false);
+  });
+});
+
 describe('repoStartServerListen / repoStopServerListen', () => {
   /**
    * The minimal Repo surface the two functions touch. `listen` records calls;
@@ -1162,6 +1176,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       }
     } as unknown as Repo;
     const path = new Path('users/alice');
+    manager.setPersistentPath(path.toString(), true);
     const query = {
       _path: path,
       _queryParams: { loadsAllData: () => true }
@@ -1424,6 +1439,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const compoundHash = computeCompoundHash(node.val(true));
     repo.persistence_ = {
       track: () => {},
+      isPersistentPath: () => true,
       restoreForListen: () => recordPromise,
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
@@ -1458,9 +1474,9 @@ describe('repoStartServerListen / repoStopServerListen', () => {
   it('a validation miss attaches exactly one cold listen', async () => {
     const { repo, query, hashFn, onComplete, calls, hashFns } =
       makeListenHarness();
-    const compoundHash = computeCompoundHash({ cached: true });
     repo.persistence_ = {
       track: () => {},
+      isPersistentPath: () => true,
       // Missing/mismatched/malformed chunks, storage failure, or an idle
       // timeout all take the same cold-listen fallback.
       restoreForListen: () => Promise.resolve(null),

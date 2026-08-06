@@ -423,9 +423,9 @@ interface ReadResult {
  */
 export class PersistenceManager {
   private db_: Promise<IDBDatabase | null> | null = null;
-  /**
-   * Roots that flow through persistence (complete default listens).
-   */
+  /** Roots explicitly selected by the application (keepSynced semantics). */
+  private persistentRoots_ = new Map<string, number>();
+  /** Active selected roots currently flowing through persistence. */
   private trackedRoots_ = new Set<string>();
   /**
    * Latest server tree per root. Revisions come from a single manager-wide
@@ -532,6 +532,22 @@ export class PersistenceManager {
     );
     rebound.setAuthScope(scope);
     return rebound;
+  }
+
+  setPersistentPath(pathString: string, enabled: boolean): void {
+    const current = this.persistentRoots_.get(pathString) ?? 0;
+    if (enabled) {
+      this.persistentRoots_.set(pathString, current + 1);
+    } else if (current <= 1) {
+      this.persistentRoots_.delete(pathString);
+      this.untrack(pathString);
+    } else {
+      this.persistentRoots_.set(pathString, current - 1);
+    }
+  }
+
+  isPersistentPath(pathString: string): boolean {
+    return this.persistentRoots_.has(pathString);
   }
 
   /**
@@ -1568,6 +1584,7 @@ export class PersistenceManager {
       }
     }
     this.activeReads_.clear();
+    this.persistentRoots_.clear();
     this.latest_.clear();
     this.lastFlush_.clear();
     void this.db_?.then(db => db?.close());
