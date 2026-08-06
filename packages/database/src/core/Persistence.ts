@@ -687,7 +687,7 @@ export class PersistenceManager {
       // cursor walks the whole store and filters by prefix in JS.
       range =
         typeof IDBKeyRange !== 'undefined'
-          ? IDBKeyRange.bound(prefix, prefix + '\uffff')
+          ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
           : undefined;
     } catch (e) {
       range = undefined;
@@ -1298,7 +1298,7 @@ export class PersistenceManager {
             store.delete(
               IDBKeyRange.bound(
                 key + CHUNK_KEY_INFIX,
-                key + CHUNK_KEY_INFIX + '\uffff'
+                key + CHUNK_KEY_INFIX + String.fromCharCode(0xffff)
               )
             );
           } catch (e) {
