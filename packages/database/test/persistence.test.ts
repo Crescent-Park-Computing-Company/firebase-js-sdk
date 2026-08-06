@@ -449,7 +449,7 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 6,
+      formatVersion: 7,
       authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(json),
@@ -458,7 +458,7 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['ext-1']
     });
-    data.set('test-repo|/aging/root#c000000', {
+    data.set('test-repo|/aging/root#c000000@ext-1', {
       revision: 'ext-1',
       entries: [['', json]]
     });
@@ -467,7 +467,7 @@ describe('PersistenceManager', () => {
     const restored = (await manager.restore(
       new Path('aging/root').toString()
     )) as PersistedRecord;
-    const chunkBefore = data.get('test-repo|/aging/root#c000000');
+    const chunkBefore = data.get('test-repo|/aging/root#c000000@ext-1');
 
     manager.track(new Path('aging/root').toString());
     manager.serverCacheUpdated(new Path('aging/root'), restored.node);
@@ -476,7 +476,9 @@ describe('PersistenceManager', () => {
 
     // Chunk and integrated protocol hashes stay joined while only the
     // manifest timestamp refreshes.
-    expect(data.get('test-repo|/aging/root#c000000')).to.equal(chunkBefore);
+    expect(data.get('test-repo|/aging/root#c000000@ext-1')).to.equal(
+      chunkBefore
+    );
     const manifest = data.get('test-repo|/aging/root') as {
       revision: string;
       updatedAt: number;
@@ -541,7 +543,7 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['old-format']
     });
-    data.set('test-repo|/old-format/root#c000000', {
+    data.set('test-repo|/old-format/root#c000000@old-format', {
       revision: 'old-format',
       entries: [['', { old: true }]]
     });
@@ -661,31 +663,37 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/corrupt/root')).to.deep.equal([]);
   });
 
-  it('an interrupted chunk write restores as a miss, never a stitched tree', async () => {
+  it('an interrupted new generation preserves the previous committed tree', async () => {
     const { factory, data } = makeFakeIndexedDB();
-    // Manifest expects two chunks of revision ext-2, but chunk 1 still
-    // carries an older write's token (interrupted mid-write).
+    const old = { a: 1 };
     data.set('test-repo|/torn/root', {
-      formatVersion: 6,
+      formatVersion: 7,
       authScope: null,
-      revision: 'ext-2',
-      updatedAt: Date.now(),
-      chunkCount: 2,
-      chunkRevisions: ['ext-2', 'ext-2']
-    });
-    data.set('test-repo|/torn/root#c000000', {
-      revision: 'ext-2',
-      entries: [['a', 1]]
-    });
-    data.set('test-repo|/torn/root#c000001', {
       revision: 'ext-1',
-      entries: [['b', 2]]
+      hash: computeCanonicalHash(old),
+      compoundHash: computeCompoundHash(old),
+      updatedAt: Date.now(),
+      estimatedBytes: 10,
+      chunkCount: 1,
+      chunkRevisions: ['ext-1']
     });
+    data.set('test-repo|/torn/root#c000000@ext-1', {
+      revision: 'ext-1',
+      entries: [['', old]]
+    });
+    // A crash after writing a new chunk but before the manifest pointer swap.
+    data.set('test-repo|/torn/root#c000000@ext-2', {
+      revision: 'ext-2',
+      entries: [['', { a: 2 }]]
+    });
+
     const manager = new PersistenceManager('test-repo', factory);
-    expect(await manager.restore('/torn/root')).to.equal(null);
+    const restored = await manager.restore('/torn/root');
+    expect(restored?.node.val()).to.deep.equal(old);
+    await manager.sweepNow();
     await flushAsync();
-    // The torn leftovers were evicted.
-    expect(keysFor(data, 'test-repo|/torn/root').length).to.equal(0);
+    expect(data.has('test-repo|/torn/root#c000000@ext-1')).to.equal(true);
+    expect(data.has('test-repo|/torn/root#c000000@ext-2')).to.equal(false);
   });
 
   it('a superseding update never leaves the stored pair uncoupled', async () => {
@@ -957,7 +965,7 @@ describe('PersistenceManager', () => {
     const mb = PERSISTENCE_CHUNK_TARGET_BYTES;
     const add = (name: string, updatedAt: number) => {
       data.set(`test-repo|/${name}`, {
-        formatVersion: 6,
+        formatVersion: 7,
         authScope: null,
         revision: name,
         hash: computeCanonicalHash({ name }),
@@ -967,7 +975,7 @@ describe('PersistenceManager', () => {
         chunkCount: 1,
         chunkRevisions: [name]
       });
-      data.set(`test-repo|/${name}#c000000`, {
+      data.set(`test-repo|/${name}#c000000@${name}`, {
         revision: name,
         entries: [['', { name }]]
       });
@@ -997,14 +1005,14 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 6,
+      formatVersion: 7,
       authScope: null,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
       chunkRevisions: ['ext-1']
     });
-    data.set('test-repo|/old/root#c000000', {
+    data.set('test-repo|/old/root#c000000@ext-1', {
       revision: 'ext-1',
       entries: [['', { stale: true }]]
     });
@@ -1017,7 +1025,7 @@ describe('PersistenceManager', () => {
     // A fresh chunked root stays, with protocol hashes integrated into its
     // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 6,
+      formatVersion: 7,
       authScope: null,
       revision: 'ext-2',
       hash: 'h',
@@ -1026,7 +1034,7 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['ext-2']
     });
-    data.set('test-repo|/fresh/root#c000000', {
+    data.set('test-repo|/fresh/root#c000000@ext-2', {
       revision: 'ext-2',
       entries: [['', { fresh: true }]]
     });
@@ -1040,11 +1048,11 @@ describe('PersistenceManager', () => {
     });
     // Orphans under the fresh root: a chunk beyond the manifest's count and
     // a chunk with no manifest at all.
-    data.set('test-repo|/fresh/root#c000007', {
+    data.set('test-repo|/fresh/root#c000007@ext-0', {
       revision: 'ext-0',
       entries: [['', { orphan: true }]]
     });
-    data.set('test-repo|/vanished/root#c000000', {
+    data.set('test-repo|/vanished/root#c000000@ext-0', {
       revision: 'ext-0',
       entries: [['', { orphan: true }]]
     });
@@ -1068,9 +1076,9 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/old/root').length).to.equal(0);
     expect(keysFor(data, 'test-repo|/fresh/root')).to.deep.equal([
       'test-repo|/fresh/root',
-      'test-repo|/fresh/root#c000000'
+      'test-repo|/fresh/root#c000000@ext-2'
     ]);
-    expect(data.has('test-repo|/vanished/root#c000000')).to.equal(false);
+    expect(data.has('test-repo|/vanished/root#c000000@ext-0')).to.equal(false);
     expect(data.has('test-repo|/legacy/root')).to.equal(true);
     expect(data.has('other-repo|/old/root')).to.equal(true);
   });
