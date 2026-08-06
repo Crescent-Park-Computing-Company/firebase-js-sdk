@@ -84,8 +84,10 @@ export declare class CompoundHashAccumulator {
     private openPath_;
     constructor(root: Node);
     serializeEntry(path: string[], node: Node, includedInHash?: boolean): unknown;
+    hashEntry(path: string[], node: Node, includedInHash?: boolean): void;
     finish(): CompoundHash;
     private moveToPath_;
+    private hashNode_;
     private serializeNode_;
 }
 /**

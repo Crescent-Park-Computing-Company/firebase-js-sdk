@@ -1742,63 +1742,6 @@ function forEachChildWithPriority(node, action, includeTrailingPriority = false)
         action('.priority', node.getPriority(), false);
     }
 }
-/**
- * The one definition of the compound-hash traversal, driven as an explicit
- * frame stack — a `child` frame runs builder.startChild, pushes its subtree,
- * and a matching `end` frame runs builder.endChild — so the builder sees the
- * exact call sequence a recursive walk would produce. The synchronous
- * computation drains it in one go; the async one drains it in bounded
- * slices. Either way the resulting hash is identical by construction.
- */
-class CompoundHashWalker {
-    constructor(node, builder_) {
-        this.builder_ = builder_;
-        this.stack_ = [{ kind: 'node', node }];
-    }
-    /**
-     * Processes frames until the walk completes or `deadline` (an epoch-ms
-     * timestamp) passes — always at least one frame, so every slice makes
-     * progress no matter how small its budget. Returns true when the walk is
-     * complete.
-     */
-    drainUntil(deadline) {
-        while (this.stack_.length > 0) {
-            this.processFrame_(this.stack_.pop());
-            if (Date.now() >= deadline) {
-                break;
-            }
-        }
-        return this.stack_.length === 0;
-    }
-    processFrame_(frame) {
-        if (frame.kind === 'end') {
-            this.builder_.endChild();
-            return;
-        }
-        const current = frame.kind === 'node' ? frame.node : frame.child;
-        if (frame.kind === 'child') {
-            this.builder_.startChild(frame.key);
-            this.stack_.push({ kind: 'end' });
-        }
-        if (current.isLeafNode()) {
-            this.builder_.processLeaf(current);
-            // A leaf pushed no 'end' of its own; the pending 'end' (if this was a
-            // child frame) already sits on the stack.
-            return;
-        }
-        const children = [];
-        forEachChildWithPriority(current, (key, child) => {
-            children.push([key, child]);
-        });
-        for (let i = children.length - 1; i >= 0; i--) {
-            this.stack_.push({
-                kind: 'child',
-                key: children[i][0],
-                child: children[i][1]
-            });
-        }
-    }
-}
 class CompoundHashBuilder {
     constructor(splitStrategy_) {
         this.splitStrategy_ = splitStrategy_;
@@ -1900,6 +1843,13 @@ class CompoundHashAccumulator {
         this.moveToPath_(path);
         return this.serializeNode_(node);
     }
+    hashEntry(path, node, includedInHash = true) {
+        if (!includedInHash) {
+            return;
+        }
+        this.moveToPath_(path);
+        this.hashNode_(node);
+    }
     finish() {
         this.moveToPath_([]);
         this.builder_.finishHashing();
@@ -1919,6 +1869,23 @@ class CompoundHashAccumulator {
             this.builder_.startChild(next[i]);
         }
         this.openPath_ = next.slice();
+    }
+    hashNode_(node) {
+        if (node.isEmpty()) {
+            return;
+        }
+        if (node.isLeafNode()) {
+            this.builder_.processLeaf(node);
+            return;
+        }
+        forEachChildWithPriority(node, (key, child, included) => {
+            if (!included) {
+                return;
+            }
+            this.builder_.startChild(key);
+            this.hashNode_(child);
+            this.builder_.endChild();
+        });
     }
     serializeNode_(node) {
         if (node.isEmpty()) {
@@ -2018,49 +1985,6 @@ function estimateSerializedNodeSize(node) {
         serializedSizeCache.set(node, sum);
         return sum;
     }
-}
-/**
- * Schedules the next slice of a background computation: idle time where the
- * platform offers it, a macrotask otherwise.
- */
-function scheduleSlice(fn) {
-    if (typeof requestIdleCallback === 'function') {
-        requestIdleCallback(() => fn(), { timeout: 200 });
-    }
-    else {
-        setTimeout(fn, 0);
-    }
-}
-/**
- * Computes a compound hash in bounded slices of main-thread time, yielding
- * to the event loop between slices, so hashing a large tree for persistence
- * never blocks the UI the way a monolithic walk would. Same traversal as
- * compoundHashFromNode (see CompoundHashWalker), so the result is identical.
- */
-function compoundHashFromNodeAsync(node, splitStrategy, sliceMs = 12, onProgress = () => { }) {
-    if (node.isEmpty()) {
-        return Promise.resolve(new CompoundHash([], ['']));
-    }
-    const strategy = splitStrategy || simpleSizeSplitStrategy(node);
-    const builder = new CompoundHashBuilder(strategy);
-    const walker = new CompoundHashWalker(node, builder);
-    return new Promise((resolve, reject) => {
-        const step = () => {
-            try {
-                if (!walker.drainUntil(Date.now() + sliceMs)) {
-                    onProgress();
-                    scheduleSlice(step);
-                    return;
-                }
-                builder.finishHashing();
-                resolve(new CompoundHash(builder.posts, builder.hashes));
-            }
-            catch (e) {
-                reject(e);
-            }
-        };
-        step();
-    });
 }
 
 /**
@@ -4860,9 +4784,6 @@ class PersistenceManager {
                 dirtyIndexes.push(i);
             }
         }
-        const initialCompoundAccumulator = dirtyIndexes.length === plans.length
-            ? new CompoundHashAccumulator(node)
-            : null;
         persistenceStats.chunksWritten += dirtyIndexes.length;
         persistenceStats.chunksSkipped += plans.length - dirtyIndexes.length;
         if (dirtyIndexes.length === 0 &&
@@ -4892,6 +4813,8 @@ class PersistenceManager {
                 }
             });
         }
+        const compoundAccumulator = new CompoundHashAccumulator(node);
+        const dirtyIndexSet = new Set(dirtyIndexes);
         persistenceStats.writeThroughs++;
         // Dirty chunks land in separate short transactions; the manifest commits
         // last as the authoritative join. A crash mid-sequence leaves the old
@@ -4914,16 +4837,20 @@ class PersistenceManager {
         // defeated chunking. The manifest is committed last in a tiny transaction
         // and is the authoritative join, so a crash between chunks is a safe miss.
         let put = Promise.resolve(true);
-        for (const i of dirtyIndexes) {
+        for (let i = 0; i < plans.length; i++) {
             put = put.then(ok => {
                 if (!ok) {
                     return false;
                 }
-                const entries = plans[i].map(e => [
-                    e.relPath,
-                    initialCompoundAccumulator
-                        ? initialCompoundAccumulator.serializeEntry(e.relPath === '' ? [] : e.relPath.split('/'), e.node, e.includedInCompoundHash)
-                        : e.node.val(true)
+                if (!dirtyIndexSet.has(i)) {
+                    for (const entry of plans[i]) {
+                        compoundAccumulator.hashEntry(entry.relPath === '' ? [] : entry.relPath.split('/'), entry.node, entry.includedInCompoundHash);
+                    }
+                    return true;
+                }
+                const entries = plans[i].map(entry => [
+                    entry.relPath,
+                    compoundAccumulator.serializeEntry(entry.relPath === '' ? [] : entry.relPath.split('/'), entry.node, entry.includedInCompoundHash)
                 ]);
                 const payload = stringify(entries);
                 const chunk = {
@@ -4941,14 +4868,12 @@ class PersistenceManager {
             if (!ok) {
                 return false;
             }
-            if (initialCompoundAccumulator) {
-                const compound = initialCompoundAccumulator.finish();
-                manifest.hash = '';
-                manifest.compoundHash = {
-                    hashes: compound.hashes,
-                    posts: compound.posts
-                };
-            }
+            const compound = compoundAccumulator.finish();
+            manifest.hash = '';
+            manifest.compoundHash = {
+                hashes: compound.hashes,
+                posts: compound.posts
+            };
             return this.withStore_('readwrite', false, (store, done) => {
                 store.put(manifest, key);
                 if (prev?.chunkRevisions) {
@@ -4976,41 +4901,9 @@ class PersistenceManager {
                 storedUpdatedAt: now
             });
             recordPersistenceEvent(pathString, 'stored', `${plans.length} chunks`);
-            if (initialCompoundAccumulator) {
-                // The first generation already produced storage bytes + compound hash
-                // in one traversal; it is durable as soon as the manifest commits.
-                return;
-            }
-            // Incremental later writes may reuse clean chunks. Their protocol hash
-            // still runs in the background because a cached compound hash cannot be
-            // patched independently without re-walking the changed tree.
-            return compoundHashFromNodeAsync(node)
-                .then(compoundHash => ({ hash: '', compoundHash }))
-                .then(({ hash, compoundHash }) => {
-                node.stampLazyHash(hash);
-                if (this.disposed_) {
-                    return;
-                }
-                persistenceStats.hashRecomputes++;
-                return this.withStore_('readwrite', undefined, store => {
-                    // Another tab may have replaced the manifest while we hashed;
-                    // attach protocol hashes only to the exact cached root revision.
-                    const dataReq = store.get(key);
-                    dataReq.onsuccess = () => {
-                        const current = dataReq.result;
-                        if (current && current.revision === revision) {
-                            store.put({
-                                ...current,
-                                hash,
-                                compoundHash: {
-                                    hashes: compoundHash.hashes,
-                                    posts: compoundHash.posts
-                                }
-                            }, key);
-                        }
-                    };
-                });
-            });
+            // Every generation commits its compound hash with the manifest. There is
+            // no hashless window and no second traversal after storage completes.
+            return;
         });
     }
 }
