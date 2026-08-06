@@ -466,6 +466,7 @@ export class PersistenceManager {
   private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
   private activeRestoreCount_ = 0;
   private restoreQueue_: Array<() => void> = [];
+  private writesDeferredUntilRestores_ = new Set<string>();
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
   private disposed_ = false;
   private authScope_: string | null = null;
@@ -479,6 +480,7 @@ export class PersistenceManager {
     }
     this.writeTimers_.clear();
     this.flushPending_.clear();
+    this.writesDeferredUntilRestores_.clear();
     this.latest_.clear();
     this.lastFlush_.clear();
     this.activeReads_.clear();
@@ -1331,7 +1333,12 @@ export class PersistenceManager {
       this.activeRestoreCount_++;
       return work().finally(() => {
         this.activeRestoreCount_--;
-        this.restoreQueue_.shift()?.();
+        const next = this.restoreQueue_.shift();
+        if (next) {
+          next();
+        } else if (this.activeRestoreCount_ === 0) {
+          this.flushWritesDeferredUntilRestores_();
+        }
       });
     };
     if (this.activeRestoreCount_ < PERSISTENCE_MAX_CONCURRENT_RESTORES) {
@@ -1491,6 +1498,14 @@ export class PersistenceManager {
    * unchanged — is skipped outright unless its stored timestamp needs a
    * refresh (see PERSISTENCE_REFRESH_AGE_MS).
    */
+  private flushWritesDeferredUntilRestores_(): void {
+    const paths = [...this.writesDeferredUntilRestores_];
+    this.writesDeferredUntilRestores_.clear();
+    for (const pathString of paths) {
+      this.scheduleFlush_(pathString);
+    }
+  }
+
   serverCacheUpdated(path: Path, node: Node): void {
     if (this.disposed_) {
       return;
@@ -1512,6 +1527,15 @@ export class PersistenceManager {
       revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
       authScope: this.authScope_
     });
+    // IndexedDB serializes readwrite transactions for this object store. A
+    // cold root must not begin a large write while another selected root is
+    // still restoring, or the restore can hit its idle timeout behind its own
+    // write-through. Android gets this ordering from one persistence runloop;
+    // the web manager reproduces it explicitly.
+    if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
+      this.writesDeferredUntilRestores_.add(pathString);
+      return;
+    }
     // Android persists each authoritative server update transactionally. On
     // web, guarantee the first complete tree immediately, then throttle later
     // churn so a quick reload never races an arbitrary 10-second empty window.

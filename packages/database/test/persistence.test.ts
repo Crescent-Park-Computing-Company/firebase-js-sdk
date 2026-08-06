@@ -1843,6 +1843,35 @@ describe('persistence auth scope', () => {
 });
 
 describe('persistence restore scheduling', () => {
+  it('defers cold writes until the restore wave drains', async () => {
+    const shared = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', shared.factory);
+    const path = new Path('cold/write');
+    manager.track(path.toString());
+    const internals = manager as unknown as {
+      activeRestoreCount_: number;
+      writesDeferredUntilRestores_: Set<string>;
+      flushWritesDeferredUntilRestores_: () => void;
+      queues_: Map<string, Promise<void>>;
+    };
+    internals.activeRestoreCount_ = 1;
+    manager.serverCacheUpdated(path, nodeFromJSON({ fresh: true }));
+    expect(
+      internals.writesDeferredUntilRestores_.has(path.toString())
+    ).to.equal(true);
+    expect(internals.queues_.size).to.equal(0);
+
+    internals.activeRestoreCount_ = 0;
+    internals.flushWritesDeferredUntilRestores_();
+    await internals.queues_.get(path.toString());
+    await flushAsync();
+    const restored = await restoreForTest(
+      new PersistenceManager('test-repo', shared.factory),
+      path.toString()
+    );
+    expect(restored?.node.val()).to.deep.equal({ fresh: true });
+  });
+
   it('bounds concurrent IndexedDB restores like Androids serialized runloop', async () => {
     const { factory } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory, true, 100);
