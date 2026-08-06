@@ -5508,11 +5508,12 @@ class PersistenceManager {
             // canonical traversal is non-retaining (it does not fill every child's
             // lazyHash_); only this listened root is stamped and stored natively in
             // its manifest for future tab loads.
-            return canonicalHashFromNodeAsync(node)
-                .then(hash => compoundHashFromNodeAsync(node).then(compoundHash => ({
-                hash,
-                compoundHash
-            })))
+            // The compound hash alone is enough for the RTDB range protocol: an
+            // unchanged tree yields no ranges, while a changed tree yields only its
+            // differing ranges. Persist an empty simple hash and avoid a second
+            // full-tree canonical walk on the cold-write path.
+            return compoundHashFromNodeAsync(node)
+                .then(compoundHash => ({ hash: '', compoundHash }))
                 .then(({ hash, compoundHash }) => {
                 node.stampLazyHash(hash);
                 if (this.disposed_) {
