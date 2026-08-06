@@ -4130,7 +4130,7 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 7;
+const PERSISTENCE_FORMAT_VERSION = 8;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 function readSchemaMarker() {
     if (typeof localStorage === 'undefined') {
@@ -4237,6 +4237,9 @@ const CHUNK_KEY_INFIX = '#c';
  */
 function chunkKeySuffix(index, revision) {
     return `${CHUNK_KEY_INFIX}${String(index).padStart(6, '0')}@${revision}`;
+}
+function persistedChunkHash(entries) {
+    return sha1(stringify(entries));
 }
 function isLegacyRecord(record) {
     return record.json !== undefined;
@@ -4970,7 +4973,9 @@ class PersistenceManager {
                     }).then(chunk => {
                         if (!chunk ||
                             chunk.revision !== manifest.chunkRevisions[index] ||
-                            !Array.isArray(chunk.entries)) {
+                            !Array.isArray(chunk.entries) ||
+                            typeof chunk.contentHash !== 'string' ||
+                            persistedChunkHash(chunk.entries) !== chunk.contentHash) {
                             return 'mismatch';
                         }
                         onProgress();
@@ -5003,19 +5008,21 @@ class PersistenceManager {
                 if (result === 'mismatch') {
                     return result;
                 }
-                const actualHash = await canonicalHashFromNodeAsync(result.record.node, 12, onProgress);
+                // Current chunks have already been verified independently. Trust
+                // the root protocol hashes committed by the same atomic manifest;
+                // only the rare crash window before those hashes landed needs a
+                // one-time full recomputation.
                 if (typeof result.record.hash === 'string' &&
-                    actualHash !== result.record.hash) {
-                    return 'mismatch';
+                    result.record.compoundHash) {
+                    return result;
                 }
+                const actualHash = await canonicalHashFromNodeAsync(result.record.node, 12, onProgress);
                 result.record.hash = actualHash;
-                if (!result.record.compoundHash) {
-                    const compound = await compoundHashFromNodeAsync(result.record.node, undefined, 12, onProgress);
-                    result.record.compoundHash = {
-                        hashes: compound.hashes,
-                        posts: compound.posts
-                    };
-                }
+                const compound = await compoundHashFromNodeAsync(result.record.node, undefined, 12, onProgress);
+                result.record.compoundHash = {
+                    hashes: compound.hashes,
+                    posts: compound.posts
+                };
                 return result;
             });
         })
@@ -5451,9 +5458,14 @@ class PersistenceManager {
                 if (!ok) {
                     return false;
                 }
+                const entries = plans[i].map(e => [
+                    e.relPath,
+                    e.node.val(true)
+                ]);
                 const chunk = {
                     revision,
-                    entries: plans[i].map(e => [e.relPath, e.node.val(true)])
+                    contentHash: persistedChunkHash(entries),
+                    entries
                 };
                 return this.withStore_('readwrite', false, (store, done) => {
                     store.put(chunk, key + chunkKeySuffix(i, revision));
