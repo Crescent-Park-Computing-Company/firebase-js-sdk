@@ -4283,7 +4283,7 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 6;
+const PERSISTENCE_FORMAT_VERSION = 7;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 function readSchemaMarker() {
     if (typeof localStorage === 'undefined') {
@@ -4397,8 +4397,8 @@ const CHUNK_KEY_INFIX = '#c';
  * and below '#hash' ('c' < 'h') — one key range spans exactly a root's
  * chunk records.
  */
-function chunkKeySuffix(index) {
-    return CHUNK_KEY_INFIX + String(index).padStart(6, '0');
+function chunkKeySuffix(index, revision) {
+    return `${CHUNK_KEY_INFIX}${String(index).padStart(6, '0')}@${revision}`;
 }
 function isLegacyRecord(record) {
     return record.json !== undefined;
@@ -4772,8 +4772,11 @@ class PersistenceManager {
                         }
                         if (!drop && key.startsWith(base + CHUNK_KEY_INFIX)) {
                             const chunkIndex = parseInt(key.slice(base.length + CHUNK_KEY_INFIX.length), 10);
+                            const expectedRevision = decision?.chunkRevisions[chunkIndex];
                             if (!Number.isFinite(chunkIndex) ||
-                                chunkIndex >= decisions.get(base).chunkCount) {
+                                chunkIndex >= decisions.get(base).chunkCount ||
+                                typeof expectedRevision !== 'string' ||
+                                key !== base + chunkKeySuffix(chunkIndex, expectedRevision)) {
                                 drop = true;
                             }
                         }
@@ -4819,7 +4822,10 @@ class PersistenceManager {
                                 ? record.estimatedBytes
                                 : typeof record?.chunkCount === 'number'
                                     ? record.chunkCount * PERSISTENCE_CHUNK_TARGET_BYTES
-                                    : 0
+                                    : 0,
+                            chunkRevisions: record && Array.isArray(record.chunkRevisions)
+                                ? record.chunkRevisions.filter((value) => typeof value === 'string')
+                                : []
                         });
                         step();
                     };
@@ -5085,7 +5091,7 @@ class PersistenceManager {
                         return status;
                     }
                     return this.withStore_('readonly', null, (store, done) => {
-                        const req = store.get(key + chunkKeySuffix(index));
+                        const req = store.get(key + chunkKeySuffix(index, manifest.chunkRevisions[index]));
                         req.onsuccess = () => done(req.result ?? null);
                     }).then(chunk => {
                         if (!chunk ||
@@ -5170,10 +5176,15 @@ class PersistenceManager {
                 const chunkCount = record && typeof record.chunkCount === 'number'
                     ? record.chunkCount
                     : 0;
+                const chunkRevisions = record && Array.isArray(record.chunkRevisions)
+                    ? record.chunkRevisions
+                    : [];
                 store.delete(key);
                 store.delete(key + HASH_KEY_SUFFIX);
                 for (let i = 0; i < chunkCount; i++) {
-                    store.delete(key + chunkKeySuffix(i));
+                    if (typeof chunkRevisions[i] === 'string') {
+                        store.delete(key + chunkKeySuffix(i, chunkRevisions[i]));
+                    }
                 }
                 if (typeof IDBKeyRange !== 'undefined') {
                     try {
@@ -5524,7 +5535,6 @@ class PersistenceManager {
             chunkCount: plans.length,
             chunkRevisions
         };
-        const prevChunkCount = prev !== undefined ? prev.chunkCount : null;
         // One transaction PER dirty chunk. WebKit may retain every put's
         // structured-clone input until its transaction closes; one transaction
         // for all chunks therefore retained a root-sized exported JSON graph and
@@ -5541,7 +5551,7 @@ class PersistenceManager {
                     entries: plans[i].map(e => [e.relPath, e.node.val(true)])
                 };
                 return this.withStore_('readwrite', false, (store, done) => {
-                    store.put(chunk, key + chunkKeySuffix(i));
+                    store.put(chunk, key + chunkKeySuffix(i, revision));
                     done(true);
                 });
             });
@@ -5552,17 +5562,12 @@ class PersistenceManager {
             }
             return this.withStore_('readwrite', false, (store, done) => {
                 store.put(manifest, key);
-                if (prevChunkCount !== null) {
-                    for (let i = plans.length; i < prevChunkCount; i++) {
-                        store.delete(key + chunkKeySuffix(i));
-                    }
-                }
-                else if (typeof IDBKeyRange !== 'undefined') {
-                    try {
-                        store.delete(IDBKeyRange.bound(key + chunkKeySuffix(plans.length), key + CHUNK_KEY_INFIX + '\uffff'));
-                    }
-                    catch (e) {
-                        // Key-range deletes are an optimization, never a requirement.
+                if (prev?.chunkRevisions) {
+                    for (let i = 0; i < prev.chunkRevisions.length; i++) {
+                        if (i >= chunkRevisions.length ||
+                            prev.chunkRevisions[i] !== chunkRevisions[i]) {
+                            store.delete(key + chunkKeySuffix(i, prev.chunkRevisions[i]));
+                        }
                     }
                 }
                 store.delete(key + HASH_KEY_SUFFIX);
