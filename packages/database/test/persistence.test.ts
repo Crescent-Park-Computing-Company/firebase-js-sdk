@@ -1050,6 +1050,26 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/inactive-new')).to.deep.equal([]);
   });
 
+  it('defers cleanup while a warm restore is active', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = new PersistenceManager('test-repo', factory);
+    data.set('test-repo|/expired', {
+      json: { stale: true },
+      updatedAt: Date.now() - 15 * 24 * 60 * 60 * 1000,
+      revision: 'old'
+    });
+    const internals = manager as unknown as { activeRestoreCount_: number };
+    internals.activeRestoreCount_ = 1;
+    await manager.sweepNow();
+    expect(data.has('test-repo|/expired')).to.equal(true);
+
+    internals.activeRestoreCount_ = 0;
+    await manager.sweepNow();
+    await flushAsync();
+    expect(data.has('test-repo|/expired')).to.equal(false);
+    manager.dispose();
+  });
+
   it('sweeps expired and orphaned records for its own prefix', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;

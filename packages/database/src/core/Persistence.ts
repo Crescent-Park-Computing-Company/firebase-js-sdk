@@ -679,6 +679,16 @@ export class PersistenceManager {
    * failure leaves the records for the next session's sweep.
    */
   private sweepExpired_(): Promise<void> {
+    if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
+      if (!this.disposed_) {
+        this.sweepTimer_ = setTimeout(() => {
+          void this.sweepExpired_();
+        }, 5000);
+        (this.sweepTimer_ as { unref?: () => void }).unref?.();
+      }
+      return Promise.resolve();
+    }
+    this.sweepTimer_ = null;
     const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
     const prefix = this.key_('');
     let range: IDBKeyRange | undefined;
