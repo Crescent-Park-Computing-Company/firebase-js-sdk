@@ -65,6 +65,30 @@ export declare function simpleSizeSplitStrategy(node: Node): CompoundHashSplitSt
  */
 export declare function compoundHashFromNode(node: Node, splitStrategy?: CompoundHashSplitStrategy): CompoundHash;
 /**
+ * Iterates children in key order with the node's priority interleaved as a
+ * `.priority` pseudo-child, matching the serialization the server hashes
+ * (Android ChildrenNode.forEachChild(visitor, includePriority = true)): the
+ * priority is emitted immediately before the first child key that sorts
+ * after '.priority'. A priority that sorts after every child is dropped, as
+ * it is on Android and iOS — both ends of the protocol must agree.
+ */
+export declare function forEachChildWithPriority(node: Node, action: (key: string, child: Node, includedInHash: boolean) => void, includeTrailingPriority?: boolean): void;
+/**
+ * Builds the protocol compound hash while serializing disjoint persistence
+ * entries in traversal order. The first full cache write therefore walks each
+ * Node once: the returned JSON is stored in the chunk and the same visit feeds
+ * the wire hash builder.
+ */
+export declare class CompoundHashAccumulator {
+    private readonly builder_;
+    private openPath_;
+    constructor(root: Node);
+    serializeEntry(path: string[], node: Node, includedInHash?: boolean): unknown;
+    finish(): CompoundHash;
+    private moveToPath_;
+    private serializeNode_;
+}
+/**
  * Estimates the serialized size of a node in bytes — a cheap approximation
  * that only drives the default split threshold and the persistence chunk
  * planner, never a wire value (port of Android NodeSizeEstimator).

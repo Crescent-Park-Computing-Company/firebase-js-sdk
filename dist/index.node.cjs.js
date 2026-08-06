@@ -2300,19 +2300,24 @@ function simpleSizeSplitStrategy(node) {
  * after '.priority'. A priority that sorts after every child is dropped, as
  * it is on Android and iOS — both ends of the protocol must agree.
  */
-function forEachChildWithPriority(node, action) {
+function forEachChildWithPriority(node, action, includeTrailingPriority = false) {
     if (node.getPriority().isEmpty()) {
-        node.forEachChild(KEY_INDEX, action);
+        node.forEachChild(KEY_INDEX, (key, child) => action(key, child, true));
         return;
     }
     let passedPriority = false;
     node.forEachChild(KEY_INDEX, (key, child) => {
         if (!passedPriority && nameCompare(key, '.priority') > 0) {
             passedPriority = true;
-            action('.priority', node.getPriority());
+            action('.priority', node.getPriority(), true);
         }
-        action(key, child);
+        action(key, child, true);
     });
+    if (!passedPriority && includeTrailingPriority) {
+        // Android's compound grammar omits a priority that sorts after every
+        // child, but export-format persistence must still serialize it.
+        action('.priority', node.getPriority(), false);
+    }
 }
 /**
  * The one definition of the compound-hash traversal, driven as an explicit
@@ -2452,6 +2457,72 @@ class CompoundHashBuilder {
         this.posts.push(post === '' ? '/' : post);
         this.currentHash_ = null;
         this.needsComma_ = true;
+    }
+}
+/**
+ * Builds the protocol compound hash while serializing disjoint persistence
+ * entries in traversal order. The first full cache write therefore walks each
+ * Node once: the returned JSON is stored in the chunk and the same visit feeds
+ * the wire hash builder.
+ */
+class CompoundHashAccumulator {
+    constructor(root) {
+        this.openPath_ = [];
+        this.builder_ = new CompoundHashBuilder(simpleSizeSplitStrategy(root));
+    }
+    serializeEntry(path, node, includedInHash = true) {
+        if (!includedInHash) {
+            return node.val(true);
+        }
+        this.moveToPath_(path);
+        return this.serializeNode_(node);
+    }
+    finish() {
+        this.moveToPath_([]);
+        this.builder_.finishHashing();
+        return new CompoundHash(this.builder_.posts, this.builder_.hashes);
+    }
+    moveToPath_(next) {
+        let common = 0;
+        while (common < this.openPath_.length &&
+            common < next.length &&
+            this.openPath_[common] === next[common]) {
+            common++;
+        }
+        for (let i = this.openPath_.length; i > common; i--) {
+            this.builder_.endChild();
+        }
+        for (let i = common; i < next.length; i++) {
+            this.builder_.startChild(next[i]);
+        }
+        this.openPath_ = next.slice();
+    }
+    serializeNode_(node) {
+        if (node.isEmpty()) {
+            return null;
+        }
+        if (node.isLeafNode()) {
+            this.builder_.processLeaf(node);
+            if (!node.getPriority().isEmpty()) {
+                return {
+                    '.value': node.val(),
+                    '.priority': node.getPriority().val()
+                };
+            }
+            return node.val();
+        }
+        const out = {};
+        forEachChildWithPriority(node, (key, child, included) => {
+            if (included) {
+                this.builder_.startChild(key);
+                out[key] = this.serializeNode_(child);
+                this.builder_.endChild();
+            }
+            else {
+                out[key] = child.val(true);
+            }
+        }, true);
+        return out;
     }
 }
 /**
@@ -4183,12 +4254,12 @@ function planChunks(root) {
             currentSize = 0;
         }
     };
-    const emit = (relPath, node, size) => {
+    const emit = (relPath, node, size, includedInCompoundHash = true) => {
         if (currentSize > 0 &&
             currentSize + size > PERSISTENCE_CHUNK_TARGET_BYTES) {
             flushBin();
         }
-        current.push({ relPath, node });
+        current.push({ relPath, node, includedInCompoundHash });
         currentSize += size;
         if (currentSize >= PERSISTENCE_CHUNK_TARGET_BYTES) {
             flushBin();
@@ -4200,13 +4271,16 @@ function planChunks(root) {
             emit(relPath, node, size);
             return;
         }
-        node.forEachChild(KEY_INDEX, (key, child) => {
-            walk(relPath === '' ? key : relPath + '/' + key, child);
-        });
-        const priority = node.getPriority();
-        if (!priority.isEmpty()) {
-            emit(relPath === '' ? '.priority' : relPath + '/.priority', priority, estimateSerializedNodeSize(priority));
-        }
+        forEachChildWithPriority(node, (key, child, includedInHash) => {
+            const childPath = relPath === '' ? key : relPath + '/' + key;
+            if (child.isLeafNode() ||
+                estimateSerializedNodeSize(child) <= PERSISTENCE_CHUNK_TARGET_BYTES) {
+                emit(childPath, child, estimateSerializedNodeSize(child), includedInHash);
+            }
+            else {
+                walk(childPath, child);
+            }
+        }, true);
     };
     walk('', root);
     flushBin();
@@ -4217,7 +4291,9 @@ function samePlan(a, b) {
         return false;
     }
     for (let i = 0; i < a.length; i++) {
-        if (a[i].relPath !== b[i].relPath || a[i].node !== b[i].node) {
+        if (a[i].relPath !== b[i].relPath ||
+            a[i].node !== b[i].node ||
+            a[i].includedInCompoundHash !== b[i].includedInCompoundHash) {
             return false;
         }
     }
@@ -4885,6 +4961,7 @@ class PersistenceManager {
                 return null;
             }
             let assembled = ChildrenNode.EMPTY_NODE;
+            const priorities = [];
             const plans = [];
             let chain = Promise.resolve(true);
             for (let index = 0; index < manifest.chunkCount; index++) {
@@ -4917,8 +4994,20 @@ class PersistenceManager {
                         const plan = [];
                         for (const [relPath, json] of entries) {
                             const node = nodeFromJSON(json);
-                            assembled = assembled.updateChild(new Path(relPath), node);
-                            plan.push({ relPath, node });
+                            if (relPath === '.priority' || relPath.endsWith('/.priority')) {
+                                priorities.push([relPath, node]);
+                            }
+                            else {
+                                assembled = assembled.updateChild(new Path(relPath), node);
+                            }
+                            plan.push({
+                                relPath,
+                                node,
+                                // The stored payload does not need this bit for restore.
+                                // Mark true; a rare trailing-priority entry will simply be
+                                // treated as dirty on the next incremental flush.
+                                includedInCompoundHash: true
+                            });
                         }
                         plans.push(plan);
                         return true;
@@ -4926,9 +5015,14 @@ class PersistenceManager {
                 });
             }
             return chain
-                .then(status => status === 'mismatch'
-                ? status
-                : {
+                .then(status => {
+                if (status === 'mismatch') {
+                    return status;
+                }
+                for (const [relPath, priority] of priorities) {
+                    assembled = assembled.updateChild(new Path(relPath), priority);
+                }
+                return {
                     record: {
                         node: assembled,
                         ...joined,
@@ -4938,7 +5032,8 @@ class PersistenceManager {
                     plans,
                     chunkRevisions: manifest.chunkRevisions,
                     chunkCount: manifest.chunkCount
-                })
+                };
+            })
                 .then(async (result) => {
                 if (result === 'mismatch') {
                     return result;
@@ -5342,6 +5437,9 @@ class PersistenceManager {
                 dirtyIndexes.push(i);
             }
         }
+        const initialCompoundAccumulator = dirtyIndexes.length === plans.length
+            ? new CompoundHashAccumulator(node)
+            : null;
         persistenceStats.chunksWritten += dirtyIndexes.length;
         persistenceStats.chunksSkipped += plans.length - dirtyIndexes.length;
         if (dirtyIndexes.length === 0 &&
@@ -5400,7 +5498,9 @@ class PersistenceManager {
                 }
                 const entries = plans[i].map(e => [
                     e.relPath,
-                    e.node.val(true)
+                    initialCompoundAccumulator
+                        ? initialCompoundAccumulator.serializeEntry(e.relPath === '' ? [] : e.relPath.split('/'), e.node, e.includedInCompoundHash)
+                        : e.node.val(true)
                 ]);
                 const payload = util.stringify(entries);
                 const chunk = {
@@ -5417,6 +5517,14 @@ class PersistenceManager {
         put = put.then(ok => {
             if (!ok) {
                 return false;
+            }
+            if (initialCompoundAccumulator) {
+                const compound = initialCompoundAccumulator.finish();
+                manifest.hash = '';
+                manifest.compoundHash = {
+                    hashes: compound.hashes,
+                    posts: compound.posts
+                };
             }
             return this.withStore_('readwrite', false, (store, done) => {
                 store.put(manifest, key);
@@ -5445,14 +5553,14 @@ class PersistenceManager {
                 storedUpdatedAt: now
             });
             recordPersistenceEvent(pathString, 'stored', `${plans.length} chunks`);
-            // Compute protocol hashes once, when server data is persisted. The
-            // canonical traversal is non-retaining (it does not fill every child's
-            // lazyHash_); only this listened root is stamped and stored natively in
-            // its manifest for future tab loads.
-            // The compound hash alone is enough for the RTDB range protocol: an
-            // unchanged tree yields no ranges, while a changed tree yields only its
-            // differing ranges. Persist an empty simple hash and avoid a second
-            // full-tree canonical walk on the cold-write path.
+            if (initialCompoundAccumulator) {
+                // The first generation already produced storage bytes + compound hash
+                // in one traversal; it is durable as soon as the manifest commits.
+                return;
+            }
+            // Incremental later writes may reuse clean chunks. Their protocol hash
+            // still runs in the background because a cached compound hash cannot be
+            // patched independently without re-walking the changed tree.
             return compoundHashFromNodeAsync(node)
                 .then(compoundHash => ({ hash: '', compoundHash }))
                 .then(({ hash, compoundHash }) => {
