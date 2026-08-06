@@ -23,8 +23,7 @@ import {
   compoundHashFromNode,
   compoundHashFromNodeAsync,
   CompoundHashSplitState,
-  estimateSerializedNodeSize,
-  hashFromNodeAsync
+  estimateSerializedNodeSize
 } from '../src/core/CompoundHash';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { sha1 } from '../src/core/util/util';
@@ -221,19 +220,5 @@ describe('CompoundHash', () => {
     expect(await canonicalHashFromNodeAsync(node, 1)).to.equal(
       nodeFromJSON(json).hash()
     );
-  });
-
-  it('async simple hash matches node.hash()', async () => {
-    const shapes: unknown[] = [
-      'leaf',
-      { a: 1, b: { c: 'x', '.priority': 2 } },
-      Object.fromEntries(Array.from({ length: 800 }, (_, i) => [String(i), i]))
-    ];
-    for (const json of shapes) {
-      // Fresh nodes for each side so the async walk cannot ride on hashes
-      // the sync walk already cached.
-      const asyncResult = await hashFromNodeAsync(nodeFromJSON(json), 1);
-      expect(asyncResult).to.equal(nodeFromJSON(json).hash());
-    }
   });
 });

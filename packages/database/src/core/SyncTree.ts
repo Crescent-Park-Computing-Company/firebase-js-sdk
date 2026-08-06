@@ -30,12 +30,9 @@ import {
 } from './operation/Operation';
 import { Overwrite } from './operation/Overwrite';
 import {
-  buildSeedNode,
   getNodeCanonicalHash,
   getNodeCompoundHash,
-  ListenHashFn,
-  ServerCacheSeed,
-  serverCacheSeedStats
+  ListenHashFn
 } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
@@ -112,12 +109,6 @@ export interface ListenProvider {
   ): Event[];
 
   stopListening(a: QueryContext, b: number | null): void;
-
-  /**
-   * Consumes the server-cache seed registered for `pathString`, if any (see
-   * ServerCacheSeedStore). Absent for providers without seeding (.info).
-   */
-  takeServerCacheSeed?(pathString: string): ServerCacheSeed | undefined;
 }
 
 /**
@@ -709,24 +700,7 @@ export function syncTreeAddEventRegistration(
     // INCOMPLETE initial server cache: the listen then carries the seeded
     // tree's hash instead of the empty hash, but no value event is raised
     // until the server certifies it (see ServerCacheSeed).
-    serverCache = null;
-    if (query._queryParams.loadsAllData()) {
-      const seed = syncTree.listenProvider_.takeServerCacheSeed?.(
-        path.toString()
-      );
-      if (seed !== undefined) {
-        try {
-          serverCache = buildSeedNode(seed);
-          serverCacheSeedStats.seededPaths.push(path.toString());
-        } catch (e) {
-          // A malformed seed must never break listener registration.
-          serverCache = null;
-        }
-      }
-    }
-    if (serverCache == null) {
-      serverCache = ChildrenNode.EMPTY_NODE;
-    }
+    serverCache = ChildrenNode.EMPTY_NODE;
     const subtree = syncTree.syncPointTree_.subtree(path);
     subtree.foreachChild((childName, childSyncPoint) => {
       const completeCache = syncPointGetCompleteServerCache(

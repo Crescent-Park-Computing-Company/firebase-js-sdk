@@ -83,17 +83,13 @@ export {
   getPersistedValue as _getPersistedValue,
   setPersistenceEnabled as _setPersistenceEnabled,
   setPersistenceAuthScope as _setPersistenceAuthScope,
-  whenListenComplete as _whenListenComplete,
-  seedServerCache as _seedServerCache,
-  clearServerCacheSeeds as _clearServerCacheSeeds
+  whenListenComplete as _whenListenComplete
 } from './api/Database';
 export {
   onPersistenceEvent as _onPersistenceEvent,
   PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS
 } from './core/Persistence';
 export {
-  computeCanonicalHash as _computeCanonicalHash,
-  computeCompoundHash as _computeCompoundHash,
   serverCacheSeedStats as _serverCacheSeedStats,
   SeedCompoundHash
 } from './core/ServerCacheSeed';

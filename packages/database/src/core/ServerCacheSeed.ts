@@ -15,40 +15,12 @@
  * limitations under the License.
  */
 
-import { compoundHashFromNode } from './CompoundHash';
 import { Node } from './snap/Node';
-import { nodeFromJSON } from './snap/nodeFromJSON';
-import { Path } from './util/Path';
 
 /**
- * Server-cache seeding: apps that persist a copy of their data (e.g. in
- * IndexedDB) can install it as the SDK's initial server cache BEFORE the
- * listener for that path attaches. The first listen then carries the seeded
- * tree's hash (and, when provided, its compound hash) instead of the
- * empty-node hash:
- *
- * - If the server's data still matches, the listen completes with no data
- *   download at all.
- * - If it doesn't and a compound hash was seeded, the server responds with
- *   range merges covering only the parts that changed.
- * - Otherwise the server sends the full tree, exactly as an unseeded listen
- *   would.
- *
- * A seed is installed as an INCOMPLETE server cache, so no value event is
- * raised from it: only a server message (a listen 'ok', a range merge, or a
- * full overwrite) promotes it to complete, server-certified state. Wrong or
- * stale seeded data therefore costs at most a missed hash — it is never
- * surfaced to the app as current data.
- *
- * Seeds are scoped to one Database instance (one Repo): each Repo owns a
- * ServerCacheSeedStore, and its SyncTree consumes from that store only —
- * two instances listening to the same path never steal each other's seeds.
- *
- * The optional precomputed hashes exist so callers can compute them off the
- * main thread (e.g. in a worker, via computeCanonicalHash /
- * computeCompoundHash) and stamp them at boot in O(1). Both must be computed
- * from exactly the seeded JSON: the server certifies whatever the listen
- * carries, and on a match the seeded tree is promoted as server state.
+ * Internal listen-hash protocol types shared by persistence, SyncTree, and
+ * PersistentConnection. Application-level manual seeding was removed; the SDK
+ * persistence manager is the only source of restored server cache state.
  */
 
 /**
@@ -69,58 +41,6 @@ export interface SeedCompoundHash {
 export interface ListenHashFn {
   (): string;
   compoundHash?: () => SeedCompoundHash | undefined;
-}
-
-export interface ServerCacheSeed {
-  json: unknown;
-  hash?: string;
-  compoundHash?: SeedCompoundHash;
-}
-
-/**
- * The seeds registered for one Repo, keyed by canonical path string
- * (Path.toString() — the same canonicalization the consumer uses, so a seed
- * for 'a//b/' and a listen at '/a/b' cannot drift apart).
- */
-export class ServerCacheSeedStore {
-  private seeds_ = new Map<string, ServerCacheSeed>();
-
-  set(
-    path: string,
-    json: unknown,
-    hash?: string,
-    compoundHash?: SeedCompoundHash
-  ): void {
-    if (json === null || json === undefined) {
-      return;
-    }
-    this.seeds_.set(new Path(path).toString(), { json, hash, compoundHash });
-  }
-
-  /**
-   * Consumes (at most once) the seed registered for exactly `pathString`.
-   * Returns undefined when no seed matches.
-   */
-  take(pathString: string): ServerCacheSeed | undefined {
-    const key = new Path(pathString).toString();
-    const seed = this.seeds_.get(key);
-    if (seed !== undefined) {
-      this.seeds_.delete(key);
-    }
-    return seed;
-  }
-
-  clear(): void {
-    this.seeds_.clear();
-  }
-}
-
-/**
- * Builds the node for a seed, stamping the precomputed hashes (see
- * stampSeedHashes).
- */
-export function buildSeedNode(seed: ServerCacheSeed): Node {
-  return stampSeedHashes(nodeFromJSON(seed.json), seed.hash, seed.compoundHash);
 }
 
 /**
@@ -183,27 +103,6 @@ export function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined {
  */
 export function getNodeCanonicalHash(node: Node): string | undefined {
   return nodeCanonicalHashes.get(node);
-}
-
-/**
- * The canonical listen hash of a JSON value — exactly what an unseeded
- * client would send for this tree. Exposed so apps can precompute seeds'
- * hashes off the main thread with the SDK's own canonicalization.
- * @internal
- */
-export function computeCanonicalHash(json: unknown): string {
-  return nodeFromJSON(json).hash();
-}
-
-/**
- * The compound hash of a JSON value, in wire shape. Exposed so apps can
- * precompute seeds' compound hashes off the main thread with the SDK's own
- * canonicalization.
- * @internal
- */
-export function computeCompoundHash(json: unknown): SeedCompoundHash {
-  const compoundHash = compoundHashFromNode(nodeFromJSON(json));
-  return { hashes: compoundHash.hashes, posts: compoundHash.posts };
 }
 
 /**

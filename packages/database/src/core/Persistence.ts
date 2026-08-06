@@ -1410,37 +1410,6 @@ export class PersistenceManager {
     });
   }
 
-  restore(pathString: string): Promise<PersistedRecord | null> {
-    if (this.disposed_) {
-      return Promise.resolve(null);
-    }
-    if (!this.schemaKnownCurrent_) {
-      return Promise.resolve(null);
-    }
-    return this.raceRestoreTimeout_(onProgress =>
-      this.readRecord_(pathString, onProgress).then(result => {
-        if (result !== null && !this.disposed_) {
-          this.lastFlush_.set(pathString, {
-            rootNode: result.record.node,
-            revision: result.record.revision,
-            plans: result.plans,
-            chunkRevisions: result.chunkRevisions,
-            chunkCount: result.chunkCount,
-            storedUpdatedAt: result.record.updatedAt
-          });
-        }
-        return result === null ? null : result.record;
-      })
-    ).then(record => {
-      if (record) {
-        persistenceStats.restoredRoots.push(pathString);
-      } else {
-        persistenceStats.restoreMisses.push(pathString);
-      }
-      return record;
-    });
-  }
-
   /**
    * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
    * chunked restores reset the timer after every completed chunk; callers

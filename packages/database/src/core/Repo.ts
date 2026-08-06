@@ -33,11 +33,7 @@ import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import {
-  ListenHashFn,
-  ServerCacheSeedStore,
-  stampSeedHashes
-} from './ServerCacheSeed';
+import { ListenHashFn, stampSeedHashes } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
@@ -210,12 +206,6 @@ export class Repo {
   persistence_: PersistenceManager | null = null;
 
   /**
-   * Seeds registered for this Repo's listens (see ServerCacheSeed); consumed
-   * by serverSyncTree_ via its listen provider.
-   */
-  serverCacheSeeds_ = new ServerCacheSeedStore();
-
-  /**
    * Listens held back while their persisted root restores, keyed by path.
    * stopListening flips the token so a listen whose last registration was
    * removed mid-restore is never sent (see repoStartServerListen).
@@ -370,8 +360,7 @@ export function repoStart(
     },
     stopListening: (query, tag) => {
       repoStopServerListen(repo, query, tag);
-    },
-    takeServerCacheSeed: pathString => repo.serverCacheSeeds_.take(pathString)
+    }
   });
 }
 

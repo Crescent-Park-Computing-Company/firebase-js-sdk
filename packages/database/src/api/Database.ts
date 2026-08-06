@@ -51,7 +51,6 @@ import {
   repoWhenListenComplete
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
-import { SeedCompoundHash } from '../core/ServerCacheSeed';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
@@ -532,49 +531,6 @@ export function setPersistenceAuthScope(
   db = getModularInstance(db);
   db._checkNotDeleted('setPersistenceAuthScope');
   db._repoInternal.persistence_?.setAuthScope(scope);
-}
-
-/**
- * Registers cached JSON as the initial server cache for `path` on this
- * Database instance. Must be called before the listener for that exact path
- * attaches — the seed is consumed (once) at listener registration, and only
- * by a default (complete, unfiltered) query: a filtered query's listen hash
- * is computed over the filtered subset, which raw cached JSON is not. See
- * core/ServerCacheSeed.ts.
- *
- * @param db - The instance whose next listen at `path` should be seeded.
- * @param path - Absolute database path the JSON was cached for.
- * @param json - The cached value. null/undefined seeds nothing (an empty
- * tree's hash is what an unseeded listen sends anyway).
- * @param hash - Optional precomputed canonical hash of `json` (the exact
- * value computeCanonicalHash returns for it).
- * @param compoundHash - Optional precomputed compound hash of `json` (the
- * exact value computeCompoundHash returns for it).
- * @internal
- */
-export function seedServerCache(
-  db: Database,
-  path: string,
-  json: unknown,
-  hash?: string,
-  compoundHash?: SeedCompoundHash
-): void {
-  db = getModularInstance(db);
-  db._checkNotDeleted('seedServerCache');
-  validateRootPathString('seedServerCache', 'path', path, false);
-  // _repoInternal: seeding is boot-time configuration and must not start
-  // the instance.
-  db._repoInternal.serverCacheSeeds_.set(path, json, hash, compoundHash);
-}
-
-/**
- * Removes all seeds registered on this Database instance.
- * @internal
- */
-export function clearServerCacheSeeds(db: Database): void {
-  db = getModularInstance(db);
-  db._checkNotDeleted('clearServerCacheSeeds');
-  db._repoInternal.serverCacheSeeds_.clear();
 }
 
 /**

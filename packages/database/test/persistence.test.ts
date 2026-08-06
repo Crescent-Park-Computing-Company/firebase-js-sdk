@@ -19,7 +19,10 @@ import { expect } from 'chai';
 
 import { getPersistedValue, setPersistenceEnabled } from '../src/api/Database';
 import { QueryImpl } from '../src/api/Reference_impl';
-import { canonicalHashFromNodeAsync } from '../src/core/CompoundHash';
+import {
+  canonicalHashFromNodeAsync,
+  compoundHashFromNode
+} from '../src/core/CompoundHash';
 import {
   PersistenceManager,
   PersistedRecord,
@@ -36,11 +39,7 @@ import {
   repoWhenListenComplete,
   Repo
 } from '../src/core/Repo';
-import {
-  computeCanonicalHash,
-  computeCompoundHash,
-  ListenHashFn
-} from '../src/core/ServerCacheSeed';
+import { ListenHashFn } from '../src/core/ServerCacheSeed';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import {
   SyncTree,
@@ -54,6 +53,23 @@ import {
   QueryParams,
   queryParamsLimitToFirst
 } from '../src/core/view/QueryParams';
+
+function computeCanonicalHash(json: unknown): string {
+  return nodeFromJSON(json).hash();
+}
+
+function computeCompoundHash(json: unknown) {
+  const hash = compoundHashFromNode(nodeFromJSON(json));
+  return { hashes: hash.hashes, posts: hash.posts };
+}
+
+async function restoreForTest(
+  manager: PersistenceManager,
+  pathString: string
+): Promise<PersistedRecord | null> {
+  manager.track(pathString);
+  return manager.restoreForListen(pathString);
+}
 
 /**
  * A minimal in-memory IDBFactory covering exactly the calls the manager
@@ -271,7 +287,8 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     await flushAsync();
 
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored).to.not.equal(null);
@@ -302,7 +319,8 @@ describe('PersistenceManager', () => {
     );
     expect(chunkKeys.length).to.be.greaterThan(1);
 
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
@@ -347,7 +365,8 @@ describe('PersistenceManager', () => {
     expect(kept).to.be.greaterThan(0);
     expect(rewritten).to.equal(1);
 
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(v2.val(true));
@@ -366,7 +385,8 @@ describe('PersistenceManager', () => {
     // Next session: restore, then the listen 'ok' write-through hands the
     // SAME node back (the sync tree holds the seeded tree by reference).
     const managerB = new PersistenceManager('test-repo', factory);
-    const restored = (await managerB.restore(
+    const restored = (await restoreForTest(
+      managerB,
       path.toString()
     )) as PersistedRecord;
     const before = new Map(
@@ -464,7 +484,8 @@ describe('PersistenceManager', () => {
     });
 
     const manager = new PersistenceManager('test-repo', factory);
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       new Path('aging/root').toString()
     )) as PersistedRecord;
     const chunkBefore = data.get('test-repo|/aging/root#c000000@ext-1');
@@ -486,7 +507,8 @@ describe('PersistenceManager', () => {
     expect(manifest.revision).to.equal('ext-1');
     expect(manifest.updatedAt).to.be.greaterThan(oldUpdatedAt);
 
-    const again = (await manager.restore(
+    const again = (await restoreForTest(
+      manager,
       new Path('aging/root').toString()
     )) as PersistedRecord;
     expect(again.node.val(true)).to.deep.equal(json);
@@ -508,7 +530,10 @@ describe('PersistenceManager', () => {
       revision: 'oldtab-1'
     });
     const manager = new PersistenceManager('test-repo', factory);
-    const restored = (await manager.restore('/legacy/root')) as PersistedRecord;
+    const restored = (await restoreForTest(
+      manager,
+      '/legacy/root'
+    )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(json);
     expect(restored.hash).to.equal(computeCanonicalHash(json));
   });
@@ -530,7 +555,7 @@ describe('PersistenceManager', () => {
     });
     const manager = new PersistenceManager('test-repo', factory);
     // First open upgrades + clears inside IDB; restore never gets the value.
-    expect(await manager.restore('/huge/legacy')).to.equal(null);
+    expect(await restoreForTest(manager, '/huge/legacy')).to.equal(null);
     expect(data.size).to.equal(0);
   });
 
@@ -548,7 +573,7 @@ describe('PersistenceManager', () => {
       entries: [['', { old: true }]]
     });
     const manager = new PersistenceManager('test-repo', factory);
-    expect(await manager.restore('/old-format/root')).to.equal(null);
+    expect(await restoreForTest(manager, '/old-format/root')).to.equal(null);
     await flushAsync();
     expect(keysFor(data, 'test-repo|/old-format/root')).to.deep.equal([]);
   });
@@ -625,7 +650,7 @@ describe('PersistenceManager', () => {
   it('resolves null for a root never persisted', async () => {
     const { factory } = makeFakeIndexedDB();
     const manager = new PersistenceManager('test-repo', factory);
-    expect(await manager.restore('missing/root')).to.equal(null);
+    expect(await restoreForTest(manager, 'missing/root')).to.equal(null);
   });
 
   it('expired records are dropped on restore', async () => {
@@ -636,7 +661,7 @@ describe('PersistenceManager', () => {
       updatedAt: Date.now() - 15 * 24 * 60 * 60 * 1000,
       revision: 'ext-1'
     });
-    expect(await manager.restore('/old/root')).to.equal(null);
+    expect(await restoreForTest(manager, '/old/root')).to.equal(null);
     await flushAsync();
     expect(data.has('test-repo|/old/root')).to.equal(false);
   });
@@ -688,7 +713,7 @@ describe('PersistenceManager', () => {
     });
 
     const manager = new PersistenceManager('test-repo', factory);
-    const restored = await manager.restore('/torn/root');
+    const restored = await restoreForTest(manager, '/torn/root');
     expect(restored?.node.val()).to.deep.equal(old);
     await manager.sweepNow();
     await flushAsync();
@@ -727,14 +752,20 @@ describe('PersistenceManager', () => {
 
     // Flush #1's pair: v1 data with v1's hash — the superseding update never
     // bled into it.
-    const mid = (await manager.restore(path.toString())) as PersistedRecord;
+    const mid = (await restoreForTest(
+      manager,
+      path.toString()
+    )) as PersistedRecord;
     expect(mid.node.val(true)).to.deep.equal({ v: 1 });
     expect(mid.hash).to.equal(computeCanonicalHash({ v: 1 }));
 
     // And flush #2 (still throttled) then writes the v2 pair.
     await manager.flushNow(path.toString());
     await flushAsync();
-    const final = (await manager.restore(path.toString())) as PersistedRecord;
+    const final = (await restoreForTest(
+      manager,
+      path.toString()
+    )) as PersistedRecord;
     expect(final.node.val(true)).to.deep.equal({ v: 2 });
     expect(final.hash).to.equal(computeCanonicalHash({ v: 2 }));
   });
@@ -762,7 +793,8 @@ describe('PersistenceManager', () => {
     manager.serverCacheUpdated(path, nodeFromJSON({ fresh: true }));
     await manager.flushNow(path.toString());
     await flushAsync();
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ fresh: true });
@@ -776,7 +808,7 @@ describe('PersistenceManager', () => {
     manager.track(path.toString());
     manager.serverCacheUpdated(path, nodeFromJSON({ first: true }));
     await flushAsync();
-    const restored = await manager.restore(path.toString());
+    const restored = await restoreForTest(manager, path.toString());
     expect(restored?.node.val()).to.deep.equal({ first: true });
   });
 
@@ -791,7 +823,8 @@ describe('PersistenceManager', () => {
     manager.serverCacheUpdated(path, nodeFromJSON({ n: 2 }));
     await manager.flushNow(path.toString());
     await flushAsync();
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ n: 2 });
@@ -823,7 +856,8 @@ describe('PersistenceManager', () => {
     await flushAsync();
     // The one pending flush drained and wrote v2.
     expect(internals.flushPending_.size).to.equal(0);
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ v: 2 });
@@ -897,7 +931,8 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     await flushAsync();
     expect(data.has('test-repo|/repaired/root')).to.equal(true);
-    const restored = (await manager.restore(
+    const restored = (await restoreForTest(
+      manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ ok: true });
@@ -909,7 +944,7 @@ describe('PersistenceManager', () => {
     manager.track(path.toString());
     manager.serverCacheUpdated(path, nodeFromJSON({ a: 1 }));
     await manager.flushNow(path.toString());
-    expect(await manager.restore(path.toString())).to.equal(null);
+    expect(await restoreForTest(manager, path.toString())).to.equal(null);
   });
 
   it('untrack flushes the final tree, keeps the record, drops the memory', async () => {
@@ -924,7 +959,9 @@ describe('PersistenceManager', () => {
 
     // The throttled write-through still landed…
     expect(data.has('test-repo|/rotated/root')).to.equal(true);
-    const restored = (await manager.restore(
+    const firstReader = new PersistenceManager('test-repo', factory);
+    const restored = (await restoreForTest(
+      firstReader,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ kept: true });
@@ -934,9 +971,12 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     await flushAsync();
     expect(
-      ((await manager.restore(path.toString())) as PersistedRecord).node.val(
-        true
-      )
+      (
+        (await restoreForTest(
+          new PersistenceManager('test-repo', factory),
+          path.toString()
+        )) as PersistedRecord
+      ).node.val(true)
     ).to.deep.equal({ kept: true });
   });
 
@@ -1612,9 +1652,11 @@ describe('persistence auth scope', () => {
 
     const reader = new PersistenceManager('test-repo', shared.factory);
     reader.setAuthScope('user-b');
-    expect(await reader.restore(path.toString())).to.equal(null);
+    expect(await restoreForTest(reader, path.toString())).to.equal(null);
     reader.setAuthScope('user-a');
-    expect((await reader.restore(path.toString()))!.node.val()).to.deep.equal({
+    expect(
+      (await restoreForTest(reader, path.toString()))!.node.val()
+    ).to.deep.equal({
       secret: 'a'
     });
   });
@@ -1639,9 +1681,11 @@ describe('persistence auth scope', () => {
 
     const reader = new PersistenceManager('test-repo', shared.factory);
     reader.setAuthScope('user-b');
-    expect(await reader.restore(path.toString())).to.equal(null);
+    expect(await restoreForTest(reader, path.toString())).to.equal(null);
     reader.setAuthScope('user-a');
-    expect((await reader.restore(path.toString()))!.node.val()).to.deep.equal({
+    expect(
+      (await restoreForTest(reader, path.toString()))!.node.val()
+    ).to.deep.equal({
       owner: 'a'
     });
   });
