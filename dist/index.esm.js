@@ -3972,6 +3972,16 @@ class PersistenceManager {
      * failure leaves the records for the next session's sweep.
      */
     sweepExpired_() {
+        if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
+            if (!this.disposed_) {
+                this.sweepTimer_ = setTimeout(() => {
+                    void this.sweepExpired_();
+                }, 5000);
+                this.sweepTimer_.unref?.();
+            }
+            return Promise.resolve();
+        }
+        this.sweepTimer_ = null;
         const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
         const prefix = this.key_('');
         let range;
