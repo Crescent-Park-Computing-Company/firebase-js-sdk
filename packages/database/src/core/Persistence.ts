@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { isIndexedDBAvailable } from '@firebase/util';
+import { isIndexedDBAvailable, stringify } from '@firebase/util';
 
 import {
   canonicalHashFromNodeAsync,
@@ -28,6 +28,7 @@ import { KEY_INDEX } from './snap/indexes/KeyIndex';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { Path } from './util/Path';
+import { sha1 } from './util/util';
 
 /**
  * Client-side persistence of the server cache, in the spirit of the mobile
@@ -94,7 +95,7 @@ const STORE = 'firebase-server-cache';
 // The upgrade clears the store inside IndexedDB without materializing the old
 // (potentially huge monolithic) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 8;
-const PERSISTENCE_FORMAT_VERSION = 7;
+const PERSISTENCE_FORMAT_VERSION = 8;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 
 function readSchemaMarker(): boolean {
@@ -238,6 +239,8 @@ interface LegacyPersistedRecord {
 /** One chunk record: disjoint subtrees, in assembly order. */
 interface PersistedChunk {
   revision: string;
+  /** Hash of the exported entries below; verified before Node reconstruction. */
+  contentHash: string;
   /** [path relative to the root, exported JSON of the subtree there]. */
   entries: Array<[string, unknown]>;
 }
@@ -320,6 +323,10 @@ const CHUNK_KEY_INFIX = '#c';
  */
 function chunkKeySuffix(index: number, revision: string): string {
   return `${CHUNK_KEY_INFIX}${String(index).padStart(6, '0')}@${revision}`;
+}
+
+function persistedChunkHash(entries: Array<[string, unknown]>): string {
+  return sha1(stringify(entries));
 }
 
 function isLegacyRecord(
@@ -1192,7 +1199,9 @@ export class PersistenceManager {
               if (
                 !chunk ||
                 chunk.revision !== manifest.chunkRevisions[index] ||
-                !Array.isArray(chunk.entries)
+                !Array.isArray(chunk.entries) ||
+                typeof chunk.contentHash !== 'string' ||
+                persistedChunkHash(chunk.entries) !== chunk.contentHash
               ) {
                 return 'mismatch' as const;
               }
@@ -1228,30 +1237,32 @@ export class PersistenceManager {
             if (result === 'mismatch') {
               return result;
             }
+            // Current chunks have already been verified independently. Trust
+            // the root protocol hashes committed by the same atomic manifest;
+            // only the rare crash window before those hashes landed needs a
+            // one-time full recomputation.
+            if (
+              typeof result.record.hash === 'string' &&
+              result.record.compoundHash
+            ) {
+              return result;
+            }
             const actualHash = await canonicalHashFromNodeAsync(
               result.record.node,
               12,
               onProgress
             );
-            if (
-              typeof result.record.hash === 'string' &&
-              actualHash !== result.record.hash
-            ) {
-              return 'mismatch' as const;
-            }
             result.record.hash = actualHash;
-            if (!result.record.compoundHash) {
-              const compound = await compoundHashFromNodeAsync(
-                result.record.node,
-                undefined,
-                12,
-                onProgress
-              );
-              result.record.compoundHash = {
-                hashes: compound.hashes,
-                posts: compound.posts
-              };
-            }
+            const compound = await compoundHashFromNodeAsync(
+              result.record.node,
+              undefined,
+              12,
+              onProgress
+            );
+            result.record.compoundHash = {
+              hashes: compound.hashes,
+              posts: compound.posts
+            };
             return result;
           });
       })
@@ -1763,9 +1774,14 @@ export class PersistenceManager {
         if (!ok) {
           return false;
         }
+        const entries: Array<[string, unknown]> = plans[i].map(e => [
+          e.relPath,
+          e.node.val(true)
+        ]);
         const chunk: PersistedChunk = {
           revision,
-          entries: plans[i].map(e => [e.relPath, e.node.val(true)])
+          contentHash: persistedChunkHash(entries),
+          entries
         };
         return this.withStore_<boolean>('readwrite', false, (store, done) => {
           store.put(chunk, key + chunkKeySuffix(i, revision));

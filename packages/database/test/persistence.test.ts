@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+import { stringify } from '@firebase/util';
 import { expect } from 'chai';
 
 import { getPersistedValue, setPersistenceEnabled } from '../src/api/Database';
@@ -50,6 +51,7 @@ import {
   syncTreeGetCompleteServerCache
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
+import { sha1 } from '../src/core/util/util';
 import { EventQueue } from '../src/core/view/EventQueue';
 import {
   QueryParams,
@@ -63,6 +65,14 @@ function computeCanonicalHash(json: unknown): string {
 function computeCompoundHash(json: unknown) {
   const hash = compoundHashFromNode(nodeFromJSON(json));
   return { hashes: hash.hashes, posts: hash.posts };
+}
+
+function makeChunk(revision: string, entries: Array<[string, unknown]>) {
+  return {
+    revision,
+    contentHash: sha1(stringify(entries)),
+    entries
+  };
 }
 
 async function restoreForTest(
@@ -471,7 +481,7 @@ describe('PersistenceManager', () => {
     const oldUpdatedAt = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days
     const json = { steady: true };
     data.set('test-repo|/aging/root', {
-      formatVersion: 7,
+      formatVersion: 8,
       authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(json),
@@ -480,10 +490,10 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['ext-1']
     });
-    data.set('test-repo|/aging/root#c000000@ext-1', {
-      revision: 'ext-1',
-      entries: [['', json]]
-    });
+    data.set(
+      'test-repo|/aging/root#c000000@ext-1',
+      makeChunk('ext-1', [['', json]])
+    );
 
     const manager = new PersistenceManager('test-repo', factory);
     const restored = (await restoreForTest(
@@ -572,10 +582,10 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['old-format']
     });
-    data.set('test-repo|/old-format/root#c000000@old-format', {
-      revision: 'old-format',
-      entries: [['', { old: true }]]
-    });
+    data.set(
+      'test-repo|/old-format/root#c000000@old-format',
+      makeChunk('old-format', [['', { old: true }]])
+    );
     const manager = new PersistenceManager('test-repo', factory);
     expect(await restoreForTest(manager, '/old-format/root')).to.equal(null);
     await flushAsync();
@@ -702,7 +712,7 @@ describe('PersistenceManager', () => {
     const { factory, data } = makeFakeIndexedDB();
     const old = { a: 1 };
     data.set('test-repo|/torn/root', {
-      formatVersion: 7,
+      formatVersion: 8,
       authScope: null,
       revision: 'ext-1',
       hash: computeCanonicalHash(old),
@@ -712,15 +722,15 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['ext-1']
     });
-    data.set('test-repo|/torn/root#c000000@ext-1', {
-      revision: 'ext-1',
-      entries: [['', old]]
-    });
+    data.set(
+      'test-repo|/torn/root#c000000@ext-1',
+      makeChunk('ext-1', [['', old]])
+    );
     // A crash after writing a new chunk but before the manifest pointer swap.
-    data.set('test-repo|/torn/root#c000000@ext-2', {
-      revision: 'ext-2',
-      entries: [['', { a: 2 }]]
-    });
+    data.set(
+      'test-repo|/torn/root#c000000@ext-2',
+      makeChunk('ext-2', [['', { a: 2 }]])
+    );
 
     const manager = new PersistenceManager('test-repo', factory);
     const restored = await restoreForTest(manager, '/torn/root');
@@ -1015,7 +1025,7 @@ describe('PersistenceManager', () => {
     const mb = PERSISTENCE_CHUNK_TARGET_BYTES;
     const add = (name: string, updatedAt: number) => {
       data.set(`test-repo|/${name}`, {
-        formatVersion: 7,
+        formatVersion: 8,
         authScope: null,
         revision: name,
         hash: computeCanonicalHash({ name }),
@@ -1025,10 +1035,10 @@ describe('PersistenceManager', () => {
         chunkCount: 1,
         chunkRevisions: [name]
       });
-      data.set(`test-repo|/${name}#c000000@${name}`, {
-        revision: name,
-        entries: [['', { name }]]
-      });
+      data.set(
+        `test-repo|/${name}#c000000@${name}`,
+        makeChunk(name, [['', { name }]])
+      );
     };
     const now = Date.now();
     add('active-old', now - 3000);
@@ -1075,17 +1085,17 @@ describe('PersistenceManager', () => {
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
     // An expired chunked root: manifest, chunk, and hash all go.
     data.set('test-repo|/old/root', {
-      formatVersion: 7,
+      formatVersion: 8,
       authScope: null,
       revision: 'ext-1',
       updatedAt: expired,
       chunkCount: 1,
       chunkRevisions: ['ext-1']
     });
-    data.set('test-repo|/old/root#c000000@ext-1', {
-      revision: 'ext-1',
-      entries: [['', { stale: true }]]
-    });
+    data.set(
+      'test-repo|/old/root#c000000@ext-1',
+      makeChunk('ext-1', [['', { stale: true }]])
+    );
     data.set('test-repo|/old/root#hash', {
       hash: 'h',
       compoundHash: { hashes: [''], posts: [] },
@@ -1095,7 +1105,7 @@ describe('PersistenceManager', () => {
     // A fresh chunked root stays, with protocol hashes integrated into its
     // manifest rather than a separately expiring sidecar.
     data.set('test-repo|/fresh/root', {
-      formatVersion: 7,
+      formatVersion: 8,
       authScope: null,
       revision: 'ext-2',
       hash: 'h',
@@ -1104,10 +1114,10 @@ describe('PersistenceManager', () => {
       chunkCount: 1,
       chunkRevisions: ['ext-2']
     });
-    data.set('test-repo|/fresh/root#c000000@ext-2', {
-      revision: 'ext-2',
-      entries: [['', { fresh: true }]]
-    });
+    data.set(
+      'test-repo|/fresh/root#c000000@ext-2',
+      makeChunk('ext-2', [['', { fresh: true }]])
+    );
     // Current manifests own their protocol hashes; a surviving legacy
     // sidecar under the same base is an orphan and must be swept.
     data.set('test-repo|/fresh/root#hash', {
@@ -1118,14 +1128,14 @@ describe('PersistenceManager', () => {
     });
     // Orphans under the fresh root: a chunk beyond the manifest's count and
     // a chunk with no manifest at all.
-    data.set('test-repo|/fresh/root#c000007@ext-0', {
-      revision: 'ext-0',
-      entries: [['', { orphan: true }]]
-    });
-    data.set('test-repo|/vanished/root#c000000@ext-0', {
-      revision: 'ext-0',
-      entries: [['', { orphan: true }]]
-    });
+    data.set(
+      'test-repo|/fresh/root#c000007@ext-0',
+      makeChunk('ext-0', [['', { orphan: true }]])
+    );
+    data.set(
+      'test-repo|/vanished/root#c000000@ext-0',
+      makeChunk('ext-0', [['', { orphan: true }]])
+    );
     // A fresh legacy record survives by its own updatedAt.
     data.set('test-repo|/legacy/root', {
       json: { legacy: true },
