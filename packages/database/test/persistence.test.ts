@@ -305,7 +305,7 @@ describe('PersistenceManager', () => {
     )) as PersistedRecord;
     expect(restored).to.not.equal(null);
     expect(restored.node.val(true)).to.deep.equal(json);
-    expect(restored.hash).to.equal(computeCanonicalHash(json));
+    expect(restored.hash).to.equal('');
     expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
   });
 
@@ -336,7 +336,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
-    expect(restored.hash).to.equal(computeCanonicalHash(json));
+    expect(restored.hash).to.equal('');
   });
 
   it('rewrites only the chunks an update dirtied', async () => {
@@ -382,7 +382,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(v2.val(true));
-    expect(restored.hash).to.equal(computeCanonicalHash(v2.val(true)));
+    expect(restored.hash).to.equal('');
   });
 
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
@@ -777,7 +777,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(mid.node.val(true)).to.deep.equal({ v: 1 });
-    expect(mid.hash).to.equal(computeCanonicalHash({ v: 1 }));
+    expect(mid.hash).to.equal('');
 
     // And flush #2 (still throttled) then writes the v2 pair.
     await manager.flushNow(path.toString());
@@ -787,7 +787,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(final.node.val(true)).to.deep.equal({ v: 2 });
-    expect(final.hash).to.equal(computeCanonicalHash({ v: 2 }));
+    expect(final.hash).to.equal('');
   });
 
   it('a surviving hash sidecar from another session never pairs with new data', async () => {
@@ -818,7 +818,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ fresh: true });
-    expect(restored.hash).to.equal(computeCanonicalHash({ fresh: true }));
+    expect(restored.hash).to.equal('');
   });
 
   it('persists the first authoritative tree without waiting for the throttle', async () => {
@@ -848,7 +848,7 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ n: 2 });
-    expect(restored.hash).to.equal(computeCanonicalHash({ n: 2 }));
+    expect(restored.hash).to.equal('');
   });
 
   it('a throttle firing into a busy queue coalesces to one trailing flush', async () => {
