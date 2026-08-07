@@ -146,7 +146,7 @@ const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export const PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
 /**
  * Maximum gap with NO restore progress before the listen attaches unseeded.
