@@ -1297,10 +1297,7 @@ export class PersistenceManager {
     pathString: string,
     expectedAuthScope: string | null
   ): Promise<PersistedRecord | null> | null {
-    if (
-      !this.authScopeConfigured_ ||
-      expectedAuthScope !== this.authScope_
-    ) {
+    if (!this.authScopeConfigured_ || expectedAuthScope !== this.authScope_) {
       return null;
     }
     let bestRoot: string | null = null;
@@ -1380,10 +1377,7 @@ export class PersistenceManager {
       return Promise.resolve(null);
     }
     const authGeneration = this.authGeneration_;
-    const covering = this.peekFromCoveringRead_(
-      pathString,
-      expectedAuthScope
-    );
+    const covering = this.peekFromCoveringRead_(pathString, expectedAuthScope);
     if (covering !== null) {
       return covering;
     }
@@ -1767,16 +1761,22 @@ export class PersistenceManager {
     if (prev && prev.rootNode === node) {
       // Content-identical: refresh only the manifest timestamp. The revision
       // guard prevents a stale tab from refreshing a superseded generation.
-      return this.withStore_<boolean>('readwrite', false, (store, done) => {
-        const req = store.get(key);
-        req.onsuccess = () => {
-          const current = req.result as PersistedManifest | undefined;
-          if (current && current.revision === prev.revision) {
-            store.put({ ...current, updatedAt: now }, key);
-            done(true);
-          }
-        };
-      }).then(ok => {
+      return this.withStore_<boolean>(
+        'readwrite',
+        false,
+        (store, done, progress) => {
+          const req = store.get(key);
+          req.onsuccess = () => {
+            progress();
+            const current = req.result as PersistedManifest | undefined;
+            if (current && current.revision === prev.revision) {
+              const put = store.put({ ...current, updatedAt: now }, key);
+              put.onsuccess = progress;
+              done(true);
+            }
+          };
+        }
+      ).then(ok => {
         if (ok && !this.disposed_) {
           this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
         }
@@ -1899,27 +1899,38 @@ export class PersistenceManager {
             .filter(recordId => !liveIds.has(recordId))
         : [];
 
-      return this.withStore_<boolean>('readwrite', false, (store, done) => {
-        const currentReq = store.get(key);
-        currentReq.onsuccess = () => {
-          const current = currentReq.result as PersistedManifest | undefined;
-          // Optimistic cross-tab CAS. If another tab advanced the manifest
-          // after our local base, retry from scratch; immutable payload ids
-          // ensure no partial/mixed generation can be observed meanwhile.
-          if (prev && (!current || current.revision !== prev.revision)) {
-            done(false);
-            return;
-          }
-          for (const record of newRecords.values()) {
-            store.put(record, key + RANGE_KEY_INFIX + record.recordId);
-          }
-          for (const recordId of retiredIds) {
-            store.delete(key + RANGE_KEY_INFIX + recordId);
-          }
-          store.put(manifest, key);
-          done(true);
-        };
-      }).then(ok => {
+      return this.withStore_<boolean>(
+        'readwrite',
+        false,
+        (store, done, progress) => {
+          const currentReq = store.get(key);
+          currentReq.onsuccess = () => {
+            progress();
+            const current = currentReq.result as PersistedManifest | undefined;
+            // Optimistic cross-tab CAS. If another tab advanced the manifest
+            // after our local base, retry from scratch; immutable payload ids
+            // ensure no partial/mixed generation can be observed meanwhile.
+            if (prev && (!current || current.revision !== prev.revision)) {
+              done(false);
+              return;
+            }
+            for (const record of newRecords.values()) {
+              const put = store.put(
+                record,
+                key + RANGE_KEY_INFIX + record.recordId
+              );
+              put.onsuccess = progress;
+            }
+            for (const recordId of retiredIds) {
+              const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
+              remove.onsuccess = progress;
+            }
+            const manifestPut = store.put(manifest, key);
+            manifestPut.onsuccess = progress;
+            done(true);
+          };
+        }
+      ).then(ok => {
         if (!ok || this.disposed_) {
           if (prev) {
             // Another writer won. The follow-up must not reuse this tab's old
