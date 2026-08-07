@@ -1288,6 +1288,73 @@ export class PersistenceManager {
   }
 
   /**
+   * Projects an exact-path peek from a covering root that is already restored
+   * or actively restoring in this manager. This never starts a large ancestor
+   * read just to answer a tiny token lookup; it only reuses work the app is
+   * already paying for, preserving the exact-root fast path on direct boots.
+   */
+  private peekFromCoveringRead_(
+    pathString: string,
+    expectedAuthScope: string | null
+  ): Promise<PersistedRecord | null> | null {
+    if (
+      !this.authScopeConfigured_ ||
+      expectedAuthScope !== this.authScope_
+    ) {
+      return null;
+    }
+    let bestRoot: string | null = null;
+    let source: Promise<ReadResult | null> | null = null;
+    for (const [root, read] of this.activeReads_) {
+      if (
+        pathString !== root &&
+        (root === '/' || pathString.startsWith(root + '/')) &&
+        (bestRoot === null || root.length > bestRoot.length)
+      ) {
+        bestRoot = root;
+        source = read.promise;
+      }
+    }
+    for (const [root, state] of this.lastFlush_) {
+      if (
+        pathString !== root &&
+        (root === '/' || pathString.startsWith(root + '/')) &&
+        (bestRoot === null || root.length > bestRoot.length)
+      ) {
+        bestRoot = root;
+        source = Promise.resolve({
+          record: {
+            node: state.rootNode,
+            updatedAt: state.storedUpdatedAt,
+            revision: state.revision
+          },
+          ranges: state.ranges
+        });
+      }
+    }
+    if (bestRoot === null || source === null) {
+      return null;
+    }
+    const relative =
+      bestRoot === '/'
+        ? pathString.replace(/^\/+/, '')
+        : pathString.slice(bestRoot.length).replace(/^\/+/, '');
+    return source.then(result => {
+      if (result === null) {
+        return null;
+      }
+      const node = result.record.node.getChild(new Path(relative));
+      return node.isEmpty()
+        ? null
+        : {
+            node,
+            updatedAt: result.record.updatedAt,
+            revision: result.record.revision
+          };
+    });
+  }
+
+  /**
    * Exact-root optimistic peek. The completed range assembly is retained briefly
    * so the authenticated listener consumes the same immutable Node instead of
    * reconstructing the root twice during boot.
@@ -1313,6 +1380,13 @@ export class PersistenceManager {
       return Promise.resolve(null);
     }
     const authGeneration = this.authGeneration_;
+    const covering = this.peekFromCoveringRead_(
+      pathString,
+      expectedAuthScope
+    );
+    if (covering !== null) {
+      return covering;
+    }
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
         onProgress =>

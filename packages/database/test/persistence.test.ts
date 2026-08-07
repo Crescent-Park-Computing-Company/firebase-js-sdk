@@ -242,11 +242,15 @@ function makeFakeIndexedDB(
       data.clear();
       return makeRequest(undefined);
     },
-    delete: (key: string) => {
-      // Key-range deletes (used only as an orphan-cleanup optimization)
-      // no-op here: the fake predates IDBKeyRange in Node.
+    delete: (key: string | IDBKeyRange) => {
       if (typeof key === 'string') {
         data.delete(key);
+      } else if (key && typeof key.includes === 'function') {
+        for (const storedKey of [...data.keys()]) {
+          if (key.includes(storedKey)) {
+            data.delete(storedKey);
+          }
+        }
       }
       return makeRequest(undefined);
     },
@@ -2444,11 +2448,11 @@ describe('getPersistedValue', () => {
       settings: { theme: 'dark' },
       name: 'alice'
     });
-    // A caller must peek the same root it is about to listen to. Ancestor
-    // fallback made optimistic data impossible to hand off safely.
+    // A tiny exact-path peek may safely project from the already-restored
+    // covering root without starting another ancestor decode.
     expect(
       await getPersistedValue(db as never, '/users/alice/settings/theme')
-    ).to.equal(null);
+    ).to.equal('dark');
     expect(await getPersistedValue(db as never, '/users/bob')).to.equal(null);
   });
 
