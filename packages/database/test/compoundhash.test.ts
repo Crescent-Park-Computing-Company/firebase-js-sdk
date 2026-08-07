@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 
 import {
+  collectChangedSubtreePaths,
   canonicalHashFromNodeAsync,
   CompoundHash,
   compoundHashFromNode,
@@ -26,6 +27,7 @@ import {
   estimateSerializedNodeSize
 } from '../src/core/CompoundHash';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
+import { Path } from '../src/core/util/Path';
 import { sha1 } from '../src/core/util/util';
 
 /**
@@ -220,5 +222,24 @@ describe('CompoundHash', () => {
     expect(await canonicalHashFromNodeAsync(node, 1)).to.equal(
       nodeFromJSON(json).hash()
     );
+  });
+
+  it('collapses a broad changed subtree instead of dirtying the whole root', () => {
+    const beforeJson: Record<string, unknown> = {
+      stable: { untouched: true },
+      broad: {}
+    };
+    const afterBroad: Record<string, unknown> = {};
+    for (let i = 0; i < 100; i++) {
+      (beforeJson.broad as Record<string, unknown>)['k' + i] = { value: i };
+      afterBroad['k' + i] = { value: i + 1 };
+    }
+    const before = nodeFromJSON(beforeJson);
+    const after = before.updateChild(
+      new Path('broad'),
+      nodeFromJSON(afterBroad)
+    );
+    const changed = collectChangedSubtreePaths(before, after, 8, 4);
+    expect(changed).to.deep.equal([['broad']]);
   });
 });

@@ -249,6 +249,7 @@ export class CompoundHashBuilder {
 
   /** null when not currently inside a range. */
   private currentHash_: string | null = null;
+  private currentHashLength_ = 0;
   /** Fresh, mutable accumulator for the current persisted range only. */
   private currentPayload_: unknown = undefined;
   /**
@@ -262,16 +263,23 @@ export class CompoundHashBuilder {
 
   private readonly splitState_: CompoundHashSplitState = {
     hashLength: () =>
-      this.currentHash_ === null ? 0 : this.currentHash_.length,
+      this.currentHash_ === null ? 0 : this.currentHashLength_,
     currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
   };
 
-  constructor(private splitStrategy_: CompoundHashSplitStrategy) {}
+  constructor(
+    private splitStrategy_: CompoundHashSplitStrategy,
+    private lengthOnly_ = false
+  ) {}
 
   processLeaf(node: LeafNode): void {
     this.ensureRange_();
     this.lastLeafDepth_ = this.currentDepth_;
-    this.currentHash_ += leafHashRepresentation(node);
+    const leafText = leafHashRepresentation(node);
+    if (!this.lengthOnly_) {
+      this.currentHash_ += leafText;
+    }
+    this.currentHashLength_ += leafText.length;
     this.appendPayloadLeaf_(node);
     this.needsComma_ = true;
     if (this.splitStrategy_(this.splitState_)) {
@@ -282,9 +290,16 @@ export class CompoundHashBuilder {
   startChild(key: string): void {
     this.ensureRange_();
     if (this.needsComma_) {
-      this.currentHash_ += ',';
+      if (!this.lengthOnly_) {
+        this.currentHash_ += ',';
+      }
+      this.currentHashLength_++;
     }
-    this.currentHash_ += hashQuotedString(key) + ':(';
+    const opening = hashQuotedString(key) + ':(';
+    if (!this.lengthOnly_) {
+      this.currentHash_ += opening;
+    }
+    this.currentHashLength_ += opening.length;
     if (this.currentDepth_ === this.currentPath_.length) {
       this.currentPath_.push(key);
     } else {
@@ -298,7 +313,10 @@ export class CompoundHashBuilder {
     this.currentDepth_--;
     if (this.currentHash_ !== null) {
       // Add closing parenthesis for the child that was just processed.
-      this.currentHash_ += ')';
+      if (!this.lengthOnly_) {
+        this.currentHash_ += ')';
+      }
+      this.currentHashLength_++;
     }
     this.needsComma_ = true;
   }
@@ -326,6 +344,7 @@ export class CompoundHashBuilder {
     this.currentDepth_ = path.length;
     this.lastLeafDepth_ = path.length;
     this.currentHash_ = null;
+    this.currentHashLength_ = 0;
     this.needsComma_ = true;
   }
 
@@ -347,7 +366,8 @@ export class CompoundHashBuilder {
       for (let i = 0; i < this.currentDepth_; i++) {
         hash += hashQuotedString(this.currentPath_[i]) + ':(';
       }
-      this.currentHash_ = hash;
+      this.currentHash_ = this.lengthOnly_ ? '' : hash;
+      this.currentHashLength_ = hash.length;
       this.needsComma_ = false;
     }
   }
@@ -393,13 +413,18 @@ export class CompoundHashBuilder {
 
   private endRange_(): void {
     let hash = this.currentHash_!;
-    for (let i = 0; i < this.currentDepth_; i++) {
+    if (!this.lengthOnly_) {
+      for (let i = 0; i < this.currentDepth_; i++) {
+        hash += ')';
+      }
       hash += ')';
     }
-    hash += ')';
+    const completedLength = this.currentHashLength_ + this.currentDepth_ + 1;
     const index = this.hashes.length;
-    this.sizes.push(hash.length);
-    if (this.hashSink !== null) {
+    this.sizes.push(completedLength);
+    if (this.lengthOnly_) {
+      this.hashes.push('');
+    } else if (this.hashSink !== null) {
       this.hashes.push('');
       this.hashSink(hash, index);
     } else {
@@ -411,6 +436,7 @@ export class CompoundHashBuilder {
     const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
     this.posts.push(post === '' ? '/' : post);
     this.currentHash_ = null;
+    this.currentHashLength_ = 0;
     this.currentPayload_ = undefined;
     this.needsComma_ = true;
   }
@@ -612,11 +638,21 @@ export function collectChangedSubtreePaths(
   maxPaths = 512
 ): string[][] | null {
   const changed: string[][] = [];
-  let overflow = false;
-  const visit = (a: Node, b: Node, path: string[], depth: number): void => {
-    if (overflow || a === b) {
-      return;
+  /**
+   * Returns true when the caller must collapse this branch to stay within the
+   * global path budget. A large atomic subtree update should dirty that
+   * subtree's ranges, never fall back to dirtying the entire persisted root.
+   */
+  const visit = (a: Node, b: Node, path: string[], depth: number): boolean => {
+    if (a === b) {
+      return false;
     }
+    const branchStart = changed.length;
+    const collapseBranch = (): boolean => {
+      changed.splice(branchStart);
+      changed.push(path.slice());
+      return changed.length > maxPaths;
+    };
     if (
       depth >= maxDepth ||
       a.isLeafNode() ||
@@ -624,14 +660,9 @@ export function collectChangedSubtreePaths(
       a.isEmpty() ||
       b.isEmpty()
     ) {
-      if (changed.length >= maxPaths) {
-        overflow = true;
-        return;
-      }
       changed.push(path.slice());
-      return;
+      return changed.length > maxPaths;
     }
-    // Union of child keys in sorted order; nodes are index-sorted by key.
     const aKeys: string[] = [];
     const bKeys: string[] = [];
     a.forEachChild(KEY_INDEX, key => {
@@ -642,7 +673,7 @@ export function collectChangedSubtreePaths(
     });
     let i = 0;
     let j = 0;
-    while ((i < aKeys.length || j < bKeys.length) && !overflow) {
+    while (i < aKeys.length || j < bKeys.length) {
       let key: string;
       let cmp: number;
       if (i >= aKeys.length) {
@@ -656,8 +687,9 @@ export function collectChangedSubtreePaths(
         key = cmp <= 0 ? aKeys[i] : bKeys[j];
       }
       path.push(key);
+      let overBudget = false;
       if (cmp === 0) {
-        visit(
+        overBudget = visit(
           a.getImmediateChild(key),
           b.getImmediateChild(key),
           path,
@@ -666,11 +698,8 @@ export function collectChangedSubtreePaths(
         i++;
         j++;
       } else {
-        if (changed.length >= maxPaths) {
-          overflow = true;
-        } else {
-          changed.push(path.slice());
-        }
+        changed.push(path.slice());
+        overBudget = changed.length > maxPaths;
         if (cmp < 0) {
           i++;
         } else {
@@ -678,24 +707,26 @@ export function collectChangedSubtreePaths(
         }
       }
       path.pop();
+      if (overBudget) {
+        return collapseBranch();
+      }
     }
-    // A priority change on an interior node serializes into its range too.
-    if (!overflow && a.getPriority() !== b.getPriority()) {
+    if (a.getPriority() !== b.getPriority()) {
       if (
         a.getPriority().isEmpty() !== b.getPriority().isEmpty() ||
         (!a.getPriority().isEmpty() &&
           a.getPriority().val() !== b.getPriority().val())
       ) {
-        if (changed.length >= maxPaths) {
-          overflow = true;
-        } else {
-          changed.push(path.slice());
+        changed.push(path.slice());
+        if (changed.length > maxPaths) {
+          return collapseBranch();
         }
       }
     }
+    return false;
   };
   visit(before, after, [], 0);
-  return overflow ? null : changed;
+  return changed;
 }
 
 /**

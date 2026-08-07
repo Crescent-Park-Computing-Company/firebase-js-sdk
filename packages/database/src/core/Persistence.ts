@@ -24,9 +24,10 @@ import {
   estimateSerializedNodeSize,
   fixedSizeSplitStrategy,
   markDirtyRanges,
-  rebuildStableRanges
+  rebuildStableRanges,
+  walkLeafInterval
 } from './CompoundHash';
-import { SeedCompoundHash } from './ServerCacheSeed';
+import { SeedCompoundHash, stampSeedHashes } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
 import { Node } from './snap/Node';
@@ -1804,18 +1805,13 @@ export class PersistenceManager {
       }
     }
 
-    const builder = new CompoundHashBuilder(
-      fixedSizeSplitStrategy(this.rangeTargetBytes_)
+    // First pass: boundaries/sizes only. It never creates canonical strings
+    // or export payloads, so a first generation cannot retain another full
+    // copy of the root merely to decide its ranges.
+    const planner = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(this.rangeTargetBytes_),
+      true
     );
-    const dirtyTexts: string[] = [];
-    const dirtyPayloads: unknown[] = [];
-    builder.hashSink = text => {
-      dirtyTexts.push(text);
-    };
-    builder.payloadSink = payload => {
-      dirtyPayloads.push(payload);
-    };
-
     let rebuilt: StableRange[];
     try {
       rebuilt = rebuildStableRanges(
@@ -1823,143 +1819,213 @@ export class PersistenceManager {
         previousRanges,
         dirty,
         tailDirty,
-        builder,
+        planner,
         this.rangeTargetBytes_
       );
     } catch (e) {
       persistenceStats.storageFailures++;
-      recordPersistenceEvent(pathString, 'flush-hash-error');
+      recordPersistenceEvent(pathString, 'flush-plan-error');
       return this.deleteRecord_(pathString).then(() => {
         this.lastFlush_.delete(pathString);
       });
     }
 
-    const newRecords = new Map<string, PersistedRangeRecord>();
-    let dirtyIndex = 0;
+    interface DirtyRangePlan {
+      range: PersistedRange;
+      start: string | null;
+      end: string;
+    }
+    const dirtyPlans: DirtyRangePlan[] = [];
     let previousPost: string | null = null;
+    let dirtyIndex = 0;
     const ranges: PersistedRange[] = rebuilt.map(range => {
       const carried = range as PersistedRange;
       if (range.hash !== '' && typeof carried.recordId === 'string') {
         previousPost = range.post;
         return carried;
       }
-      const recordId = revision + '-' + dirtyIndex.toString(36);
-      const payload = dirtyPayloads[dirtyIndex];
-      if (payload === undefined) {
-        throw new Error('Missing persisted payload for dirty range');
-      }
-      newRecords.set(recordId, {
-        recordId,
+      const persisted: PersistedRange = {
+        ...range,
+        recordId: revision + '-' + dirtyIndex.toString(36)
+      };
+      dirtyPlans.push({
+        range: persisted,
         start: previousPost,
-        end: range.post,
-        tree: payload
+        end: range.post
       });
       previousPost = range.post;
       dirtyIndex++;
-      return { ...range, recordId };
+      return persisted;
     });
-    if (
-      dirtyIndex !== dirtyTexts.length ||
-      dirtyIndex !== dirtyPayloads.length
-    ) {
-      persistenceStats.storageFailures++;
-      recordPersistenceEvent(pathString, 'flush-range-coupling-error');
-      return this.deleteRecord_(pathString).then(() => {
-        this.lastFlush_.delete(pathString);
-      });
-    }
 
-    persistenceStats.rangesHashed += dirtyIndex;
-    persistenceStats.rangesReused += ranges.length - dirtyIndex;
-    persistenceStats.writeThroughs++;
-
-    return digestRangeTexts(dirtyTexts).then(digests => {
-      if (this.disposed_) {
-        return;
-      }
-      let digestIndex = 0;
-      for (const range of ranges) {
-        if (range.hash === '') {
-          range.hash = digests[digestIndex++];
+    const stagedIds: string[] = [];
+    const stageBatch = async (plans: DirtyRangePlan[]): Promise<void> => {
+      const texts: string[] = [];
+      const records: PersistedRangeRecord[] = [];
+      for (const plan of plans) {
+        const builder = new CompoundHashBuilder(() => false);
+        let text: string | undefined;
+        let payload: unknown = undefined;
+        builder.hashSink = completed => {
+          text = completed;
+        };
+        builder.payloadSink = completed => {
+          payload = completed;
+        };
+        const from =
+          plan.start === null
+            ? null
+            : plan.start === '/'
+            ? []
+            : plan.start.split('/');
+        const to = plan.end === '/' ? [] : plan.end.split('/');
+        if (from !== null) {
+          builder.seedBoundary(from);
         }
+        walkLeafInterval(node, from, to, builder);
+        if (
+          text === undefined ||
+          payload === undefined ||
+          builder.posts.length !== 1 ||
+          builder.posts[0] !== plan.end
+        ) {
+          throw new Error(
+            'Dirty range did not serialize to its planned boundary'
+          );
+        }
+        texts.push(text);
+        records.push({
+          recordId: plan.range.recordId,
+          start: plan.start,
+          end: plan.end,
+          tree: payload
+        });
       }
-      const manifest: PersistedManifest = {
-        formatVersion: PERSISTENCE_FORMAT_VERSION,
-        revision,
-        updatedAt: now,
-        authScope,
-        estimatedBytes: estimateSerializedNodeSize(node),
-        hash: '',
-        ranges
-      };
-      const liveIds = new Set(ranges.map(range => range.recordId));
-      const retiredIds = prev
-        ? prev.ranges
-            .map(range => range.recordId)
-            .filter(recordId => !liveIds.has(recordId))
-        : [];
-
-      return this.withStore_<boolean>(
+      const digests = await digestRangeTexts(texts);
+      for (let i = 0; i < plans.length; i++) {
+        plans[i].range.hash = digests[i];
+      }
+      const stored = await this.withStore_<boolean>(
         'readwrite',
         false,
         (store, done, progress) => {
-          const currentReq = store.get(key);
-          currentReq.onsuccess = () => {
-            progress();
-            const current = currentReq.result as PersistedManifest | undefined;
-            // Optimistic cross-tab CAS. If another tab advanced the manifest
-            // after our local base, retry from scratch; immutable payload ids
-            // ensure no partial/mixed generation can be observed meanwhile.
-            if (prev && (!current || current.revision !== prev.revision)) {
-              done(false);
-              return;
-            }
-            for (const record of newRecords.values()) {
-              const put = store.put(
-                record,
-                key + RANGE_KEY_INFIX + record.recordId
-              );
-              put.onsuccess = progress;
-            }
-            for (const recordId of retiredIds) {
-              const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
-              remove.onsuccess = progress;
-            }
-            const manifestPut = store.put(manifest, key);
-            manifestPut.onsuccess = progress;
-            done(true);
-          };
-        }
-      ).then(ok => {
-        if (!ok || this.disposed_) {
-          if (prev) {
-            // Another writer won. The follow-up must not reuse this tab's old
-            // descriptors; a full range rebuild is self-contained.
-            this.lastFlush_.delete(pathString);
-            this.flushPending_.add(pathString);
+          for (const record of records) {
+            const put = store.put(
+              record,
+              key + RANGE_KEY_INFIX + record.recordId
+            );
+            put.onsuccess = progress;
           }
+          done(true);
+        }
+      );
+      if (!stored) {
+        throw new Error('Failed to stage persisted ranges');
+      }
+      stagedIds.push(...records.map(record => record.recordId));
+      // `texts`, payload fragments, and structured-clone inputs now leave
+      // scope before the next batch is built.
+    };
+
+    const stageAll = async (): Promise<void> => {
+      const batchSize = 8;
+      for (let i = 0; i < dirtyPlans.length; i += batchSize) {
+        await stageBatch(dirtyPlans.slice(i, i + batchSize));
+      }
+    };
+
+    return stageAll()
+      .then(() => {
+        if (this.disposed_) {
           return;
         }
-        this.lastFlush_.set(pathString, {
-          rootNode: node,
+        const manifest: PersistedManifest = {
+          formatVersion: PERSISTENCE_FORMAT_VERSION,
           revision,
-          ranges,
-          storedUpdatedAt: now
+          updatedAt: now,
+          authScope,
+          estimatedBytes: estimateSerializedNodeSize(node),
+          hash: '',
+          ranges
+        };
+        const liveIds = new Set(ranges.map(range => range.recordId));
+        const retiredIds = prev
+          ? prev.ranges
+              .map(range => range.recordId)
+              .filter(recordId => !liveIds.has(recordId))
+          : [];
+
+        // The range payloads are immutable staging records. This tiny CAS
+        // transaction is the atomic authority switch: until the manifest put
+        // commits, a crash leaves the previous generation fully live.
+        return this.withStore_<boolean>(
+          'readwrite',
+          false,
+          (store, done, progress) => {
+            const currentReq = store.get(key);
+            currentReq.onsuccess = () => {
+              progress();
+              const current = currentReq.result as
+                | PersistedManifest
+                | undefined;
+              if (prev && (!current || current.revision !== prev.revision)) {
+                done(false);
+                return;
+              }
+              for (const recordId of retiredIds) {
+                const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
+                remove.onsuccess = progress;
+              }
+              const manifestPut = store.put(manifest, key);
+              manifestPut.onsuccess = progress;
+              done(true);
+            };
+          }
+        ).then(ok => {
+          if (!ok || this.disposed_) {
+            if (prev) {
+              this.lastFlush_.delete(pathString);
+              this.flushPending_.add(pathString);
+            }
+            return;
+          }
+          persistenceStats.rangesHashed += dirtyPlans.length;
+          persistenceStats.rangesReused += ranges.length - dirtyPlans.length;
+          persistenceStats.writeThroughs++;
+          this.lastFlush_.set(pathString, {
+            rootNode: node,
+            revision,
+            ranges,
+            storedUpdatedAt: now
+          });
+          stampSeedHashes(
+            node,
+            manifest.hash,
+            wireCompoundHashFromRanges(ranges)
+          );
+          recordPersistenceEvent(
+            pathString,
+            'stored',
+            `${ranges.length} ranges, ${dirtyPlans.length} written`
+          );
+          if (!prev) {
+            void this.gcRangeRecords_(pathString, revision, liveIds);
+          }
         });
-        recordPersistenceEvent(
-          pathString,
-          'stored',
-          `${ranges.length} ranges, ${dirtyIndex} written`
-        );
-        // Incremental commits delete every id retired from their direct base.
-        // Only a self-contained first/rebase generation can inherit unknown
-        // leftovers, so the wider orphan scan runs once there — never on each
-        // hot-root flush.
-        if (!prev) {
-          void this.gcRangeRecords_(pathString, revision, liveIds);
+      })
+      .catch(() => {
+        persistenceStats.storageFailures++;
+        recordPersistenceEvent(pathString, 'flush-range-stage-error');
+        // Staged immutable records are non-authoritative and are reclaimed by
+        // the next successful full-generation GC or the deferred sweep.
+        if (stagedIds.length > 0) {
+          void this.withStore_<void>('readwrite', undefined, store => {
+            for (const recordId of stagedIds) {
+              store.delete(key + RANGE_KEY_INFIX + recordId);
+            }
+          });
         }
       });
-    });
   }
 
   private gcRangeRecords_(
