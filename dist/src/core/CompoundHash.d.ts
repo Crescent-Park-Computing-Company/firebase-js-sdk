@@ -62,6 +62,14 @@ export type CompoundHashSplitStrategy = (state: CompoundHashSplitState) => boole
  */
 export declare function simpleSizeSplitStrategy(node: Node): CompoundHashSplitStrategy;
 /**
+ * A constant-size split strategy used by persistence. Unlike the protocol's
+ * historical sqrt(tree-size) default, a fixed target gives IndexedDB records
+ * a predictable upper bound across roots and generations. Boundaries remain
+ * stable between writes; the target is consulted only when a dirty run is
+ * re-emitted.
+ */
+export declare function fixedSizeSplitStrategy(targetBytes: number): CompoundHashSplitStrategy;
+/**
  * Computes the compound hash of a node.
  */
 export declare function compoundHashFromNode(node: Node, splitStrategy?: CompoundHashSplitStrategy): CompoundHash;
@@ -87,8 +95,17 @@ export declare class CompoundHashBuilder {
      * ranges with WebCrypto off the main thread's synchronous path.
      */
     hashSink: ((text: string, index: number) => void) | null;
+    /**
+     * Optional persistence sink for the export-format fragment represented by
+     * each completed hash range. The fragment contains exactly the leaves in
+     * that range's (exclusiveStart, inclusiveEnd] interval. Persistence unions
+     * these disjoint fragments without range-deletion semantics.
+     */
+    payloadSink: ((payload: unknown, index: number) => void) | null;
     /** null when not currently inside a range. */
     private currentHash_;
+    /** Fresh, mutable accumulator for the current persisted range only. */
+    private currentPayload_;
     /**
      * Key stack of the node being processed. Kept beyond currentDepth_ so the
      * path of the last processed leaf survives popping back out of its parent.
@@ -121,6 +138,7 @@ export declare class CompoundHashBuilder {
      */
     forceEndRange(): void;
     private ensureRange_;
+    private appendPayloadLeaf_;
     private endRange_;
 }
 /**
@@ -203,7 +221,7 @@ export declare function markDirtyRanges(ranges: StableRange[], changedPaths: str
  * (the caller fills them from the sink's completions, matching indexes in
  * builder.hashes/sizes/posts order for the dirty emissions).
  */
-export declare function rebuildStableRanges(node: Node, previous: StableRange[], dirty: boolean[], tailDirty: boolean, builder: CompoundHashBuilder): StableRange[];
+export declare function rebuildStableRanges(node: Node, previous: StableRange[], dirty: boolean[], tailDirty: boolean, builder: CompoundHashBuilder, fixedTargetBytes?: number): StableRange[];
 export declare class CompoundHashAccumulator {
     private readonly builder_;
     private openPath_;

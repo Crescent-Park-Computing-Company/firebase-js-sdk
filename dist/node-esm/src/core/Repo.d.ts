@@ -21,7 +21,7 @@ import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import { ListenHashFn } from './ServerCacheSeed';
+import { ListenHashFn, PendingListenHashStore } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { SnapshotHolder } from './SnapshotHolder';
 import { SparseSnapshotTree } from './SparseSnapshotTree';
@@ -79,6 +79,9 @@ type BootBufferedOp = {
         m: unknown;
     }>;
     tag: number | null;
+} | {
+    kind: 'complete';
+    apply: () => void;
 };
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
@@ -126,6 +129,8 @@ export declare class Repo {
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
+    /** Manifest-first hashes scoped to this Repo, never process-global. */
+    pendingListenHashes_: PendingListenHashStore;
     /**
      * Server operations buffered during a manifest-first boot window: the
      * range listen is on the wire before the cached base has been applied to

@@ -58,11 +58,21 @@ export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | unde
  * permanently retain one SHA string per node.
  */
 export declare function getNodeCanonicalHash(node: Node): string | undefined;
-export declare function stampSeedValue(node: Node, value: unknown): void;
-export declare function getNodeSeedValue(node: Node): unknown | undefined;
-export declare function stampNextListenHashes(pathString: string, hash: string, compoundHash: SeedCompoundHash): void;
-export declare function clearNextListenHashes(pathString: string): void;
-export declare function getNextListenHashes(pathString: string): {
+/** The hash pair a manifest-first listen can consume before its Node exists. */
+export interface PendingListenHashes {
     hash: string;
     compoundHash: SeedCompoundHash;
-} | undefined;
+}
+/**
+ * Repo-scoped manifest-first hash registry. Different Database instances can
+ * listen to the same relative path while holding different caches; keeping
+ * this store on Repo prevents one restore from overwriting or clearing
+ * another Repo's pending hashes.
+ */
+export declare class PendingListenHashStore {
+    private readonly pending_;
+    set(pathString: string, hash: string, compoundHash: SeedCompoundHash): void;
+    clear(pathString: string): void;
+    get(pathString: string): PendingListenHashes | undefined;
+    clearAll(): void;
+}

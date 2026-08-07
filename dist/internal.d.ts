@@ -54,6 +54,9 @@ declare type BootBufferedOp = {
         m: unknown;
     }>;
     tag: number | null;
+} | {
+    kind: 'complete';
+    apply: () => void;
 };
 
 /**
@@ -898,6 +901,8 @@ declare interface ListenOutcomeState {
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
+    /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
+    getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
 }
 
 declare interface ListenWireResult {
@@ -1903,6 +1908,26 @@ declare class Path {
     toString(): string;
 }
 
+/** The hash pair a manifest-first listen can consume before its Node exists. */
+declare interface PendingListenHashes {
+    hash: string;
+    compoundHash: SeedCompoundHash;
+}
+
+/**
+ * Repo-scoped manifest-first hash registry. Different Database instances can
+ * listen to the same relative path while holding different caches; keeping
+ * this store on Repo prevents one restore from overwriting or clearing
+ * another Repo's pending hashes.
+ */
+declare class PendingListenHashStore {
+    private readonly pending_;
+    set(pathString: string, hash: string, compoundHash: SeedCompoundHash): void;
+    clear(pathString: string): void;
+    get(pathString: string): PendingListenHashes | undefined;
+    clearAll(): void;
+}
+
 /**
  * A connection to a single data repository.
  */
@@ -1940,7 +1965,7 @@ declare interface PersistedSeedHashes {
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
 declare class PersistenceManager {
     private prefix_;
@@ -1949,6 +1974,7 @@ declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private writeDelayMs_;
+    private rangeTargetBytes_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -1997,9 +2023,10 @@ declare class PersistenceManager {
     private sweepTimer_;
     private disposed_;
     private authScope_;
+    private authScopeConfigured_;
     private authGeneration_;
     setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -2051,30 +2078,27 @@ declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's stored state: the manifest in a first short transaction —
-     * validated and surfaced to `onManifest` IMMEDIATELY, so a listen carrying
-     * the stored hashes can be on the wire while the tree record is still
-     * loading — then the tree record, decoded into a Node and joined with the
-     * manifest's hashes. A revision mismatch between the two (an interrupted
-     * or foreign write; single-transaction commits make this near-impossible,
-     * but the check is cheap) resolves null. Expired or format-mismatched
-     * records resolve null and are deleted best-effort.
+     * Reads a root's committed manifest and every immutable range it references
+     * in one readonly transaction. `onManifest` fires as soon as the requests
+     * are queued, overlapping network reconciliation with structured-clone
+     * range reads and private Node assembly. Missing/mismatched ranges fail the
+     * whole restore; Repo then performs the structural-failure cold relisten.
      */
     private readRecord_;
     private readRecordOnce_;
     private deleteRecord_;
     private withRestoreSlot_;
     /**
-     * Exact-root optimistic peek. The completed decode is retained briefly so
-     * the authenticated listener can consume the same immutable Node instead of
-     * decoding a large IndexedDB record twice during boot.
+     * Exact-root optimistic peek. The completed range assembly is retained briefly
+     * so the authenticated listener consumes the same immutable Node instead of
+     * reconstructing the root twice during boot.
      */
     peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
      * Listener restore with an idle (no-progress) bound. `onManifest` fires as
      * soon as the stored generation's hashes are known — typically
-     * milliseconds — letting the caller send the range listen while the tree
-     * record is still being read and decoded. The callback is suppressed after
+     * milliseconds — letting the caller send the range listen while immutable
+     * range records are still being read and assembled. The callback is suppressed after
      * a timeout/miss resolution, and never fires once the returned promise has
      * settled null.
      */
@@ -2131,14 +2155,15 @@ declare class PersistenceManager {
     /**
      * One generation: identity-diff against the last known stored tree marks
      * the dirty ranges; only those are re-serialized (between preserved
-     * boundary posts) and re-hashed; clean ranges carry over verbatim, their
-     * bytes never read. The manifest (ranges + hashes) and the tree record
-     * (structured-clone export tree) commit in ONE transaction, so every
+     * boundary posts), re-hashed, and written under new immutable ids. Clean
+     * range records carry over verbatim and are never cloned. New records plus
+     * the manifest commit in ONE transaction, so every
      * committed generation's hashes exactly describe its stored tree — which
      * is what lets the next boot listen straight off the manifest with zero
      * hashing.
      */
     private flush_;
+    private gcRangeRecords_;
 }
 
 declare type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
@@ -2601,6 +2626,8 @@ declare class Repo {
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
+    /** Manifest-first hashes scoped to this Repo, never process-global. */
+    pendingListenHashes_: PendingListenHashStore;
     /**
      * Server operations buffered during a manifest-first boot window: the
      * range listen is on the wire before the cached base has been applied to
