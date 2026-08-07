@@ -4459,7 +4459,7 @@ const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-const PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 /**
  * Maximum gap with NO restore progress before the listen attaches unseeded.
  * Progress (a completed manifest or tree read) resets this budget. The same

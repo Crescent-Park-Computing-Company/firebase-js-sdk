@@ -30,7 +30,7 @@ export declare const PERSISTENCE_MAX_CACHE_BYTES: number;
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 /**
  * Maximum gap with NO restore progress before the listen attaches unseeded.
  * Progress (a completed manifest or tree read) resets this budget. The same
