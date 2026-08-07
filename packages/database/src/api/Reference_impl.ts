@@ -33,7 +33,6 @@ import { PathIndex } from '../core/snap/indexes/PathIndex';
 import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
 import { VALUE_INDEX } from '../core/snap/indexes/ValueIndex';
 import { Node } from '../core/snap/Node';
-import { getNodeSeedValue } from '../core/ServerCacheSeed';
 import { syncPointSetReferenceConstructor } from '../core/SyncPoint';
 import { syncTreeSetReferenceConstructor } from '../core/SyncTree';
 import { parseRepoInfo } from '../core/util/libs/parser';
@@ -460,14 +459,6 @@ export class DataSnapshot {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   val(): any {
-    // A persistence-restored root hands back the restored object by
-    // reference (val() has no memoization; re-materializing a large restored
-    // tree here would briefly double its memory). Only stamped for
-    // priority-free trees, where val() output === the stored input.
-    const seeded = getNodeSeedValue(this._node);
-    if (seeded !== undefined) {
-      return seeded;
-    }
     return this._node.val();
   }
 }

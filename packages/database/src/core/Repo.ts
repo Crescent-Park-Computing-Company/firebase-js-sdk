@@ -32,11 +32,10 @@ import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
 import {
   ListenHashFn,
-  clearNextListenHashes,
-  stampNextListenHashes,
+  PendingListenHashStore,
   stampSeedHashes
 } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
@@ -192,6 +191,10 @@ type BootBufferedOp =
       pathString: string;
       ranges: Array<{ s?: string; e?: string; m: unknown }>;
       tag: number | null;
+    }
+  | {
+      kind: 'complete';
+      apply: () => void;
     };
 
 /**
@@ -272,6 +275,9 @@ export class Repo {
    * removed mid-restore is never sent (see repoStartServerListen).
    */
   pendingSeedRestores_ = new Map<string, PendingSeedRestore>();
+
+  /** Manifest-first hashes scoped to this Repo, never process-global. */
+  pendingListenHashes_ = new PendingListenHashStore();
 
   /**
    * Server operations buffered during a manifest-first boot window: the
@@ -427,7 +433,9 @@ export function repoStart(
     },
     stopListening: (query, tag) => {
       repoStopServerListen(repo, query, tag);
-    }
+    },
+    getPendingListenHashes: pathString =>
+      repo.pendingListenHashes_.get(pathString)
   });
 }
 
@@ -476,8 +484,7 @@ function repoOnDataUpdate(
     // Manifest-first boot window: the listen went out before the cached base
     // applied. Hold server data for that root — in arrival order with range
     // merges — until the base is in SyncTree (see repoStartServerListen).
-    const bufferRoot =
-      tag == null ? repoBootBufferRootFor(repo, pathString) : null;
+    const bufferRoot = repoBootBufferRootFor(repo, pathString);
     if (bufferRoot !== null) {
       repo.bootBuffers_
         .get(bufferRoot)!
@@ -578,11 +585,39 @@ export function repoStartServerListen(
     });
   }
 
+  let activeMode: ListenOutcomeMode = 'cold';
+  let activeReason: ListenOutcomeReason | undefined;
+  const processListenComplete = (
+    status: string,
+    data: unknown,
+    wire: ListenWireResult
+  ) => {
+    const events = onComplete(status, data);
+    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+    if (!isDefaultComplete) {
+      return;
+    }
+    repoPublishListenOutcome(repo, pathString, {
+      mode: activeMode,
+      certified: status === 'ok',
+      bytes: wire.bytes,
+      reason: status === 'ok' ? activeReason : 'auth'
+    });
+    if (repo.persistence_ !== null) {
+      if (status === 'ok') {
+        repoPersistAfterServerUpdate(repo, query._path);
+      } else {
+        repo.persistence_.evict(query._path);
+      }
+    }
+  };
+
   const sendListen = (
     mode: ListenOutcomeMode,
     reason?: ListenOutcomeReason
   ) => {
-    let activeMode = mode;
+    activeMode = mode;
+    activeReason = reason;
     if (isDefaultComplete) {
       repoPublishListenOutcome(repo, pathString, {
         mode,
@@ -596,28 +631,15 @@ export function repoStartServerListen(
       currentHashFn,
       tag,
       (status, data, wire) => {
-        const events = onComplete(status, data);
-        eventQueueRaiseEventsForChangedPath(
-          repo.eventQueue_,
-          query._path,
-          events
-        );
-        if (!isDefaultComplete) {
+        const bufferRoot = repoBootBufferRootFor(repo, pathString);
+        if (bufferRoot !== null) {
+          repo.bootBuffers_.get(bufferRoot)!.push({
+            kind: 'complete',
+            apply: () => processListenComplete(status, data, wire)
+          });
           return;
         }
-        repoPublishListenOutcome(repo, pathString, {
-          mode: activeMode,
-          certified: status === 'ok',
-          bytes: wire.bytes,
-          reason: status === 'ok' ? reason : 'auth'
-        });
-        if (repo.persistence_ !== null) {
-          if (status === 'ok') {
-            repoPersistAfterServerUpdate(repo, query._path);
-          } else {
-            repo.persistence_.evict(query._path);
-          }
-        }
+        processListenComplete(status, data, wire);
       },
       wire => {
         if (!isDefaultComplete) {
@@ -675,6 +697,20 @@ export function repoStartServerListen(
   // the restore then fails, the buffered data is authoritative anyway — it
   // is applied and the listen simply behaves as an unseeded one.
   let sentFromManifest = false;
+  let restartedCold = false;
+  const restartCold = (reason: ListenOutcomeReason = 'corrupt') => {
+    if (!sentFromManifest || restartedCold) {
+      return;
+    }
+    restartedCold = true;
+    repo.pendingListenHashes_.clear(pathString);
+    repo.bootBuffers_.delete(pathString);
+    // The compound response may omit every matching range, so buffered data
+    // cannot reconstruct a missing base. Tear down the seeded listen and send
+    // exactly one ordinary full listen.
+    repo.server_.unlisten(query, tag);
+    sendListen('fallback', reason);
+  };
   const onManifest = () => {
     if (!isCurrent() || sentFromManifest) {
       return;
@@ -706,15 +742,21 @@ export function repoStartServerListen(
     for (const op of buffered) {
       if (op.kind === 'data') {
         repoOnDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
-      } else {
+      } else if (op.kind === 'rm') {
         repoOnRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+      } else {
+        op.apply();
       }
     }
   };
 
   void persistence
     .restoreForListen(pathString, hashes => {
-      stampNextListenHashes(pathString, hashes.hash, hashes.compoundHash);
+      repo.pendingListenHashes_.set(
+        pathString,
+        hashes.hash,
+        hashes.compoundHash
+      );
       onManifest();
     })
     .then(
@@ -724,14 +766,12 @@ export function repoStartServerListen(
         }
         const { record, reason } = result;
         if (record === null) {
-          // The manifest may have already sent the listen (a tree-record
-          // failure after a valid manifest): clear the stamp, drain whatever
-          // the server pushed — it is authoritative — and let the listen
-          // response settle the outcome. Without a sent listen this is the
-          // ordinary cold/fallback path.
-          clearNextListenHashes(pathString);
+          // A manifest-first listen may have omitted matching ranges. If
+          // any referenced local payload is missing/corrupt, buffered deltas
+          // are not a complete base: restart exactly once with a cold listen.
+          repo.pendingListenHashes_.clear(pathString);
           if (sentFromManifest) {
-            drainBootBuffer();
+            restartCold(reason ?? 'corrupt');
             return;
           }
           const fallback = reason === 'corrupt' || reason === 'timeout';
@@ -751,7 +791,7 @@ export function repoStartServerListen(
               query._path
             ).length > 0
           ) {
-            clearNextListenHashes(pathString);
+            repo.pendingListenHashes_.clear(pathString);
             finish('cold');
             return;
           }
@@ -775,24 +815,24 @@ export function repoStartServerListen(
           // The hashes ride the seeded node from here on; the pending stamp
           // must not outlive the boot window (a re-listen after real server
           // updates must send the CURRENT tree's hashes, not the stored ones).
-          clearNextListenHashes(pathString);
+          repo.pendingListenHashes_.clear(pathString);
           if (sentFromManifest) {
             drainBootBuffer();
           } else {
             finish('restored');
           }
         } catch {
-          clearNextListenHashes(pathString);
+          repo.pendingListenHashes_.clear(pathString);
           persistence.invalidate(query._path);
           if (sentFromManifest) {
-            drainBootBuffer();
+            restartCold('corrupt');
           } else {
             finish('fallback', 'corrupt');
           }
         }
       },
       () => {
-        clearNextListenHashes(pathString);
+        repo.pendingListenHashes_.clear(pathString);
         if (sentFromManifest) {
           drainBootBuffer();
         } else {
@@ -831,7 +871,7 @@ export function repoStopServerListen(
     repo.server_.unlisten(query, tag);
   }
   repo.bootBuffers_.delete(pathString);
-  clearNextListenHashes(pathString);
+  repo.pendingListenHashes_.clear(pathString);
   repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
 }
@@ -854,6 +894,7 @@ export function repoOnListenOutcome(
 }
 
 export function repoCancelPendingSeedRestores(repo: Repo): void {
+  repo.pendingListenHashes_.clearAll();
   for (const pending of repo.pendingSeedRestores_.values()) {
     pending.cancelled = true;
   }
@@ -913,8 +954,7 @@ function repoOnRangeMergeUpdate(
   // For testing.
   repo.dataUpdateCount++;
   {
-    const bufferRoot =
-      tag == null ? repoBootBufferRootFor(repo, pathString) : null;
+    const bufferRoot = repoBootBufferRootFor(repo, pathString);
     if (bufferRoot !== null) {
       repo.bootBuffers_
         .get(bufferRoot)!

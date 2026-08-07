@@ -8,6 +8,8 @@ internal hooks `_setPersistenceEnabled`, `_setPersistencePath`,
 `_setPersistenceAuthScope`, `_getPersistedValue`, and `_onListenOutcome`.
 Selected default-listen roots restore cached events before server
 certification; unchanged trees complete without a full download and changed
-trees reconcile through compound-hash range merges. This also ports the
-compound-hash listen and range-merge protocol used by the Android and iOS
-SDKs.
+trees reconcile through compound-hash range merges. Persistence stores one
+tiny manifest plus immutable fixed-target range records, rewrites only dirty
+ranges, guards cross-tab commits by manifest revision, and garbage-collects
+retired records. This also ports the compound-hash listen and range-merge
+protocol used by the Android and iOS SDKs.

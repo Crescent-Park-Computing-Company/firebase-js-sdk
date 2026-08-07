@@ -105,57 +105,34 @@ export function getNodeCanonicalHash(node: Node): string | undefined {
   return nodeCanonicalHashes.get(node);
 }
 
-/**
- * The restored plain tree a seeded node was decoded from, when the manifest
- * proved it priority-free — for such a tree, `val()` output is structurally
- * identical to the stored input, so the first snapshot can hand the
- * application the RESTORED OBJECT BY REFERENCE instead of walking the Node
- * tree and materializing a third full copy of the data (the SDK's val() has
- * no memoization of its own). Rides in a WeakMap keyed by the seeded root
- * node: the first server change replaces the root node instance, after
- * which val() naturally materializes from the updated Nodes.
- */
-const nodeSeedValues = new WeakMap<object, unknown>();
-
-export function stampSeedValue(node: Node, value: unknown): void {
-  nodeSeedValues.set(node, value);
-}
-
-export function getNodeSeedValue(node: Node): unknown | undefined {
-  return nodeSeedValues.get(node);
+/** The hash pair a manifest-first listen can consume before its Node exists. */
+export interface PendingListenHashes {
+  hash: string;
+  compoundHash: SeedCompoundHash;
 }
 
 /**
- * Hashes for a listen that is about to be sent for `pathString` — the
- * manifest-first boot path: the listen goes out BEFORE the restored tree
- * exists in SyncTree, so the hashes cannot ride on the cached node yet.
- * SyncTree's hashFn consults this registry first; the entry is cleared when
- * the restore settles (either the seeded node then carries the hashes, or
- * the restore failed and the next listen must not reuse them).
- *
- * Keyed by the repo-relative listened path. Single-repo keying is safe: two
- * repos listening to the same path string would only ever stamp equivalent
- * hashes for their own stores, and the entry lives for one boot window.
+ * Repo-scoped manifest-first hash registry. Different Database instances can
+ * listen to the same relative path while holding different caches; keeping
+ * this store on Repo prevents one restore from overwriting or clearing
+ * another Repo's pending hashes.
  */
-const pendingListenHashes = new Map<
-  string,
-  { hash: string; compoundHash: SeedCompoundHash }
->();
+export class PendingListenHashStore {
+  private readonly pending_ = new Map<string, PendingListenHashes>();
 
-export function stampNextListenHashes(
-  pathString: string,
-  hash: string,
-  compoundHash: SeedCompoundHash
-): void {
-  pendingListenHashes.set(pathString, { hash, compoundHash });
-}
+  set(pathString: string, hash: string, compoundHash: SeedCompoundHash): void {
+    this.pending_.set(pathString, { hash, compoundHash });
+  }
 
-export function clearNextListenHashes(pathString: string): void {
-  pendingListenHashes.delete(pathString);
-}
+  clear(pathString: string): void {
+    this.pending_.delete(pathString);
+  }
 
-export function getNextListenHashes(
-  pathString: string
-): { hash: string; compoundHash: SeedCompoundHash } | undefined {
-  return pendingListenHashes.get(pathString);
+  get(pathString: string): PendingListenHashes | undefined {
+    return this.pending_.get(pathString);
+  }
+
+  clearAll(): void {
+    this.pending_.clear();
+  }
 }

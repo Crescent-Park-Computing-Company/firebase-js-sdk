@@ -39,8 +39,9 @@ jobs:
           npx mocha \
             'test/compoundhash.test.ts' \
             'test/persistence.test.ts' \
+            'test/persistentconnection-compoundhash.test.ts' \
             'test/rangemerge.test.ts' \
-            'test/servercacheseed.test.ts' \
+            'test/websocketconnection.test.ts' \
             'test/compound_write.test.ts' \
             'test/path.test.ts' \
             'test/pushid.test.ts' \

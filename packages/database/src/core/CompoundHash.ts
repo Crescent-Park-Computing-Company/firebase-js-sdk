@@ -94,6 +94,22 @@ export function simpleSizeSplitStrategy(node: Node): CompoundHashSplitStrategy {
 }
 
 /**
+ * A constant-size split strategy used by persistence. Unlike the protocol's
+ * historical sqrt(tree-size) default, a fixed target gives IndexedDB records
+ * a predictable upper bound across roots and generations. Boundaries remain
+ * stable between writes; the target is consulted only when a dirty run is
+ * re-emitted.
+ */
+export function fixedSizeSplitStrategy(
+  targetBytes: number
+): CompoundHashSplitStrategy {
+  const splitThreshold = Math.max(512, Math.floor(targetBytes));
+  return state =>
+    state.hashLength() > splitThreshold &&
+    state.currentPath()[state.currentPath().length - 1] !== '.priority';
+}
+
+/**
  * Computes the compound hash of a node.
  */
 export function compoundHashFromNode(
@@ -223,9 +239,18 @@ export class CompoundHashBuilder {
    * ranges with WebCrypto off the main thread's synchronous path.
    */
   hashSink: ((text: string, index: number) => void) | null = null;
+  /**
+   * Optional persistence sink for the export-format fragment represented by
+   * each completed hash range. The fragment contains exactly the leaves in
+   * that range's (exclusiveStart, inclusiveEnd] interval. Persistence unions
+   * these disjoint fragments without range-deletion semantics.
+   */
+  payloadSink: ((payload: unknown, index: number) => void) | null = null;
 
   /** null when not currently inside a range. */
   private currentHash_: string | null = null;
+  /** Fresh, mutable accumulator for the current persisted range only. */
+  private currentPayload_: unknown = undefined;
   /**
    * Key stack of the node being processed. Kept beyond currentDepth_ so the
    * path of the last processed leaf survives popping back out of its parent.
@@ -247,6 +272,7 @@ export class CompoundHashBuilder {
     this.ensureRange_();
     this.lastLeafDepth_ = this.currentDepth_;
     this.currentHash_ += leafHashRepresentation(node);
+    this.appendPayloadLeaf_(node);
     this.needsComma_ = true;
     if (this.splitStrategy_(this.splitState_)) {
       this.endRange_();
@@ -326,23 +352,66 @@ export class CompoundHashBuilder {
     }
   }
 
+  private appendPayloadLeaf_(node: LeafNode): void {
+    if (this.payloadSink === null) {
+      return;
+    }
+    const path = this.currentPath_.slice(0, this.currentDepth_);
+    const value = node.val(true);
+    if (path.length === 0) {
+      this.currentPayload_ = value;
+      return;
+    }
+    if (
+      this.currentPayload_ === undefined ||
+      this.currentPayload_ === null ||
+      typeof this.currentPayload_ !== 'object'
+    ) {
+      this.currentPayload_ = {};
+    }
+    let cursor = this.currentPayload_ as Record<string, unknown>;
+    for (let i = 0; i < path.length - 1; i++) {
+      const key = path[i];
+      const existing = cursor[key];
+      if (existing === null || typeof existing !== 'object') {
+        Object.defineProperty(cursor, key, {
+          value: {},
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
+      }
+      cursor = cursor[key] as Record<string, unknown>;
+    }
+    Object.defineProperty(cursor, path[path.length - 1], {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  }
+
   private endRange_(): void {
     let hash = this.currentHash_!;
     for (let i = 0; i < this.currentDepth_; i++) {
       hash += ')';
     }
     hash += ')';
+    const index = this.hashes.length;
     this.sizes.push(hash.length);
     if (this.hashSink !== null) {
-      const index = this.hashes.length;
       this.hashes.push('');
       this.hashSink(hash, index);
     } else {
       this.hashes.push(sha1(hash));
     }
+    if (this.payloadSink !== null) {
+      this.payloadSink(this.currentPayload_, index);
+    }
     const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
     this.posts.push(post === '' ? '/' : post);
     this.currentHash_ = null;
+    this.currentPayload_ = undefined;
     this.needsComma_ = true;
   }
 }
@@ -706,12 +775,16 @@ export function rebuildStableRanges(
   previous: StableRange[],
   dirty: boolean[],
   tailDirty: boolean,
-  builder: CompoundHashBuilder
+  builder: CompoundHashBuilder,
+  fixedTargetBytes?: number
 ): StableRange[] {
-  const ideal = Math.max(
-    512,
-    Math.floor(Math.sqrt(estimateSerializedNodeSize(node) * 100))
-  );
+  const ideal =
+    fixedTargetBytes === undefined
+      ? Math.max(
+          512,
+          Math.floor(Math.sqrt(estimateSerializedNodeSize(node) * 100))
+        )
+      : Math.max(512, Math.floor(fixedTargetBytes));
   const minSize = ideal >> 1;
   // Absorb undersized clean neighbors into adjacent dirty runs (merge side of
   // the hysteresis): they re-emit merged with the run's bytes.

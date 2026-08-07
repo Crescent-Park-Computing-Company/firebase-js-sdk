@@ -31,7 +31,7 @@ import {
 import { Overwrite } from './operation/Overwrite';
 import {
   ListenHashFn,
-  getNextListenHashes,
+  PendingListenHashes,
   getNodeCanonicalHash,
   getNodeCompoundHash
 } from './ServerCacheSeed';
@@ -110,6 +110,11 @@ export interface ListenProvider {
   ): Event[];
 
   stopListening(a: QueryContext, b: number | null): void;
+
+  /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
+  getPendingListenHashes?: (
+    pathString: string
+  ) => PendingListenHashes | undefined;
 }
 
 /**
@@ -956,7 +961,8 @@ function syncTreeCreateListenerForView_(
   const hashFn: ListenHashFn = () => {
     // Manifest-first boot: the persisted hashes are stamped for this path
     // before the restored tree exists in SyncTree (see stampNextListenHashes).
-    const pending = getNextListenHashes(pathString);
+    const pending =
+      syncTree.listenProvider_.getPendingListenHashes?.(pathString);
     if (pending !== undefined) {
       return pending.hash;
     }
@@ -968,7 +974,8 @@ function syncTreeCreateListenerForView_(
   // one; once a server update replaces the cache it is gone, and re-listens
   // send only the simple hash.
   hashFn.compoundHash = () => {
-    const pending = getNextListenHashes(pathString);
+    const pending =
+      syncTree.listenProvider_.getPendingListenHashes?.(pathString);
     if (pending !== undefined) {
       return pending.compoundHash;
     }
