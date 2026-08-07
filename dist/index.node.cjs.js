@@ -2264,8 +2264,9 @@ function forEachChildWithPriority(node, action, includeTrailingPriority = false)
     }
 }
 class CompoundHashBuilder {
-    constructor(splitStrategy_) {
+    constructor(splitStrategy_, lengthOnly_ = false) {
         this.splitStrategy_ = splitStrategy_;
+        this.lengthOnly_ = lengthOnly_;
         this.posts = [];
         this.hashes = [];
         /** Serialized text length of each completed range (same order as posts). */
@@ -2286,6 +2287,7 @@ class CompoundHashBuilder {
         this.payloadSink = null;
         /** null when not currently inside a range. */
         this.currentHash_ = null;
+        this.currentHashLength_ = 0;
         /** Fresh, mutable accumulator for the current persisted range only. */
         this.currentPayload_ = undefined;
         /**
@@ -2297,14 +2299,18 @@ class CompoundHashBuilder {
         this.lastLeafDepth_ = -1;
         this.needsComma_ = true;
         this.splitState_ = {
-            hashLength: () => this.currentHash_ === null ? 0 : this.currentHash_.length,
+            hashLength: () => this.currentHash_ === null ? 0 : this.currentHashLength_,
             currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
         };
     }
     processLeaf(node) {
         this.ensureRange_();
         this.lastLeafDepth_ = this.currentDepth_;
-        this.currentHash_ += leafHashRepresentation(node);
+        const leafText = leafHashRepresentation(node);
+        if (!this.lengthOnly_) {
+            this.currentHash_ += leafText;
+        }
+        this.currentHashLength_ += leafText.length;
         this.appendPayloadLeaf_(node);
         this.needsComma_ = true;
         if (this.splitStrategy_(this.splitState_)) {
@@ -2314,9 +2320,16 @@ class CompoundHashBuilder {
     startChild(key) {
         this.ensureRange_();
         if (this.needsComma_) {
-            this.currentHash_ += ',';
+            if (!this.lengthOnly_) {
+                this.currentHash_ += ',';
+            }
+            this.currentHashLength_++;
         }
-        this.currentHash_ += hashQuotedString(key) + ':(';
+        const opening = hashQuotedString(key) + ':(';
+        if (!this.lengthOnly_) {
+            this.currentHash_ += opening;
+        }
+        this.currentHashLength_ += opening.length;
         if (this.currentDepth_ === this.currentPath_.length) {
             this.currentPath_.push(key);
         }
@@ -2330,7 +2343,10 @@ class CompoundHashBuilder {
         this.currentDepth_--;
         if (this.currentHash_ !== null) {
             // Add closing parenthesis for the child that was just processed.
-            this.currentHash_ += ')';
+            if (!this.lengthOnly_) {
+                this.currentHash_ += ')';
+            }
+            this.currentHashLength_++;
         }
         this.needsComma_ = true;
     }
@@ -2356,6 +2372,7 @@ class CompoundHashBuilder {
         this.currentDepth_ = path.length;
         this.lastLeafDepth_ = path.length;
         this.currentHash_ = null;
+        this.currentHashLength_ = 0;
         this.needsComma_ = true;
     }
     /**
@@ -2375,7 +2392,8 @@ class CompoundHashBuilder {
             for (let i = 0; i < this.currentDepth_; i++) {
                 hash += hashQuotedString(this.currentPath_[i]) + ':(';
             }
-            this.currentHash_ = hash;
+            this.currentHash_ = this.lengthOnly_ ? '' : hash;
+            this.currentHashLength_ = hash.length;
             this.needsComma_ = false;
         }
     }
@@ -2417,13 +2435,19 @@ class CompoundHashBuilder {
     }
     endRange_() {
         let hash = this.currentHash_;
-        for (let i = 0; i < this.currentDepth_; i++) {
+        if (!this.lengthOnly_) {
+            for (let i = 0; i < this.currentDepth_; i++) {
+                hash += ')';
+            }
             hash += ')';
         }
-        hash += ')';
+        const completedLength = this.currentHashLength_ + this.currentDepth_ + 1;
         const index = this.hashes.length;
-        this.sizes.push(hash.length);
-        if (this.hashSink !== null) {
+        this.sizes.push(completedLength);
+        if (this.lengthOnly_) {
+            this.hashes.push('');
+        }
+        else if (this.hashSink !== null) {
             this.hashes.push('');
             this.hashSink(hash, index);
         }
@@ -2436,6 +2460,7 @@ class CompoundHashBuilder {
         const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
         this.posts.push(post === '' ? '/' : post);
         this.currentHash_ = null;
+        this.currentHashLength_ = 0;
         this.currentPayload_ = undefined;
         this.needsComma_ = true;
     }
@@ -2584,24 +2609,29 @@ function walkLeafInterval(node, fromPost, toPost, builder) {
  */
 function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512) {
     const changed = [];
-    let overflow = false;
+    /**
+     * Returns true when the caller must collapse this branch to stay within the
+     * global path budget. A large atomic subtree update should dirty that
+     * subtree's ranges, never fall back to dirtying the entire persisted root.
+     */
     const visit = (a, b, path, depth) => {
-        if (overflow || a === b) {
-            return;
+        if (a === b) {
+            return false;
         }
+        const branchStart = changed.length;
+        const collapseBranch = () => {
+            changed.splice(branchStart);
+            changed.push(path.slice());
+            return changed.length > maxPaths;
+        };
         if (depth >= maxDepth ||
             a.isLeafNode() ||
             b.isLeafNode() ||
             a.isEmpty() ||
             b.isEmpty()) {
-            if (changed.length >= maxPaths) {
-                overflow = true;
-                return;
-            }
             changed.push(path.slice());
-            return;
+            return changed.length > maxPaths;
         }
-        // Union of child keys in sorted order; nodes are index-sorted by key.
         const aKeys = [];
         const bKeys = [];
         a.forEachChild(KEY_INDEX, key => {
@@ -2612,7 +2642,7 @@ function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512)
         });
         let i = 0;
         let j = 0;
-        while ((i < aKeys.length || j < bKeys.length) && !overflow) {
+        while (i < aKeys.length || j < bKeys.length) {
             let key;
             let cmp;
             if (i >= aKeys.length) {
@@ -2628,18 +2658,15 @@ function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512)
                 key = cmp <= 0 ? aKeys[i] : bKeys[j];
             }
             path.push(key);
+            let overBudget = false;
             if (cmp === 0) {
-                visit(a.getImmediateChild(key), b.getImmediateChild(key), path, depth + 1);
+                overBudget = visit(a.getImmediateChild(key), b.getImmediateChild(key), path, depth + 1);
                 i++;
                 j++;
             }
             else {
-                if (changed.length >= maxPaths) {
-                    overflow = true;
-                }
-                else {
-                    changed.push(path.slice());
-                }
+                changed.push(path.slice());
+                overBudget = changed.length > maxPaths;
                 if (cmp < 0) {
                     i++;
                 }
@@ -2648,23 +2675,24 @@ function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512)
                 }
             }
             path.pop();
+            if (overBudget) {
+                return collapseBranch();
+            }
         }
-        // A priority change on an interior node serializes into its range too.
-        if (!overflow && a.getPriority() !== b.getPriority()) {
+        if (a.getPriority() !== b.getPriority()) {
             if (a.getPriority().isEmpty() !== b.getPriority().isEmpty() ||
                 (!a.getPriority().isEmpty() &&
                     a.getPriority().val() !== b.getPriority().val())) {
-                if (changed.length >= maxPaths) {
-                    overflow = true;
-                }
-                else {
-                    changed.push(path.slice());
+                changed.push(path.slice());
+                if (changed.length > maxPaths) {
+                    return collapseBranch();
                 }
             }
         }
+        return false;
     };
     visit(before, after, [], 0);
-    return overflow ? null : changed;
+    return changed;
 }
 /**
  * Marks the ranges whose leaf interval intersects any changed subtree. Range
@@ -2885,6 +2913,97 @@ function estimateSerializedNodeSize(node) {
         }
         serializedSizeCache.set(node, sum);
         return sum;
+    }
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
+ *
+ * An empty tree is returned unstamped: an empty node is the shared
+ * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
+ * empty node in the app.
+ */
+function stampSeedHashes(node, hash, compoundHash) {
+    if (node.isEmpty()) {
+        return node;
+    }
+    if (typeof hash === 'string') {
+        nodeCanonicalHashes.set(node, hash);
+        if (hash.length > 0) {
+            node.stampLazyHash(hash);
+        }
+    }
+    if (compoundHash &&
+        Array.isArray(compoundHash.hashes) &&
+        Array.isArray(compoundHash.posts) &&
+        compoundHash.hashes.length === compoundHash.posts.length + 1) {
+        setNodeCompoundHash(node, compoundHash);
+    }
+    return node;
+}
+/**
+ * The compound hash rides on the seeded node itself: once a server update
+ * replaces the cached node the stamp is gone, so re-listens after real data
+ * arrived send only the simple hash (which is then correct by construction).
+ */
+const nodeCompoundHashes = new WeakMap();
+const nodeCanonicalHashes = new WeakMap();
+function setNodeCompoundHash(node, compoundHash) {
+    nodeCompoundHashes.set(node, compoundHash);
+}
+function getNodeCompoundHash(node) {
+    return nodeCompoundHashes.get(node);
+}
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+function getNodeCanonicalHash(node) {
+    return nodeCanonicalHashes.get(node);
+}
+/**
+ * Repo-scoped manifest-first hash registry. Different Database instances can
+ * listen to the same relative path while holding different caches; keeping
+ * this store on Repo prevents one restore from overwriting or clearing
+ * another Repo's pending hashes.
+ */
+class PendingListenHashStore {
+    constructor() {
+        this.pending_ = new Map();
+    }
+    set(pathString, hash, compoundHash) {
+        this.pending_.set(pathString, { hash, compoundHash });
+    }
+    clear(pathString) {
+        this.pending_.delete(pathString);
+    }
+    get(pathString) {
+        return this.pending_.get(pathString);
+    }
+    clearAll() {
+        this.pending_.clear();
     }
 }
 
@@ -5717,70 +5836,109 @@ class PersistenceManager {
                 }
             }
         }
-        const builder = new CompoundHashBuilder(fixedSizeSplitStrategy(this.rangeTargetBytes_));
-        const dirtyTexts = [];
-        const dirtyPayloads = [];
-        builder.hashSink = text => {
-            dirtyTexts.push(text);
-        };
-        builder.payloadSink = payload => {
-            dirtyPayloads.push(payload);
-        };
+        // First pass: boundaries/sizes only. It never creates canonical strings
+        // or export payloads, so a first generation cannot retain another full
+        // copy of the root merely to decide its ranges.
+        const planner = new CompoundHashBuilder(fixedSizeSplitStrategy(this.rangeTargetBytes_), true);
         let rebuilt;
         try {
-            rebuilt = rebuildStableRanges(node, previousRanges, dirty, tailDirty, builder, this.rangeTargetBytes_);
+            rebuilt = rebuildStableRanges(node, previousRanges, dirty, tailDirty, planner, this.rangeTargetBytes_);
         }
         catch (e) {
             persistenceStats.storageFailures++;
-            recordPersistenceEvent(pathString, 'flush-hash-error');
+            recordPersistenceEvent(pathString, 'flush-plan-error');
             return this.deleteRecord_(pathString).then(() => {
                 this.lastFlush_.delete(pathString);
             });
         }
-        const newRecords = new Map();
-        let dirtyIndex = 0;
+        const dirtyPlans = [];
         let previousPost = null;
+        let dirtyIndex = 0;
         const ranges = rebuilt.map(range => {
             const carried = range;
             if (range.hash !== '' && typeof carried.recordId === 'string') {
                 previousPost = range.post;
                 return carried;
             }
-            const recordId = revision + '-' + dirtyIndex.toString(36);
-            const payload = dirtyPayloads[dirtyIndex];
-            if (payload === undefined) {
-                throw new Error('Missing persisted payload for dirty range');
-            }
-            newRecords.set(recordId, {
-                recordId,
+            const persisted = {
+                ...range,
+                recordId: revision + '-' + dirtyIndex.toString(36)
+            };
+            dirtyPlans.push({
+                range: persisted,
                 start: previousPost,
-                end: range.post,
-                tree: payload
+                end: range.post
             });
             previousPost = range.post;
             dirtyIndex++;
-            return { ...range, recordId };
+            return persisted;
         });
-        if (dirtyIndex !== dirtyTexts.length ||
-            dirtyIndex !== dirtyPayloads.length) {
-            persistenceStats.storageFailures++;
-            recordPersistenceEvent(pathString, 'flush-range-coupling-error');
-            return this.deleteRecord_(pathString).then(() => {
-                this.lastFlush_.delete(pathString);
+        const stagedIds = [];
+        const stageBatch = async (plans) => {
+            const texts = [];
+            const records = [];
+            for (const plan of plans) {
+                const builder = new CompoundHashBuilder(() => false);
+                let text;
+                let payload = undefined;
+                builder.hashSink = completed => {
+                    text = completed;
+                };
+                builder.payloadSink = completed => {
+                    payload = completed;
+                };
+                const from = plan.start === null
+                    ? null
+                    : plan.start === '/'
+                        ? []
+                        : plan.start.split('/');
+                const to = plan.end === '/' ? [] : plan.end.split('/');
+                if (from !== null) {
+                    builder.seedBoundary(from);
+                }
+                walkLeafInterval(node, from, to, builder);
+                if (text === undefined ||
+                    payload === undefined ||
+                    builder.posts.length !== 1 ||
+                    builder.posts[0] !== plan.end) {
+                    throw new Error('Dirty range did not serialize to its planned boundary');
+                }
+                texts.push(text);
+                records.push({
+                    recordId: plan.range.recordId,
+                    start: plan.start,
+                    end: plan.end,
+                    tree: payload
+                });
+            }
+            const digests = await digestRangeTexts(texts);
+            for (let i = 0; i < plans.length; i++) {
+                plans[i].range.hash = digests[i];
+            }
+            const stored = await this.withStore_('readwrite', false, (store, done, progress) => {
+                for (const record of records) {
+                    const put = store.put(record, key + RANGE_KEY_INFIX + record.recordId);
+                    put.onsuccess = progress;
+                }
+                done(true);
             });
-        }
-        persistenceStats.rangesHashed += dirtyIndex;
-        persistenceStats.rangesReused += ranges.length - dirtyIndex;
-        persistenceStats.writeThroughs++;
-        return digestRangeTexts(dirtyTexts).then(digests => {
+            if (!stored) {
+                throw new Error('Failed to stage persisted ranges');
+            }
+            stagedIds.push(...records.map(record => record.recordId));
+            // `texts`, payload fragments, and structured-clone inputs now leave
+            // scope before the next batch is built.
+        };
+        const stageAll = async () => {
+            const batchSize = 8;
+            for (let i = 0; i < dirtyPlans.length; i += batchSize) {
+                await stageBatch(dirtyPlans.slice(i, i + batchSize));
+            }
+        };
+        return stageAll()
+            .then(() => {
             if (this.disposed_) {
                 return;
-            }
-            let digestIndex = 0;
-            for (const range of ranges) {
-                if (range.hash === '') {
-                    range.hash = digests[digestIndex++];
-                }
             }
             const manifest = {
                 formatVersion: PERSISTENCE_FORMAT_VERSION,
@@ -5797,21 +5955,17 @@ class PersistenceManager {
                     .map(range => range.recordId)
                     .filter(recordId => !liveIds.has(recordId))
                 : [];
+            // The range payloads are immutable staging records. This tiny CAS
+            // transaction is the atomic authority switch: until the manifest put
+            // commits, a crash leaves the previous generation fully live.
             return this.withStore_('readwrite', false, (store, done, progress) => {
                 const currentReq = store.get(key);
                 currentReq.onsuccess = () => {
                     progress();
                     const current = currentReq.result;
-                    // Optimistic cross-tab CAS. If another tab advanced the manifest
-                    // after our local base, retry from scratch; immutable payload ids
-                    // ensure no partial/mixed generation can be observed meanwhile.
                     if (prev && (!current || current.revision !== prev.revision)) {
                         done(false);
                         return;
-                    }
-                    for (const record of newRecords.values()) {
-                        const put = store.put(record, key + RANGE_KEY_INFIX + record.recordId);
-                        put.onsuccess = progress;
                     }
                     for (const recordId of retiredIds) {
                         const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
@@ -5824,28 +5978,39 @@ class PersistenceManager {
             }).then(ok => {
                 if (!ok || this.disposed_) {
                     if (prev) {
-                        // Another writer won. The follow-up must not reuse this tab's old
-                        // descriptors; a full range rebuild is self-contained.
                         this.lastFlush_.delete(pathString);
                         this.flushPending_.add(pathString);
                     }
                     return;
                 }
+                persistenceStats.rangesHashed += dirtyPlans.length;
+                persistenceStats.rangesReused += ranges.length - dirtyPlans.length;
+                persistenceStats.writeThroughs++;
                 this.lastFlush_.set(pathString, {
                     rootNode: node,
                     revision,
                     ranges,
                     storedUpdatedAt: now
                 });
-                recordPersistenceEvent(pathString, 'stored', `${ranges.length} ranges, ${dirtyIndex} written`);
-                // Incremental commits delete every id retired from their direct base.
-                // Only a self-contained first/rebase generation can inherit unknown
-                // leftovers, so the wider orphan scan runs once there — never on each
-                // hot-root flush.
+                stampSeedHashes(node, manifest.hash, wireCompoundHashFromRanges(ranges));
+                recordPersistenceEvent(pathString, 'stored', `${ranges.length} ranges, ${dirtyPlans.length} written`);
                 if (!prev) {
                     void this.gcRangeRecords_(pathString, revision, liveIds);
                 }
             });
+        })
+            .catch(() => {
+            persistenceStats.storageFailures++;
+            recordPersistenceEvent(pathString, 'flush-range-stage-error');
+            // Staged immutable records are non-authoritative and are reclaimed by
+            // the next successful full-generation GC or the deferred sweep.
+            if (stagedIds.length > 0) {
+                void this.withStore_('readwrite', undefined, store => {
+                    for (const recordId of stagedIds) {
+                        store.delete(key + RANGE_KEY_INFIX + recordId);
+                    }
+                });
+            }
         });
     }
     gcRangeRecords_(pathString, revision, liveIds) {
@@ -9309,97 +9474,6 @@ class ReadonlyRestClient extends ServerActions {
             xhr.open('GET', url, /*asynchronous=*/ true);
             xhr.send();
         });
-    }
-}
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
- * hash() returns it without an O(tree) walk) and attaches the precomputed
- * compound hash for the listen to send. Both must describe exactly this
- * tree — the server certifies whatever the listen carries.
- *
- * An empty tree is returned unstamped: an empty node is the shared
- * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
- * empty node in the app.
- */
-function stampSeedHashes(node, hash, compoundHash) {
-    if (node.isEmpty()) {
-        return node;
-    }
-    if (typeof hash === 'string') {
-        nodeCanonicalHashes.set(node, hash);
-        if (hash.length > 0) {
-            node.stampLazyHash(hash);
-        }
-    }
-    if (compoundHash &&
-        Array.isArray(compoundHash.hashes) &&
-        Array.isArray(compoundHash.posts) &&
-        compoundHash.hashes.length === compoundHash.posts.length + 1) {
-        setNodeCompoundHash(node, compoundHash);
-    }
-    return node;
-}
-/**
- * The compound hash rides on the seeded node itself: once a server update
- * replaces the cached node the stamp is gone, so re-listens after real data
- * arrived send only the simple hash (which is then correct by construction).
- */
-const nodeCompoundHashes = new WeakMap();
-const nodeCanonicalHashes = new WeakMap();
-function setNodeCompoundHash(node, compoundHash) {
-    nodeCompoundHashes.set(node, compoundHash);
-}
-function getNodeCompoundHash(node) {
-    return nodeCompoundHashes.get(node);
-}
-/**
- * The persisted canonical hash associated with a seeded node. This rides in
- * a WeakMap instead of being stamped into every subtree by node.hash(): a
- * compound-hash-only seed deliberately stores the empty simple hash, letting
- * the server validate its ranges without a full-tree hash pass that would
- * permanently retain one SHA string per node.
- */
-function getNodeCanonicalHash(node) {
-    return nodeCanonicalHashes.get(node);
-}
-/**
- * Repo-scoped manifest-first hash registry. Different Database instances can
- * listen to the same relative path while holding different caches; keeping
- * this store on Repo prevents one restore from overwriting or clearing
- * another Repo's pending hashes.
- */
-class PendingListenHashStore {
-    constructor() {
-        this.pending_ = new Map();
-    }
-    set(pathString, hash, compoundHash) {
-        this.pending_.set(pathString, { hash, compoundHash });
-    }
-    clear(pathString) {
-        this.pending_.delete(pathString);
-    }
-    get(pathString) {
-        return this.pending_.get(pathString);
-    }
-    clearAll() {
-        this.pending_.clear();
     }
 }
 

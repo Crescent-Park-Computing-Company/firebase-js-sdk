@@ -84,6 +84,7 @@ export declare function compoundHashFromNode(node: Node, splitStrategy?: Compoun
 export declare function forEachChildWithPriority(node: Node, action: (key: string, child: Node, includedInHash: boolean) => void, includeTrailingPriority?: boolean): void;
 export declare class CompoundHashBuilder {
     private splitStrategy_;
+    private lengthOnly_;
     posts: string[];
     hashes: string[];
     /** Serialized text length of each completed range (same order as posts). */
@@ -104,6 +105,7 @@ export declare class CompoundHashBuilder {
     payloadSink: ((payload: unknown, index: number) => void) | null;
     /** null when not currently inside a range. */
     private currentHash_;
+    private currentHashLength_;
     /** Fresh, mutable accumulator for the current persisted range only. */
     private currentPayload_;
     /**
@@ -115,7 +117,7 @@ export declare class CompoundHashBuilder {
     private lastLeafDepth_;
     private needsComma_;
     private readonly splitState_;
-    constructor(splitStrategy_: CompoundHashSplitStrategy);
+    constructor(splitStrategy_: CompoundHashSplitStrategy, lengthOnly_?: boolean);
     processLeaf(node: LeafNode): void;
     startChild(key: string): void;
     endChild(): void;
