@@ -228,6 +228,13 @@ export declare class PersistenceManager {
     private deleteRecord_;
     private withRestoreSlot_;
     /**
+     * Projects an exact-path peek from a covering root that is already restored
+     * or actively restoring in this manager. This never starts a large ancestor
+     * read just to answer a tiny token lookup; it only reuses work the app is
+     * already paying for, preserving the exact-root fast path on direct boots.
+     */
+    private peekFromCoveringRead_;
+    /**
      * Exact-root optimistic peek. The completed range assembly is retained briefly
      * so the authenticated listener consumes the same immutable Node instead of
      * reconstructing the root twice during boot.
