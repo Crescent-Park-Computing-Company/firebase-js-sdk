@@ -1951,9 +1951,13 @@ export class PersistenceManager {
           'stored',
           `${ranges.length} ranges, ${dirtyIndex} written`
         );
-        // The commit already removes ranges retired from our direct base. A
-        // guarded key-only pass also reclaims older crash/legacy/orphan ids.
-        void this.gcRangeRecords_(pathString, revision, liveIds);
+        // Incremental commits delete every id retired from their direct base.
+        // Only a self-contained first/rebase generation can inherit unknown
+        // leftovers, so the wider orphan scan runs once there — never on each
+        // hot-root flush.
+        if (!prev) {
+          void this.gcRangeRecords_(pathString, revision, liveIds);
+        }
       });
     });
   }
@@ -1982,7 +1986,15 @@ export class PersistenceManager {
         } catch (e) {
           range = undefined;
         }
-        const req = store.openCursor(range);
+        const keyCursorStore = store as unknown as {
+          openKeyCursor?: (range?: IDBKeyRange) => IDBRequest;
+        };
+        // A value cursor structured-clones every range payload; on a 65 MB
+        // root that would recreate the full-read cost solely to discover keys.
+        const req =
+          typeof keyCursorStore.openKeyCursor === 'function'
+            ? keyCursorStore.openKeyCursor(range)
+            : store.openCursor(range);
         req.onsuccess = () => {
           const cursor = req.result as IDBCursor | null;
           if (!cursor) {
