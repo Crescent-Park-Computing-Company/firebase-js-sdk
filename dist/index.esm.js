@@ -4725,8 +4725,7 @@ class PersistenceManager {
      * already paying for, preserving the exact-root fast path on direct boots.
      */
     peekFromCoveringRead_(pathString, expectedAuthScope) {
-        if (!this.authScopeConfigured_ ||
-            expectedAuthScope !== this.authScope_) {
+        if (!this.authScopeConfigured_ || expectedAuthScope !== this.authScope_) {
             return null;
         }
         let bestRoot = null;
@@ -5103,12 +5102,14 @@ class PersistenceManager {
         if (prev && prev.rootNode === node) {
             // Content-identical: refresh only the manifest timestamp. The revision
             // guard prevents a stale tab from refreshing a superseded generation.
-            return this.withStore_('readwrite', false, (store, done) => {
+            return this.withStore_('readwrite', false, (store, done, progress) => {
                 const req = store.get(key);
                 req.onsuccess = () => {
+                    progress();
                     const current = req.result;
                     if (current && current.revision === prev.revision) {
-                        store.put({ ...current, updatedAt: now }, key);
+                        const put = store.put({ ...current, updatedAt: now }, key);
+                        put.onsuccess = progress;
                         done(true);
                     }
                 };
@@ -5219,9 +5220,10 @@ class PersistenceManager {
                     .map(range => range.recordId)
                     .filter(recordId => !liveIds.has(recordId))
                 : [];
-            return this.withStore_('readwrite', false, (store, done) => {
+            return this.withStore_('readwrite', false, (store, done, progress) => {
                 const currentReq = store.get(key);
                 currentReq.onsuccess = () => {
+                    progress();
                     const current = currentReq.result;
                     // Optimistic cross-tab CAS. If another tab advanced the manifest
                     // after our local base, retry from scratch; immutable payload ids
@@ -5231,12 +5233,15 @@ class PersistenceManager {
                         return;
                     }
                     for (const record of newRecords.values()) {
-                        store.put(record, key + RANGE_KEY_INFIX + record.recordId);
+                        const put = store.put(record, key + RANGE_KEY_INFIX + record.recordId);
+                        put.onsuccess = progress;
                     }
                     for (const recordId of retiredIds) {
-                        store.delete(key + RANGE_KEY_INFIX + recordId);
+                        const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
+                        remove.onsuccess = progress;
                     }
-                    store.put(manifest, key);
+                    const manifestPut = store.put(manifest, key);
+                    manifestPut.onsuccess = progress;
                     done(true);
                 };
             }).then(ok => {
