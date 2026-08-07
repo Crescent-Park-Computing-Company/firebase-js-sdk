@@ -58,3 +58,11 @@ export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | unde
  * permanently retain one SHA string per node.
  */
 export declare function getNodeCanonicalHash(node: Node): string | undefined;
+export declare function stampSeedValue(node: Node, value: unknown): void;
+export declare function getNodeSeedValue(node: Node): unknown | undefined;
+export declare function stampNextListenHashes(pathString: string, hash: string, compoundHash: SeedCompoundHash): void;
+export declare function clearNextListenHashes(pathString: string): void;
+export declare function getNextListenHashes(pathString: string): {
+    hash: string;
+    compoundHash: SeedCompoundHash;
+} | undefined;

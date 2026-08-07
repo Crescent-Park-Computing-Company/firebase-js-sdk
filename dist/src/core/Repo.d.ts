@@ -63,6 +63,23 @@ interface Transaction {
 interface PendingSeedRestore {
     cancelled: boolean;
 }
+/** One server operation held during a manifest-first boot window. */
+type BootBufferedOp = {
+    kind: 'data';
+    pathString: string;
+    data: unknown;
+    isMerge: boolean;
+    tag: number | null;
+} | {
+    kind: 'rm';
+    pathString: string;
+    ranges: Array<{
+        s?: string;
+        e?: string;
+        m: unknown;
+    }>;
+    tag: number | null;
+};
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 export interface ListenOutcome {
@@ -110,6 +127,14 @@ export declare class Repo {
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
     /**
+     * Server operations buffered during a manifest-first boot window: the
+     * range listen is on the wire before the cached base has been applied to
+     * SyncTree, so anything the server sends for that root (range merges —
+     * deltas against the base — or full pushes) is held, in arrival order,
+     * until the base applies, then replayed. Keyed by the listened root path.
+     */
+    bootBuffers_: Map<string, BootBufferedOp[]>;
+    /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters
      * to publish its certification outcome (see onListenOutcome in api/Database.ts).
@@ -130,6 +155,11 @@ export declare function repoServerTime(repo: Repo): number;
  * Generate ServerValues using some variables from the repo object.
  */
 export declare function repoGenerateServerValues(repo: Repo): Indexable;
+/**
+ * Called by realtime when we get new messages from the server.
+ */
+/** Test seam: drives a server data push exactly as the connection would. @internal */
+export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
 export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[]): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may
