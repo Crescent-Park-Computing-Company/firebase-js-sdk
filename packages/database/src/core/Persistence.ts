@@ -2004,9 +2004,7 @@ export class PersistenceManager {
               }
               const commit = () => {
                 for (const recordId of retiredIds) {
-                  const remove = store.delete(
-                    key + RANGE_KEY_INFIX + recordId
-                  );
+                  const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
                   remove.onsuccess = progress;
                 }
                 const manifestPut = store.put(manifest, key);
