@@ -441,6 +441,7 @@ export class PersistenceManager {
   private restoreQueue_: Array<() => void> = [];
   private writesDeferredUntilRestores_ = new Set<string>();
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
+  private sweepInFlight_: Promise<void> | null = null;
   private disposed_ = false;
   private authScope_: string | null = null;
   private authScopeConfigured_ = false;
@@ -493,6 +494,7 @@ export class PersistenceManager {
 
   rebindTo(prefix: string): PersistenceManager {
     const scope = this.authScope_;
+    const selectedRoots = [...this.persistentRoots_];
     this.dispose();
     const rebound = new PersistenceManager(
       prefix,
@@ -505,6 +507,9 @@ export class PersistenceManager {
     );
     if (this.authScopeConfigured_) {
       rebound.setAuthScope(scope);
+    }
+    for (const [pathString, count] of selectedRoots) {
+      rebound.persistentRoots_.set(pathString, count);
     }
     return rebound;
   }
@@ -661,7 +666,11 @@ export class PersistenceManager {
    * session's sweep.
    */
   private sweepExpired_(): Promise<void> {
-    if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
+    if (
+      this.activeRestoreCount_ > 0 ||
+      this.restoreQueue_.length > 0 ||
+      this.queues_.size > 0
+    ) {
       if (!this.disposed_) {
         this.sweepTimer_ = setTimeout(() => {
           void this.sweepExpired_();
@@ -671,6 +680,9 @@ export class PersistenceManager {
       return Promise.resolve();
     }
     this.sweepTimer_ = null;
+    if (this.sweepInFlight_ !== null) {
+      return this.sweepInFlight_;
+    }
     const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
     const prefix = this.key_('');
     let range: IDBKeyRange | undefined;
@@ -684,7 +696,7 @@ export class PersistenceManager {
     } catch (e) {
       range = undefined;
     }
-    return this.withStore_<string[]>('readonly', [], (store, done) => {
+    const work = this.withStore_<string[]>('readonly', [], (store, done) => {
       const keys: string[] = [];
       // openKeyCursor never materializes values; the value-cursor fallback
       // (test fakes) walks values but only retains keys.
@@ -850,6 +862,10 @@ export class PersistenceManager {
         step();
       });
     });
+    this.sweepInFlight_ = work.finally(() => {
+      this.sweepInFlight_ = null;
+    });
+    return this.sweepInFlight_;
   }
 
   private openAtVersion_(
@@ -1380,7 +1396,12 @@ export class PersistenceManager {
     const authGeneration = this.authGeneration_;
     const covering = this.peekFromCoveringRead_(pathString, expectedAuthScope);
     if (covering !== null) {
-      return covering;
+      return covering.then(record =>
+        authGeneration === this.authGeneration_ &&
+        expectedAuthScope === this.authScope_
+          ? record
+          : null
+      );
     }
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
@@ -1596,14 +1617,9 @@ export class PersistenceManager {
       this.writesDeferredUntilRestores_.add(pathString);
       return;
     }
-    // Guarantee the first complete tree immediately (a quick reload must
-    // never race an arbitrary empty window), then coalesce later churn.
-    if (!prev && !this.queues_.has(pathString)) {
-      this.scheduleFlush_(pathString);
-      return;
-    }
-    // The single-flight window: non-restarting, so a root that churns
-    // continuously still flushes every writeDelayMs_. The flush reads
+    // Every generation, including the first, enters the non-restarting
+    // window. Cache creation is an optional accelerator and must not compete
+    // with the cold page's initial render/LCP. The flush reads
     // latest_ when it runs, so it always writes the newest tree.
     if (!this.writeTimers_.has(pathString)) {
       this.writeTimers_.set(
@@ -1739,6 +1755,9 @@ export class PersistenceManager {
    * hashing.
    */
   private flush_(pathString: string): Promise<void> {
+    if (this.sweepInFlight_ !== null) {
+      return this.sweepInFlight_.then(() => this.flush_(pathString));
+    }
     const entry = this.latest_.get(pathString);
     if (!entry || this.disposed_ || !this.authScopeConfigured_) {
       return Promise.resolve();
@@ -1923,12 +1942,20 @@ export class PersistenceManager {
         throw new Error('Failed to stage persisted ranges');
       }
       stagedIds.push(...records.map(record => record.recordId));
-      // `texts`, payload fragments, and structured-clone inputs now leave
-      // scope before the next batch is built.
+      // Async activation records can otherwise retain completed IDB request
+      // inputs until the whole generation settles. Drop every large reference
+      // explicitly and yield a macrotask so WebKit can collect between batches.
+      for (const record of records) {
+        record.tree = undefined;
+      }
+      records.length = 0;
+      texts.length = 0;
+      digests.length = 0;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
     };
 
     const stageAll = async (): Promise<void> => {
-      const batchSize = 8;
+      const batchSize = 4;
       for (let i = 0; i < dirtyPlans.length; i += batchSize) {
         await stageBatch(dirtyPlans.slice(i, i + batchSize));
       }
@@ -1968,7 +1995,10 @@ export class PersistenceManager {
               const current = currentReq.result as
                 | PersistedManifest
                 | undefined;
-              if (prev && (!current || current.revision !== prev.revision)) {
+              if (
+                (prev && (!current || current.revision !== prev.revision)) ||
+                (!prev && current !== undefined)
+              ) {
                 done(false);
                 return;
               }
@@ -1983,11 +2013,31 @@ export class PersistenceManager {
           }
         ).then(ok => {
           if (!ok || this.disposed_) {
-            if (prev) {
-              this.lastFlush_.delete(pathString);
-              this.flushPending_.add(pathString);
+            if (this.disposed_) {
+              return;
             }
-            return;
+            // A different tab committed while we staged. Remove only our
+            // immutable ids, adopt the winning manifest/base, then diff the
+            // current live Node against it on one coalesced retry.
+            return this.withStore_<void>('readwrite', undefined, store => {
+              for (const recordId of stagedIds) {
+                store.delete(key + RANGE_KEY_INFIX + recordId);
+              }
+            }).then(() =>
+              this.readRecord_(pathString).then(winner => {
+                if (winner !== null) {
+                  this.lastFlush_.set(pathString, {
+                    rootNode: winner.record.node,
+                    revision: winner.record.revision,
+                    ranges: winner.ranges,
+                    storedUpdatedAt: winner.record.updatedAt
+                  });
+                } else {
+                  this.lastFlush_.delete(pathString);
+                }
+                this.flushPending_.add(pathString);
+              })
+            );
           }
           persistenceStats.rangesHashed += dirtyPlans.length;
           persistenceStats.rangesReused += ranges.length - dirtyPlans.length;

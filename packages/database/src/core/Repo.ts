@@ -564,7 +564,8 @@ function repoPublishListenOutcome(
   }
   state.outcome = outcome;
   for (const subscriber of state.subscribers) {
-    subscriber(outcome);
+    // Observability callbacks must never abort authoritative wire processing.
+    exceptionGuard(() => subscriber(outcome));
   }
 }
 
@@ -699,10 +700,11 @@ export function repoStartServerListen(
   let sentFromManifest = false;
   let restartedCold = false;
   const restartCold = (reason: ListenOutcomeReason = 'corrupt') => {
-    if (!sentFromManifest || restartedCold) {
+    if (!sentFromManifest || restartedCold || !isCurrent()) {
       return;
     }
     restartedCold = true;
+    repo.pendingSeedRestores_.delete(pathString);
     repo.pendingListenHashes_.clear(pathString);
     repo.bootBuffers_.delete(pathString);
     // The compound response may omit every matching range, so buffered data
@@ -727,10 +729,9 @@ export function repoStartServerListen(
     }
     sentFromManifest = true;
     repo.bootBuffers_.set(pathString, []);
-    // The listen's hashFn resolves through SyncTree's view of the (not yet
-    // applied) server cache. stampNextListenHashes hands the stored hashes
-    // to the pending listen directly, keyed by path (see ServerCacheSeed).
-    finish('restored');
+    // Keep the pending token until range assembly finishes. A stop after this
+    // send must cancel replay/restart as well as unlisten the wire request.
+    sendListen('restored');
   };
 
   const drainBootBuffer = () => {
@@ -761,7 +762,9 @@ export function repoStartServerListen(
     })
     .then(
       result => {
-        if (!isCurrent() && !sentFromManifest) {
+        if (!isCurrent()) {
+          repo.pendingListenHashes_.clear(pathString);
+          repo.bootBuffers_.delete(pathString);
           return;
         }
         const { record, reason } = result;
@@ -812,6 +815,14 @@ export function repoStartServerListen(
             query._path,
             events
           );
+          if (!isCurrent()) {
+            repo.pendingListenHashes_.clear(pathString);
+            repo.bootBuffers_.delete(pathString);
+            return;
+          }
+          if (sentFromManifest) {
+            repo.pendingSeedRestores_.delete(pathString);
+          }
           // The hashes ride the seeded node from here on; the pending stamp
           // must not outlive the boot window (a re-listen after real server
           // updates must send the CURRENT tree's hashes, not the stored ones).

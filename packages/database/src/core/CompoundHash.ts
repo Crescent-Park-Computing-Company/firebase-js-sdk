@@ -372,12 +372,24 @@ export class CompoundHashBuilder {
     }
   }
 
+  /** Adds an interior-node priority to the persisted payload only. */
+  processPriorityForPayload(path: string[], priority: Node): void {
+    if (!priority.isEmpty()) {
+      this.appendPayloadValue_(path.concat('.priority'), priority.val());
+    }
+  }
+
   private appendPayloadLeaf_(node: LeafNode): void {
+    this.appendPayloadValue_(
+      this.currentPath_.slice(0, this.currentDepth_),
+      node.val(true)
+    );
+  }
+
+  private appendPayloadValue_(path: string[], value: unknown): void {
     if (this.payloadSink === null) {
       return;
     }
-    const path = this.currentPath_.slice(0, this.currentDepth_);
-    const value = node.val(true);
     if (path.length === 0) {
       this.currentPayload_ = value;
       return;
@@ -392,7 +404,9 @@ export class CompoundHashBuilder {
     let cursor = this.currentPayload_ as Record<string, unknown>;
     for (let i = 0; i < path.length - 1; i++) {
       const key = path[i];
-      const existing = cursor[key];
+      const existing = Object.prototype.hasOwnProperty.call(cursor, key)
+        ? cursor[key]
+        : undefined;
       if (existing === null || typeof existing !== 'object') {
         Object.defineProperty(cursor, key, {
           value: {},
@@ -606,6 +620,10 @@ export function walkLeafInterval(
       emitLeaf(path, current as LeafNode);
       return;
     }
+    // The mobile wire grammar deliberately drops a trailing interior-node
+    // priority. Persistence cannot: store it in the sparse payload without
+    // feeding it to the canonical hash builder.
+    builder.processPriorityForPayload(path, current.getPriority());
     forEachChildWithPriority(current, (key, child) => {
       if (stopped) {
         return;

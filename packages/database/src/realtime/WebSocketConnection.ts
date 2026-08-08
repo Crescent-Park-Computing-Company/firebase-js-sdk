@@ -15,7 +15,13 @@
  * limitations under the License.
  */
 
-import { assert, isNodeSdk, jsonEval, stringify } from '@firebase/util';
+import {
+  stringLength,
+  assert,
+  isNodeSdk,
+  jsonEval,
+  stringify
+} from '@firebase/util';
 
 import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
 import { StatsCollection } from '../core/stats/StatsCollection';
@@ -345,9 +351,10 @@ export class WebSocketConnection implements Transport {
       return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
     }
     const data = mess['data'] as string;
-    this.pendingMessageBytes_ += data.length;
-    this.bytesReceived += data.length;
-    this.stats_.incrementCounter('bytes_received', data.length);
+    const wireBytes = stringLength(data);
+    this.pendingMessageBytes_ += wireBytes;
+    this.bytesReceived += wireBytes;
+    this.stats_.incrementCounter('bytes_received', wireBytes);
 
     this.resetKeepAlive();
 
@@ -371,8 +378,9 @@ export class WebSocketConnection implements Transport {
     this.resetKeepAlive();
 
     const dataStr = stringify(data);
-    this.bytesSent += dataStr.length;
-    this.stats_.incrementCounter('bytes_sent', dataStr.length);
+    const wireBytes = stringLength(dataStr);
+    this.bytesSent += wireBytes;
+    this.stats_.incrementCounter('bytes_sent', wireBytes);
 
     //We can only fit a certain amount in each websocket frame, so we need to split this request
     //up into multiple pieces if it doesn't fit in one request.

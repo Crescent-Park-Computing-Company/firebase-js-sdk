@@ -86,4 +86,16 @@ describe('WebSocketConnection', () => {
     connection.handleIncomingFrame({ data: payload.slice(midpoint) });
     expect(bytes).to.equal(payload.length + 1);
   });
+
+  it('counts non-ASCII payloads in UTF-8 wire bytes', () => {
+    const connection = new WebSocketConnection('connId', testRepoInfo(), 'app');
+    let bytes: number | undefined;
+    connection.mySock = {} as WebSocket;
+    connection.onMessage = (_message, received) => {
+      bytes = received;
+    };
+    const payload = JSON.stringify({ t: 'd', d: { value: 'سلام 🌍' } });
+    connection.handleIncomingFrame({ data: payload });
+    expect(bytes).to.equal(new TextEncoder().encode(payload).length);
+  });
 });

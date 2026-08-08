@@ -198,6 +198,55 @@ describe('PersistentConnection compound-hash wire protocol', () => {
     });
   });
 
+  it('never recomputes the listen hash on incoming pushes', () => {
+    const connection = makeConnection([]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (connection as any).connected_ = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (connection as any).sendRequest = () => {};
+    let hashCalls = 0;
+    let compoundCalls = 0;
+    const hashFn: ListenHashFn = () => {
+      hashCalls++;
+      return 'hash';
+    };
+    hashFn.compoundHash = () => {
+      compoundCalls++;
+      return { hashes: ['h', ''], posts: ['a'] };
+    };
+    const progress: unknown[] = [];
+    connection.listen(
+      defaultQueryAt('some/path'),
+      hashFn,
+      null,
+      () => {},
+      wire => progress.push(wire)
+    );
+    const sentHashCalls = hashCalls;
+    const sentCompoundCalls = compoundCalls;
+    // A large seeded root receives hundreds of range-merge frames; the
+    // progress result must reuse the captured request facts instead of
+    // re-hashing the (changed) server cache per frame.
+    for (let i = 0; i < 50; i++) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (connection as any).onDataPush_(
+        'rm',
+        { p: 'some/path', d: [{ s: null, e: null, m: { i } }], t: null },
+        10
+      );
+    }
+    expect(progress.length).to.equal(50);
+    expect(hashCalls).to.equal(sentHashCalls);
+    expect(compoundCalls).to.equal(sentCompoundCalls);
+    expect(progress[49]).to.deep.equal({
+      bytes: 500,
+      hadHash: true,
+      hadCompoundHash: true,
+      dataReceived: true,
+      rangeMerged: true
+    });
+  });
+
   it('onDataPush_ ignores rm when no callback is registered', () => {
     const connection = new PersistentConnection(
       new RepoInfo(

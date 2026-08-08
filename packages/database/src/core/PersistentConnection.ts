@@ -59,6 +59,12 @@ interface ListenSpec {
 
   hashFn: ListenHashFn;
   bytes: number;
+  // Captured once when the listen request is serialized. The wire result
+  // must never call back into hashFn(): recomputing the canonical hash of a
+  // large post-merge cache is a full-tree serialize+SHA-1 walk, and the
+  // progress callback runs on every incoming frame.
+  hadHash: boolean;
+  hadCompoundHash: boolean;
   dataReceived: boolean;
   rangeMerged: boolean;
 
@@ -264,6 +270,8 @@ export class PersistentConnection extends ServerActions {
       query,
       tag,
       bytes: 0,
+      hadHash: false,
+      hadCompoundHash: false,
       dataReceived: false,
       rangeMerged: false
     };
@@ -313,10 +321,8 @@ export class PersistentConnection extends ServerActions {
     if (compoundHash) {
       req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
     }
-    if (req['h'] !== '') {
-    }
-    const hadHash = req['h'] !== '';
-    const hadCompoundHash = compoundHash !== undefined;
+    listenSpec.hadHash = req['h'] !== '';
+    listenSpec.hadCompoundHash = compoundHash !== undefined;
     listenSpec.bytes = 0;
     listenSpec.dataReceived = false;
     listenSpec.rangeMerged = false;
@@ -345,9 +351,7 @@ export class PersistentConnection extends ServerActions {
           if (listenSpec.onComplete) {
             listenSpec.onComplete(status, payload, {
               ...this.listenWireResult_(listenSpec),
-              bytes: listenSpec.bytes + responseBytes,
-              hadHash,
-              hadCompoundHash
+              bytes: listenSpec.bytes + responseBytes
             });
           }
         }
@@ -702,8 +706,8 @@ export class PersistentConnection extends ServerActions {
   private listenWireResult_(listen: ListenSpec): ListenWireResult {
     return {
       bytes: listen.bytes,
-      hadHash: listen.hashFn() !== '',
-      hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+      hadHash: listen.hadHash,
+      hadCompoundHash: listen.hadCompoundHash,
       dataReceived: listen.dataReceived,
       rangeMerged: listen.rangeMerged
     };
@@ -1045,8 +1049,8 @@ export class PersistentConnection extends ServerActions {
     if (listen && listen.onComplete) {
       listen.onComplete('permission_denied', null, {
         bytes: listen.bytes,
-        hadHash: listen.hashFn() !== '',
-        hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+        hadHash: listen.hadHash,
+        hadCompoundHash: listen.hadCompoundHash,
         dataReceived: listen.dataReceived,
         rangeMerged: listen.rangeMerged
       });
