@@ -160,6 +160,7 @@ export declare class PersistenceManager {
     private restoreQueue_;
     private writesDeferredUntilRestores_;
     private sweepTimer_;
+    private sweepInFlight_;
     private disposed_;
     private authScope_;
     private authScopeConfigured_;

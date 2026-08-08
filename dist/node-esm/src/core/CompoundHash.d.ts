@@ -140,7 +140,10 @@ export declare class CompoundHashBuilder {
      */
     forceEndRange(): void;
     private ensureRange_;
+    /** Adds an interior-node priority to the persisted payload only. */
+    processPriorityForPayload(path: string[], priority: Node): void;
     private appendPayloadLeaf_;
+    private appendPayloadValue_;
     private endRange_;
 }
 /**

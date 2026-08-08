@@ -1820,12 +1820,19 @@ class CompoundHashBuilder {
             this.needsComma_ = false;
         }
     }
+    /** Adds an interior-node priority to the persisted payload only. */
+    processPriorityForPayload(path, priority) {
+        if (!priority.isEmpty()) {
+            this.appendPayloadValue_(path.concat('.priority'), priority.val());
+        }
+    }
     appendPayloadLeaf_(node) {
+        this.appendPayloadValue_(this.currentPath_.slice(0, this.currentDepth_), node.val(true));
+    }
+    appendPayloadValue_(path, value) {
         if (this.payloadSink === null) {
             return;
         }
-        const path = this.currentPath_.slice(0, this.currentDepth_);
-        const value = node.val(true);
         if (path.length === 0) {
             this.currentPayload_ = value;
             return;
@@ -1838,7 +1845,9 @@ class CompoundHashBuilder {
         let cursor = this.currentPayload_;
         for (let i = 0; i < path.length - 1; i++) {
             const key = path[i];
-            const existing = cursor[key];
+            const existing = Object.prototype.hasOwnProperty.call(cursor, key)
+                ? cursor[key]
+                : undefined;
             if (existing === null || typeof existing !== 'object') {
                 Object.defineProperty(cursor, key, {
                     value: {},
@@ -2007,6 +2016,10 @@ function walkLeafInterval(node, fromPost, toPost, builder) {
             emitLeaf(path, current);
             return;
         }
+        // The mobile wire grammar deliberately drops a trailing interior-node
+        // priority. Persistence cannot: store it in the sparse payload without
+        // feeding it to the canonical hash builder.
+        builder.processPriorityForPayload(path, current.getPriority());
         forEachChildWithPriority(current, (key, child) => {
             if (stopped) {
                 return;
@@ -4144,6 +4157,7 @@ class PersistenceManager {
         this.restoreQueue_ = [];
         this.writesDeferredUntilRestores_ = new Set();
         this.sweepTimer_ = null;
+        this.sweepInFlight_ = null;
         this.disposed_ = false;
         this.authScope_ = null;
         this.authScopeConfigured_ = false;
@@ -4157,10 +4171,14 @@ class PersistenceManager {
     }
     rebindTo(prefix) {
         const scope = this.authScope_;
+        const selectedRoots = [...this.persistentRoots_];
         this.dispose();
         const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_, this.writeDelayMs_, this.rangeTargetBytes_);
         if (this.authScopeConfigured_) {
             rebound.setAuthScope(scope);
+        }
+        for (const [pathString, count] of selectedRoots) {
+            rebound.persistentRoots_.set(pathString, count);
         }
         return rebound;
     }
@@ -4309,7 +4327,9 @@ class PersistenceManager {
      * session's sweep.
      */
     sweepExpired_() {
-        if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
+        if (this.activeRestoreCount_ > 0 ||
+            this.restoreQueue_.length > 0 ||
+            this.queues_.size > 0) {
             if (!this.disposed_) {
                 this.sweepTimer_ = setTimeout(() => {
                     void this.sweepExpired_();
@@ -4319,6 +4339,9 @@ class PersistenceManager {
             return Promise.resolve();
         }
         this.sweepTimer_ = null;
+        if (this.sweepInFlight_ !== null) {
+            return this.sweepInFlight_;
+        }
         const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
         const prefix = this.key_('');
         let range;
@@ -4333,7 +4356,7 @@ class PersistenceManager {
         catch (e) {
             range = undefined;
         }
-        return this.withStore_('readonly', [], (store, done) => {
+        const work = this.withStore_('readonly', [], (store, done) => {
             const keys = [];
             // openKeyCursor never materializes values; the value-cursor fallback
             // (test fakes) walks values but only retains keys.
@@ -4458,6 +4481,10 @@ class PersistenceManager {
                 step();
             });
         });
+        this.sweepInFlight_ = work.finally(() => {
+            this.sweepInFlight_ = null;
+        });
+        return this.sweepInFlight_;
     }
     openAtVersion_(version) {
         return new Promise(resolve => {
@@ -4911,7 +4938,10 @@ class PersistenceManager {
         const authGeneration = this.authGeneration_;
         const covering = this.peekFromCoveringRead_(pathString, expectedAuthScope);
         if (covering !== null) {
-            return covering;
+            return covering.then(record => authGeneration === this.authGeneration_ &&
+                expectedAuthScope === this.authScope_
+                ? record
+                : null);
         }
         return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
             recordPersistenceEvent(pathString, result ? 'peek-hit' : 'peek-miss');
@@ -5066,14 +5096,9 @@ class PersistenceManager {
             this.writesDeferredUntilRestores_.add(pathString);
             return;
         }
-        // Guarantee the first complete tree immediately (a quick reload must
-        // never race an arbitrary empty window), then coalesce later churn.
-        if (!prev && !this.queues_.has(pathString)) {
-            this.scheduleFlush_(pathString);
-            return;
-        }
-        // The single-flight window: non-restarting, so a root that churns
-        // continuously still flushes every writeDelayMs_. The flush reads
+        // Every generation, including the first, enters the non-restarting
+        // window. Cache creation is an optional accelerator and must not compete
+        // with the cold page's initial render/LCP. The flush reads
         // latest_ when it runs, so it always writes the newest tree.
         if (!this.writeTimers_.has(pathString)) {
             this.writeTimers_.set(pathString, setTimeout(() => {
@@ -5200,6 +5225,9 @@ class PersistenceManager {
      * hashing.
      */
     flush_(pathString) {
+        if (this.sweepInFlight_ !== null) {
+            return this.sweepInFlight_.then(() => this.flush_(pathString));
+        }
         const entry = this.latest_.get(pathString);
         if (!entry || this.disposed_ || !this.authScopeConfigured_) {
             return Promise.resolve();
@@ -5349,11 +5377,19 @@ class PersistenceManager {
                 throw new Error('Failed to stage persisted ranges');
             }
             stagedIds.push(...records.map(record => record.recordId));
-            // `texts`, payload fragments, and structured-clone inputs now leave
-            // scope before the next batch is built.
+            // Async activation records can otherwise retain completed IDB request
+            // inputs until the whole generation settles. Drop every large reference
+            // explicitly and yield a macrotask so WebKit can collect between batches.
+            for (const record of records) {
+                record.tree = undefined;
+            }
+            records.length = 0;
+            texts.length = 0;
+            digests.length = 0;
+            await new Promise(resolve => setTimeout(resolve, 0));
         };
         const stageAll = async () => {
-            const batchSize = 8;
+            const batchSize = 4;
             for (let i = 0; i < dirtyPlans.length; i += batchSize) {
                 await stageBatch(dirtyPlans.slice(i, i + batchSize));
             }
@@ -5386,7 +5422,8 @@ class PersistenceManager {
                 currentReq.onsuccess = () => {
                     progress();
                     const current = currentReq.result;
-                    if (prev && (!current || current.revision !== prev.revision)) {
+                    if ((prev && (!current || current.revision !== prev.revision)) ||
+                        (!prev && current !== undefined)) {
                         done(false);
                         return;
                     }
@@ -5400,11 +5437,30 @@ class PersistenceManager {
                 };
             }).then(ok => {
                 if (!ok || this.disposed_) {
-                    if (prev) {
-                        this.lastFlush_.delete(pathString);
-                        this.flushPending_.add(pathString);
+                    if (this.disposed_) {
+                        return;
                     }
-                    return;
+                    // A different tab committed while we staged. Remove only our
+                    // immutable ids, adopt the winning manifest/base, then diff the
+                    // current live Node against it on one coalesced retry.
+                    return this.withStore_('readwrite', undefined, store => {
+                        for (const recordId of stagedIds) {
+                            store.delete(key + RANGE_KEY_INFIX + recordId);
+                        }
+                    }).then(() => this.readRecord_(pathString).then(winner => {
+                        if (winner !== null) {
+                            this.lastFlush_.set(pathString, {
+                                rootNode: winner.record.node,
+                                revision: winner.record.revision,
+                                ranges: winner.ranges,
+                                storedUpdatedAt: winner.record.updatedAt
+                            });
+                        }
+                        else {
+                            this.lastFlush_.delete(pathString);
+                        }
+                        this.flushPending_.add(pathString);
+                    }));
                 }
                 persistenceStats.rangesHashed += dirtyPlans.length;
                 persistenceStats.rangesReused += ranges.length - dirtyPlans.length;
@@ -6621,9 +6677,10 @@ class WebSocketConnection {
             return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
         }
         const data = mess['data'];
-        this.pendingMessageBytes_ += data.length;
-        this.bytesReceived += data.length;
-        this.stats_.incrementCounter('bytes_received', data.length);
+        const wireBytes = stringLength(data);
+        this.pendingMessageBytes_ += wireBytes;
+        this.bytesReceived += wireBytes;
+        this.stats_.incrementCounter('bytes_received', wireBytes);
         this.resetKeepAlive();
         if (this.frames !== null) {
             // we're buffering
@@ -6644,8 +6701,9 @@ class WebSocketConnection {
     send(data) {
         this.resetKeepAlive();
         const dataStr = stringify(data);
-        this.bytesSent += dataStr.length;
-        this.stats_.incrementCounter('bytes_sent', dataStr.length);
+        const wireBytes = stringLength(dataStr);
+        this.bytesSent += wireBytes;
+        this.stats_.incrementCounter('bytes_sent', wireBytes);
         //We can only fit a certain amount in each websocket frame, so we need to split this request
         //up into multiple pieces if it doesn't fit in one request.
         const dataSegs = splitStringBySize(dataStr, WEBSOCKET_MAX_FRAME_SIZE);
@@ -7663,6 +7721,8 @@ class PersistentConnection extends ServerActions {
             query,
             tag,
             bytes: 0,
+            hadHash: false,
+            hadCompoundHash: false,
             dataReceived: false,
             rangeMerged: false
         };
@@ -7705,9 +7765,8 @@ class PersistentConnection extends ServerActions {
         if (compoundHash) {
             req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
         }
-        if (req['h'] !== '') ;
-        const hadHash = req['h'] !== '';
-        const hadCompoundHash = compoundHash !== undefined;
+        listenSpec.hadHash = req['h'] !== '';
+        listenSpec.hadCompoundHash = compoundHash !== undefined;
         listenSpec.bytes = 0;
         listenSpec.dataReceived = false;
         listenSpec.rangeMerged = false;
@@ -7727,9 +7786,7 @@ class PersistentConnection extends ServerActions {
                 if (listenSpec.onComplete) {
                     listenSpec.onComplete(status, payload, {
                         ...this.listenWireResult_(listenSpec),
-                        bytes: listenSpec.bytes + responseBytes,
-                        hadHash,
-                        hadCompoundHash
+                        bytes: listenSpec.bytes + responseBytes
                     });
                 }
             }
@@ -7997,8 +8054,8 @@ class PersistentConnection extends ServerActions {
     listenWireResult_(listen) {
         return {
             bytes: listen.bytes,
-            hadHash: listen.hashFn() !== '',
-            hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+            hadHash: listen.hadHash,
+            hadCompoundHash: listen.hadCompoundHash,
             dataReceived: listen.dataReceived,
             rangeMerged: listen.rangeMerged
         };
@@ -8268,8 +8325,8 @@ class PersistentConnection extends ServerActions {
         if (listen && listen.onComplete) {
             listen.onComplete('permission_denied', null, {
                 bytes: listen.bytes,
-                hadHash: listen.hashFn() !== '',
-                hadCompoundHash: listen.hashFn.compoundHash?.() !== undefined,
+                hadHash: listen.hadHash,
+                hadCompoundHash: listen.hadCompoundHash,
                 dataReceived: listen.dataReceived,
                 rangeMerged: listen.rangeMerged
             });
@@ -13847,7 +13904,8 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
     }
     state.outcome = outcome;
     for (const subscriber of state.subscribers) {
-        subscriber(outcome);
+        // Observability callbacks must never abort authoritative wire processing.
+        exceptionGuard(() => subscriber(outcome));
     }
 }
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
@@ -13953,10 +14011,11 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
     let sentFromManifest = false;
     let restartedCold = false;
     const restartCold = (reason = 'corrupt') => {
-        if (!sentFromManifest || restartedCold) {
+        if (!sentFromManifest || restartedCold || !isCurrent()) {
             return;
         }
         restartedCold = true;
+        repo.pendingSeedRestores_.delete(pathString);
         repo.pendingListenHashes_.clear(pathString);
         repo.bootBuffers_.delete(pathString);
         // The compound response may omit every matching range, so buffered data
@@ -13979,10 +14038,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         }
         sentFromManifest = true;
         repo.bootBuffers_.set(pathString, []);
-        // The listen's hashFn resolves through SyncTree's view of the (not yet
-        // applied) server cache. stampNextListenHashes hands the stored hashes
-        // to the pending listen directly, keyed by path (see ServerCacheSeed).
-        finish('restored');
+        // Keep the pending token until range assembly finishes. A stop after this
+        // send must cancel replay/restart as well as unlisten the wire request.
+        sendListen('restored');
     };
     const drainBootBuffer = () => {
         const buffered = repo.bootBuffers_.get(pathString);
@@ -14008,7 +14066,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         onManifest();
     })
         .then(result => {
-        if (!isCurrent() && !sentFromManifest) {
+        if (!isCurrent()) {
+            repo.pendingListenHashes_.clear(pathString);
+            repo.bootBuffers_.delete(pathString);
             return;
         }
         const { record, reason } = result;
@@ -14039,6 +14099,14 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
             const restored = stampSeedHashes(record.node, record.hash, record.compoundHash);
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+            if (!isCurrent()) {
+                repo.pendingListenHashes_.clear(pathString);
+                repo.bootBuffers_.delete(pathString);
+                return;
+            }
+            if (sentFromManifest) {
+                repo.pendingSeedRestores_.delete(pathString);
+            }
             // The hashes ride the seeded node from here on; the pending stamp
             // must not outlive the boot window (a re-listen after real server
             // updates must send the CURRENT tree's hashes, not the stored ones).
