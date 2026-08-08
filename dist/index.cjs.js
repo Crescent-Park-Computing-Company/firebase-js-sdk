@@ -5431,22 +5431,65 @@ class PersistenceManager {
                         done(false);
                         return;
                     }
-                    for (const recordId of retiredIds) {
-                        const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
-                        remove.onsuccess = progress;
+                    const commit = () => {
+                        for (const recordId of retiredIds) {
+                            const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
+                            remove.onsuccess = progress;
+                        }
+                        const manifestPut = store.put(manifest, key);
+                        manifestPut.onsuccess = progress;
+                        done(true);
+                    };
+                    if (stagedIds.length === 0) {
+                        commit();
+                        return;
                     }
-                    const manifestPut = store.put(manifest, key);
-                    manifestPut.onsuccess = progress;
-                    done(true);
+                    // Another tab's sweep classifies suffixed records against the
+                    // manifest that is COMMITTED, so records staged for this still
+                    // unpublished generation look like orphans there and can be
+                    // reclaimed between staging and this transaction without
+                    // moving the manifest revision (in-memory guards only cover
+                    // this tab). Publishing would durably reference missing
+                    // payloads. Re-verify every staged id inside the same atomic
+                    // switch — key-only reads — and treat a loss exactly like a
+                    // CAS conflict. Ordering is airtight because readwrite
+                    // transactions on one store serialize: a sweep that ran before
+                    // this transaction is observed here; one that runs after reads
+                    // this manifest and keeps its records.
+                    let missing = false;
+                    let verified = 0;
+                    for (const recordId of stagedIds) {
+                        const stagedKey = key + RANGE_KEY_INFIX + recordId;
+                        // Key-only where the platform (or fake) provides it; the
+                        // fallback get only runs in environments without getKey.
+                        const check = typeof store.getKey === 'function'
+                            ? store.getKey(stagedKey)
+                            : store.get(stagedKey);
+                        check.onsuccess = () => {
+                            progress();
+                            if (missing) {
+                                return;
+                            }
+                            if (check.result === undefined) {
+                                missing = true;
+                                done(false);
+                                return;
+                            }
+                            if (++verified === stagedIds.length) {
+                                commit();
+                            }
+                        };
+                    }
                 };
             }).then(ok => {
                 if (!ok || this.disposed_) {
                     if (this.disposed_) {
                         return;
                     }
-                    // A different tab committed while we staged. Remove only our
-                    // immutable ids, adopt the winning manifest/base, then diff the
-                    // current live Node against it on one coalesced retry.
+                    // A different tab committed while we staged, or a concurrent
+                    // sweep reclaimed our still-unreferenced staged records. Remove
+                    // our immutable ids, adopt the winning manifest/base, then diff
+                    // the current live Node against it on one coalesced retry.
                     return this.withStore_('readwrite', undefined, store => {
                         for (const recordId of stagedIds) {
                             store.delete(key + RANGE_KEY_INFIX + recordId);
