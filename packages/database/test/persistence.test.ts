@@ -704,6 +704,92 @@ describe('PersistenceManager', () => {
     expect(await restoreForTest(manager, path.toString())).to.not.equal(null);
   });
 
+  it('a sweep between chunk staging and the manifest commit forces a clean retry', async () => {
+    const path = new Path('swept-stage/root');
+    const prefix = 'test-repo|/swept-stage/root';
+    // Simulates the other tab's sweep at the exact hazardous interleave: a
+    // freshly staged range record is not referenced by the COMMITTED
+    // manifest, so a concurrent sweep classifies it as an orphan and deletes
+    // it after the staging put but before the manifest CAS transaction.
+    let dataRef: Map<string, unknown> | null = null;
+    let baseline = new Set<string>();
+    let sabotage = false;
+    const swept: string[] = [];
+    const shared = makeFakeIndexedDB({
+      onPut: key => {
+        if (
+          sabotage &&
+          dataRef !== null &&
+          key.startsWith(prefix + '#range:') &&
+          !baseline.has(key)
+        ) {
+          swept.push(key);
+          dataRef.delete(key);
+        }
+      }
+    });
+    dataRef = shared.data;
+
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 1 }));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const committed = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(committed).to.not.equal(undefined);
+    baseline = new Set(
+      [...shared.data.keys()].filter(key => key.startsWith(prefix))
+    );
+
+    const base = (await restoreForTest(manager, path.toString()))!;
+    manager.serverCacheUpdated(
+      path,
+      base.node.updateChild(new Path('a'), nodeFromJSON(2))
+    );
+    sabotage = true;
+    await manager.flushNow(path.toString());
+    sabotage = false;
+    expect(swept.length).to.be.greaterThan(0);
+
+    // The sabotaged generation must not have been published: the committed
+    // manifest is still the previous revision and every range record it
+    // references is present.
+    const afterLoss = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(afterLoss.revision).to.equal(committed.revision);
+    for (const range of afterLoss.ranges) {
+      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
+        true
+      );
+    }
+
+    // The queue drain retries the flush coalesced; the retry publishes a
+    // complete generation and a fresh session restores it warm.
+    await flushAsync();
+    await flushAsync();
+    const final = await restoreForTest(
+      scopedManager('test-repo', shared.factory),
+      path.toString()
+    );
+    expect(final).to.not.equal(null);
+    expect(final!.node.val()).to.deep.equal({ a: 2, b: 1 });
+    const republished = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(republished.revision).to.not.equal(committed.revision);
+    for (const range of republished.ranges) {
+      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
+        true
+      );
+    }
+  });
+
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const managerA = scopedManager('test-repo', factory);
