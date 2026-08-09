@@ -15,67 +15,83 @@
  * limitations under the License.
  */
 
-import { base64, isIndexedDBAvailable } from '@firebase/util';
+import { isIndexedDBAvailable } from '@firebase/util';
 
 import {
-  CompoundHashBuilder,
-  StableRange,
   collectChangedSubtreePaths,
-  estimateSerializedNodeSize,
-  fixedSizeSplitStrategy,
-  markDirtyRanges,
-  rebuildStableRanges,
-  walkLeafInterval
+  estimateSerializedNodeSize
 } from './CompoundHash';
-import { SeedCompoundHash, stampSeedHashes } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
+import { buildChildSet } from './snap/childSet';
+import { NAME_COMPARATOR, NAME_ONLY_COMPARATOR } from './snap/comparators';
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
-import { Node } from './snap/Node';
+import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
+import { IndexMap } from './snap/IndexMap';
+import { NamedNode, Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
+import { SortedMap } from './util/SortedMap';
 import { Path } from './util/Path';
-import { sha1 } from './util/util';
+import { nameCompare } from './util/util';
 
 /**
  * Client-side persistence of the server cache, in the spirit of the mobile
  * SDKs' setPersistenceEnabled(true): the SDK itself stores what the server
  * sent for each listened root and restores it on the next startup, so a
  * reload serves cached data immediately and revalidates with the server via
- * the hash protocol (see ServerCacheSeed) instead of re-downloading.
+ * the hash protocol instead of re-downloading.
  *
- * STORAGE MODEL — one manifest plus immutable fixed-target range records.
- * Each persisted root stores:
+ * DESIGN — boot-time hashing over path-keyed segments.
+ *
+ * Storage carries NO hashes. The compound hash a warm listen sends is
+ * computed AT BOOT from the tree that was actually assembled
+ * (compoundHashFromNodeAsync, in bounded main-thread slices, after the
+ * restored tree has been applied and painted — see repoStartServerListen).
+ * The hashes are therefore correct by construction: whatever the cache
+ * held, the server receives hashes describing exactly the tree the client
+ * is showing, and reconciles any staleness through ordinary range merges.
+ * Storage corruption can cost a cold reload; it can never corrupt the
+ * protocol. That single property is what lets this file omit write-time
+ * hash maintenance, commit CAS, staged-record verification, and boot-order
+ * buffering entirely.
+ *
+ * STORAGE MODEL. Each persisted root stores one MANIFEST plus segment
+ * records:
  *
  *   - a MANIFEST (`<prefix>|<path>`): revision, timestamps, auth scope, and
- *     ordered stable ranges `{recordId, post, hash, size}`. It is the complete
- *     compound-listen descriptor and reads in milliseconds.
- *   - one structured-clone RANGE record per stable interval
- *     (`<prefix>|<path>#range:<recordId>`): start/end markers plus a sparse
- *     export-format fragment containing exactly that interval's leaves.
+ *     a list of SPLIT NODES `{path, priority?, segs: [{from, id, bytes}]}`.
+ *     A split node partitions the children of one tree node into contiguous
+ *     child-key SEGMENTS: segment i covers keys [segs[i].from,
+ *     segs[i+1].from) — the first `from` is null (start of the key range),
+ *     the last segment runs to the end. A child too large for inline
+ *     storage is instead the root of its own (deeper) split node; split
+ *     paths form a tree in which every non-root split is a direct child of
+ *     a segment interval of its parent split.
+ *   - one record per segment (`<prefix>|<path>#seg:<id>`): the JSON text of
+ *     `{childKey: exportValue, ...}` for exactly that segment's inline
+ *     children (deep children excluded — their own split stores them).
+ *     Segments are serialized directly from the immutable Node; no export
+ *     object of the whole tree is ever materialized, and clean segments are
+ *     never re-read or re-written.
  *
- * Dirty/split/merged ranges receive new immutable ids; clean ranges keep the
- * exact prior record. New records and the manifest commit in ONE transaction.
- * An optimistic manifest-revision check prevents a stale tab from reusing a
- * different tab's records; on conflict it retries with a self-contained full
- * range generation. Retired ids are deleted in the commit, and a guarded
- * key-only GC plus the expiry sweep reclaim older crash/legacy/orphan ids.
- * No full-root val(true) or full-root structured clone occurs on a steady
- * state flush.
+ * Segment ids are never reused, so a record is written once and never
+ * mutated: any manifest read either finds every referenced id intact (a
+ * consistent generation) or misses one (a restore miss — cold reload).
+ * Commits are last-writer-wins: dirty segment records are staged in bounded
+ * batches, then one small transaction puts the manifest and deletes retired
+ * ids. If another tab committed meanwhile, the later manifest simply wins —
+ * both tabs listen to the same server data, so either generation is a valid
+ * cache — and the commit skips the retire-deletes (reclamation falls to the
+ * age-guarded sweep) so it never deletes records a foreign manifest may
+ * reference.
  *
- * MANIFEST-FIRST BOOT. Because the manifest alone carries the protocol
- * hashes, a warm boot reads it first and hands the hashes to the caller
- * (see restoreForListen's onManifest) so the range listen can be sent
- * IMMEDIATELY — the server round-trip overlaps the tree record's read and
- * Node construction. A warm boot computes NO hashes.
- *
- * SELF-CONSISTENT GENERATIONS. Range hashes are maintained at write time,
- * inside the flush: an identity-diff of the immutable trees marks the
- * ranges a change dirtied, only those ranges are re-serialized and
- * re-hashed (between preserved boundary posts — see CompoundHash's stable
- * ranges), and the manifest commits with hashes that exactly describe the
- * tree record beside it. Clean ranges carry over without their bytes ever
- * being read. Stale hashes are never persisted: a stale hash could falsely
- * match a reverted server range, the one corruption the range handshake
- * cannot self-heal.
+ * WRITE PATH. An identity-diff of the immutable trees
+ * (collectChangedSubtreePaths) maps changes to their covering segments:
+ * only those are re-serialized and re-written. Segment boundaries carry
+ * over from the previous generation; each maximal dirty run is re-cut at
+ * the target size (natural hysteresis: boundaries only move where content
+ * changed), a changed child that outgrew inline storage is promoted to its
+ * own split node, and a split that shrank folds back inline. Steady-state
+ * work is proportional to what changed, never to tree size.
  *
  * WRITE POLICY — single-flight coalescing flush. The first change after a
  * committed generation arms a NON-restarting timer (writeDelayMs, default
@@ -85,19 +101,25 @@ import { sha1 } from './util/util';
  * max(delay, flush duration) — natural backpressure, bounded staleness.
  * Cache writes are never awaited by the UI, certification, or navigation.
  *
+ * BOOT PATH. One readonly transaction reads the manifest and queues every
+ * referenced segment record; segments are JSON.parsed as they arrive and
+ * the split tree is assembled bottom-up into one Node. The caller applies
+ * it (paint), then derives the listen hashes from the node itself.
+ *
  * All storage failures degrade to cold loads; nothing here may ever break
  * the live connection.
  */
 
 const STORE = 'firebase-server-cache';
-// Version 3 invalidated pre-chunking caches; version 8 is current. The
-// upgrade clears the store inside IndexedDB without materializing old
-// (potentially huge) values into JavaScript memory.
+// Version 3 invalidated pre-chunking caches; 9 (current) invalidated
+// chunked caches. The upgrade clears the store inside IndexedDB without
+// materializing old (potentially huge) values into JavaScript memory.
 const PERSISTENCE_DB_VERSION = 9;
-// Format 11: immutable fixed-target range records + one stable-range
-// manifest. Earlier monolithic/chunked formats restore as misses and are
-// reclaimed without materializing their payloads.
-const PERSISTENCE_FORMAT_VERSION = 11;
+// Format 12: path-keyed JSON-text segments, no stored hashes. Earlier
+// formats (incl. the write-time-hashed range format 11) restore as misses
+// and are reclaimed by the sweep without materializing their payloads —
+// the IndexedDB schema itself is unchanged, so no version bump.
+const PERSISTENCE_FORMAT_VERSION = 12;
 const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
 
 function readSchemaMarker(): boolean {
@@ -151,19 +173,33 @@ const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
 export const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
 /**
- * Constant canonical-text target for one persisted/hash range. Boundaries are
- * stable across generations and only dirty runs reconsult this target. The
- * constructor accepts an override so 128/256/512 KiB can be benchmarked
- * without changing protocol code.
+ * Serialized-text target for one persisted segment. Boundaries carry over
+ * across generations; only dirty runs reconsult this target.
  * @internal
  */
-export const PERSISTENCE_RANGE_TARGET_BYTES = 256 * 1024;
+export const PERSISTENCE_SEGMENT_TARGET_BYTES = 256 * 1024;
+
+/**
+ * A child whose serialized estimate exceeds this many times the segment
+ * target is stored as its own split node instead of inline in a segment; an
+ * existing split whose estimate falls back below ONE target folds inline
+ * again. The band between the two thresholds is the promote/demote
+ * hysteresis that keeps a child hovering near the limit from flapping.
+ */
+const PERSISTENCE_DEEP_CHILD_FACTOR = 2;
+
+/**
+ * How many dirty segments are serialized + written per staging transaction.
+ * Bounds peak memory (texts awaiting put) and yields a macrotask between
+ * batches so a large first generation cannot monopolize the main thread.
+ */
+const PERSISTENCE_STAGE_BATCH_SIZE = 4;
 
 /**
  * Maximum gap with NO restore progress before the listen attaches unseeded.
- * Progress (a completed manifest or tree read) resets this budget. The same
- * bound applies to each IndexedDB open/transaction, so a request that fires
- * neither success nor error can never hold the live listen forever.
+ * Progress (a completed read) resets this budget. The same bound applies to
+ * each IndexedDB open/transaction, so a request that fires neither success
+ * nor error can never hold the live listen forever.
  */
 export const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 
@@ -173,7 +209,7 @@ const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the tree record stays put) — so a tree that never
+ * a fresh timestamp (the segment records stay put) — so a tree that never
  * changes but is used daily never ages into the expiry cutoff.
  * @internal
  */
@@ -188,13 +224,21 @@ export const PERSISTENCE_REFRESH_AGE_MS = 24 * 60 * 60 * 1000;
 export const PERSISTENCE_SWEEP_DELAY_MS = 15000;
 
 /**
- * What a restore resolves: the assembled tree, with the stored hashes joined
- * when they describe exactly this tree.
+ * Minimum age (from the timestamp embedded in the id) before the sweep may
+ * reclaim a segment record no manifest references. The guard keeps a sweep
+ * in one tab from deleting records another tab has staged for a generation
+ * whose manifest hasn't committed yet — staging and commit are seconds
+ * apart, never an hour.
+ * @internal
+ */
+export const PERSISTENCE_ORPHAN_MIN_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * What a restore resolves: the assembled tree. The caller derives listen
+ * hashes from the node itself (boot-time hashing); storage carries none.
  */
 export interface PersistedRecord {
   node: Node;
-  hash?: string;
-  compoundHash?: SeedCompoundHash;
   updatedAt: number;
   /** The write token of the manifest this record was assembled from. */
   revision: string;
@@ -212,20 +256,26 @@ export interface PersistenceRestoreResult {
   reason?: PersistenceRestoreReason;
 }
 
-/**
- * The protocol hashes of a committed generation, as handed to
- * restoreForListen's onManifest callback — everything a range listen needs,
- * available long before the tree record has been read.
- */
-export interface PersistedSeedHashes {
-  hash: string;
-  compoundHash: SeedCompoundHash;
+/** One segment of a split node: child keys in [from, next.from). */
+interface PersistedSegment {
+  /** First child key covered; null for a split's first segment. */
+  from: string | null;
+  /** The immutable record id holding this segment's JSON text. */
+  id: string;
+  /** Serialized size when written (planning/observability input only). */
+  bytes: number;
 }
 
-/** One immutable stored range referenced by a manifest. */
-interface PersistedRange extends StableRange {
-  /** Immutable payload id. A changed/split/merged range always gets a new id. */
-  recordId: string;
+/** One split node: the partitioned children of the tree node at `path`. */
+interface PersistedSplit {
+  /** Slash-joined path from the persisted root; '' for the root itself. */
+  path: string;
+  /** The split node's own .priority export value, when present. */
+  priority?: unknown;
+  /** The root split's leaf value marker: segs[0] holds the whole export. */
+  leaf?: boolean;
+  /** Ordered segments; together they cover the whole child-key range. */
+  segs: PersistedSegment[];
 }
 
 /** The manifest record stored at a root's main key. */
@@ -235,21 +285,8 @@ interface PersistedManifest {
   updatedAt: number;
   authScope: string | null;
   estimatedBytes: number;
-  /** The root's simple hash (empty for compound-only seeds). */
-  hash: string;
-  /** Ordered ranges describing and locating the complete persisted tree. */
-  ranges: PersistedRange[];
-}
-
-/** One immutable structured-clone range payload. */
-interface PersistedRangeRecord {
-  recordId: string;
-  /** Exclusive start marker; null for the first range. */
-  start: string | null;
-  /** Inclusive end marker; equal to the manifest range's post. */
-  end: string;
-  /** Sparse export-format fragment for exactly (start, end]. */
-  tree: unknown;
+  /** Every split node of the tree, root first (insertion order). */
+  splits: PersistedSplit[];
 }
 
 /**
@@ -260,7 +297,7 @@ interface PersistedRangeRecord {
 interface FlushedState {
   rootNode: Node;
   revision: string;
-  ranges: PersistedRange[];
+  splits: PersistedSplit[];
   storedUpdatedAt: number;
 }
 
@@ -272,8 +309,8 @@ export const persistenceStats: {
   restoredRoots: string[];
   restoreMisses: string[];
   writeThroughs: number;
-  rangesHashed: number;
-  rangesReused: number;
+  segmentsWritten: number;
+  segmentsReused: number;
   evictions: number;
   storageFailures: number;
   events: Array<{ at: number; path: string; event: string; detail?: string }>;
@@ -281,8 +318,8 @@ export const persistenceStats: {
   restoredRoots: [],
   restoreMisses: [],
   writeThroughs: 0,
-  rangesHashed: 0,
-  rangesReused: 0,
+  segmentsWritten: 0,
+  segmentsReused: 0,
   evictions: 0,
   storageFailures: 0,
   events: []
@@ -299,86 +336,593 @@ function recordPersistenceEvent(
   }
 }
 
-const RANGE_KEY_INFIX = '#range:';
+const SEG_KEY_INFIX = '#seg:';
 
-function wireCompoundHashFromRanges(ranges: StableRange[]): SeedCompoundHash {
-  const posts: string[] = [];
-  const hashes: string[] = [];
-  for (const range of ranges) {
-    posts.push(range.post);
-    hashes.push(range.hash);
-  }
-  // The empty tail hash lets the server append past the last post.
-  hashes.push('');
-  return { posts, hashes };
-}
-
-/**
- * Hashes the dirty ranges' serialized texts — WebCrypto where available
- * (native, off the JavaScript thread, ~40x the JS implementation), the
- * synchronous JS sha1 otherwise (Node without webcrypto, insecure contexts).
- * Falls back wholesale on any WebCrypto failure: a flush must never fail on
- * the choice of hash backend.
- */
-function digestRangeTexts(texts: string[]): Promise<string[]> {
-  if (texts.length === 0) {
-    return Promise.resolve([]);
-  }
-  const subtle =
-    typeof crypto !== 'undefined' &&
-    typeof TextEncoder !== 'undefined' &&
-    crypto.subtle &&
-    typeof crypto.subtle.digest === 'function'
-      ? crypto.subtle
-      : null;
-  if (subtle === null) {
-    return Promise.resolve(texts.map(sha1));
-  }
-  const encoder = new TextEncoder();
-  return Promise.all(
-    texts.map(text =>
-      subtle
-        .digest('SHA-1', encoder.encode(text))
-        .then(digest => base64.encodeByteArray(new Uint8Array(digest)))
-    )
-  ).catch(() => texts.map(sha1));
-}
-
-/** The joined result of one physical manifest+tree read. */
+/** The joined result of one physical manifest+segments read. */
 interface ReadResult {
   record: PersistedRecord;
-  ranges: PersistedRange[];
+  splits: PersistedSplit[];
+}
+
+// ============================== SERIALIZATION ==============================
+
+/**
+ * Appends the export-format JSON of `node` to `parts`. Equivalent to
+ * JSON.stringify(node.val(true)) but written directly from the immutable
+ * tree — no intermediate export object is ever materialized.
+ */
+function appendExportJson(parts: string[], node: Node): void {
+  const priority = node.getPriority();
+  if (node.isLeafNode()) {
+    const value = JSON.stringify(node.val());
+    if (priority.isEmpty()) {
+      parts.push(value);
+    } else {
+      parts.push(
+        '{".value":',
+        value,
+        ',".priority":',
+        JSON.stringify(priority.val()),
+        '}'
+      );
+    }
+    return;
+  }
+  parts.push('{');
+  let first = true;
+  node.forEachChild(KEY_INDEX, (key, child) => {
+    if (!first) {
+      parts.push(',');
+    }
+    first = false;
+    parts.push(JSON.stringify(key), ':');
+    appendExportJson(parts, child);
+  });
+  if (!priority.isEmpty()) {
+    if (!first) {
+      parts.push(',');
+    }
+    parts.push('".priority":', JSON.stringify(priority.val()));
+  }
+  parts.push('}');
 }
 
 /**
- * Unions two disjoint sparse export fragments without range-deletion
- * semantics. RangeMerge is correct for authoritative server deltas, where an
- * omitted value inside the interval means delete; persisted fragments instead
- * partition one complete snapshot, so omission means "owned by another
- * record". In particular this preserves a prioritized leaf at the exclusive
- * boundary of the following range.
+ * Serializes one segment of a split node: the JSON text of an object holding
+ * the export values of the node's children in [fromKey, toKey) key order,
+ * skipping children stored as their own split nodes. `fromKey === null`
+ * starts at the first child; `toKey === null` runs to the last. The node's
+ * own priority is NOT serialized here — it rides in the manifest split.
  */
-function mergePersistedFragment(base: Node, fragment: Node): Node {
-  if (base.isEmpty()) {
-    return fragment;
-  }
-  if (fragment.isEmpty()) {
-    return base;
-  }
-  if (fragment.isLeafNode()) {
-    return fragment;
-  }
-  let result = base;
-  fragment.forEachChild(KEY_INDEX, (key, child) => {
-    result = result.updateImmediateChild(
-      key,
-      mergePersistedFragment(result.getImmediateChild(key), child)
-    );
+function serializeSegment(
+  node: Node,
+  fromKey: string | null,
+  toKey: string | null,
+  deepKeys: Set<string>
+): string {
+  const parts: string[] = ['{'];
+  let first = true;
+  forEachChildFrom(node, fromKey, (key, child) => {
+    if (toKey !== null && nameCompare(key, toKey) >= 0) {
+      return true;
+    }
+    if (!deepKeys.has(key)) {
+      if (!first) {
+        parts.push(',');
+      }
+      first = false;
+      parts.push(JSON.stringify(key), ':');
+      appendExportJson(parts, child);
+    }
+    return false;
   });
-  if (!fragment.getPriority().isEmpty()) {
-    result = result.updatePriority(fragment.getPriority());
+  parts.push('}');
+  return parts.join('');
+}
+
+/**
+ * Iterates `node`'s children in key order starting at `fromKey` (inclusive;
+ * null = first child). The action returns true to stop the iteration.
+ */
+function forEachChildFrom(
+  node: Node,
+  fromKey: string | null,
+  action: (key: string, child: Node) => boolean
+): void {
+  if (node.isLeafNode() || node.isEmpty()) {
+    return;
+  }
+  const children = node as ChildrenNode;
+  const iterator =
+    fromKey === null
+      ? children.getIterator(KEY_INDEX)
+      : children.getIteratorFrom(KEY_INDEX.makePost(fromKey, fromKey), KEY_INDEX);
+  let next = iterator.getNext() as NamedNode | null;
+  while (next !== null) {
+    if (action(next.name, next.node)) {
+      return;
+    }
+    next = iterator.getNext() as NamedNode | null;
+  }
+}
+
+
+/** The export JSON text of a leaf root (single-segment leaf split). */
+function leafExportJson(node: Node): string {
+  const parts: string[] = [];
+  appendExportJson(parts, node);
+  return parts.join('');
+}
+
+// ================================ PLANNING =================================
+
+/** One segment that must be serialized and written under a fresh id. */
+interface DirtySegmentJob {
+  /** The split whose segs this job writes into (object identity). */
+  split: PersistedSplit;
+  /** Index into that split's `segs`. */
+  segIndex: number;
+  fromKey: string | null;
+  toKey: string | null;
+  /** The tree node the split partitions (serialization source). */
+  node: Node;
+}
+
+interface GenerationPlan {
+  splits: PersistedSplit[];
+  dirty: DirtySegmentJob[];
+  /** Record ids referenced by the previous generation but not this one. */
+  retiredIds: string[];
+}
+
+/** Returns every segment record id referenced by a split list. */
+function allSegmentIds(splits: PersistedSplit[]): string[] {
+  const ids: string[] = [];
+  for (const split of splits) {
+    for (const seg of split.segs) {
+      ids.push(seg.id);
+    }
+  }
+  return ids;
+}
+
+/** The index of the segment whose [from, next.from) interval holds `key`. */
+function segmentIndexFor(segs: PersistedSegment[], key: string): number {
+  let lo = 0;
+  let hi = segs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const from = segs[mid].from;
+    if (from === null || nameCompare(from, key) <= 0) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+/** The `deep` (own-split) child keys of one split, from the split list. */
+function deepChildKeys(
+  splits: PersistedSplit[],
+  parentPath: string
+): Map<string, PersistedSplit> {
+  const result = new Map<string, PersistedSplit>();
+  const prefix = parentPath === '' ? '' : parentPath + '/';
+  for (const split of splits) {
+    if (
+      split.path !== parentPath &&
+      split.path.startsWith(prefix) &&
+      split.path.indexOf('/', prefix.length) === -1 &&
+      split.path.length > prefix.length
+    ) {
+      result.set(split.path.slice(prefix.length), split);
+    }
   }
   return result;
+}
+
+/**
+ * Plans the segment layout of one generation.
+ *
+ * With no usable previous layout every split is cut fresh at the target
+ * size. With one, clean segments carry their record ids over verbatim and
+ * only segments whose child-key interval contains a changed path are re-cut
+ * and re-written: each maximal dirty run is re-partitioned at the target
+ * (boundaries move only where content changed), a dirty run whose total
+ * shrank below a quarter target absorbs its right neighbor, a changed child
+ * whose estimate exceeds PERSISTENCE_DEEP_CHILD_FACTOR targets is promoted
+ * to its own split node, and a previously-deep child that shrank below one
+ * target folds back inline (the band between the thresholds is the
+ * promote/demote hysteresis). Only non-leaf children are ever promoted — a
+ * leaf is atomic however large its value.
+ *
+ * `changedPaths === null` means the diff is unusable (no previous tree);
+ * an empty array means only identity-invisible changes (never happens in
+ * practice — the caller skips identical roots).
+ */
+function planGeneration(
+  node: Node,
+  previous: PersistedSplit[] | null,
+  changedPaths: string[][] | null,
+  targetBytes: number
+): GenerationPlan {
+  const splits: PersistedSplit[] = [];
+  const dirty: DirtySegmentJob[] = [];
+  const keptIds = new Set<string>();
+
+  const addDirty = (
+    split: PersistedSplit,
+    segIndex: number,
+    current: Node
+  ): void => {
+    dirty.push({
+      split,
+      segIndex,
+      fromKey: split.segs[segIndex].from,
+      toKey:
+        segIndex + 1 < split.segs.length ? split.segs[segIndex + 1].from : null,
+      node: current
+    });
+  };
+
+  /** Plans one node's children from scratch (no previous layout). */
+  const planFresh = (path: string, current: Node): void => {
+    if (current.isLeafNode()) {
+      const split: PersistedSplit = {
+        path,
+        leaf: true,
+        segs: [{ from: null, id: '', bytes: 0 }]
+      };
+      splits.push(split);
+      addDirty(split, 0, current);
+      return;
+    }
+    const split: PersistedSplit = { path, segs: [] };
+    if (!current.getPriority().isEmpty()) {
+      split.priority = current.getPriority().val();
+    }
+    splits.push(split);
+    const deep: Array<[string, Node]> = [];
+    let segFrom: string | null = null;
+    let segBytes = 0;
+    current.forEachChild(KEY_INDEX, (key, child) => {
+      const estimate = estimateSerializedNodeSize(child) + key.length + 4;
+      if (
+        !child.isLeafNode() &&
+        estimate > targetBytes * PERSISTENCE_DEEP_CHILD_FACTOR
+      ) {
+        deep.push([key, child]);
+        return;
+      }
+      if (segBytes > 0 && segBytes + estimate > targetBytes) {
+        split.segs.push({ from: segFrom, id: '', bytes: 0 });
+        segFrom = key;
+        segBytes = 0;
+      }
+      segBytes += estimate;
+    });
+    split.segs.push({ from: segFrom, id: '', bytes: 0 });
+    for (let i = 0; i < split.segs.length; i++) {
+      addDirty(split, i, current);
+    }
+    // Parents precede children in the manifest (assembly relies only on
+    // paths, but keeping the invariant makes manifests debuggable).
+    for (const [key, child] of deep) {
+      planFresh(path === '' ? key : path + '/' + key, child);
+    }
+  };
+
+  /**
+   * Re-partitions the child-key interval [runFrom, runTo) of `current` at
+   * the target size, appending fresh (dirty) segments to `split`.
+   */
+  const recutRun = (
+    split: PersistedSplit,
+    current: Node,
+    runFrom: string | null,
+    runTo: string | null,
+    deepNow: Set<string>
+  ): void => {
+    const startIndex = split.segs.length;
+    let segFrom: string | null = runFrom;
+    let segBytes = 0;
+    forEachChildFrom(current, runFrom, (key, child) => {
+      if (runTo !== null && nameCompare(key, runTo) >= 0) {
+        return true;
+      }
+      if (!deepNow.has(key)) {
+        const estimate = estimateSerializedNodeSize(child) + key.length + 4;
+        if (segBytes > 0 && segBytes + estimate > targetBytes) {
+          split.segs.push({ from: segFrom, id: '', bytes: 0 });
+          segFrom = key;
+          segBytes = 0;
+        }
+        segBytes += estimate;
+      }
+      return false;
+    });
+    // Always emit at least one segment so the interval stays covered.
+    split.segs.push({ from: segFrom, id: '', bytes: 0 });
+    // NOT addDirty: the run's LAST segment must stop at runTo. addDirty
+    // derives toKey from the next entry in segs, and the clean segments
+    // that follow this run are appended only after recutRun returns — a
+    // null there would serialize past the run boundary into content the
+    // carried-over segments already own (duplicated children).
+    for (let i = startIndex; i < split.segs.length; i++) {
+      dirty.push({
+        split,
+        segIndex: i,
+        fromKey: split.segs[i].from,
+        toKey:
+          i + 1 < split.segs.length ? split.segs[i + 1].from : runTo,
+        node: current
+      });
+    }
+  };
+
+  /** Keeps an untouched deep split — and its whole subtree — verbatim. */
+  const carryOverSubtree = (
+    prev: PersistedSplit,
+    prevAll: PersistedSplit[]
+  ): void => {
+    splits.push(prev);
+    for (const seg of prev.segs) {
+      keptIds.add(seg.id);
+    }
+    for (const child of deepChildKeys(prevAll, prev.path).values()) {
+      carryOverSubtree(child, prevAll);
+    }
+  };
+
+  /**
+   * Plans one previously-split node. `changes` holds the changed paths
+   * RELATIVE to this split; an empty element means this whole node changed.
+   */
+  const planExisting = (
+    path: string,
+    current: Node,
+    prev: PersistedSplit,
+    prevAll: PersistedSplit[],
+    changes: string[][]
+  ): void => {
+    if (current.isLeafNode() || prev.leaf === true) {
+      // Shape changed at the root of this split (or a leaf value changed):
+      // re-plan the subtree from scratch; its old records retire.
+      planFresh(path, current);
+      return;
+    }
+    const split: PersistedSplit = { path, segs: [] };
+    if (!current.getPriority().isEmpty()) {
+      split.priority = current.getPriority().val();
+    }
+    splits.push(split);
+
+    const wholeDirty = changes.some(c => c.length === 0);
+    const prevDeep = deepChildKeys(prevAll, path);
+
+    // Route changes: through a still-deep child -> recurse; anything else ->
+    // the covering segment goes dirty.
+    const childChanges = new Map<string, string[][]>();
+    if (!wholeDirty) {
+      for (const change of changes) {
+        const key = change[0];
+        let scoped = childChanges.get(key);
+        if (scoped === undefined) {
+          scoped = [];
+          childChanges.set(key, scoped);
+        }
+        scoped.push(change.slice(1));
+      }
+    }
+
+    // Decide each previously-deep child: keep deep (recurse), or fold
+    // inline (demote) into the covering parent segment.
+    const deepNow = new Set<string>();
+    const dirtyKeys: string[] = [];
+    for (const [key, childPrev] of prevDeep) {
+      const childNode = current.getImmediateChild(key);
+      const childPath = path === '' ? key : path + '/' + key;
+      const keepDeep =
+        !childNode.isLeafNode() &&
+        !childNode.isEmpty() &&
+        estimateSerializedNodeSize(childNode) > targetBytes;
+      if (keepDeep) {
+        deepNow.add(key);
+        const scoped = wholeDirty ? [[]] : childChanges.get(key) ?? [];
+        childChanges.delete(key);
+        if (scoped.length > 0) {
+          planExisting(childPath, childNode, childPrev, prevAll, scoped);
+        } else {
+          carryOverSubtree(childPrev, prevAll);
+        }
+      } else {
+        childChanges.delete(key);
+        dirtyKeys.push(key);
+      }
+    }
+
+    // Remaining changed keys are inline children; a changed inline child
+    // that outgrew the promote threshold becomes its own split node.
+    for (const key of childChanges.keys()) {
+      const childNode = current.getImmediateChild(key);
+      if (
+        !childNode.isLeafNode() &&
+        !childNode.isEmpty() &&
+        estimateSerializedNodeSize(childNode) >
+          targetBytes * PERSISTENCE_DEEP_CHILD_FACTOR
+      ) {
+        deepNow.add(key);
+        planFresh(path === '' ? key : path + '/' + key, childNode);
+      }
+      dirtyKeys.push(key);
+    }
+
+    // Map dirty keys onto the previous segment boundaries, then re-cut each
+    // maximal dirty run and carry every clean segment over.
+    const prevSegs = prev.segs;
+    const segDirty = new Array<boolean>(prevSegs.length).fill(wholeDirty);
+    if (!wholeDirty) {
+      for (const key of dirtyKeys) {
+        segDirty[segmentIndexFor(prevSegs, key)] = true;
+      }
+    }
+    let i = 0;
+    while (i < prevSegs.length) {
+      if (!segDirty[i]) {
+        split.segs.push(prevSegs[i]);
+        keptIds.add(prevSegs[i].id);
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < prevSegs.length && segDirty[j]) {
+        j++;
+      }
+      // Absorb-right hysteresis: a shrunken run merges with its clean right
+      // neighbor instead of surviving as an ever-smaller fragment.
+      if (
+        j < prevSegs.length &&
+        prevSegs.slice(i, j).reduce((sum, seg) => sum + seg.bytes, 0) <
+          targetBytes / 4
+      ) {
+        j++;
+      }
+      recutRun(
+        split,
+        current,
+        prevSegs[i].from,
+        j < prevSegs.length ? prevSegs[j].from : null,
+        deepNow
+      );
+      i = j;
+    }
+  };
+
+  if (previous === null || changedPaths === null) {
+    planFresh('', node);
+  } else {
+    const rootPrev = previous.find(split => split.path === '');
+    if (rootPrev === undefined) {
+      planFresh('', node);
+    } else {
+      planExisting('', node, rootPrev, previous, changedPaths);
+    }
+  }
+
+  const retiredIds: string[] = [];
+  if (previous !== null) {
+    for (const id of allSegmentIds(previous)) {
+      if (!keptIds.has(id)) {
+        retiredIds.push(id);
+      }
+    }
+  }
+  return { splits, dirty, retiredIds };
+}
+
+// ================================ ASSEMBLY =================================
+
+/**
+ * Builds a ChildrenNode from named children (mirroring nodeFromJSON's
+ * balanced-tree construction, including the priority index when any child
+ * carries one) plus the node's own priority export value.
+ */
+function buildChildrenNode(children: NamedNode[], priorityValue: unknown): Node {
+  const priority =
+    priorityValue === undefined || priorityValue === null
+      ? ChildrenNode.EMPTY_NODE
+      : nodeFromJSON(priorityValue);
+  if (children.length === 0) {
+    return ChildrenNode.EMPTY_NODE;
+  }
+  let childrenHavePriority = false;
+  for (const child of children) {
+    if (!child.node.getPriority().isEmpty()) {
+      childrenHavePriority = true;
+      break;
+    }
+  }
+  const childSet = buildChildSet(
+    children.slice(),
+    NAME_ONLY_COMPARATOR,
+    namedNode => namedNode.name,
+    NAME_COMPARATOR
+  ) as SortedMap<string, Node>;
+  if (childrenHavePriority) {
+    const sortedChildSet = buildChildSet(
+      children.slice(),
+      PRIORITY_INDEX.getCompare()
+    );
+    return new ChildrenNode(
+      childSet,
+      priority,
+      new IndexMap(
+        { '.priority': sortedChildSet },
+        { '.priority': PRIORITY_INDEX }
+      )
+    );
+  }
+  return new ChildrenNode(childSet, priority, IndexMap.Default);
+}
+
+/**
+ * Assembles the restored root from the manifest's split tree and each
+ * segment's already-built child Nodes. Deepest splits first, grafting each
+ * built split into its parent's child list.
+ */
+function assembleTree(
+  manifest: PersistedManifest,
+  segChildren: Map<string, NamedNode[]>,
+  leafNodes: Map<string, Node>
+): Node {
+  const byDepth = manifest.splits
+    .slice()
+    .sort(
+      (a, b) =>
+        (b.path === '' ? 0 : b.path.split('/').length) -
+        (a.path === '' ? 0 : a.path.split('/').length)
+    );
+  const built = new Map<string, Node>();
+  for (const split of byDepth) {
+    if (split.leaf === true) {
+      const leaf = leafNodes.get(split.segs[0].id);
+      if (leaf === undefined) {
+        throw new Error('Persisted leaf segment missing');
+      }
+      built.set(split.path, leaf);
+      continue;
+    }
+    const children: NamedNode[] = [];
+    for (const seg of split.segs) {
+      const segNodes = segChildren.get(seg.id);
+      if (segNodes === undefined) {
+        throw new Error('Persisted segment missing');
+      }
+      for (const child of segNodes) {
+        children.push(child);
+      }
+    }
+    for (const [key, childSplit] of deepChildKeys(
+      manifest.splits,
+      split.path
+    )) {
+      const child = built.get(childSplit.path);
+      if (child !== undefined && !child.isEmpty()) {
+        children.push(new NamedNode(key, child));
+      }
+    }
+    // buildChildSet requires name-sorted input (it builds the balanced tree
+    // positionally). Segments arrive in key order, but grafted deep children
+    // belong in the middle of the range.
+    children.sort((a, b) => nameCompare(a.name, b.name));
+    built.set(split.path, buildChildrenNode(children, split.priority));
+  }
+  const root = built.get('');
+  if (root === undefined) {
+    throw new Error('Persisted manifest has no root split');
+  }
+  return root;
 }
 
 export class PersistenceManager {
@@ -403,18 +947,17 @@ export class PersistenceManager {
    */
   private lastFlush_ = new Map<string, FlushedState>();
   /**
-   * Distinguishes this manager's write tokens from every other tab's and
-   * session's — numeric counters restart at zero on reload, which would let
-   * a new data write pair up with a write token from another manager
-   * instance.
+   * Distinguishes this manager's revisions and record ids from every other
+   * tab's and session's — numeric counters restart at zero on reload.
    */
   private instanceId_ = Math.random().toString(36).slice(2, 10);
   private writeCounter_ = 0;
+  private segmentCounter_ = 0;
   /**
-   * The single-flight coalescing window per root: `timer` is the pending
-   * (non-restarting) window; `rearm` marks a change that landed while the
-   * root's queue was busy flushing — exactly one follow-up window is armed
-   * when the queue drains, however many changes landed meanwhile.
+   * The single-flight coalescing window per root: `writeTimers_` holds the
+   * pending (non-restarting) window; `flushPending_` marks a change that
+   * landed while the root's queue was busy flushing — exactly one follow-up
+   * flush runs when the queue drains, however many changes landed meanwhile.
    */
   private writeTimers_ = new Map<string, ReturnType<typeof setTimeout>>();
   private flushPending_ = new Set<string>();
@@ -423,7 +966,7 @@ export class PersistenceManager {
   /**
    * One physical IndexedDB decode per root. The pre-auth peek and the
    * authenticated listener often overlap; without coalescing they each read
-   * the tree record and rebuilt the same large Node tree concurrently.
+   * the segment records and rebuilt the same large Node tree concurrently.
    */
   private activeReads_ = new Map<
     string,
@@ -432,8 +975,6 @@ export class PersistenceManager {
       progress: Set<() => void>;
       retainAfterResolve: boolean;
       cleanupTimer: ReturnType<typeof setTimeout> | null;
-      manifestHashes: PersistedSeedHashes | null;
-      manifestCallbacks: Set<(hashes: PersistedSeedHashes) => void>;
     }
   >();
   private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
@@ -482,7 +1023,7 @@ export class PersistenceManager {
     private operationTimeoutMs_: number = PERSISTENCE_RESTORE_TIMEOUT_MS,
     private cacheMaxBytes_: number = PERSISTENCE_MAX_CACHE_BYTES,
     private writeDelayMs_: number = PERSISTENCE_WRITE_DEBOUNCE_MS,
-    private rangeTargetBytes_: number = PERSISTENCE_RANGE_TARGET_BYTES
+    private segmentTargetBytes_: number = PERSISTENCE_SEGMENT_TARGET_BYTES
   ) {
     if (!this.schemaKnownCurrent_) {
       // Do not put the cold server listen behind a potentially slow Safari
@@ -503,7 +1044,7 @@ export class PersistenceManager {
       this.operationTimeoutMs_,
       this.cacheMaxBytes_,
       this.writeDelayMs_,
-      this.rangeTargetBytes_
+      this.segmentTargetBytes_
     );
     if (this.authScopeConfigured_) {
       rebound.setAuthScope(scope);
@@ -605,11 +1146,11 @@ export class PersistenceManager {
         if (db === null) {
           return null;
         }
-        // One-time migration away from monolithic / shared-transaction cache
-        // formats. Close and upgrade BEFORE any get(): clearing in the version
-        // change transaction drops the old values inside IndexedDB, without
-        // structured-cloning them into the WebKit heap (which is exactly what
-        // crashed large legacy accounts during restore).
+        // One-time migration away from older cache formats. Close and upgrade
+        // BEFORE any get(): clearing in the version change transaction drops
+        // the old values inside IndexedDB, without structured-cloning them
+        // into the WebKit heap (which is exactly what crashed large legacy
+        // accounts during restore).
         if (db.version < PERSISTENCE_DB_VERSION) {
           db.close();
           return this.openAtVersion_(PERSISTENCE_DB_VERSION);
@@ -642,230 +1183,6 @@ export class PersistenceManager {
       }
     });
     return this.db_;
-  }
-
-  /**
-   * Test seam: runs the deferred expiry sweep immediately.
-   * @internal
-   */
-  sweepNow(): Promise<void> {
-    if (this.sweepTimer_ !== null) {
-      clearTimeout(this.sweepTimer_);
-    }
-    return this.sweepExpired_();
-  }
-
-  /**
-   * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
-   * Expiry is decided by each root's manifest: the '#'-suffixed tree record
-   * carries no authority of its own and is dropped exactly when its
-   * manifest is dropped, is missing (an orphan), or belongs to a different
-   * revision. Scoped to this manager's key range and reading keys before
-   * values, where the platform allows, so foreign records are never
-   * materialized. Best-effort: any failure leaves the records for the next
-   * session's sweep.
-   */
-  private sweepExpired_(): Promise<void> {
-    if (
-      this.activeRestoreCount_ > 0 ||
-      this.restoreQueue_.length > 0 ||
-      this.queues_.size > 0
-    ) {
-      if (!this.disposed_) {
-        this.sweepTimer_ = setTimeout(() => {
-          void this.sweepExpired_();
-        }, 5000);
-        (this.sweepTimer_ as { unref?: () => void }).unref?.();
-      }
-      return Promise.resolve();
-    }
-    this.sweepTimer_ = null;
-    if (this.sweepInFlight_ !== null) {
-      return this.sweepInFlight_;
-    }
-    const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
-    const prefix = this.key_('');
-    let range: IDBKeyRange | undefined;
-    try {
-      // Not in every embedding (Node test environments) — without it the
-      // cursor walks the whole store and filters by prefix in JS.
-      range =
-        typeof IDBKeyRange !== 'undefined'
-          ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
-          : undefined;
-    } catch (e) {
-      range = undefined;
-    }
-    const work = this.withStore_<string[]>('readonly', [], (store, done) => {
-      const keys: string[] = [];
-      // openKeyCursor never materializes values; the value-cursor fallback
-      // (test fakes) walks values but only retains keys.
-      const keyCursorStore = store as unknown as {
-        openKeyCursor?: (range?: IDBKeyRange) => IDBRequest;
-      };
-      const req =
-        typeof keyCursorStore.openKeyCursor === 'function'
-          ? keyCursorStore.openKeyCursor(range)
-          : store.openCursor(range);
-      req.onsuccess = () => {
-        const cursor = req.result as IDBCursor | null;
-        if (!cursor) {
-          done(keys);
-          return;
-        }
-        if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
-          keys.push(cursor.key);
-        }
-        cursor.continue();
-      };
-    }).then(keys => {
-      if (keys.length === 0) {
-        return;
-      }
-      const baseKeys: string[] = [];
-      const suffixedKeys: string[] = [];
-      for (const key of keys) {
-        if (key.indexOf('#', prefix.length) === -1) {
-          baseKeys.push(key);
-        } else {
-          suffixedKeys.push(key);
-        }
-      }
-      return this.withStore_<void>('readwrite', undefined, store => {
-        // Decide each base record (manifests are small), then settle the
-        // suffixed records against those decisions — all in one transaction,
-        // so a flush cannot interleave between the read and the delete.
-        const decisions = new Map<
-          string,
-          {
-            expired: boolean;
-            updatedAt: number;
-            estimatedBytes: number;
-            revision: string | null;
-            liveRangeKeys: Set<string>;
-          }
-        >();
-        let index = 0;
-        const pruneLru = () => {
-          const activeKeys = new Set(
-            [...this.trackedRoots_].map(path => this.key_(path))
-          );
-          const live = [...decisions.entries()].filter(([, d]) => !d.expired);
-          let totalBytes = live.reduce(
-            (sum, [, d]) => sum + d.estimatedBytes,
-            0
-          );
-          if (
-            totalBytes <= this.cacheMaxBytes_ &&
-            live.length <= PERSISTENCE_MAX_PRUNABLE_ROOTS
-          ) {
-            return;
-          }
-          const targetBytes =
-            this.cacheMaxBytes_ * PERSISTENCE_PRUNE_TARGET_RATIO;
-          const targetRoots = Math.floor(
-            PERSISTENCE_MAX_PRUNABLE_ROOTS * PERSISTENCE_PRUNE_TARGET_RATIO
-          );
-          const candidates = live
-            .filter(([key]) => !activeKeys.has(key))
-            .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
-          let liveRoots = live.length;
-          for (const [, decision] of candidates) {
-            if (totalBytes <= targetBytes && liveRoots <= targetRoots) {
-              break;
-            }
-            decision.expired = true;
-            totalBytes -= decision.estimatedBytes;
-            liveRoots--;
-          }
-        };
-
-        const settleSuffixed = () => {
-          for (const key of suffixedKeys) {
-            const base = key.slice(0, key.indexOf('#', prefix.length));
-            const decision = decisions.get(base);
-            // Keep only immutable payloads referenced by the current live
-            // manifest. Retired range versions and every legacy sidecar are
-            // garbage-collected without materializing their values.
-            const drop =
-              decision === undefined ||
-              decision.expired ||
-              !decision.liveRangeKeys.has(key);
-            if (drop) {
-              store.delete(key);
-            }
-          }
-        };
-        const step = () => {
-          if (index >= baseKeys.length) {
-            pruneLru();
-            for (const [key, decision] of decisions) {
-              if (decision.expired) {
-                persistenceStats.evictions++;
-                store.delete(key);
-              }
-            }
-            settleSuffixed();
-            return;
-          }
-          const key = baseKeys[index++];
-          const req = store.get(key);
-          req.onsuccess = () => {
-            const record = req.result as
-              | {
-                  formatVersion?: unknown;
-                  updatedAt?: unknown;
-                  estimatedBytes?: unknown;
-                  revision?: unknown;
-                  ranges?: unknown;
-                }
-              | undefined;
-            const expired =
-              !record ||
-              record.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-              typeof record.updatedAt !== 'number' ||
-              record.updatedAt < cutoff;
-            decisions.set(key, {
-              expired,
-              updatedAt:
-                record && typeof record.updatedAt === 'number'
-                  ? record.updatedAt
-                  : 0,
-              estimatedBytes:
-                record && typeof record.estimatedBytes === 'number'
-                  ? record.estimatedBytes
-                  : 0,
-              revision:
-                record && typeof record.revision === 'string'
-                  ? record.revision
-                  : null,
-              liveRangeKeys:
-                record &&
-                record.formatVersion === PERSISTENCE_FORMAT_VERSION &&
-                Array.isArray(record.ranges)
-                  ? new Set(
-                      record.ranges
-                        .filter(
-                          (range): range is PersistedRange =>
-                            range !== null &&
-                            typeof range === 'object' &&
-                            typeof (range as PersistedRange).recordId ===
-                              'string'
-                        )
-                        .map(range => key + RANGE_KEY_INFIX + range.recordId)
-                    )
-                  : new Set<string>()
-            });
-            step();
-          };
-        };
-        step();
-      });
-    });
-    this.sweepInFlight_ = work.finally(() => {
-      this.sweepInFlight_ = null;
-    });
-    return this.sweepInFlight_;
   }
 
   private openAtVersion_(
@@ -932,6 +1249,20 @@ export class PersistenceManager {
   }
 
   /**
+   * A fresh, never-reused segment record id. The leading base36 wall clock
+   * is what the sweep's orphan age guard reads (see sweepExpired_).
+   */
+  private newSegmentId_(): string {
+    return (
+      Date.now().toString(36) +
+      '.' +
+      this.instanceId_ +
+      '.' +
+      (++this.segmentCounter_).toString(36)
+    );
+  }
+
+  /**
    * Runs `body` against the object store in a transaction of the given mode
    * and resolves with what `body` chose to deliver (via its `done` callback)
    * once the transaction completes. Every failure path — no database, a
@@ -983,11 +1314,11 @@ export class PersistenceManager {
               }
               timer = setTimeout(() => {
                 // Abort a stalled transaction so an abandoned cache read
-                // cannot keep buffering network data indefinitely.
+                // cannot keep buffering indefinitely.
                 try {
                   tx.abort();
                 } catch (e) {
-                  // It may have completed between the timer firing and abort().
+                  // It may have completed between the timer firing and abort.
                 }
                 finish(fallback, true);
               }, this.operationTimeoutMs_);
@@ -1011,31 +1342,20 @@ export class PersistenceManager {
   }
 
   /**
-   * Reads a root's committed manifest and every immutable range it references
-   * in one readonly transaction. `onManifest` fires as soon as the requests
-   * are queued, overlapping network reconciliation with structured-clone
-   * range reads and private Node assembly. Missing/mismatched ranges fail the
-   * whole restore; Repo then performs the structural-failure cold relisten.
+   * Coalesced physical read: one manifest+segments decode per root however
+   * many callers (pre-auth peek, authenticated listener) overlap on it.
    */
   private readRecord_(
     pathString: string,
     onProgress: () => void = () => {},
     retainAfterResolve = false,
-    expectedAuthScope: string | null = this.authScope_,
-    onManifest: (hashes: PersistedSeedHashes) => void = () => {}
+    expectedAuthScope: string | null = this.authScope_
   ): Promise<ReadResult | null> {
     const active = this.activeReads_.get(pathString);
     if (active) {
       active.progress.add(onProgress);
-      // Joining an already-progressing read is itself progress. A pre-auth
-      // peek may have started the physical read, so replay any already-read
-      // manifest to the real listener instead of making it wait for assembly.
+      // Joining an already-progressing read is itself progress.
       onProgress();
-      if (active.manifestHashes !== null) {
-        onManifest(active.manifestHashes);
-      } else {
-        active.manifestCallbacks.add(onManifest);
-      }
       if (retainAfterResolve) {
         active.retainAfterResolve = true;
       } else if (active.retainAfterResolve) {
@@ -1061,33 +1381,21 @@ export class PersistenceManager {
       progress: Set<() => void>;
       retainAfterResolve: boolean;
       cleanupTimer: ReturnType<typeof setTimeout> | null;
-      manifestHashes: PersistedSeedHashes | null;
-      manifestCallbacks: Set<(hashes: PersistedSeedHashes) => void>;
     } = {
       promise: Promise.resolve(null),
       progress,
       retainAfterResolve,
-      cleanupTimer: null,
-      manifestHashes: null,
-      manifestCallbacks: new Set([onManifest])
+      cleanupTimer: null
     };
     const promise = this.readRecordOnce_(
       pathString,
       emitProgress,
-      expectedAuthScope,
-      hashes => {
-        entry.manifestHashes = hashes;
-        for (const callback of entry.manifestCallbacks) {
-          callback(hashes);
-        }
-        entry.manifestCallbacks.clear();
-      }
+      expectedAuthScope
     );
     entry.promise = promise;
     this.activeReads_.set(pathString, entry);
     const release = () => {
       entry.progress.clear();
-      entry.manifestCallbacks.clear();
       if (this.activeReads_.get(pathString) !== entry) {
         return;
       }
@@ -1105,20 +1413,29 @@ export class PersistenceManager {
     return promise;
   }
 
+  /**
+   * One physical restore. A single readonly transaction reads the manifest
+   * and queues every referenced segment get; each segment's JSON text is
+   * parsed and its children built as results arrive (bounded work per
+   * event-loop turn by IndexedDB's own request cadence), and the split tree
+   * is assembled once the transaction completes.
+   */
   private readRecordOnce_(
     pathString: string,
     onProgress: () => void,
-    expectedAuthScope: string | null = this.authScope_,
-    onManifest: (hashes: PersistedSeedHashes) => void = () => {}
+    expectedAuthScope: string | null = this.authScope_
   ): Promise<ReadResult | null> {
     const key = this.key_(pathString);
-    // One readonly transaction is the consistency boundary for manifest +
-    // immutable range records. The manifest callback fires after every range
-    // request has been synchronously queued, but before those payloads finish
-    // cloning, so the network comparison overlaps the complete local restore.
-    return this.withStore_<ReadResult | null>(
+    interface Assembly {
+      manifest: PersistedManifest;
+      segChildren: Map<string, NamedNode[]>;
+      leafNodes: Map<string, Node>;
+    }
+    let assembly: Assembly | null = null;
+    let failed = false;
+    return this.withStore_<boolean>(
       'readonly',
-      null,
+      false,
       (store, done, progress) => {
         const manifestReq = store.get(key);
         manifestReq.onsuccess = () => {
@@ -1126,68 +1443,97 @@ export class PersistenceManager {
           const manifest =
             (manifestReq.result as PersistedManifest | undefined) ?? null;
           if (manifest === null) {
-            done(null);
+            done(false);
             return;
           }
           const structurallyValid =
             manifest.formatVersion === PERSISTENCE_FORMAT_VERSION &&
             typeof manifest.revision === 'string' &&
             typeof manifest.updatedAt === 'number' &&
-            typeof manifest.hash === 'string' &&
-            Array.isArray(manifest.ranges) &&
-            manifest.ranges.length > 0 &&
-            manifest.ranges.every(
-              range =>
-                range !== null &&
-                typeof range === 'object' &&
-                typeof range.recordId === 'string' &&
-                range.recordId.length > 0 &&
-                typeof range.post === 'string' &&
-                typeof range.hash === 'string' &&
-                typeof range.size === 'number'
+            Array.isArray(manifest.splits) &&
+            manifest.splits.length > 0 &&
+            manifest.splits.every(
+              split =>
+                split !== null &&
+                typeof split === 'object' &&
+                typeof split.path === 'string' &&
+                Array.isArray(split.segs) &&
+                split.segs.length > 0 &&
+                split.segs.every(
+                  seg =>
+                    seg !== null &&
+                    typeof seg === 'object' &&
+                    typeof seg.id === 'string' &&
+                    seg.id.length > 0 &&
+                    (seg.from === null || typeof seg.from === 'string')
+                )
             );
           if (!structurallyValid) {
             this.restoreReasons_.set(pathString, 'corrupt');
-            done(null);
+            done(false);
             return;
           }
           if (manifest.authScope !== expectedAuthScope) {
             this.restoreReasons_.set(pathString, 'auth');
-            done(null);
+            done(false);
             return;
           }
           if (manifest.updatedAt < Date.now() - PERSISTENCE_MAX_AGE_MS) {
             this.restoreReasons_.set(pathString, 'expired');
-            done(null);
+            done(false);
             return;
           }
-
-          let assembled: Node = ChildrenNode.EMPTY_NODE;
-          let failed = false;
-          let remaining = manifest.ranges.length;
-          let previousPost: string | null = null;
-          manifest.ranges.forEach(range => {
-            const expectedStart = previousPost;
-            previousPost = range.post;
-            const req = store.get(key + RANGE_KEY_INFIX + range.recordId);
+          const current: Assembly = {
+            manifest,
+            segChildren: new Map(),
+            leafNodes: new Map()
+          };
+          assembly = current;
+          const leafIds = new Set<string>();
+          for (const split of manifest.splits) {
+            if (split.leaf === true) {
+              leafIds.add(split.segs[0].id);
+            }
+          }
+          let remaining = 0;
+          for (const id of allSegmentIds(manifest.splits)) {
+            remaining++;
+            const req = store.get(key + SEG_KEY_INFIX + id);
             req.onsuccess = () => {
               progress();
               if (!failed) {
-                const record = req.result as PersistedRangeRecord | undefined;
-                if (
-                  !record ||
-                  record.recordId !== range.recordId ||
-                  record.start !== expectedStart ||
-                  record.end !== range.post ||
-                  record.tree === null ||
-                  record.tree === undefined
-                ) {
+                const text = req.result as string | undefined;
+                if (typeof text !== 'string') {
                   failed = true;
                   this.restoreReasons_.set(pathString, 'corrupt');
                 } else {
                   try {
-                    const fragment = nodeFromJSON(record.tree);
-                    assembled = mergePersistedFragment(assembled, fragment);
+                    // Parse and build Nodes NOW, one segment per success
+                    // callback: the expensive work interleaves with the
+                    // remaining gets instead of forming one giant post-
+                    // transaction pause, and the text becomes collectable
+                    // immediately.
+                    const parsed = JSON.parse(text) as unknown;
+                    if (leafIds.has(id)) {
+                      current.leafNodes.set(id, nodeFromJSON(parsed));
+                    } else {
+                      if (
+                        parsed === null ||
+                        typeof parsed !== 'object' ||
+                        Array.isArray(parsed)
+                      ) {
+                        throw new Error('segment is not an object');
+                      }
+                      const record = parsed as Record<string, unknown>;
+                      const children: NamedNode[] = [];
+                      for (const childKey of Object.keys(record)) {
+                        const child = nodeFromJSON(record[childKey]);
+                        if (!child.isEmpty()) {
+                          children.push(new NamedNode(childKey, child));
+                        }
+                      }
+                      current.segChildren.set(id, children);
+                    }
                   } catch (e) {
                     failed = true;
                     this.restoreReasons_.set(pathString, 'corrupt');
@@ -1196,43 +1542,47 @@ export class PersistenceManager {
               }
               remaining--;
               if (remaining === 0) {
-                if (failed || assembled.isEmpty()) {
-                  done(null);
-                } else {
-                  done({
-                    record: {
-                      node: assembled,
-                      hash: manifest.hash,
-                      compoundHash: wireCompoundHashFromRanges(manifest.ranges),
-                      updatedAt: manifest.updatedAt,
-                      revision: manifest.revision
-                    },
-                    ranges: manifest.ranges
-                  });
-                }
+                done(!failed);
               }
             };
-          });
-
-          // Every referenced get is now queued in this same snapshot. It is
-          // safe to put the range listen on the wire immediately.
-          onManifest({
-            hash: manifest.hash,
-            compoundHash: wireCompoundHashFromRanges(manifest.ranges)
-          });
+          }
         };
       },
       onProgress
-    ).then(result => {
-      if (result === null) {
+    ).then(ok => {
+      if (!ok || assembly === null || failed) {
         const reason = this.restoreReasons_.get(pathString);
         if (reason === 'corrupt' || reason === 'expired') {
           // Best-effort cleanup. Auth/missing misses must not delete another
           // identity's otherwise valid cache record.
           void this.deleteRecord_(pathString);
         }
+        return null;
       }
-      return result;
+      try {
+        const node = assembleTree(
+          assembly.manifest,
+          assembly.segChildren,
+          assembly.leafNodes
+        );
+        if (node.isEmpty()) {
+          this.restoreReasons_.set(pathString, 'corrupt');
+          void this.deleteRecord_(pathString);
+          return null;
+        }
+        return {
+          record: {
+            node,
+            updatedAt: assembly.manifest.updatedAt,
+            revision: assembly.manifest.revision
+          },
+          splits: assembly.manifest.splits
+        };
+      } catch (e) {
+        this.restoreReasons_.set(pathString, 'corrupt');
+        void this.deleteRecord_(pathString);
+        return null;
+      }
     });
   }
 
@@ -1240,9 +1590,9 @@ export class PersistenceManager {
     const key = this.key_(pathString);
     return this.withStore_<void>('readwrite', undefined, store => {
       store.delete(key);
-      // Immutable ranges and legacy chunk/hash/tree sidecars share '#'.
-      // suffix namespace. Range-delete where the platform has IDBKeyRange;
-      // cursor-walk otherwise (Node, test fakes) — key-only, no values.
+      // Segment records and legacy sidecars share the '#' suffix namespace.
+      // Range-delete where the platform has IDBKeyRange; cursor-walk
+      // otherwise (Node, test fakes) — key-only, no values.
       if (typeof IDBKeyRange !== 'undefined') {
         try {
           store.delete(
@@ -1342,7 +1692,7 @@ export class PersistenceManager {
             updatedAt: state.storedUpdatedAt,
             revision: state.revision
           },
-          ranges: state.ranges
+          splits: state.splits
         });
       }
     }
@@ -1369,9 +1719,9 @@ export class PersistenceManager {
   }
 
   /**
-   * Exact-root optimistic peek. The completed range assembly is retained briefly
-   * so the authenticated listener consumes the same immutable Node instead of
-   * reconstructing the root twice during boot.
+   * Exact-root optimistic peek. The completed assembly is retained briefly
+   * so the authenticated listener consumes the same immutable Node instead
+   * of reconstructing the root twice during boot.
    */
   peek(
     pathString: string,
@@ -1430,17 +1780,11 @@ export class PersistenceManager {
   }
 
   /**
-   * Listener restore with an idle (no-progress) bound. `onManifest` fires as
-   * soon as the stored generation's hashes are known — typically
-   * milliseconds — letting the caller send the range listen while immutable
-   * range records are still being read and assembled. The callback is suppressed after
-   * a timeout/miss resolution, and never fires once the returned promise has
-   * settled null.
+   * Listener restore with an idle (no-progress) bound. Resolves with the
+   * assembled tree; the caller applies it and derives the listen hashes
+   * from the node itself (see repoStartServerListen).
    */
-  restoreForListen(
-    pathString: string,
-    onManifest: (hashes: PersistedSeedHashes) => void = () => {}
-  ): Promise<PersistenceRestoreResult> {
+  restoreForListen(pathString: string): Promise<PersistenceRestoreResult> {
     this.restoreReasons_.delete(pathString);
     const authGeneration = this.authGeneration_;
     const expectedAuthScope = this.authScope_;
@@ -1464,17 +1808,6 @@ export class PersistenceManager {
       );
       return Promise.resolve({ record: null, reason });
     }
-    let settledNull = false;
-    const guardedOnManifest = (hashes: PersistedSeedHashes) => {
-      if (
-        !settledNull &&
-        authGeneration === this.authGeneration_ &&
-        !this.disposed_ &&
-        this.trackedRoots_.has(pathString)
-      ) {
-        onManifest(hashes);
-      }
-    };
     return this.withRestoreSlot_(() =>
       this.raceRestoreTimeout_(
         onProgress =>
@@ -1482,8 +1815,7 @@ export class PersistenceManager {
             pathString,
             onProgress,
             false,
-            expectedAuthScope,
-            guardedOnManifest
+            expectedAuthScope
           ).then(result => {
             if (
               result === null ||
@@ -1497,7 +1829,7 @@ export class PersistenceManager {
             this.lastFlush_.set(pathString, {
               rootNode: result.record.node,
               revision: result.record.revision,
-              ranges: result.ranges,
+              splits: result.splits,
               storedUpdatedAt: result.record.updatedAt
             });
             persistenceStats.restoredRoots.push(pathString);
@@ -1517,9 +1849,6 @@ export class PersistenceManager {
         this.restoreReasons_.set(pathString, 'auth');
         record = null;
       }
-      if (record === null) {
-        settledNull = true;
-      }
       const reason = record
         ? undefined
         : this.restoreReasons_.get(pathString) ?? 'missing';
@@ -1534,7 +1863,7 @@ export class PersistenceManager {
 
   /**
    * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
-   * chunked restores reset the timer after every completed chunk; callers
+   * segment restores reset the timer after every completed request; callers
    * that pass an already-started Promise retain the old total-time bound.
    */
   private raceRestoreTimeout_<T>(
@@ -1569,16 +1898,7 @@ export class PersistenceManager {
       return result;
     });
   }
-  /**
-   * Write-through: the server confirmed `node` as the state of the tracked
-   * root `path`. Coalesced per root under the single-flight window (see the
-   * file header): the first change arms a non-restarting timer; later
-   * changes coalesce; a change landing while a flush is in flight re-arms
-   * exactly one follow-up window when the queue drains. A tree the store is
-   * known to already hold — the warm boot's listen-'ok' certifying the
-   * restored tree unchanged — is skipped outright unless its stored
-   * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
-   */
+
   private flushWritesDeferredUntilRestores_(): void {
     const paths = [...this.writesDeferredUntilRestores_];
     this.writesDeferredUntilRestores_.clear();
@@ -1731,10 +2051,10 @@ export class PersistenceManager {
 
   /**
    * Chains an operation onto the root's queue. One writer per root at a
-   * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
-   * before the next flush or delete for that root starts, which is the
-   * whole storage consistency argument — no cross-operation races to
-   * reason about.
+   * time: a flush's segments and manifest commit before the next flush or
+   * delete for that root starts — no cross-operation races to reason about
+   * WITHIN a tab. (Cross-tab writers are last-writer-wins by design; see
+   * the file header.)
    */
   private enqueue_(pathString: string, op: () => Promise<void>): Promise<void> {
     const next = (this.queues_.get(pathString) ?? Promise.resolve()).then(op);
@@ -1752,15 +2072,15 @@ export class PersistenceManager {
     });
     return next;
   }
+
   /**
-   * One generation: identity-diff against the last known stored tree marks
-   * the dirty ranges; only those are re-serialized (between preserved
-   * boundary posts), re-hashed, and written under new immutable ids. Clean
-   * range records carry over verbatim and are never cloned. New records plus
-   * the manifest commit in ONE transaction, so every
-   * committed generation's hashes exactly describe its stored tree — which
-   * is what lets the next boot listen straight off the manifest with zero
-   * hashing.
+   * One generation: identity-diff against the last known stored tree maps
+   * the change set to dirty segments; only those are re-serialized (direct
+   * Node -> JSON text, no export objects) and written under fresh ids in
+   * bounded batches. Clean segment records carry over verbatim and are
+   * never read or cloned. The commit is one small last-writer-wins
+   * transaction: manifest put + retired-id deletes. No hashing anywhere —
+   * the next boot derives listen hashes from whatever tree it assembles.
    */
   private flush_(pathString: string): Promise<void> {
     if (this.sweepInFlight_ !== null) {
@@ -1814,11 +2134,11 @@ export class PersistenceManager {
           this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
           return;
         }
-        // The stored generation is gone (another identity's manifest, a
-        // sweep, or manual storage clearing). lastFlush_ no longer describes
-        // storage; left in place, every future identical-node write-through
-        // would skip against it and the root would stay unpersisted for the
-        // whole session. Resync from storage and rebuild once.
+        // The stored generation is gone (another tab's manifest, a sweep, or
+        // manual storage clearing). lastFlush_ no longer describes storage;
+        // left in place, every future identical-node write-through would
+        // skip against it and the root would stay unpersisted for the whole
+        // session. Resync from storage and rebuild once.
         return this.readRecord_(pathString).then(winner => {
           if (this.disposed_) {
             return;
@@ -1827,7 +2147,7 @@ export class PersistenceManager {
             this.lastFlush_.set(pathString, {
               rootNode: winner.record.node,
               revision: winner.record.revision,
-              ranges: winner.ranges,
+              splits: winner.splits,
               storedUpdatedAt: winner.record.updatedAt
             });
           } else {
@@ -1838,43 +2158,24 @@ export class PersistenceManager {
       });
     }
 
-    // Identity-diff against the exact generation this tab restored/committed.
-    // A mismatch at commit time triggers one full-range retry instead of ever
-    // reusing records from another tab's manifest.
-    let previousRanges: PersistedRange[] = [];
-    let dirty: boolean[] = [];
-    let tailDirty = false;
+    // Identity-diff against the exact generation this tab restored or
+    // committed. An unusable diff — the first generation, or a path-budget
+    // overflow (collectChangedSubtreePaths returns null) — plans the whole
+    // tree from scratch.
+    let previousSplits: PersistedSplit[] | null = null;
     let changed: string[][] | null = null;
-    if (prev && prev.ranges.length > 0) {
+    if (prev && prev.splits.length > 0) {
       changed = collectChangedSubtreePaths(prev.rootNode, node);
-      if (changed !== null) {
-        previousRanges = prev.ranges;
-        if (changed.length === 0) {
-          dirty = new Array(prev.ranges.length).fill(false);
-        } else {
-          const marked = markDirtyRanges(prev.ranges, changed);
-          dirty = marked.dirty;
-          tailDirty = marked.tailDirty;
-        }
-      }
+      previousSplits = changed === null ? null : prev.splits;
     }
 
-    // First pass: boundaries/sizes only. It never creates canonical strings
-    // or export payloads, so a first generation cannot retain another full
-    // copy of the root merely to decide its ranges.
-    const planner = new CompoundHashBuilder(
-      fixedSizeSplitStrategy(this.rangeTargetBytes_),
-      true
-    );
-    let rebuilt: StableRange[];
+    let plan: GenerationPlan;
     try {
-      rebuilt = rebuildStableRanges(
+      plan = planGeneration(
         node,
-        previousRanges,
-        dirty,
-        tailDirty,
-        planner,
-        this.rangeTargetBytes_
+        previousSplits,
+        changed,
+        this.segmentTargetBytes_
       );
     } catch (e) {
       persistenceStats.storageFailures++;
@@ -1884,115 +2185,57 @@ export class PersistenceManager {
       });
     }
 
-    interface DirtyRangePlan {
-      range: PersistedRange;
-      start: string | null;
-      end: string;
+    // Assign fresh immutable ids to every dirty segment up front; the
+    // manifest is complete before any byte is written.
+    for (const job of plan.dirty) {
+      job.split.segs[job.segIndex].id = this.newSegmentId_();
     }
-    const dirtyPlans: DirtyRangePlan[] = [];
-    let previousPost: string | null = null;
-    let dirtyIndex = 0;
-    const ranges: PersistedRange[] = rebuilt.map(range => {
-      const carried = range as PersistedRange;
-      if (range.hash !== '' && typeof carried.recordId === 'string') {
-        previousPost = range.post;
-        return carried;
-      }
-      const persisted: PersistedRange = {
-        ...range,
-        recordId: revision + '-' + dirtyIndex.toString(36)
-      };
-      dirtyPlans.push({
-        range: persisted,
-        start: previousPost,
-        end: range.post
-      });
-      previousPost = range.post;
-      dirtyIndex++;
-      return persisted;
-    });
 
-    const stagedIds: string[] = [];
-    const stageBatch = async (plans: DirtyRangePlan[]): Promise<void> => {
-      const texts: string[] = [];
-      const records: PersistedRangeRecord[] = [];
-      for (const plan of plans) {
-        const builder = new CompoundHashBuilder(() => false);
-        let text: string | undefined;
-        let payload: unknown = undefined;
-        builder.hashSink = completed => {
-          text = completed;
-        };
-        builder.payloadSink = completed => {
-          payload = completed;
-        };
-        const from =
-          plan.start === null
-            ? null
-            : plan.start === '/'
-            ? []
-            : plan.start.split('/');
-        const to = plan.end === '/' ? [] : plan.end.split('/');
-        if (from !== null) {
-          builder.seedBoundary(from);
-        }
-        walkLeafInterval(node, from, to, builder);
-        if (
-          text === undefined ||
-          payload === undefined ||
-          builder.posts.length !== 1 ||
-          builder.posts[0] !== plan.end
-        ) {
-          throw new Error(
-            'Dirty range did not serialize to its planned boundary'
-          );
-        }
-        texts.push(text);
-        records.push({
-          recordId: plan.range.recordId,
-          start: plan.start,
-          end: plan.end,
-          tree: payload
-        });
+    const stageBatch = (jobs: DirtySegmentJob[]): Promise<void> => {
+      const puts: Array<{ id: string; text: string }> = [];
+      for (const job of jobs) {
+        const seg = job.split.segs[job.segIndex];
+        const deep = new Set(
+          deepChildKeys(plan.splits, job.split.path).keys()
+        );
+        const text =
+          job.split.leaf === true
+            ? leafExportJson(job.node)
+            : serializeSegment(job.node, job.fromKey, job.toKey, deep);
+        seg.bytes = text.length;
+        puts.push({ id: seg.id, text });
       }
-      const digests = await digestRangeTexts(texts);
-      for (let i = 0; i < plans.length; i++) {
-        plans[i].range.hash = digests[i];
-      }
-      const stored = await this.withStore_<boolean>(
+      return this.withStore_<boolean>(
         'readwrite',
         false,
         (store, done, progress) => {
-          for (const record of records) {
-            const put = store.put(
-              record,
-              key + RANGE_KEY_INFIX + record.recordId
-            );
-            put.onsuccess = progress;
+          for (const put of puts) {
+            const req = store.put(put.text, key + SEG_KEY_INFIX + put.id);
+            req.onsuccess = progress;
           }
           done(true);
         }
-      );
-      if (!stored) {
-        throw new Error('Failed to stage persisted ranges');
-      }
-      stagedIds.push(...records.map(record => record.recordId));
-      // Async activation records can otherwise retain completed IDB request
-      // inputs until the whole generation settles. Drop every large reference
-      // explicitly and yield a macrotask so WebKit can collect between batches.
-      for (const record of records) {
-        record.tree = undefined;
-      }
-      records.length = 0;
-      texts.length = 0;
-      digests.length = 0;
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      ).then(stored => {
+        if (!stored) {
+          throw new Error('Failed to stage persisted segments');
+        }
+        puts.length = 0;
+        // Yield a macrotask so a large first generation cannot monopolize
+        // the main thread between staging transactions.
+        return new Promise<void>(resolve => setTimeout(resolve, 0));
+      });
     };
 
     const stageAll = async (): Promise<void> => {
-      const batchSize = 4;
-      for (let i = 0; i < dirtyPlans.length; i += batchSize) {
-        await stageBatch(dirtyPlans.slice(i, i + batchSize));
+      for (
+        let i = 0;
+        i < plan.dirty.length;
+        i += PERSISTENCE_STAGE_BATCH_SIZE
+      ) {
+        if (this.disposed_) {
+          return;
+        }
+        await stageBatch(plan.dirty.slice(i, i + PERSISTENCE_STAGE_BATCH_SIZE));
       }
     };
 
@@ -2007,19 +2250,15 @@ export class PersistenceManager {
           updatedAt: now,
           authScope,
           estimatedBytes: estimateSerializedNodeSize(node),
-          hash: '',
-          ranges
+          splits: plan.splits
         };
-        const liveIds = new Set(ranges.map(range => range.recordId));
-        const retiredIds = prev
-          ? prev.ranges
-              .map(range => range.recordId)
-              .filter(recordId => !liveIds.has(recordId))
-          : [];
-
-        // The range payloads are immutable staging records. This tiny CAS
-        // transaction is the atomic authority switch: until the manifest put
-        // commits, a crash leaves the previous generation fully live.
+        // LAST-WRITER-WINS COMMIT. When the stored manifest is still the
+        // generation this flush built on (or the slot is empty/foreign),
+        // retired ids are deleted here too. When another tab interleaved,
+        // the manifest still wins the slot — both tabs cache the same
+        // server data — but the deletes are skipped: the loser must not
+        // delete records the interleaved manifest may reference. The sweep
+        // reclaims whatever ends up unreferenced, age-guarded.
         return this.withStore_<boolean>(
           'readwrite',
           false,
@@ -2030,198 +2269,287 @@ export class PersistenceManager {
               const current = currentReq.result as
                 | PersistedManifest
                 | undefined;
-              // A first generation may REPLACE a manifest this manager can
-              // never restore (another identity's scope, or an unknown
-              // format): treating those as CAS winners would strand the
-              // adopt-and-retry loser forever — its readRecord_ always
-              // resolves null against a foreign manifest, so every retry
-              // re-stages the full tree and conflicts again. Same-scope
-              // manifests keep strict CAS semantics. Replacement is LIVE
-              // scope only: a generation staged under a superseded identity
-              // may still publish into an absent key under its own label
-              // (reads are scope-checked; see the in-flight relabel test)
-              // but must never replace the new identity's fresh manifest.
-              const replaceableForeign =
-                !prev &&
-                current !== undefined &&
-                authScope === this.authScope_ &&
-                (current.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-                  current.authScope !== authScope);
-              if (
-                (prev && (!current || current.revision !== prev.revision)) ||
-                (!prev && current !== undefined && !replaceableForeign)
-              ) {
-                done(false);
-                return;
-              }
-              const commit = () => {
-                for (const recordId of retiredIds) {
-                  const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
+              const undisturbed =
+                (prev === undefined && current === undefined) ||
+                (prev !== undefined &&
+                  current !== undefined &&
+                  current.revision === prev.revision);
+              if (undisturbed) {
+                for (const id of plan.retiredIds) {
+                  const remove = store.delete(key + SEG_KEY_INFIX + id);
                   remove.onsuccess = progress;
                 }
-                const manifestPut = store.put(manifest, key);
-                manifestPut.onsuccess = progress;
-                done(true);
-              };
-              if (stagedIds.length === 0) {
-                commit();
-                return;
               }
-              // Another tab's sweep classifies suffixed records against the
-              // manifest that is COMMITTED, so records staged for this still
-              // unpublished generation look like orphans there and can be
-              // reclaimed between staging and this transaction without
-              // moving the manifest revision (in-memory guards only cover
-              // this tab). Publishing would durably reference missing
-              // payloads. Re-verify every staged id inside the same atomic
-              // switch — key-only reads — and treat a loss exactly like a
-              // CAS conflict. Ordering is airtight because readwrite
-              // transactions on one store serialize: a sweep that ran before
-              // this transaction is observed here; one that runs after reads
-              // this manifest and keeps its records.
-              let missing = false;
-              let verified = 0;
-              for (const recordId of stagedIds) {
-                const stagedKey = key + RANGE_KEY_INFIX + recordId;
-                // Key-only where the platform (or fake) provides it; the
-                // fallback get only runs in environments without getKey.
-                const check =
-                  typeof store.getKey === 'function'
-                    ? store.getKey(stagedKey)
-                    : store.get(stagedKey);
-                check.onsuccess = () => {
-                  progress();
-                  if (missing) {
-                    return;
-                  }
-                  if (check.result === undefined) {
-                    missing = true;
-                    done(false);
-                    return;
-                  }
-                  if (++verified === stagedIds.length) {
-                    commit();
-                  }
-                };
-              }
+              const manifestPut = store.put(manifest, key);
+              manifestPut.onsuccess = progress;
+              done(true);
             };
           }
         ).then(ok => {
-          if (!ok || this.disposed_) {
-            if (this.disposed_) {
-              return;
+          if (this.disposed_ || !ok) {
+            if (!ok) {
+              recordPersistenceEvent(pathString, 'flush-commit-error');
             }
-            // A different tab committed while we staged, or a concurrent
-            // sweep reclaimed our still-unreferenced staged records. Remove
-            // our immutable ids, adopt the winning manifest/base, then diff
-            // the current live Node against it on one coalesced retry.
-            return this.withStore_<void>('readwrite', undefined, store => {
-              for (const recordId of stagedIds) {
-                store.delete(key + RANGE_KEY_INFIX + recordId);
-              }
-            }).then(() =>
-              this.readRecord_(pathString).then(winner => {
-                if (winner !== null) {
-                  this.lastFlush_.set(pathString, {
-                    rootNode: winner.record.node,
-                    revision: winner.record.revision,
-                    ranges: winner.ranges,
-                    storedUpdatedAt: winner.record.updatedAt
-                  });
-                } else {
-                  this.lastFlush_.delete(pathString);
-                }
-                this.flushPending_.add(pathString);
-              })
-            );
+            return;
           }
-          persistenceStats.rangesHashed += dirtyPlans.length;
-          persistenceStats.rangesReused += ranges.length - dirtyPlans.length;
+          persistenceStats.segmentsWritten += plan.dirty.length;
+          persistenceStats.segmentsReused +=
+            allSegmentIds(plan.splits).length - plan.dirty.length;
           persistenceStats.writeThroughs++;
           this.lastFlush_.set(pathString, {
             rootNode: node,
             revision,
-            ranges,
+            splits: plan.splits,
             storedUpdatedAt: now
           });
-          stampSeedHashes(
-            node,
-            manifest.hash,
-            wireCompoundHashFromRanges(ranges)
-          );
           recordPersistenceEvent(
             pathString,
             'stored',
-            `${ranges.length} ranges, ${dirtyPlans.length} written`
+            `${allSegmentIds(plan.splits).length} segments, ${
+              plan.dirty.length
+            } written`
           );
-          if (!prev) {
-            void this.gcRangeRecords_(pathString, revision, liveIds);
-          }
         });
       })
       .catch(() => {
         persistenceStats.storageFailures++;
-        recordPersistenceEvent(pathString, 'flush-range-stage-error');
-        // Staged immutable records are non-authoritative and are reclaimed by
-        // the next successful full-generation GC or the deferred sweep.
-        if (stagedIds.length > 0) {
-          void this.withStore_<void>('readwrite', undefined, store => {
-            for (const recordId of stagedIds) {
-              store.delete(key + RANGE_KEY_INFIX + recordId);
-            }
-          });
-        }
+        recordPersistenceEvent(pathString, 'flush-stage-error');
+        // Staged records are unreferenced until the manifest commits; the
+        // age-guarded sweep reclaims them.
       });
   }
 
-  private gcRangeRecords_(
-    pathString: string,
-    revision: string,
-    liveIds: Set<string>
-  ): Promise<void> {
-    const key = this.key_(pathString);
-    const prefix = key + RANGE_KEY_INFIX;
-    return this.withStore_<void>('readwrite', undefined, (store, done) => {
-      const manifestReq = store.get(key);
-      manifestReq.onsuccess = () => {
-        const manifest = manifestReq.result as PersistedManifest | undefined;
-        if (!manifest || manifest.revision !== revision) {
-          done(undefined);
+  sweepNow(): Promise<void> {
+    if (this.sweepTimer_ !== null) {
+      clearTimeout(this.sweepTimer_);
+    }
+    return this.sweepExpired_();
+  }
+
+  /**
+   * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) and
+   * reclaims unreferenced segment records. Expiry is decided by each root's
+   * manifest: a '#'-suffixed record carries no authority of its own and is
+   * dropped exactly when its manifest is dropped, is missing, or no longer
+   * references it — except that an unreferenced record younger than
+   * PERSISTENCE_ORPHAN_MIN_AGE_MS is left alone, because another tab may
+   * have staged it for a generation whose manifest hasn't committed yet.
+   * Scoped to this manager's key range and reading keys before values, so
+   * foreign records are never materialized. Best-effort: any failure leaves
+   * the records for the next session's sweep.
+   */
+  private sweepExpired_(): Promise<void> {
+    if (
+      this.activeRestoreCount_ > 0 ||
+      this.restoreQueue_.length > 0 ||
+      this.queues_.size > 0
+    ) {
+      if (!this.disposed_) {
+        this.sweepTimer_ = setTimeout(() => {
+          void this.sweepExpired_();
+        }, 5000);
+        (this.sweepTimer_ as { unref?: () => void }).unref?.();
+      }
+      return Promise.resolve();
+    }
+    this.sweepTimer_ = null;
+    if (this.sweepInFlight_ !== null) {
+      return this.sweepInFlight_;
+    }
+    const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
+    const orphanCutoff = Date.now() - PERSISTENCE_ORPHAN_MIN_AGE_MS;
+    const prefix = this.key_('');
+    let range: IDBKeyRange | undefined;
+    try {
+      // Not in every embedding (Node test environments) — without it the
+      // cursor walks the whole store and filters by prefix in JS.
+      range =
+        typeof IDBKeyRange !== 'undefined'
+          ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
+          : undefined;
+    } catch (e) {
+      range = undefined;
+    }
+    const work = this.withStore_<string[]>('readonly', [], (store, done) => {
+      const keys: string[] = [];
+      // openKeyCursor never materializes values; the value-cursor fallback
+      // (test fakes) walks values but only retains keys.
+      const keyCursorStore = store as unknown as {
+        openKeyCursor?: (range?: IDBKeyRange) => IDBRequest;
+      };
+      const req =
+        typeof keyCursorStore.openKeyCursor === 'function'
+          ? keyCursorStore.openKeyCursor(range)
+          : store.openCursor(range);
+      req.onsuccess = () => {
+        const cursor = req.result as IDBCursor | null;
+        if (!cursor) {
+          done(keys);
           return;
         }
-        let range: IDBKeyRange | undefined;
-        try {
-          range =
-            typeof IDBKeyRange !== 'undefined'
-              ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
-              : undefined;
-        } catch (e) {
-          range = undefined;
+        if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
+          keys.push(cursor.key);
         }
-        const keyCursorStore = store as unknown as {
-          openKeyCursor?: (range?: IDBKeyRange) => IDBRequest;
-        };
-        // A value cursor structured-clones every range payload; on a 65 MB
-        // root that would recreate the full-read cost solely to discover keys.
-        const req =
-          typeof keyCursorStore.openKeyCursor === 'function'
-            ? keyCursorStore.openKeyCursor(range)
-            : store.openCursor(range);
-        req.onsuccess = () => {
-          const cursor = req.result as IDBCursor | null;
-          if (!cursor) {
-            done(undefined);
+        cursor.continue();
+      };
+    }).then(keys => {
+      if (keys.length === 0) {
+        return;
+      }
+      const baseKeys: string[] = [];
+      const suffixedKeys: string[] = [];
+      for (const key of keys) {
+        if (key.indexOf('#', prefix.length) === -1) {
+          baseKeys.push(key);
+        } else {
+          suffixedKeys.push(key);
+        }
+      }
+      return this.withStore_<void>('readwrite', undefined, store => {
+        // Decide each base record (manifests are small), then settle the
+        // suffixed records against those decisions — all in one transaction,
+        // so a flush cannot interleave between the read and the delete.
+        const decisions = new Map<
+          string,
+          {
+            expired: boolean;
+            updatedAt: number;
+            estimatedBytes: number;
+            liveSegKeys: Set<string>;
+          }
+        >();
+        let index = 0;
+        const pruneLru = () => {
+          const activeKeys = new Set(
+            [...this.trackedRoots_].map(path => this.key_(path))
+          );
+          const live = [...decisions.entries()].filter(([, d]) => !d.expired);
+          let totalBytes = live.reduce(
+            (sum, [, d]) => sum + d.estimatedBytes,
+            0
+          );
+          if (
+            totalBytes <= this.cacheMaxBytes_ &&
+            live.length <= PERSISTENCE_MAX_PRUNABLE_ROOTS
+          ) {
             return;
           }
-          if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
-            const recordId = cursor.key.slice(prefix.length);
-            if (!liveIds.has(recordId)) {
-              cursor.delete();
+          const targetBytes =
+            this.cacheMaxBytes_ * PERSISTENCE_PRUNE_TARGET_RATIO;
+          const targetRoots = Math.floor(
+            PERSISTENCE_MAX_PRUNABLE_ROOTS * PERSISTENCE_PRUNE_TARGET_RATIO
+          );
+          const candidates = live
+            .filter(([key]) => !activeKeys.has(key))
+            .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+          let liveRoots = live.length;
+          for (const [, decision] of candidates) {
+            if (totalBytes <= targetBytes && liveRoots <= targetRoots) {
+              break;
             }
+            decision.expired = true;
+            totalBytes -= decision.estimatedBytes;
+            liveRoots--;
           }
-          cursor.continue();
         };
-      };
+
+        const settleSuffixed = () => {
+          for (const key of suffixedKeys) {
+            const base = key.slice(0, key.indexOf('#', prefix.length));
+            const decision = decisions.get(base);
+            const referenced =
+              decision !== undefined &&
+              !decision.expired &&
+              decision.liveSegKeys.has(key);
+            if (referenced) {
+              continue;
+            }
+            // Unreferenced. A young segment may belong to a generation
+            // another tab is staging RIGHT NOW — for a first generation
+            // there is not even a manifest yet — so any '#seg:' record
+            // younger than the orphan guard is left for a later sweep. Its
+            // id embeds its staging wall clock. (An expired manifest's
+            // segments are always older than the manifest's own cutoff-aged
+            // timestamp, so this never retains expired content.) Legacy
+            // suffixed records ('#range:', '#chunk:', '#hash') have no
+            // '#seg:' infix and are reclaimed unconditionally.
+            const infix = key.indexOf(SEG_KEY_INFIX, prefix.length);
+            if (infix !== -1) {
+              const id = key.slice(infix + SEG_KEY_INFIX.length);
+              const stampEnd = id.indexOf('.');
+              const stamp =
+                stampEnd === -1 ? NaN : parseInt(id.slice(0, stampEnd), 36);
+              if (!isNaN(stamp) && stamp > orphanCutoff) {
+                continue;
+              }
+            }
+            store.delete(key);
+          }
+        };
+        const step = () => {
+          if (index >= baseKeys.length) {
+            pruneLru();
+            for (const [key, decision] of decisions) {
+              if (decision.expired) {
+                persistenceStats.evictions++;
+                store.delete(key);
+              }
+            }
+            settleSuffixed();
+            return;
+          }
+          const key = baseKeys[index++];
+          const req = store.get(key);
+          req.onsuccess = () => {
+            const record = req.result as
+              | {
+                  formatVersion?: unknown;
+                  updatedAt?: unknown;
+                  estimatedBytes?: unknown;
+                  splits?: unknown;
+                }
+              | undefined;
+            const expired =
+              !record ||
+              record.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+              typeof record.updatedAt !== 'number' ||
+              record.updatedAt < cutoff;
+            decisions.set(key, {
+              expired,
+              updatedAt:
+                record && typeof record.updatedAt === 'number'
+                  ? record.updatedAt
+                  : 0,
+              estimatedBytes:
+                record && typeof record.estimatedBytes === 'number'
+                  ? record.estimatedBytes
+                  : 0,
+              liveSegKeys:
+                record &&
+                record.formatVersion === PERSISTENCE_FORMAT_VERSION &&
+                Array.isArray(record.splits)
+                  ? new Set(
+                      (record.splits as PersistedSplit[]).flatMap(split =>
+                        Array.isArray(split?.segs)
+                          ? split.segs
+                              .filter(
+                                seg => typeof seg?.id === 'string'
+                              )
+                              .map(seg => key + SEG_KEY_INFIX + seg.id)
+                          : []
+                      )
+                    )
+                  : new Set<string>()
+            });
+            step();
+          };
+        };
+        step();
+      });
     });
+    this.sweepInFlight_ = work.finally(() => {
+      this.sweepInFlight_ = null;
+    });
+    return this.sweepInFlight_;
   }
 }

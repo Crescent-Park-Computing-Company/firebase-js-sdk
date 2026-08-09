@@ -104,35 +104,3 @@ export function getNodeCompoundHash(node: Node): SeedCompoundHash | undefined {
 export function getNodeCanonicalHash(node: Node): string | undefined {
   return nodeCanonicalHashes.get(node);
 }
-
-/** The hash pair a manifest-first listen can consume before its Node exists. */
-export interface PendingListenHashes {
-  hash: string;
-  compoundHash: SeedCompoundHash;
-}
-
-/**
- * Repo-scoped manifest-first hash registry. Different Database instances can
- * listen to the same relative path while holding different caches; keeping
- * this store on Repo prevents one restore from overwriting or clearing
- * another Repo's pending hashes.
- */
-export class PendingListenHashStore {
-  private readonly pending_ = new Map<string, PendingListenHashes>();
-
-  set(pathString: string, hash: string, compoundHash: SeedCompoundHash): void {
-    this.pending_.set(pathString, { hash, compoundHash });
-  }
-
-  clear(pathString: string): void {
-    this.pending_.delete(pathString);
-  }
-
-  get(pathString: string): PendingListenHashes | undefined {
-    return this.pending_.get(pathString);
-  }
-
-  clearAll(): void {
-    this.pending_.clear();
-  }
-}

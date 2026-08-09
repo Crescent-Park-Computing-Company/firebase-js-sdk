@@ -16,14 +16,9 @@
  */
 
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
-import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
 import { LeafNode } from './snap/LeafNode';
 import { Node } from './snap/Node';
-import {
-  hashQuotedString,
-  leafHashValueText,
-  priorityHashText
-} from './snap/snap';
+import { hashQuotedString, leafHashValueText } from './snap/snap';
 import { nameCompare, sha1 } from './util/util';
 
 /**
@@ -88,22 +83,6 @@ export function simpleSizeSplitStrategy(node: Node): CompoundHashSplitStrategy {
     512,
     Math.floor(Math.sqrt(estimatedSize * 100))
   );
-  return state =>
-    state.hashLength() > splitThreshold &&
-    state.currentPath()[state.currentPath().length - 1] !== '.priority';
-}
-
-/**
- * A constant-size split strategy used by persistence. Unlike the protocol's
- * historical sqrt(tree-size) default, a fixed target gives IndexedDB records
- * a predictable upper bound across roots and generations. Boundaries remain
- * stable between writes; the target is consulted only when a dirty run is
- * re-emitted.
- */
-export function fixedSizeSplitStrategy(
-  targetBytes: number
-): CompoundHashSplitStrategy {
-  const splitThreshold = Math.max(512, Math.floor(targetBytes));
   return state =>
     state.hashLength() > splitThreshold &&
     state.currentPath()[state.currentPath().length - 1] !== '.priority';
@@ -227,31 +206,19 @@ type CompoundHashFrame =
   | { kind: 'child'; key: string; child: Node }
   | { kind: 'end' };
 
+/**
+ * Incrementally builds the compound hash while a walk feeds it the
+ * startChild / processLeaf / endChild sequence of the tree's leaves in key
+ * order. A port of Android's CompoundHash.CompoundHashBuilder; the range
+ * grammar (quoted keys, parenthesized nesting, V2 leaf text) matches the
+ * server byte for byte.
+ */
 export class CompoundHashBuilder {
   posts: string[] = [];
   hashes: string[] = [];
-  /** Serialized text length of each completed range (same order as posts). */
-  sizes: number[] = [];
-  /**
-   * When set, completed range texts are handed to the sink instead of being
-   * hashed synchronously; `hashes` receives a placeholder the caller fills in
-   * (the sink receives the index to fill). Lets the persistence flush hash
-   * ranges with WebCrypto off the main thread's synchronous path.
-   */
-  hashSink: ((text: string, index: number) => void) | null = null;
-  /**
-   * Optional persistence sink for the export-format fragment represented by
-   * each completed hash range. The fragment contains exactly the leaves in
-   * that range's (exclusiveStart, inclusiveEnd] interval. Persistence unions
-   * these disjoint fragments without range-deletion semantics.
-   */
-  payloadSink: ((payload: unknown, index: number) => void) | null = null;
 
   /** null when not currently inside a range. */
   private currentHash_: string | null = null;
-  private currentHashLength_ = 0;
-  /** Fresh, mutable accumulator for the current persisted range only. */
-  private currentPayload_: unknown = undefined;
   /**
    * Key stack of the node being processed. Kept beyond currentDepth_ so the
    * path of the last processed leaf survives popping back out of its parent.
@@ -263,24 +230,16 @@ export class CompoundHashBuilder {
 
   private readonly splitState_: CompoundHashSplitState = {
     hashLength: () =>
-      this.currentHash_ === null ? 0 : this.currentHashLength_,
+      this.currentHash_ === null ? 0 : this.currentHash_.length,
     currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
   };
 
-  constructor(
-    private splitStrategy_: CompoundHashSplitStrategy,
-    private lengthOnly_ = false
-  ) {}
+  constructor(private splitStrategy_: CompoundHashSplitStrategy) {}
 
   processLeaf(node: LeafNode): void {
     this.ensureRange_();
     this.lastLeafDepth_ = this.currentDepth_;
-    const leafText = leafHashRepresentation(node);
-    if (!this.lengthOnly_) {
-      this.currentHash_ += leafText;
-    }
-    this.currentHashLength_ += leafText.length;
-    this.appendPayloadLeaf_(node);
+    this.currentHash_ += leafHashRepresentation(node);
     this.needsComma_ = true;
     if (this.splitStrategy_(this.splitState_)) {
       this.endRange_();
@@ -290,16 +249,9 @@ export class CompoundHashBuilder {
   startChild(key: string): void {
     this.ensureRange_();
     if (this.needsComma_) {
-      if (!this.lengthOnly_) {
-        this.currentHash_ += ',';
-      }
-      this.currentHashLength_++;
+      this.currentHash_ += ',';
     }
-    const opening = hashQuotedString(key) + ':(';
-    if (!this.lengthOnly_) {
-      this.currentHash_ += opening;
-    }
-    this.currentHashLength_ += opening.length;
+    this.currentHash_ += hashQuotedString(key) + ':(';
     if (this.currentDepth_ === this.currentPath_.length) {
       this.currentPath_.push(key);
     } else {
@@ -313,10 +265,7 @@ export class CompoundHashBuilder {
     this.currentDepth_--;
     if (this.currentHash_ !== null) {
       // Add closing parenthesis for the child that was just processed.
-      if (!this.lengthOnly_) {
-        this.currentHash_ += ')';
-      }
-      this.currentHashLength_++;
+      this.currentHash_ += ')';
     }
     this.needsComma_ = true;
   }
@@ -330,315 +279,29 @@ export class CompoundHashBuilder {
     this.hashes.push('');
   }
 
-  /**
-   * Seeds the builder into the exact state the natural full-tree walk has
-   * immediately after ending a range at the leaf `path`: no open range, the
-   * walker positioned at that leaf's depth. A subsequent walk of the leaves
-   * AFTER `path` then serializes ranges byte-identically to the corresponding
-   * portion of a full walk — the next range's opening parenthesis prefix is
-   * reconstructed from the common path with this boundary, which is exactly
-   * what ensureRange_ derives from currentPath_/currentDepth_.
-   */
-  seedBoundary(path: string[]): void {
-    this.currentPath_ = path.slice();
-    this.currentDepth_ = path.length;
-    this.lastLeafDepth_ = path.length;
-    this.currentHash_ = null;
-    this.currentHashLength_ = 0;
-    this.needsComma_ = true;
-  }
-
-  /**
-   * Ends the open range at the last processed leaf regardless of the split
-   * strategy — used by the stable-range rewalk to close a dirty run exactly
-   * at a preserved boundary post so the following clean range's interval is
-   * untouched. No-op when no range is open.
-   */
-  forceEndRange(): void {
-    if (this.currentHash_ !== null) {
-      this.endRange_();
-    }
-  }
-
   private ensureRange_(): void {
     if (this.currentHash_ === null) {
       let hash = '(';
       for (let i = 0; i < this.currentDepth_; i++) {
         hash += hashQuotedString(this.currentPath_[i]) + ':(';
       }
-      this.currentHash_ = this.lengthOnly_ ? '' : hash;
-      this.currentHashLength_ = hash.length;
+      this.currentHash_ = hash;
       this.needsComma_ = false;
     }
   }
 
-  /** Adds an interior-node priority to the persisted payload only. */
-  processPriorityForPayload(path: string[], priority: Node): void {
-    if (!priority.isEmpty()) {
-      this.appendPayloadValue_(path.concat('.priority'), priority.val());
-    }
-  }
-
-  private appendPayloadLeaf_(node: LeafNode): void {
-    this.appendPayloadValue_(
-      this.currentPath_.slice(0, this.currentDepth_),
-      node.val(true)
-    );
-  }
-
-  private appendPayloadValue_(path: string[], value: unknown): void {
-    if (this.payloadSink === null) {
-      return;
-    }
-    if (path.length === 0) {
-      this.currentPayload_ = value;
-      return;
-    }
-    if (
-      this.currentPayload_ === undefined ||
-      this.currentPayload_ === null ||
-      typeof this.currentPayload_ !== 'object'
-    ) {
-      this.currentPayload_ = {};
-    }
-    let cursor = this.currentPayload_ as Record<string, unknown>;
-    for (let i = 0; i < path.length - 1; i++) {
-      const key = path[i];
-      const existing = Object.prototype.hasOwnProperty.call(cursor, key)
-        ? cursor[key]
-        : undefined;
-      if (existing === null || typeof existing !== 'object') {
-        Object.defineProperty(cursor, key, {
-          value: {},
-          enumerable: true,
-          configurable: true,
-          writable: true
-        });
-      }
-      cursor = cursor[key] as Record<string, unknown>;
-    }
-    Object.defineProperty(cursor, path[path.length - 1], {
-      value,
-      enumerable: true,
-      configurable: true,
-      writable: true
-    });
-  }
-
   private endRange_(): void {
     let hash = this.currentHash_!;
-    if (!this.lengthOnly_) {
-      for (let i = 0; i < this.currentDepth_; i++) {
-        hash += ')';
-      }
+    for (let i = 0; i < this.currentDepth_; i++) {
       hash += ')';
     }
-    const completedLength = this.currentHashLength_ + this.currentDepth_ + 1;
-    const index = this.hashes.length;
-    this.sizes.push(completedLength);
-    if (this.lengthOnly_) {
-      this.hashes.push('');
-    } else if (this.hashSink !== null) {
-      this.hashes.push('');
-      this.hashSink(hash, index);
-    } else {
-      this.hashes.push(sha1(hash));
-    }
-    if (this.payloadSink !== null) {
-      this.payloadSink(this.currentPayload_, index);
-    }
+    hash += ')';
+    this.hashes.push(sha1(hash));
     const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
     this.posts.push(post === '' ? '/' : post);
     this.currentHash_ = null;
-    this.currentHashLength_ = 0;
-    this.currentPayload_ = undefined;
     this.needsComma_ = true;
   }
-}
-
-/**
- * Builds the protocol compound hash while serializing disjoint persistence
- * entries in traversal order. The first full cache write therefore walks each
- * Node once: the returned JSON is stored in the chunk and the same visit feeds
- * the wire hash builder.
- */
-
-/**
- * ============================ STABLE RANGES ============================
- *
- * A committed persistence generation stores its compound hash as a list of
- * ranges [{ post, hash, size }] whose BOUNDARIES ARE PRESERVED across
- * generations. A flush re-hashes only ranges whose leaf interval intersects
- * a changed subtree; clean ranges keep their stored hash without their bytes
- * ever being read. The wire protocol permits this: posts are arbitrary
- * client-chosen markers, and the server recomputes each interval's hash from
- * the posts alone — boundaries never expire, only balance matters.
- *
- * Balance is kept with a half/double hysteresis around the ideal size `s`
- * from simpleSizeSplitStrategy: a rewalked run re-splits naturally at ~s (so
- * a range that grew past ~2s divides), and a clean range smaller than s/2
- * adjacent to a dirty run is absorbed into the run and re-emitted merged.
- * Occasional under-sized survivors are harmless — a small range is valid,
- * merely suboptimal — so rebalancing is amortized, never a correctness step.
- */
-
-/** One stored range: interval end marker, its hash, serialized text length. */
-export interface StableRange {
-  post: string;
-  hash: string;
-  size: number;
-}
-
-/**
- * Compares two range markers (slash-joined leaf paths) in compound-hash leaf
- * order: segment-wise nameCompare, a strict prefix sorting first. Posts are
- * ordering markers only — they need not exist as leaves in the current tree,
- * so the comparison must be total over arbitrary paths.
- */
-export function compareRangeMarkers(a: string[], b: string[]): number {
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    const cmp = nameCompare(a[i], b[i]);
-    if (cmp !== 0) {
-      return cmp;
-    }
-  }
-  return a.length - b.length;
-}
-
-const ROOT_POST = '/';
-
-function markerToPath(post: string): string[] {
-  return post === ROOT_POST || post === '' ? [] : post.split('/');
-}
-
-/**
- * Relation of the subtree rooted at `path` to the marker `post`:
- *   -1 → every leaf in the subtree sorts before-or-at the marker
- *    0 → the marker lies inside (or at the root of) the subtree
- *    1 → every leaf in the subtree sorts after the marker
- */
-function subtreeVsMarker(path: string[], post: string[]): -1 | 0 | 1 {
-  const n = Math.min(path.length, post.length);
-  for (let i = 0; i < n; i++) {
-    const cmp = nameCompare(path[i], post[i]);
-    if (cmp < 0) {
-      return -1;
-    }
-    if (cmp > 0) {
-      return 1;
-    }
-  }
-  if (path.length <= post.length) {
-    // path is a (possibly equal) prefix of post: marker inside subtree. An
-    // exactly-equal leaf path counts as inside; the walk emits it and the
-    // interval's half-open bounds decide inclusion.
-    return 0;
-  }
-  // post is a strict prefix of path: markers sort before their extensions,
-  // so the whole subtree sorts after the marker.
-  return 1;
-}
-
-/**
- * Walks the leaves of `node` whose paths lie in the half-open marker interval
- * (fromPost, toPost], feeding the builder exactly the startChild / endChild /
- * processLeaf sequence the natural full-tree walk produces for those leaves.
- * The builder must have been seeded at `fromPost` (seedBoundary) so the first
- * emitted range opens with the same common-ancestor prefix the full walk
- * would write. `toPost === null` walks to the end of the tree.
- *
- * Subtrees entirely outside the interval are pruned without reading them —
- * the cost is O(interval bytes + pruned fanout), not O(tree).
- */
-export function walkLeafInterval(
-  node: Node,
-  fromPost: string[] | null,
-  toPost: string[] | null,
-  builder: CompoundHashBuilder
-): void {
-  // Transition state: the path of the previously emitted leaf (or the seeded
-  // boundary), from which endChild/startChild transitions are derived.
-  let openPath: string[] = fromPost === null ? [] : fromPost;
-  let openDepth = openPath.length;
-  let started = fromPost !== null;
-  let stopped = false;
-
-  const emitLeaf = (path: string[], leaf: LeafNode): void => {
-    if (!started) {
-      // First leaf of a from-the-start walk: descend from the root.
-      for (let i = 0; i < path.length; i++) {
-        builder.startChild(path[i]);
-      }
-      started = true;
-    } else {
-      let common = 0;
-      while (
-        common < openDepth &&
-        common < path.length &&
-        openPath[common] === path[common]
-      ) {
-        common++;
-      }
-      for (let i = openDepth; i > common; i--) {
-        builder.endChild();
-      }
-      for (let i = common; i < path.length; i++) {
-        builder.startChild(path[i]);
-      }
-    }
-    builder.processLeaf(leaf);
-    // Copy: `path` is the walker's live mutable array.
-    openPath = path.slice();
-    openDepth = openPath.length;
-  };
-
-  const walk = (current: Node, path: string[]): void => {
-    if (stopped) {
-      return;
-    }
-    if (fromPost !== null) {
-      const rel = subtreeVsMarker(path, fromPost);
-      if (rel === -1) {
-        return; // entirely at-or-before the opening boundary
-      }
-      if (rel === 0 && current.isLeafNode()) {
-        // The boundary leaf itself: excluded (interval is open at fromPost).
-        if (compareRangeMarkers(path, fromPost) <= 0) {
-          return;
-        }
-      }
-    }
-    if (toPost !== null) {
-      const rel = subtreeVsMarker(path, toPost);
-      if (rel === 1) {
-        stopped = true; // entirely after the closing boundary
-        return;
-      }
-    }
-    if (current.isLeafNode()) {
-      emitLeaf(path, current as LeafNode);
-      return;
-    }
-    // The mobile wire grammar deliberately drops a trailing interior-node
-    // priority. Persistence cannot: store it in the sparse payload without
-    // feeding it to the canonical hash builder.
-    builder.processPriorityForPayload(path, current.getPriority());
-    forEachChildWithPriority(current, (key, child) => {
-      if (stopped) {
-        return;
-      }
-      path.push(key);
-      walk(child, path);
-      path.pop();
-    });
-  };
-
-  walk(node, []);
-  // Pop back out of the last emitted leaf's ancestry so a caller chaining
-  // further work sees a balanced builder; endChild is a no-op on text when
-  // no range is open.
-  builder.forceEndRange();
 }
 
 /**
@@ -745,281 +408,6 @@ export function collectChangedSubtreePaths(
   };
   visit(before, after, [], 0);
   return changed;
-}
-
-/**
- * Marks the ranges whose leaf interval intersects any changed subtree. Range
- * i covers the half-open marker interval (posts[i-1], posts[i]]; the virtual
- * tail after the last post is reported via the returned `tailDirty` (leaves
- * appended after the previously last leaf fall there).
- */
-export function markDirtyRanges(
-  ranges: StableRange[],
-  changedPaths: string[][]
-): { dirty: boolean[]; tailDirty: boolean } {
-  const dirty = new Array<boolean>(ranges.length).fill(false);
-  let tailDirty = false;
-  const posts = ranges.map(r => markerToPath(r.post));
-  for (const path of changedPaths) {
-    if (path.length === 0) {
-      dirty.fill(true);
-      tailDirty = true;
-      break;
-    }
-    // First range not entirely before the subtree: subtree's leaves start at
-    // marker `path` (a prefix sorts before its extensions), so binary-search
-    // the first post >= path.
-    let lo = 0;
-    let hi = ranges.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (compareRangeMarkers(posts[mid], path) < 0) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    if (lo === ranges.length) {
-      tailDirty = true;
-      continue;
-    }
-    // Mark ranges from lo while their interval intersects the subtree: the
-    // interval (posts[i-1], posts[i]] intersects until the PREVIOUS post
-    // already sorts past every leaf under `path` (after it, not inside it).
-    for (let i = lo; i < ranges.length; i++) {
-      if (i > lo) {
-        // Stop once the subtree's leaves all sort at-or-before the PREVIOUS
-        // post: the interval (posts[i-1], posts[i]] can no longer intersect.
-        if (subtreeVsMarker(path, posts[i - 1]) === -1) {
-          break;
-        }
-      }
-      dirty[i] = true;
-      if (
-        i === ranges.length - 1 &&
-        subtreeVsMarker(path, posts[ranges.length - 1]) !== -1
-      ) {
-        // The subtree extends past the last post into the virtual tail.
-        tailDirty = true;
-      }
-    }
-  }
-  return { dirty, tailDirty };
-}
-
-/**
- * Produces the next generation's stable ranges: clean ranges carry over
- * verbatim; each maximal dirty run (pre-extended over undersized clean
- * neighbors) is re-serialized over the current tree between its preserved
- * outer boundaries, re-splitting naturally at the current ideal size. Ranges
- * are emitted through `builder`, whose hashSink/hashes the caller owns —
- * pass a sink to hash the dirty texts with WebCrypto afterwards.
- *
- * Returns the new range list with hashes for SINK-DEFERRED entries empty
- * (the caller fills them from the sink's completions, matching indexes in
- * builder.hashes/sizes/posts order for the dirty emissions).
- */
-export function rebuildStableRanges(
-  node: Node,
-  previous: StableRange[],
-  dirty: boolean[],
-  tailDirty: boolean,
-  builder: CompoundHashBuilder,
-  fixedTargetBytes?: number
-): StableRange[] {
-  const ideal =
-    fixedTargetBytes === undefined
-      ? Math.max(
-          512,
-          Math.floor(Math.sqrt(estimateSerializedNodeSize(node) * 100))
-        )
-      : Math.max(512, Math.floor(fixedTargetBytes));
-  const minSize = ideal >> 1;
-  // Absorb undersized clean neighbors into adjacent dirty runs (merge side of
-  // the hysteresis): they re-emit merged with the run's bytes.
-  const effectiveDirty = dirty.slice();
-  for (let i = 0; i < effectiveDirty.length; i++) {
-    if (!effectiveDirty[i]) {
-      continue;
-    }
-    for (
-      let p = i - 1;
-      p >= 0 && !effectiveDirty[p] && previous[p].size < minSize;
-      p--
-    ) {
-      effectiveDirty[p] = true;
-    }
-    for (
-      let n = i + 1;
-      n < effectiveDirty.length &&
-      !effectiveDirty[n] &&
-      previous[n].size < minSize;
-      n++
-    ) {
-      effectiveDirty[n] = true;
-      i = n;
-    }
-  }
-
-  const result: StableRange[] = [];
-  let i = 0;
-  while (i < previous.length) {
-    if (!effectiveDirty[i]) {
-      result.push(previous[i]);
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < previous.length && effectiveDirty[j]) {
-      j++;
-    }
-    const runEndsAtTail = j === previous.length && tailDirty;
-    const fromPost = i === 0 ? null : markerToPath(previous[i - 1].post);
-    const toPost = runEndsAtTail ? null : markerToPath(previous[j - 1].post);
-    const firstEmitIndex = builder.posts.length;
-    if (fromPost !== null) {
-      builder.seedBoundary(fromPost);
-    }
-    walkLeafInterval(node, fromPost, toPost, builder);
-    for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-      result.push({
-        post: builder.posts[k],
-        hash: builder.hashes[k],
-        size: builder.sizes[k]
-      });
-    }
-    i = j;
-  }
-  if (tailDirty && previous.length > 0) {
-    // Tail handled by extending the last run (runEndsAtTail) when the last
-    // range was dirty; when it was clean, walk the pure tail interval.
-    const lastWasClean = !effectiveDirty[previous.length - 1];
-    if (lastWasClean) {
-      const fromPost = markerToPath(previous[previous.length - 1].post);
-      const firstEmitIndex = builder.posts.length;
-      builder.seedBoundary(fromPost);
-      walkLeafInterval(node, fromPost, null, builder);
-      for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-        result.push({
-          post: builder.posts[k],
-          hash: builder.hashes[k],
-          size: builder.sizes[k]
-        });
-      }
-    }
-  }
-  if (previous.length === 0) {
-    // First-ever generation: one natural full walk.
-    const firstEmitIndex = builder.posts.length;
-    walkLeafInterval(node, null, null, builder);
-    for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-      result.push({
-        post: builder.posts[k],
-        hash: builder.hashes[k],
-        size: builder.sizes[k]
-      });
-    }
-  }
-  return result;
-}
-
-export class CompoundHashAccumulator {
-  private readonly builder_: CompoundHashBuilder;
-  private openPath_: string[] = [];
-
-  constructor(root: Node) {
-    this.builder_ = new CompoundHashBuilder(simpleSizeSplitStrategy(root));
-  }
-
-  serializeEntry(path: string[], node: Node, includedInHash = true): unknown {
-    if (!includedInHash) {
-      return node.val(true);
-    }
-    this.moveToPath_(path);
-    return this.serializeNode_(node);
-  }
-
-  hashEntry(path: string[], node: Node, includedInHash = true): void {
-    if (!includedInHash) {
-      return;
-    }
-    this.moveToPath_(path);
-    this.hashNode_(node);
-  }
-
-  finish(): CompoundHash {
-    this.moveToPath_([]);
-    this.builder_.finishHashing();
-    return new CompoundHash(this.builder_.posts, this.builder_.hashes);
-  }
-
-  private moveToPath_(next: string[]): void {
-    let common = 0;
-    while (
-      common < this.openPath_.length &&
-      common < next.length &&
-      this.openPath_[common] === next[common]
-    ) {
-      common++;
-    }
-    for (let i = this.openPath_.length; i > common; i--) {
-      this.builder_.endChild();
-    }
-    for (let i = common; i < next.length; i++) {
-      this.builder_.startChild(next[i]);
-    }
-    this.openPath_ = next.slice();
-  }
-
-  private hashNode_(node: Node): void {
-    if (node.isEmpty()) {
-      return;
-    }
-    if (node.isLeafNode()) {
-      this.builder_.processLeaf(node as LeafNode);
-      return;
-    }
-    forEachChildWithPriority(node, (key, child, included) => {
-      if (!included) {
-        return;
-      }
-      this.builder_.startChild(key);
-      this.hashNode_(child);
-      this.builder_.endChild();
-    });
-  }
-
-  private serializeNode_(node: Node): unknown {
-    if (node.isEmpty()) {
-      return null;
-    }
-    if (node.isLeafNode()) {
-      this.builder_.processLeaf(node as LeafNode);
-      if (!node.getPriority().isEmpty()) {
-        return {
-          '.value': node.val(),
-          '.priority': node.getPriority().val()
-        };
-      }
-      return node.val();
-    }
-
-    const out: Record<string, unknown> = {};
-    forEachChildWithPriority(
-      node,
-      (key, child, included) => {
-        if (included) {
-          this.builder_.startChild(key);
-          out[key] = this.serializeNode_(child);
-          this.builder_.endChild();
-        } else {
-          out[key] = child.val(true);
-        }
-      },
-      true
-    );
-    return out;
-  }
 }
 
 /**
@@ -1135,107 +523,6 @@ export function compoundHashFromNodeAsync(
         }
         builder.finishHashing();
         resolve(new CompoundHash(builder.posts, builder.hashes));
-      } catch (e) {
-        reject(e);
-      }
-    };
-    step();
-  });
-}
-
-/**
- * Computes the canonical Node hash without populating every subtree's
- * lazyHash_. Only frames on the current depth-first path are retained; each
- * child hash is folded into its parent and released. Persistence uses this at
- * write time, stores the resulting root hash in the manifest, and stamps only
- * the restored root on the next boot.
- */
-export function canonicalHashFromNodeAsync(
-  node: Node,
-  sliceMs = 12,
-  onProgress: () => void = () => {}
-): Promise<string> {
-  if (node.isEmpty()) {
-    return Promise.resolve('');
-  }
-  interface CanonicalFrame {
-    node: Node;
-    key: string | null;
-    children: Array<[string, Node]> | null;
-    nextChild: number;
-    toHash: string;
-  }
-  const stack: CanonicalFrame[] = [
-    { node, key: null, children: null, nextChild: 0, toHash: '' }
-  ];
-  return new Promise((resolve, reject) => {
-    const completeFrame = (hash: string) => {
-      const finished = stack.pop();
-      if (!finished) {
-        resolve(hash);
-        return;
-      }
-      const parent = stack[stack.length - 1];
-      if (!parent) {
-        resolve(hash);
-      } else if (hash !== '' && finished.key !== null) {
-        parent.toHash += ':' + finished.key + ':' + hash;
-      }
-    };
-    const step = (): void => {
-      try {
-        const deadline = Date.now() + sliceMs;
-        while (stack.length > 0) {
-          const frame = stack[stack.length - 1];
-          if (frame.node.isLeafNode()) {
-            const leaf = frame.node as LeafNode;
-            let text = '';
-            const priority = leaf.getPriority();
-            if (!priority.isEmpty()) {
-              text +=
-                'priority:' +
-                priorityHashText(priority.val() as string | number) +
-                ':';
-            }
-            text += leafHashValueText(
-              leaf.val() as string | number | boolean,
-              false
-            );
-            completeFrame(sha1(text));
-          } else {
-            if (frame.children === null) {
-              const priority = frame.node.getPriority();
-              if (!priority.isEmpty()) {
-                frame.toHash =
-                  'priority:' +
-                  priorityHashText(priority.val() as string | number) +
-                  ':';
-              }
-              const children: Array<[string, Node]> = [];
-              frame.children = children;
-              frame.node.forEachChild(PRIORITY_INDEX, (key, child) => {
-                children.push([key, child]);
-              });
-            }
-            if (frame.nextChild < frame.children.length) {
-              const [key, child] = frame.children[frame.nextChild++];
-              stack.push({
-                node: child,
-                key,
-                children: null,
-                nextChild: 0,
-                toHash: ''
-              });
-            } else {
-              completeFrame(frame.toHash === '' ? '' : sha1(frame.toHash));
-            }
-          }
-          if (stack.length > 0 && Date.now() >= deadline) {
-            onProgress();
-            scheduleSlice(step);
-            return;
-          }
-        }
       } catch (e) {
         reject(e);
       }

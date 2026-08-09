@@ -21,17 +21,13 @@ import { expect } from 'chai';
 import { getPersistedValue, setPersistenceEnabled } from '../src/api/Database';
 import { DataSnapshot, QueryImpl } from '../src/api/Reference_impl';
 import {
-  CompoundHashBuilder,
-  canonicalHashFromNodeAsync,
   compoundHashFromNode,
-  fixedSizeSplitStrategy,
-  rebuildStableRanges,
-  walkLeafInterval
+  compoundHashFromNodeAsync,
+  simpleSizeSplitStrategy
 } from '../src/core/CompoundHash';
 import {
   PersistenceManager,
   PersistedRecord,
-  PersistedSeedHashes,
   PersistenceRestoreResult,
   persistenceStats
 } from '../src/core/Persistence';
@@ -48,8 +44,9 @@ import {
 } from '../src/core/Repo';
 import { ListenWireResult } from '../src/core/ServerActions';
 import {
-  ListenHashFn,
-  PendingListenHashStore
+  getNodeCanonicalHash,
+  getNodeCompoundHash,
+  ListenHashFn
 } from '../src/core/ServerCacheSeed';
 import { PRIORITY_INDEX } from '../src/core/snap/indexes/PriorityIndex';
 import { Node } from '../src/core/snap/Node';
@@ -61,6 +58,7 @@ import {
   syncTreeGetCompleteServerCache
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
+import { Tree } from '../src/core/util/Tree';
 import { sha1 } from '../src/core/util/util';
 import { EventQueue } from '../src/core/view/EventQueue';
 import {
@@ -77,24 +75,6 @@ function computeCompoundHash(json: unknown) {
   return { hashes: hash.hashes, posts: hash.posts };
 }
 
-function expectRangesDescribeNode(
-  node: Node,
-  ranges: Array<{ post: string; hash: string }>
-): void {
-  let previous: string[] | null = null;
-  for (const range of ranges) {
-    const end = range.post === '/' ? [] : range.post.split('/');
-    const builder = new CompoundHashBuilder(() => false);
-    if (previous !== null) {
-      builder.seedBoundary(previous);
-    }
-    walkLeafInterval(node, previous, end, builder);
-    expect(builder.posts).to.deep.equal([range.post]);
-    expect(builder.hashes).to.deep.equal([range.hash]);
-    previous = end;
-  }
-}
-
 function makeChunk(revision: string, entries: Array<[string, unknown]>) {
   const payload = stringify(entries);
   return {
@@ -105,9 +85,10 @@ function makeChunk(revision: string, entries: Array<[string, unknown]>) {
 }
 
 /**
- * Hand-crafts a current-format (v10) stored generation: the manifest with
- * stable ranges computed from the tree, plus the structured-clone tree
- * record — what a real flush of `json` would have committed.
+ * Hand-crafts a current-format (v12) stored generation: the manifest with a
+ * single root split holding one segment per shard of the export object —
+ * what a real flush of `json` would have committed (simplified to one
+ * segment covering all children unless `segmentKeys` splits them).
  */
 function makeStoredGeneration(
   json: unknown,
@@ -118,37 +99,48 @@ function makeStoredGeneration(
   } = {}
 ) {
   const node = nodeFromJSON(json);
-  const payloads: unknown[] = [];
-  const builder = new CompoundHashBuilder(fixedSizeSplitStrategy(256 * 1024));
-  builder.payloadSink = payload => payloads.push(payload);
-  const stable = rebuildStableRanges(node, [], [], false, builder, 256 * 1024);
   const revision = options.revision ?? 'ext-1';
-  let previousPost: string | null = null;
-  const ranges = stable.map((range, i) => ({
-    ...range,
-    recordId: revision + '-' + i.toString(36)
-  }));
-  const rangeRecords = ranges.map((range, i) => {
-    const record = {
-      recordId: range.recordId,
-      start: previousPost,
-      end: range.post,
-      tree: payloads[i]
+  const exportValue = node.val(true) as Record<string, unknown>;
+  if (node.isLeafNode()) {
+    const id = revision + '-0';
+    return {
+      manifest: {
+        formatVersion: 12,
+        revision,
+        updatedAt: options.updatedAt ?? Date.now(),
+        authScope: options.authScope ?? null,
+        estimatedBytes: 1024,
+        splits: [
+          { path: '', leaf: true, segs: [{ from: null, id, bytes: 0 }] }
+        ]
+      },
+      segments: [{ id, text: JSON.stringify(exportValue) }]
     };
-    previousPost = range.post;
-    return record;
-  });
+  }
+  const id = revision + '-0';
+  const text = JSON.stringify(
+    Object.fromEntries(
+      Object.entries(exportValue).filter(([key]) => key !== '.priority')
+    )
+  );
+  const split: {
+    path: string;
+    priority?: unknown;
+    segs: Array<{ from: string | null; id: string; bytes: number }>;
+  } = { path: '', segs: [{ from: null, id, bytes: text.length }] };
+  if (!node.getPriority().isEmpty()) {
+    split.priority = node.getPriority().val();
+  }
   return {
     manifest: {
-      formatVersion: 11,
+      formatVersion: 12,
       revision,
       updatedAt: options.updatedAt ?? Date.now(),
       authScope: options.authScope ?? null,
       estimatedBytes: 1024,
-      hash: '',
-      ranges
+      splits: [split]
     },
-    rangeRecords
+    segments: [{ id, text }]
   };
 }
 
@@ -158,8 +150,8 @@ function installStoredGeneration(
   generation: ReturnType<typeof makeStoredGeneration>
 ): void {
   data.set(root, generation.manifest);
-  for (const record of generation.rangeRecords) {
-    data.set(root + '#range:' + record.recordId, record);
+  for (const segment of generation.segments) {
+    data.set(root + '#seg:' + segment.id, segment.text);
   }
 }
 
@@ -406,7 +398,7 @@ function bigLeaf(seed: string): string {
 }
 
 describe('PersistenceManager', () => {
-  it('restores what a flush persisted, hashes coupled to the tree', async () => {
+  it('restores exactly what a flush persisted', async () => {
     const { factory } = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', factory);
     const json = { a: 'x', b: { c: 1 } };
@@ -424,15 +416,19 @@ describe('PersistenceManager', () => {
     )) as PersistedRecord;
     expect(restored).to.not.equal(null);
     expect(restored.node.val(true)).to.deep.equal(json);
-    expect(restored.hash).to.equal('');
-    expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
+    // Storage carries no hashes; the listen hashes are derived from the
+    // restored node at boot and must equal a from-scratch computation.
+    expect(computeCompoundHash(restored.node.val(true))).to.deep.equal(
+      computeCompoundHash(json)
+    );
+    expect(restored.node.hash()).to.equal(computeCanonicalHash(json));
   });
 
-  it('stores one manifest + immutable range records and reassembles exactly', async () => {
+  it('stores one manifest + immutable segment records and reassembles exactly', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', factory);
-    // Large multi-range tree, plus priorities on an interior node and on a
-    // leaf — the export-format and range-serialization paths in one tree.
+    // Large multi-segment tree, plus priorities on an interior node and on a
+    // leaf — the export-format and segment-serialization paths in one tree.
     const json = {
       big1: { deep: { '.value': bigLeaf('a'), '.priority': 1 } },
       big2: { x: bigLeaf('b'), y: bigLeaf('c'), '.priority': 'p' },
@@ -446,26 +442,39 @@ describe('PersistenceManager', () => {
     await flushAsync();
 
     const manifest = data.get('test-repo|/chunked/root') as {
-      ranges: Array<{ recordId: string; post: string }>;
+      splits: Array<{
+        path: string;
+        segs: Array<{ from: string | null; id: string }>;
+      }>;
     };
+    const segmentCount = manifest.splits.reduce(
+      (sum, split) => sum + split.segs.length,
+      0
+    );
+    // The two big children exceed the deep-child threshold, so they become
+    // their own split nodes rather than inline segment content.
+    expect(manifest.splits.map(s => s.path).sort()).to.deep.equal([
+      '',
+      'big1',
+      'big2'
+    ]);
     const keys = keysFor(data, 'test-repo|/chunked/root').sort();
-    expect(keys.length).to.equal(1 + manifest.ranges.length);
+    expect(keys.length).to.equal(1 + segmentCount);
     expect(keys[0]).to.equal('test-repo|/chunked/root');
-    for (const range of manifest.ranges) {
-      const record = data.get(
-        'test-repo|/chunked/root#range:' + range.recordId
-      ) as { tree: unknown; end: string };
-      expect(record).to.not.equal(undefined);
-      expect(typeof record.tree).to.equal('object');
-      expect(record.end).to.equal(range.post);
+    for (const split of manifest.splits) {
+      for (const seg of split.segs) {
+        const record = data.get('test-repo|/chunked/root#seg:' + seg.id);
+        expect(typeof record).to.equal('string');
+        expect(() => JSON.parse(record as string)).to.not.throw();
+      }
     }
     const restored = (await restoreForTest(
       manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(node.val(true));
-    expect(restored.hash).to.equal('');
-    expect(restored.compoundHash).to.deep.equal(
+    expect(restored.node.hash()).to.equal(node.hash());
+    expect(computeCompoundHash(restored.node.val(true))).to.deep.equal(
       computeCompoundHash(node.val(true))
     );
   });
@@ -505,7 +514,7 @@ describe('PersistenceManager', () => {
     );
   });
 
-  it('re-hashes only the ranges an update dirtied, boundaries preserved', async () => {
+  it('rewrites only the segments an update dirtied, ids preserved', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', factory);
     const path = new Path('incremental/root');
@@ -519,16 +528,14 @@ describe('PersistenceManager', () => {
     await manager.flushNow(path.toString());
     await flushAsync();
 
+    const segIds = (manifest: {
+      splits: Array<{ segs: Array<{ id: string }> }>;
+    }) => manifest.splits.flatMap(split => split.segs.map(seg => seg.id));
     const manifestBefore = data.get('test-repo|/incremental/root') as {
-      ranges: Array<{
-        post: string;
-        hash: string;
-        size: number;
-        recordId: string;
-      }>;
+      splits: Array<{ path: string; segs: Array<{ id: string }> }>;
     };
-    expect(manifestBefore.ranges.length).to.be.greaterThan(1);
-    const hashedAfterFirst = persistenceStats.rangesHashed;
+    expect(segIds(manifestBefore).length).to.be.greaterThan(1);
+    const writtenAfterFirst = persistenceStats.segmentsWritten;
 
     // Immutable update: the untouched big subtrees keep their identity.
     const v2 = v1.updateChild(new Path('small'), nodeFromJSON('v2'));
@@ -537,52 +544,34 @@ describe('PersistenceManager', () => {
     await flushAsync();
 
     const manifestAfter = data.get('test-repo|/incremental/root') as {
-      ranges: Array<{
-        post: string;
-        hash: string;
-        size: number;
-        recordId: string;
-      }>;
+      splits: Array<{ path: string; segs: Array<{ id: string }> }>;
     };
-    // Clean ranges carried over by identity: same post AND same hash object;
-    // only the dirtied tail of the range list was re-hashed.
-    const dirtyHashed = persistenceStats.rangesHashed - hashedAfterFirst;
-    expect(dirtyHashed).to.be.greaterThan(0);
-    expect(dirtyHashed).to.be.lessThan(manifestAfter.ranges.length);
-    let reused = 0;
-    for (const range of manifestAfter.ranges) {
-      if (
-        manifestBefore.ranges.some(
-          prev => prev.post === range.post && prev.hash === range.hash
-        )
-      ) {
-        reused++;
-      }
-    }
-    expect(reused).to.equal(manifestAfter.ranges.length - dirtyHashed);
-    const liveRangeKeys = new Set(
-      manifestAfter.ranges.map(
-        range => 'test-repo|/incremental/root#range:' + range.recordId
-      )
+    // Clean segments carried over by id; only the dirty ones were written.
+    const dirtyWritten = persistenceStats.segmentsWritten - writtenAfterFirst;
+    expect(dirtyWritten).to.be.greaterThan(0);
+    expect(dirtyWritten).to.be.lessThan(segIds(manifestAfter).length);
+    const before = new Set(segIds(manifestBefore));
+    const reused = segIds(manifestAfter).filter(id => before.has(id)).length;
+    expect(reused).to.equal(segIds(manifestAfter).length - dirtyWritten);
+    // Retired records were deleted; exactly the live ids remain on disk.
+    const liveSegKeys = segIds(manifestAfter).map(
+      id => 'test-repo|/incremental/root#seg:' + id
     );
     expect(
       keysFor(data, 'test-repo|/incremental/root').filter(key =>
-        key.includes('#range:')
+        key.includes('#seg:')
       )
-    ).to.have.members([...liveRangeKeys]);
+    ).to.have.members(liveSegKeys);
 
-    // The incremental manifest's compound hash must equal a from-scratch
-    // computation over the same tree at the same posts — the wire contract.
     const restored = (await restoreForTest(
       manager,
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal(v2.val(true));
-    expect(restored.hash).to.equal('');
-    expectRangesDescribeNode(v2, manifestAfter.ranges);
+    expect(restored.node.hash()).to.equal(v2.hash());
   });
 
-  it('uses a constant configurable target for persisted range sizes', async () => {
+  it('uses a constant configurable target for persisted segment sizes', async () => {
     const shared = makeFakeIndexedDB();
     const json: Record<string, string> = {};
     for (let i = 0; i < 192; i++) {
@@ -605,19 +594,23 @@ describe('PersistenceManager', () => {
       await manager.flushNow(path.toString());
       await flushAsync();
       return shared.data.get(prefix + '|/fixed/root') as {
-        ranges: Array<{ size: number }>;
+        splits: Array<{ segs: Array<{ id: string; bytes: number }> }>;
       };
     };
     const small = await write('small', 64 * 1024);
     const large = await write('large', 512 * 1024);
-    expect(small.ranges.length).to.be.greaterThan(large.ranges.length);
-    // A range can exceed the target by at most the leaf that crossed it.
-    expect(Math.max(...small.ranges.map(range => range.size))).to.be.lessThan(
+    const segsOf = (manifest: {
+      splits: Array<{ segs: Array<{ bytes: number }> }>;
+    }) => manifest.splits.flatMap(split => split.segs);
+    expect(segsOf(small).length).to.be.greaterThan(segsOf(large).length);
+    // A segment exceeds the target by at most the child that crossed it.
+    expect(Math.max(...segsOf(small).map(seg => seg.bytes))).to.be.lessThan(
       80 * 1024
     );
   });
 
-  it('rebases a stale cross-tab writer instead of mixing range generations', async () => {
+
+  it('a later cross-tab writer wins the manifest slot consistently', async () => {
     const shared = makeFakeIndexedDB();
     const path = new Path('tabs/root');
     const initial = scopedManager('test-repo', shared.factory);
@@ -643,18 +636,24 @@ describe('PersistenceManager', () => {
     await flushAsync();
     await flushAsync();
 
+    // Last writer wins: tab B's generation owns the slot, and because B
+    // observed the interleaved commit it skipped its retire-deletes — every
+    // record its manifest references is present, so a fresh session
+    // restores B's complete tree.
     const final = await restoreForTest(
       scopedManager('test-repo', shared.factory),
       path.toString()
     );
     expect(final!.node.val()).to.deep.equal({ a: 1, b: 3 });
     const manifest = shared.data.get('test-repo|/tabs/root') as {
-      ranges: Array<{ recordId: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
-    for (const range of manifest.ranges) {
-      expect(
-        shared.data.has('test-repo|/tabs/root#range:' + range.recordId)
-      ).to.equal(true);
+    for (const split of manifest.splits) {
+      for (const seg of split.segs) {
+        expect(
+          shared.data.has('test-repo|/tabs/root#seg:' + seg.id)
+        ).to.equal(true);
+      }
     }
   });
 
@@ -673,13 +672,15 @@ describe('PersistenceManager', () => {
     ]);
     await flushAsync();
     const manifest = shared.data.get('test-repo|/cold-tabs/root') as {
-      ranges: Array<{ recordId: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
     expect(manifest).to.not.equal(undefined);
-    for (const range of manifest.ranges) {
-      expect(
-        shared.data.has('test-repo|/cold-tabs/root#range:' + range.recordId)
-      ).to.equal(true);
+    for (const split of manifest.splits) {
+      for (const seg of split.segs) {
+        expect(
+          shared.data.has('test-repo|/cold-tabs/root#seg:' + seg.id)
+        ).to.equal(true);
+      }
     }
     const restored = await restoreForTest(
       scopedManager('test-repo', shared.factory),
@@ -688,7 +689,7 @@ describe('PersistenceManager', () => {
     expect(restored).to.not.equal(null);
   });
 
-  it('does not sweep immutable ranges while a generation is staging', async () => {
+  it('does not sweep segment records while a generation is staging', async () => {
     const shared = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', shared.factory);
     const path = new Path('sweep-race/root');
@@ -704,91 +705,44 @@ describe('PersistenceManager', () => {
     expect(await restoreForTest(manager, path.toString())).to.not.equal(null);
   });
 
-  it('a sweep between chunk staging and the manifest commit forces a clean retry', async () => {
-    const path = new Path('swept-stage/root');
-    const prefix = 'test-repo|/swept-stage/root';
-    // Simulates the other tab's sweep at the exact hazardous interleave: a
-    // freshly staged range record is not referenced by the COMMITTED
-    // manifest, so a concurrent sweep classifies it as an orphan and deletes
-    // it after the staging put but before the manifest CAS transaction.
-    let dataRef: Map<string, unknown> | null = null;
-    let baseline = new Set<string>();
-    let sabotage = false;
-    const swept: string[] = [];
-    const shared = makeFakeIndexedDB({
-      onPut: key => {
-        if (
-          sabotage &&
-          dataRef !== null &&
-          key.startsWith(prefix + '#range:') &&
-          !baseline.has(key)
-        ) {
-          swept.push(key);
-          dataRef.delete(key);
-        }
-      }
-    });
-    dataRef = shared.data;
-
-    const manager = scopedManager('test-repo', shared.factory);
-    manager.track(path.toString());
-    manager.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 1 }));
-    await manager.flushNow(path.toString());
+  it('a torn generation self-heals: one cold miss, then warm again', async () => {
+    // The failure ceiling of last-writer-wins storage: a manifest whose
+    // referenced segment vanished (a foreign tab's interleaved deletes, a
+    // partial eviction) restores as a MISS — never a stitched or partial
+    // tree — the leftovers are reclaimed, and the very next flush publishes
+    // a complete generation that restores warm.
+    const shared = makeFakeIndexedDB();
+    const path = new Path('torn/root');
+    const prefix = 'test-repo|/torn/root';
+    const writer = scopedManager('test-repo', shared.factory);
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 2 }));
+    await writer.flushNow(path.toString());
     await flushAsync();
-    const committed = shared.data.get(prefix) as {
-      revision: string;
-      ranges: Array<{ recordId: string }>;
+
+    const manifest = shared.data.get(prefix) as {
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
-    expect(committed).to.not.equal(undefined);
-    baseline = new Set(
-      [...shared.data.keys()].filter(key => key.startsWith(prefix))
-    );
+    shared.data.delete(prefix + '#seg:' + manifest.splits[0].segs[0].id);
 
-    const base = (await restoreForTest(manager, path.toString()))!;
-    manager.serverCacheUpdated(
-      path,
-      base.node.updateChild(new Path('a'), nodeFromJSON(2))
-    );
-    sabotage = true;
-    await manager.flushNow(path.toString());
-    sabotage = false;
-    expect(swept.length).to.be.greaterThan(0);
-
-    // The sabotaged generation must not have been published: the committed
-    // manifest is still the previous revision and every range record it
-    // references is present.
-    const afterLoss = shared.data.get(prefix) as {
-      revision: string;
-      ranges: Array<{ recordId: string }>;
-    };
-    expect(afterLoss.revision).to.equal(committed.revision);
-    for (const range of afterLoss.ranges) {
-      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
-        true
-      );
-    }
-
-    // The queue drain retries the flush coalesced; the retry publishes a
-    // complete generation and a fresh session restores it warm.
+    const reader = scopedManager('test-repo', shared.factory);
+    reader.track(path.toString());
+    const result = await reader.restoreForListen(path.toString());
+    expect(result.record).to.equal(null);
+    expect(result.reason).to.equal('corrupt');
     await flushAsync();
+    expect(keysFor(shared.data, prefix)).to.deep.equal([]);
+
+    reader.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 2 }));
+    await reader.flushNow(path.toString());
     await flushAsync();
-    const final = await restoreForTest(
+    const healed = await restoreForTest(
       scopedManager('test-repo', shared.factory),
       path.toString()
     );
-    expect(final).to.not.equal(null);
-    expect(final!.node.val()).to.deep.equal({ a: 2, b: 1 });
-    const republished = shared.data.get(prefix) as {
-      revision: string;
-      ranges: Array<{ recordId: string }>;
-    };
-    expect(republished.revision).to.not.equal(committed.revision);
-    for (const range of republished.ranges) {
-      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
-        true
-      );
-    }
+    expect(healed!.node.val()).to.deep.equal({ a: 1, b: 2 });
   });
+
 
   it('draining deferred writes re-arms the write window instead of flushing', async () => {
     const shared = makeFakeIndexedDB();
@@ -891,13 +845,13 @@ describe('PersistenceManager', () => {
 
     const manifest = shared.data.get(prefix) as {
       authScope: string;
-      ranges: Array<{ recordId: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
     expect(manifest.authScope).to.equal('bob');
-    for (const range of manifest.ranges) {
-      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
-        true
-      );
+    for (const split of manifest.splits) {
+      for (const seg of split.segs) {
+        expect(shared.data.has(prefix + '#seg:' + seg.id)).to.equal(true);
+      }
     }
     // No retry left pending: the generation settled cleanly.
     const internals = bob as unknown as { flushPending_: Set<string> };
@@ -934,13 +888,13 @@ describe('PersistenceManager', () => {
     // alice's label must never ride bob's session forward.
     const manifest = shared.data.get(prefix) as {
       authScope: string;
-      ranges: Array<{ recordId: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
     expect(manifest.authScope).to.equal('bob');
-    for (const range of manifest.ranges) {
-      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
-        true
-      );
+    for (const split of manifest.splits) {
+      for (const seg of split.segs) {
+        expect(shared.data.has(prefix + '#seg:' + seg.id)).to.equal(true);
+      }
     }
     const reader = scopedManager('test-repo', shared.factory);
     reader.setAuthScope('bob');
@@ -988,11 +942,11 @@ describe('PersistenceManager', () => {
     await writer.flushNow(path.toString());
     await flushAsync();
 
-    let treeGets = 0;
+    let segGets = 0;
     const readerFactory = makeFakeIndexedDB({
       onGet: key => {
-        if (key.startsWith('test-repo|/coalesced/root#range:')) {
-          treeGets++;
+        if (key.startsWith('test-repo|/coalesced/root#seg:')) {
+          segGets++;
         }
       }
     });
@@ -1001,26 +955,26 @@ describe('PersistenceManager', () => {
     }
     const reader = scopedManager('test-repo', readerFactory.factory);
 
-    // Start the optimistic peek and authenticated listener together. They
-    // share one physical range read, and the listener still receives the
-    // manifest as soon as it arrives even though the peek started the read.
-    let manifests = 0;
+    // Start the optimistic peek and authenticated listener together: they
+    // must share ONE physical segment read and resolve the same Node.
     const peekPromise = reader.peek(path.toString());
     reader.track(path.toString());
-    const restorePromise = reader.restoreForListen(path.toString(), () => {
-      manifests++;
-    });
+    const restorePromise = reader.restoreForListen(path.toString());
     const [peeked, restored] = await Promise.all([peekPromise, restorePromise]);
 
     expect(peeked).to.not.equal(null);
-    expect(restored).to.not.equal(null);
-    expect(manifests).to.equal(1);
+    expect(restored.record).to.not.equal(null);
     expect(peeked!.node).to.equal(restored.record!.node);
     const manifest = seeded.data.get('test-repo|/coalesced/root') as {
-      ranges: unknown[];
+      splits: Array<{ segs: unknown[] }>;
     };
-    expect(treeGets).to.equal(manifest.ranges.length);
+    const segmentCount = manifest.splits.reduce(
+      (sum, split) => sum + split.segs.length,
+      0
+    );
+    expect(segGets).to.equal(segmentCount);
   });
+
 
   it('does not repopulate in-memory state after the root is untracked', async () => {
     const seeded = makeFakeIndexedDB();
@@ -1056,8 +1010,8 @@ describe('PersistenceManager', () => {
       manager,
       new Path('aging/root').toString()
     )) as PersistedRecord;
-    const rangesBefore = keysFor(data, 'test-repo|/aging/root')
-      .filter(key => key.includes('#range:'))
+    const segmentsBefore = keysFor(data, 'test-repo|/aging/root')
+      .filter(key => key.includes('#seg:'))
       .map(key => data.get(key));
 
     manager.track(new Path('aging/root').toString());
@@ -1065,29 +1019,28 @@ describe('PersistenceManager', () => {
     await manager.flushNow(new Path('aging/root').toString());
     await flushAsync();
 
-    // Tree record and ranges stay joined while only the manifest timestamp
-    // refreshes.
+    // Segment records stay put while only the manifest timestamp refreshes.
     expect(
       keysFor(data, 'test-repo|/aging/root')
-        .filter(key => key.includes('#range:'))
+        .filter(key => key.includes('#seg:'))
         .map(key => data.get(key))
-    ).to.deep.equal(rangesBefore);
+    ).to.deep.equal(segmentsBefore);
     const manifest = data.get('test-repo|/aging/root') as {
       revision: string;
       updatedAt: number;
-      ranges: unknown;
+      splits: unknown;
     };
     expect(manifest.revision).to.equal('ext-1');
     expect(manifest.updatedAt).to.be.greaterThan(oldUpdatedAt);
-    expect(manifest.ranges).to.deep.equal(stored.manifest.ranges);
+    expect(manifest.splits).to.deep.equal(stored.manifest.splits);
 
     const again = (await restoreForTest(
       manager,
       new Path('aging/root').toString()
     )) as PersistedRecord;
     expect(again.node.val(true)).to.deep.equal(json);
-    expect(again.hash).to.equal('');
   });
+
 
   it('a legacy pre-blob record restores as a miss and is reclaimed', async () => {
     const { factory, data } = makeFakeIndexedDB();
@@ -1152,18 +1105,25 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/old-format/root')).to.deep.equal([]);
   });
 
-  it('reports progress while a large cache hash is sliced', async () => {
+  it('slices the boot-time compound hash across macrotasks', async () => {
+    // Boot-time hashing must never monopolize the main thread: with a zero
+    // slice budget the async walk yields between slices yet produces the
+    // exact synchronous compound hash.
     const json: Record<string, string> = {};
     for (let i = 0; i < 50; i++) {
       json[String(i)] = 'x'.repeat(100);
     }
-    let pulses = 0;
-    const hash = await canonicalHashFromNodeAsync(nodeFromJSON(json), 0, () => {
-      pulses++;
-    });
-    expect(hash).to.equal(computeCanonicalHash(json));
-    expect(pulses).to.be.greaterThan(0);
+    const node = nodeFromJSON(json);
+    const sync = compoundHashFromNode(node);
+    const sliced = await compoundHashFromNodeAsync(
+      node,
+      simpleSizeSplitStrategy(node),
+      0
+    );
+    expect(sliced.hashes).to.deep.equal(sync.hashes);
+    expect(sliced.posts).to.deep.equal(sync.posts);
   });
+
 
   it('restore timeout resets while chunks keep making progress', async () => {
     interface TimeoutSeam {
@@ -1241,7 +1201,7 @@ describe('PersistenceManager', () => {
     expect(data.has('test-repo|/old/root')).to.equal(false);
   });
 
-  it('detects a structurally broken tree record and falls back cold', async () => {
+  it('detects a structurally broken segment record and falls back cold', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const path = new Path('corrupt/root');
     const writer = scopedManager('test-repo', factory);
@@ -1250,54 +1210,45 @@ describe('PersistenceManager', () => {
     await writer.flushNow(path.toString());
     await flushAsync();
 
-    // Structural corruption (a record restore cannot decode). Semantic
-    // corruption is deliberately NOT detected locally: the range handshake
-    // self-heals it (the server pushes the differing ranges).
+    // Structural corruption (a segment restore cannot decode). Semantic
+    // staleness is deliberately NOT detected locally: boot-time hashes
+    // describe whatever restored, and the server heals the difference
+    // through range merges.
     const corruptManifest = data.get('test-repo|/corrupt/root') as {
-      ranges: Array<{ recordId: string; post: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
-    const first = corruptManifest.ranges[0];
-    data.set('test-repo|/corrupt/root#range:' + first.recordId, {
-      recordId: first.recordId,
-      start: null,
-      end: first.post,
-      tree: null
-    });
+    const first = corruptManifest.splits[0].segs[0];
+    data.set('test-repo|/corrupt/root#seg:' + first.id, '{not json!');
 
     const reader = scopedManager('test-repo', factory);
     reader.track(path.toString());
-    expect((await reader.restoreForListen(path.toString())).record).to.equal(
-      null
-    );
+    const result = await reader.restoreForListen(path.toString());
+    expect(result.record).to.equal(null);
+    expect(result.reason).to.equal('corrupt');
     await flushAsync();
     expect(keysFor(data, 'test-repo|/corrupt/root')).to.deep.equal([]);
   });
 
-  it('a manifest↔range mismatch restores as a miss, never stitched', async () => {
-    // A single-transaction commit makes a torn generation near-impossible,
-    // but a foreign or partial write can still leave a mismatched pair. The
-    // revision join catches it: a mismatch is a miss, never a wrong tree.
+
+  it('a manifest referencing a missing segment restores as a miss, never stitched', async () => {
+    // Immutable ids make a torn generation self-evident: a manifest whose
+    // referenced segment id is absent is a miss, never a wrong tree.
     const { factory, data } = makeFakeIndexedDB();
     const stored = makeStoredGeneration({ a: 1 }, { revision: 'ext-1' });
     installStoredGeneration(data, 'test-repo|/torn/root', stored);
-    const tornRange = stored.rangeRecords[0];
-    data.set('test-repo|/torn/root#range:' + tornRange.recordId, {
-      ...tornRange,
-      end: 'wrong/end'
-    });
+    data.delete('test-repo|/torn/root#seg:' + stored.segments[0].id);
 
     const manager = scopedManager('test-repo', factory);
     expect(await restoreForTest(manager, '/torn/root')).to.equal(null);
     await flushAsync();
-    // The broken pair was reclaimed.
+    // The broken generation was reclaimed.
     expect(keysFor(data, 'test-repo|/torn/root')).to.deep.equal([]);
   });
 
-  it('a superseding update never leaves the stored pair uncoupled', async () => {
-    // The interleaving under test: v2 arrives AFTER flush #1 snapshotted v1
-    // (its manifest just landed) but BEFORE its hash recompute finishes. A
-    // flush that re-read latest_ when writing the hash record would pair
-    // v2's hash with v1's data.
+  it('a superseding update mid-flush lands in the NEXT generation', async () => {
+    // The interleaving under test: v2 arrives after flush #1 read latest_
+    // (its manifest is landing) — it must not bleed into generation #1, and
+    // the next window must publish it.
     const path = new Path('busy/root');
     let interleave: (() => void) | null = null;
     const { factory } = makeFakeIndexedDB({
@@ -1326,16 +1277,14 @@ describe('PersistenceManager', () => {
     await flushAsync();
     expect(interleave).to.equal(null); // the hook fired at the manifest put
 
-    // Flush #1's pair: v1 data with v1's hash — the superseding update never
-    // bled into it.
+    // Generation #1 is exactly v1.
     const mid = (await restoreForTest(
       manager,
       path.toString()
     )) as PersistedRecord;
     expect(mid.node.val(true)).to.deep.equal({ v: 1 });
-    expect(mid.hash).to.equal('');
 
-    // And flush #2 (still throttled) then writes the v2 pair.
+    // And flush #2 (still throttled) then publishes v2.
     await manager.flushNow(path.toString());
     await flushAsync();
     const final = (await restoreForTest(
@@ -1343,12 +1292,11 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(final.node.val(true)).to.deep.equal({ v: 2 });
-    expect(final.hash).to.equal('');
   });
 
-  it('a surviving hash sidecar from another session never pairs with new data', async () => {
+  it('a foreign-format record at the same key is replaced wholesale', async () => {
     const { factory, data } = makeFakeIndexedDB();
-    // Session 1 left a data+hash pair. Simulate its token.
+    // An older session left a legacy record + sidecar under this root.
     data.set('test-repo|/shared/root', {
       json: { old: true },
       updatedAt: Date.now(),
@@ -1356,13 +1304,12 @@ describe('PersistenceManager', () => {
     });
     data.set('test-repo|/shared/root#hash', {
       hash: computeCanonicalHash({ old: true }),
-      compoundHash: computeCompoundHash({ old: true }),
       updatedAt: Date.now(),
       revision: 'oldtab-1'
     });
-    // Session 2 (this manager) writes a NEW tree; its manifest put atomically
-    // deletes the old sidecar, so even before its own hash lands the store
-    // can never say "new data, old hash".
+    // This session writes a NEW tree; its commit owns the manifest slot and
+    // a restore returns only the new generation. The legacy '#hash' sidecar
+    // is invisible to restores and reclaimed by the sweep.
     const manager = scopedManager('test-repo', factory);
     const path = new Path('shared/root');
     manager.track(path.toString());
@@ -1374,8 +1321,11 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ fresh: true });
-    expect(restored.hash).to.equal('');
+    await manager.sweepNow();
+    await flushAsync();
+    expect(data.has('test-repo|/shared/root#hash')).to.equal(false);
   });
+
 
   it('keeps first cache creation behind the write window', async () => {
     const { factory } = makeFakeIndexedDB();
@@ -1415,7 +1365,6 @@ describe('PersistenceManager', () => {
       path.toString()
     )) as PersistedRecord;
     expect(restored.node.val(true)).to.deep.equal({ n: 2 });
-    expect(restored.hash).to.equal('');
   });
 
   it('a throttle firing into a busy queue coalesces to one trailing flush', async () => {
@@ -1638,23 +1587,22 @@ describe('PersistenceManager', () => {
   it('sweeps expired, legacy, and orphaned records for its own prefix', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
-    // An expired current-format root: manifest and tree both go.
+    // An expired current-format root: manifest and segments both go.
     const oldGen = makeStoredGeneration(
       { stale: true },
       { revision: 'ext-1', updatedAt: expired }
     );
     installStoredGeneration(data, 'test-repo|/old/root', oldGen);
-    // A fresh current-format root stays, both records intact.
+    // A fresh current-format root stays, manifest and segments intact.
     const freshGen = makeStoredGeneration(
       { fresh: true },
       { revision: 'ext-2' }
     );
     installStoredGeneration(data, 'test-repo|/fresh/root', freshGen);
-    // Legacy sidecars under the fresh root (pre-blob chunk/hash records) are
-    // orphans of the current format and are swept.
+    // Legacy sidecars under the fresh root (pre-segment hash/chunk/range
+    // records) are unreadable by the current format and are swept.
     data.set('test-repo|/fresh/root#hash', {
       hash: 'legacy',
-      compoundHash: { hashes: [''], posts: [] },
       updatedAt: Date.now(),
       revision: 'ext-2'
     });
@@ -1662,11 +1610,21 @@ describe('PersistenceManager', () => {
       'test-repo|/fresh/root#c000000@ext-0',
       makeChunk('ext-0', [['', { orphan: true }]])
     );
-    // A tree record with no manifest at all.
-    data.set('test-repo|/vanished/root#range:orphan', {
+    data.set('test-repo|/fresh/root#range:r0', {
       revision: 'ext-0',
       tree: { orphan: true }
     });
+    // An AGED unreferenced segment record (its id's embedded wall clock is
+    // past the orphan guard) is reclaimed even under a live manifest...
+    const agedId =
+      (Date.now() - 2 * 60 * 60 * 1000).toString(36) + '.deadtab.1';
+    data.set('test-repo|/fresh/root#seg:' + agedId, '{"orphan":true}');
+    // ...while a YOUNG unreferenced segment (another tab staging a not-yet-
+    // committed generation) survives this sweep.
+    const youngId = Date.now().toString(36) + '.livetab.1';
+    data.set('test-repo|/fresh/root#seg:' + youngId, '{"staging":true}');
+    // Segments whose manifest vanished follow the same age guard.
+    data.set('test-repo|/vanished/root#seg:' + agedId, '{"orphan":true}');
     // Legacy pre-blob base records expire regardless of their own updatedAt:
     // the current format cannot read them, so retention buys nothing.
     data.set('test-repo|/legacy/root', {
@@ -1689,12 +1647,13 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/fresh/root').sort()).to.deep.equal(
       [
         'test-repo|/fresh/root',
-        ...freshGen.rangeRecords.map(
-          record => 'test-repo|/fresh/root#range:' + record.recordId
-        )
+        ...freshGen.segments.map(
+          segment => 'test-repo|/fresh/root#seg:' + segment.id
+        ),
+        'test-repo|/fresh/root#seg:' + youngId
       ].sort()
     );
-    expect(data.has('test-repo|/vanished/root#range:orphan')).to.equal(false);
+    expect(data.has('test-repo|/vanished/root#seg:' + agedId)).to.equal(false);
     expect(data.has('test-repo|/legacy/root')).to.equal(false);
     expect(data.has('other-repo|/old/root')).to.equal(true);
   });
@@ -1734,18 +1693,16 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       (status: string, wire?: Partial<ListenWireResult>) => void
     > = [];
     const serverProgress: Array<(wire: ListenWireResult) => void> = [];
-    const pendingHashes = new PendingListenHashStore();
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
-      pendingListenHashes_: pendingHashes,
-      bootBuffers_: new Map(),
       listenOutcomes_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
+      // repoOnDataUpdate reruns transactions once events raise.
+      transactionQueueTree_: new Tree(),
       serverSyncTree_: new SyncTree({
         startListening: () => [],
-        stopListening: () => {},
-        getPendingListenHashes: pathString => pendingHashes.get(pathString)
+        stopListening: () => {}
       }),
       server_: {
         listen: (
@@ -1864,15 +1821,15 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(repo.persistence_!.trackedRootFor(path.toString())).to.equal(null);
   });
 
-  it('an unsubscribe from inside the cached replay unlistens the sent listen', async () => {
-    const { repo, query, path, hashFn, onComplete, calls, data } =
+  it('an unsubscribe from inside the cached replay never sends the listen', async () => {
+    const { repo, query, path, hashFn, onComplete, calls } =
       makeListenHarness();
     await persistHarnessRoot(repo, path, { a: 1 });
     // A replayed event callback unsubscribes synchronously: registration's
-    // event runner calls repoStopServerListen mid-replay. Manifest-first
-    // boot sends the listen BEFORE the cached replay (that is the point),
-    // so the stop must unlisten the already-sent listen — balanced wire
-    // traffic, no orphaned server listen, no leaked boot state.
+    // event runner calls repoStopServerListen mid-replay. The cached replay
+    // runs BEFORE the listen is sent (apply-then-listen), so the stop
+    // cancels the pending restore token and the listen never goes out —
+    // balanced wire traffic (none), no orphaned server listen.
     const realQuery = new QueryImpl(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       null as any,
@@ -1892,15 +1849,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     syncTreeAddEventRegistration(repo.serverSyncTree_, realQuery, registration);
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
-    expect(calls).to.deep.equal(['listen', 'unlisten']);
+    expect(calls).to.deep.equal([]);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.bootBuffers_.size).to.equal(0);
   });
 
-  it('a hashless record falls back cold without blocking on rehash', async () => {
+  it('a legacy-format record attaches a fallback listen without blocking', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
-    // A record persisted before its hash landed (no #hash sibling).
+    // A record from a pre-segment format at the same key.
     data.set('test-repo|' + path.toString(), {
       json: { a: 1 },
       updatedAt: Date.now(),
@@ -1911,6 +1867,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(calls).to.deep.equal(['listen']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
+
 
   it('a certified descendant makes the parent restore go cold', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
@@ -2033,10 +1990,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     );
   });
 
-  it('without a manifest callback the listen waits for the restore', async () => {
-    // A restore that resolves without ever surfacing a manifest (stub
-    // managers, legacy paths) keeps the pre-manifest-first sequencing:
-    // apply the base, then listen.
+  it('applies the restored base before sending the listen', async () => {
     const { repo, query, path, hashFn, onComplete, calls, serverCallbacks } =
       makeListenHarness();
     let resolveRecord: (record: PersistedRecord | null) => void = () => {};
@@ -2048,7 +2002,6 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         });
     });
     const node = nodeFromJSON({ cached: true });
-    const compoundHash = computeCompoundHash(node.val(true));
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
@@ -2059,6 +2012,18 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       evict: () => {},
       untrack: () => {}
     } as unknown as PersistenceManager;
+    const realQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      realQuery,
+      stubRegistration()
+    );
 
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
@@ -2066,13 +2031,15 @@ describe('repoStartServerListen / repoStopServerListen', () => {
 
     resolveRecord({
       node,
-      hash: computeCanonicalHash(node.val(true)),
-      compoundHash,
       updatedAt: Date.now(),
       revision: 'r1'
     });
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
+    // The base was applied before the listen went out.
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: true });
 
     const outcomes: ListenOutcome[] = [];
     repoOnListenOutcome(repo, path.toString(), outcome =>
@@ -2083,40 +2050,11 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(outcomes.at(-1)?.certified).to.equal(true);
   });
 
-  it('manifest-first: sends the listen before range restore resolves', async () => {
-    const { repo, query, path, hashFn, onComplete, calls } =
+  it('the seeded listen carries boot-time hashes derived from the tree', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, hashFns } =
       makeListenHarness();
-    const node = nodeFromJSON({ a: 1, b: 2 });
-    const compoundHash = computeCompoundHash(node.val(true));
-    let release: () => void = () => {};
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    repo.persistence_ = {
-      track: () => {},
-      isPersistentPath: () => true,
-      restoreForListen: async (
-        _path: string,
-        onManifest: (h: PersistedSeedHashes) => void
-      ) => {
-        onManifest({ hash: '', compoundHash });
-        await gate;
-        return {
-          record: {
-            node,
-            hash: '',
-            compoundHash,
-            updatedAt: Date.now(),
-            revision: 'r1'
-          }
-        };
-      },
-      trackedRootFor: () => null,
-      serverCacheUpdated: () => {},
-      invalidate: () => {},
-      evict: () => {},
-      untrack: () => {}
-    } as unknown as PersistenceManager;
+    const json = { a: 1, b: 2 };
+    await persistHarnessRoot(repo, path, json);
     const realQuery = new QueryImpl(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       null as any,
@@ -2129,94 +2067,33 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       realQuery,
       stubRegistration()
     );
-
     repoStartServerListen(repo, query, null, hashFn, onComplete);
-    await Promise.resolve();
-    expect(calls).to.deep.equal(['listen']);
-    expect(
-      repo.pendingListenHashes_.get(path.toString())?.compoundHash.posts
-    ).to.deep.equal(compoundHash.posts);
-
-    release();
     await flushAsync();
-    expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
-    expect(repo.bootBuffers_.size).to.equal(0);
-    expect(
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
-    ).to.deep.equal({ a: 1, b: 2 });
+    expect(calls).to.deep.equal(['listen']);
+    // The stamps ride the seeded node itself — that is what the real
+    // SyncTree listen hashFn reads (getNodeCanonicalHash /
+    // getNodeCompoundHash): simple hash '' plus the compound hash of
+    // exactly the restored tree, derived at boot, never stored.
+    const cache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
+    expect(cache).to.not.equal(null);
+    expect(getNodeCanonicalHash(cache!)).to.equal('');
+    expect(getNodeCompoundHash(cache!)).to.deep.equal(
+      computeCompoundHash(json)
+    );
   });
 
-  it('a stop after manifest send cancels range replay and cold restart', async () => {
+  it('a stop during the sliced hash cancels the listen before it is sent', async () => {
     const { repo, query, path, hashFn, onComplete, calls } =
       makeListenHarness();
-    let release: (value: PersistenceRestoreResult) => void = () => {};
-    const pending = new Promise<PersistenceRestoreResult>(resolve => {
-      release = resolve;
-    });
-    repo.persistence_ = {
-      track: () => {},
-      isPersistentPath: () => true,
-      restoreForListen: (
-        _path: string,
-        onManifest: (h: PersistedSeedHashes) => void
-      ) => {
-        onManifest({
-          hash: '',
-          compoundHash: { hashes: ['h', ''], posts: ['a'] }
-        });
-        return pending;
-      },
-      trackedRootFor: () => null,
-      serverCacheUpdated: () => {},
-      invalidate: () => {},
-      evict: () => {},
-      untrack: () => {}
-    } as unknown as PersistenceManager;
-    repoStartServerListen(repo, query, null, hashFn, onComplete);
-    await Promise.resolve();
-    expect(calls).to.deep.equal(['listen']);
-    repoStopServerListen(repo, query, null);
-    release({ record: null, reason: 'corrupt' });
-    await flushAsync();
-    expect(calls).to.deep.equal(['listen', 'unlisten']);
-    expect(repo.bootBuffers_.size).to.equal(0);
-  });
-
-  it('buffers an early listen ok until the cached base is installed', async () => {
-    const { repo, query, path, hashFn, onComplete, calls, serverCallbacks } =
-      makeListenHarness();
-    const node = nodeFromJSON({ cached: true });
-    const compoundHash = computeCompoundHash(node.val(true));
-    let release: () => void = () => {};
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    repo.persistence_ = {
-      track: () => {},
-      isPersistentPath: () => true,
-      restoreForListen: async (
-        _path: string,
-        onManifest: (h: PersistedSeedHashes) => void
-      ) => {
-        onManifest({ hash: '', compoundHash });
-        await gate;
-        return {
-          record: {
-            node,
-            hash: '',
-            compoundHash,
-            updatedAt: Date.now(),
-            revision: 'r1'
-          }
-        };
-      },
-      trackedRootFor: () => null,
-      serverCacheUpdated: () => {},
-      invalidate: () => {},
-      evict: () => {},
-      untrack: () => {}
-    } as unknown as PersistenceManager;
+    // A tree large enough that compoundHashFromNodeAsync spans macrotasks:
+    // the stop lands between the apply and the hash completion.
+    const json: Record<string, string> = {};
+    for (let i = 0; i < 400; i++) {
+      json['k' + i] = 'x'.repeat(64);
+    }
+    await persistHarnessRoot(repo, path, json);
     const realQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       null as any,
       path,
       new QueryParams(),
@@ -2227,96 +2104,29 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       realQuery,
       stubRegistration()
     );
-
     repoStartServerListen(repo, query, null, hashFn, onComplete);
-    await Promise.resolve();
-    expect(calls).to.deep.equal(['listen']);
-    serverCallbacks[0]('ok');
-    expect(repo.bootBuffers_.get(path.toString())?.length).to.equal(1);
-    expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
-      null
-    );
-
-    release();
+    // Wait only for the restore to resolve and the base to apply, not for
+    // the sliced hash: the base is in SyncTree, the listen not yet sent.
     await flushAsync();
-    expect(
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
-    ).to.deep.equal({ cached: true });
-    expect(
-      repo.listenOutcomes_.get(path.toString())?.outcome?.certified
-    ).to.equal(true);
+    if (calls.length === 0) {
+      repoStopServerListen(repo, query, null);
+      await flushAsync();
+      await flushAsync();
+      // The pending token was cancelled: no listen, hence no unlisten.
+      expect(calls).to.deep.equal([]);
+      expect(repo.pendingSeedRestores_.size).to.equal(0);
+    } else {
+      // The hash completed within the flush turns on this host — then the
+      // normal stop path must balance the sent listen.
+      repoStopServerListen(repo, query, null);
+      expect(calls).to.deep.equal(['listen', 'unlisten']);
+    }
   });
 
-  it('buffers tagged descendant pushes covered by a booting root', async () => {
-    const { repo, query, path, hashFn, onComplete } = makeListenHarness();
-    const node = nodeFromJSON({ cached: true });
-    const compoundHash = computeCompoundHash(node.val(true));
-    let release: () => void = () => {};
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    repo.persistence_ = {
-      track: () => {},
-      isPersistentPath: () => true,
-      restoreForListen: async (
-        _path: string,
-        onManifest: (h: PersistedSeedHashes) => void
-      ) => {
-        onManifest({ hash: '', compoundHash });
-        await gate;
-        return {
-          record: {
-            node,
-            hash: '',
-            compoundHash,
-            updatedAt: Date.now(),
-            revision: 'r1'
-          }
-        };
-      },
-      trackedRootFor: () => null,
-      serverCacheUpdated: () => {},
-      invalidate: () => {},
-      evict: () => {},
-      untrack: () => {}
-    } as unknown as PersistenceManager;
-    repoStartServerListen(repo, query, null, hashFn, onComplete);
-    await Promise.resolve();
-    repoOnDataUpdateForTest(
-      repo,
-      path.toString() + '/child',
-      { x: 1 },
-      false,
-      77
-    );
-    const buffered = repo.bootBuffers_.get(path.toString())!;
-    expect(buffered).to.have.length(1);
-    expect((buffered[0] as { tag: number }).tag).to.equal(77);
-    release();
-    await flushAsync();
-    expect(repo.bootBuffers_.size).to.equal(0);
-  });
-
-  it('buffers server pushes that beat the cached base, then replays them', async () => {
+  it('a server push after the seeded listen lands on the applied base', async () => {
     const { repo, query, path, hashFn, onComplete, calls } =
       makeListenHarness();
     await persistHarnessRoot(repo, path, { a: 1 });
-    // Make the restore hold after the manifest: stub restoreForListen to
-    // fire onManifest immediately and resolve the record only when told.
-    const manager = repo.persistence_!;
-    const realRestore = manager.restoreForListen.bind(manager);
-    let releaseRecord: () => void = () => {};
-    const recordGate = new Promise<void>(resolve => {
-      releaseRecord = resolve;
-    });
-    manager.restoreForListen = (pathString, onManifest) => {
-      // Delegate for the real manifest+record, but delay the resolution.
-      return realRestore(pathString, onManifest).then(async result => {
-        await recordGate;
-        return result;
-      });
-    };
-
     const realQuery = new QueryImpl(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       null as any,
@@ -2329,36 +2139,27 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       realQuery,
       stubRegistration()
     );
-
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
-    // The server answers BEFORE the base applied: a range merge for 'a',
-    // then a normal overwrite under the root. Both must hold.
+    // The base is already applied when the listen is on the wire, so a
+    // push mutates the restored tree directly — nothing buffers, nothing
+    // replays.
     repoOnDataUpdateForTest(repo, path.toString() + '/b', 7, false, null);
-    expect(repo.bootBuffers_.get(path.toString())!.length).to.equal(1);
-    expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
-      null
-    );
-
-    releaseRecord();
-    await flushAsync();
-    // Base applied, buffer drained in order: cached {a:1} + buffered b=7.
-    expect(repo.bootBuffers_.size).to.equal(0);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
     ).to.deep.equal({ a: 1, b: 7 });
   });
 
-  it('a missing range after a seeded listen restarts exactly once cold', async () => {
+  it('a missing segment record attaches exactly one fallback listen', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
     await persistHarnessRoot(repo, path, { a: 1 });
     const manifest = data.get('test-repo|' + path.toString()) as {
-      ranges: Array<{ recordId: string }>;
+      splits: Array<{ segs: Array<{ id: string }> }>;
     };
     data.delete(
-      'test-repo|' + path.toString() + '#range:' + manifest.ranges[0].recordId
+      'test-repo|' + path.toString() + '#seg:' + manifest.splits[0].segs[0].id
     );
     const realQuery = new QueryImpl(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2377,9 +2178,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     await new Promise(resolve => setTimeout(resolve, 0));
     await flushAsync();
-    expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    // The torn cache is detected BEFORE any listen goes out — one listen,
+    // no restart, no wasted round trip.
+    expect(calls).to.deep.equal(['listen']);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
+
 
   it('a validation miss attaches exactly one cold listen', async () => {
     const { repo, query, hashFn, onComplete, calls, hashFns } =

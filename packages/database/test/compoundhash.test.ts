@@ -19,7 +19,6 @@ import { expect } from 'chai';
 
 import {
   collectChangedSubtreePaths,
-  canonicalHashFromNodeAsync,
   CompoundHash,
   compoundHashFromNode,
   compoundHashFromNodeAsync,
@@ -213,15 +212,6 @@ describe('CompoundHash', () => {
       expect(asyncHash.hashes).to.deep.equal(syncHash.hashes);
       expect(asyncHash.posts).to.deep.equal(syncHash.posts);
     }
-  });
-
-  it('non-retaining canonical hash ignores lazy hash state', async () => {
-    const json = { a: 1, b: { c: 'x', '.priority': 2 } };
-    const node = nodeFromJSON(json);
-    node.stampLazyHash('deliberately-wrong');
-    expect(await canonicalHashFromNodeAsync(node, 1)).to.equal(
-      nodeFromJSON(json).hash()
-    );
   });
 
   it('collapses a broad changed subtree instead of dirtying the whole root', () => {
