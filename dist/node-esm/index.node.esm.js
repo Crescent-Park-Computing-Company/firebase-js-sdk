@@ -5636,7 +5636,19 @@ class PersistenceManager {
         const paths = [...this.writesDeferredUntilRestores_];
         this.writesDeferredUntilRestores_.clear();
         for (const pathString of paths) {
-            this.scheduleFlush_(pathString);
+            // The deferral must not bypass the write window: draining the restore
+            // wave IS the cold-boot moment (LCP, initial render). Re-arm the same
+            // non-restarting window a direct write-through would have entered.
+            this.armWriteWindow_(pathString);
+        }
+    }
+    /** Arms the non-restarting single-flight write window for a root. */
+    armWriteWindow_(pathString) {
+        if (!this.writeTimers_.has(pathString)) {
+            this.writeTimers_.set(pathString, setTimeout(() => {
+                this.writeTimers_.delete(pathString);
+                this.scheduleFlush_(pathString);
+            }, this.writeDelayMs_));
         }
     }
     serverCacheUpdated(path, node) {
@@ -5671,12 +5683,7 @@ class PersistenceManager {
         // window. Cache creation is an optional accelerator and must not compete
         // with the cold page's initial render/LCP. The flush reads
         // latest_ when it runs, so it always writes the newest tree.
-        if (!this.writeTimers_.has(pathString)) {
-            this.writeTimers_.set(pathString, setTimeout(() => {
-                this.writeTimers_.delete(pathString);
-                this.scheduleFlush_(pathString);
-            }, this.writeDelayMs_));
-        }
+        this.armWriteWindow_(pathString);
     }
     /**
      * Enqueues a flush unless the root's queue is still working — then one
@@ -5830,11 +5837,40 @@ class PersistenceManager {
                         put.onsuccess = progress;
                         done(true);
                     }
+                    else {
+                        done(false);
+                    }
                 };
             }).then(ok => {
-                if (ok && !this.disposed_) {
-                    this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
+                if (this.disposed_) {
+                    return;
                 }
+                if (ok) {
+                    this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
+                    return;
+                }
+                // The stored generation is gone (another identity's manifest, a
+                // sweep, or manual storage clearing). lastFlush_ no longer describes
+                // storage; left in place, every future identical-node write-through
+                // would skip against it and the root would stay unpersisted for the
+                // whole session. Resync from storage and rebuild once.
+                return this.readRecord_(pathString).then(winner => {
+                    if (this.disposed_) {
+                        return;
+                    }
+                    if (winner !== null) {
+                        this.lastFlush_.set(pathString, {
+                            rootNode: winner.record.node,
+                            revision: winner.record.revision,
+                            ranges: winner.ranges,
+                            storedUpdatedAt: winner.record.updatedAt
+                        });
+                    }
+                    else {
+                        this.lastFlush_.delete(pathString);
+                    }
+                    this.flushPending_.add(pathString);
+                });
             });
         }
         // Identity-diff against the exact generation this tab restored/committed.
@@ -5993,8 +6029,24 @@ class PersistenceManager {
                 currentReq.onsuccess = () => {
                     progress();
                     const current = currentReq.result;
+                    // A first generation may REPLACE a manifest this manager can
+                    // never restore (another identity's scope, or an unknown
+                    // format): treating those as CAS winners would strand the
+                    // adopt-and-retry loser forever — its readRecord_ always
+                    // resolves null against a foreign manifest, so every retry
+                    // re-stages the full tree and conflicts again. Same-scope
+                    // manifests keep strict CAS semantics. Replacement is LIVE
+                    // scope only: a generation staged under a superseded identity
+                    // may still publish into an absent key under its own label
+                    // (reads are scope-checked; see the in-flight relabel test)
+                    // but must never replace the new identity's fresh manifest.
+                    const replaceableForeign = !prev &&
+                        current !== undefined &&
+                        authScope === this.authScope_ &&
+                        (current.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+                            current.authScope !== authScope);
                     if ((prev && (!current || current.revision !== prev.revision)) ||
-                        (!prev && current !== undefined)) {
+                        (!prev && current !== undefined && !replaceableForeign)) {
                         done(false);
                         return;
                     }

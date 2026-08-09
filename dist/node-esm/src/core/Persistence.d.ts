@@ -267,6 +267,8 @@ export declare class PersistenceManager {
      * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     private flushWritesDeferredUntilRestores_;
+    /** Arms the non-restarting single-flight write window for a root. */
+    private armWriteWindow_;
     serverCacheUpdated(path: Path, node: Node): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
