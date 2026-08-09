@@ -949,6 +949,135 @@ describe('PersistenceManager', () => {
     expect(result.record!.node.val()).to.deep.equal({ owner: 'bob' });
   });
 
+  it('flushes from accumulated changed paths without running the identity diff', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('accum/root');
+    const prefix = 'test-repo|/accum/root';
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const base: Record<string, unknown> = {};
+    for (let i = 0; i < 40; i++) {
+      base['child' + i] = { body: 'x'.repeat(40000), v: i };
+    }
+    const baseNode = nodeFromJSON(base);
+    manager.serverCacheUpdated(path, baseNode, [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(manifest.ranges.length).to.be.greaterThan(3);
+
+    // Steady state: the server names the changed subtree; the flush must mark
+    // dirty ranges from that list without ever comparing the two trees.
+    const internals = manager as unknown as {
+      changedSinceFlush_: Map<string, string[][] | null>;
+    };
+    const updated = baseNode.updateChild(
+      new Path('child3/v'),
+      nodeFromJSON(999)
+    );
+    manager.serverCacheUpdated(path, updated, [['child3', 'v']]);
+    expect(internals.changedSinceFlush_.get(path.toString())).to.deep.equal([
+      ['child3', 'v']
+    ]);
+    // Poison the baseline's identity: if flush_ ran collectChangedSubtreePaths
+    // it would compare against THIS node and dirty everything. The accumulated
+    // list must win instead.
+    const lastFlush = (
+      manager as unknown as {
+        lastFlush_: Map<string, { rootNode: unknown }>;
+      }
+    ).lastFlush_.get(path.toString())!;
+    lastFlush.rootNode = nodeFromJSON({ unrelated: true });
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const next = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    const before = new Set(manifest.ranges.map(r => r.recordId));
+    const reused = next.ranges.filter(r => before.has(r.recordId)).length;
+    // Identity-diff against the poisoned baseline would have re-staged every
+    // range; the accumulated path re-stages only the touched one(s).
+    expect(next.ranges.length - reused).to.be.lessThan(3);
+    expect(reused).to.be.greaterThan(manifest.ranges.length - 3);
+    // Consumed: the accumulator reset to empty for the new baseline.
+    expect(internals.changedSinceFlush_.get(path.toString())).to.deep.equal([]);
+  });
+
+  it('an unnamed update falls the flush back to the identity diff', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('accum-fallback/root');
+    const prefix = 'test-repo|/accum-fallback/root';
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const base: Record<string, unknown> = {};
+    for (let i = 0; i < 40; i++) {
+      base['child' + i] = { body: 'x'.repeat(40000), v: i };
+    }
+    const baseNode = nodeFromJSON(base);
+    manager.serverCacheUpdated(path, baseNode, [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = shared.data.get(prefix) as {
+      ranges: Array<{ recordId: string }>;
+    };
+
+    // A range merge (or any caller that cannot name the change) marks the
+    // set imprecise; the identity diff must still find the real change.
+    const updated = baseNode.updateChild(
+      new Path('child7/v'),
+      nodeFromJSON(1000)
+    );
+    manager.serverCacheUpdated(path, updated); // no changedPaths
+    const internals = manager as unknown as {
+      changedSinceFlush_: Map<string, string[][] | null>;
+    };
+    expect(internals.changedSinceFlush_.get(path.toString())).to.equal(null);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const next = shared.data.get(prefix) as {
+      ranges: Array<{ recordId: string }>;
+    };
+    const restored = await restoreForTest(
+      scopedManager('test-repo', shared.factory),
+      path.toString()
+    );
+    expect(
+      (restored!.node.val() as Record<string, { v: number }>)['child7'].v
+    ).to.equal(1000);
+    // Incremental even on the fallback: the diff found one subtree.
+    const before = new Set(manifest.ranges.map(r => r.recordId));
+    const reused = next.ranges.filter(r => before.has(r.recordId)).length;
+    expect(reused).to.be.greaterThan(manifest.ranges.length - 3);
+  });
+
+  it('a named change after an unnamed one stays imprecise until the flush', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('accum-sticky/root');
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const baseNode = nodeFromJSON({ a: 1, b: 2 });
+    manager.serverCacheUpdated(path, baseNode, [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const internals = manager as unknown as {
+      changedSinceFlush_: Map<string, string[][] | null>;
+    };
+    manager.serverCacheUpdated(
+      path,
+      baseNode.updateChild(new Path('a'), nodeFromJSON(10))
+    ); // unnamed
+    manager.serverCacheUpdated(
+      path,
+      baseNode.updateChild(new Path('b'), nodeFromJSON(20)),
+      [['b']]
+    ); // named — must NOT un-poison the set (the 'a' change is unaccounted)
+    expect(internals.changedSinceFlush_.get(path.toString())).to.equal(null);
+  });
+
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const managerA = scopedManager('test-repo', factory);

@@ -265,6 +265,13 @@ interface FlushedState {
 }
 
 /**
+ * Cap on precisely-accumulated changed paths per root between flushes.
+ * Matches collectChangedSubtreePaths' default budget: past it the identity
+ * diff is the cheaper, equally-correct answer.
+ */
+const MAX_ACCUMULATED_CHANGED_PATHS = 512;
+
+/**
  * Counters for observing persistence effectiveness.
  * @internal
  */
@@ -393,6 +400,21 @@ export class PersistenceManager {
    * collide with a tree that arrived after its root was evicted and
    * re-tracked.
    */
+  /**
+   * Changed subtree paths accumulated since the flush baseline
+   * (lastFlush_.rootNode), keyed by root. The server names the exact path of
+   * every ordinary data push, so steady-state flushes can mark dirty ranges
+   * from this list directly instead of re-discovering the same information
+   * with a full-width identity diff of two ~60MB trees (the diff's sorted
+   * child merges were the single largest CPU slice of a flush).
+   *
+   * `null` = imprecise: an update arrived whose changed path is unknown or
+   * at/above the root (range merges, listen completions, foreign rebases) —
+   * the flush falls back to the identity diff, which is exactly today's
+   * behavior. Entries reset to [] whenever lastFlush_ gains a fresh baseline.
+   */
+  private changedSinceFlush_ = new Map<string, string[][] | null>();
+
   private latest_ = new Map<
     string,
     { node: Node; revision: string; authScope: string | null }
@@ -462,6 +484,7 @@ export class PersistenceManager {
     this.writesDeferredUntilRestores_.clear();
     this.latest_.clear();
     this.lastFlush_.clear();
+    this.changedSinceFlush_.clear();
     this.activeReads_.clear();
     this.restoreReasons_.clear();
     this.authScope_ = scope;
@@ -561,6 +584,7 @@ export class PersistenceManager {
     if (this.trackedRootFor(pathString) !== null) {
       this.latest_.delete(pathString);
       this.lastFlush_.delete(pathString);
+      this.changedSinceFlush_.delete(pathString);
       void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
       return;
     }
@@ -572,6 +596,7 @@ export class PersistenceManager {
       if (!this.trackedRoots_.has(pathString)) {
         this.latest_.delete(pathString);
         this.lastFlush_.delete(pathString);
+        this.changedSinceFlush_.delete(pathString);
       }
     };
     void this.flushNow(pathString).then(release, release);
@@ -1494,6 +1519,9 @@ export class PersistenceManager {
             ) {
               return null;
             }
+            // Updates accumulated before this point were named against a
+            // pre-restore chain; the restored record starts a new baseline.
+            this.changedSinceFlush_.set(pathString, null);
             this.lastFlush_.set(pathString, {
               rootNode: result.record.node,
               revision: result.record.revision,
@@ -1603,7 +1631,39 @@ export class PersistenceManager {
     }
   }
 
-  serverCacheUpdated(path: Path, node: Node): void {
+  private accumulateChangedPaths_(
+    pathString: string,
+    changedPaths: string[][] | undefined
+  ): void {
+    if (changedPaths === undefined) {
+      this.changedSinceFlush_.set(pathString, null);
+      return;
+    }
+    const existing = this.changedSinceFlush_.get(pathString);
+    if (existing === null) {
+      return; // already imprecise until the next flush baseline
+    }
+    const list = existing ?? [];
+    for (const changedPath of changedPaths) {
+      if (list.length >= MAX_ACCUMULATED_CHANGED_PATHS) {
+        this.changedSinceFlush_.set(pathString, null);
+        return;
+      }
+      list.push(changedPath);
+    }
+    this.changedSinceFlush_.set(pathString, list);
+  }
+
+  /**
+   * `changedPaths` — the root-relative paths of the subtrees this update
+   * changed, when the caller knows them precisely: an ordinary server data
+   * push names its own path (`[relative]`), a listen certification confirms
+   * already-accounted state (`[]`, nothing new). Omitted/undefined marks the
+   * accumulated change-set imprecise — a range merge, or any update whose
+   * shape the caller cannot name — falling the next flush back to the
+   * identity diff.
+   */
+  serverCacheUpdated(path: Path, node: Node, changedPaths?: string[][]): void {
     if (this.disposed_ || !this.authScopeConfigured_) {
       return;
     }
@@ -1619,6 +1679,7 @@ export class PersistenceManager {
     ) {
       return;
     }
+    this.accumulateChangedPaths_(pathString, changedPaths);
     this.latest_.set(pathString, {
       node,
       revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
@@ -1661,6 +1722,7 @@ export class PersistenceManager {
     const pathString = path.toString();
     this.latest_.delete(pathString);
     this.lastFlush_.delete(pathString);
+    this.changedSinceFlush_.delete(pathString);
     recordPersistenceEvent(pathString, 'invalidate', 'corrupt-or-incompatible');
     void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
   }
@@ -1676,6 +1738,7 @@ export class PersistenceManager {
     this.trackedRoots_.delete(pathString);
     this.latest_.delete(pathString);
     this.lastFlush_.delete(pathString);
+    this.changedSinceFlush_.delete(pathString);
     this.flushPending_.delete(pathString);
     const timer = this.writeTimers_.get(pathString);
     if (timer) {
@@ -1713,6 +1776,7 @@ export class PersistenceManager {
     this.persistentRoots_.clear();
     this.latest_.clear();
     this.lastFlush_.clear();
+    this.changedSinceFlush_.clear();
     void this.db_?.then(db => db?.close());
   }
 
@@ -1823,6 +1887,9 @@ export class PersistenceManager {
           if (this.disposed_) {
             return;
           }
+          // The adopted baseline is another generation's tree; paths named
+          // against our own chain do not describe diffs from it.
+          this.changedSinceFlush_.set(pathString, null);
           if (winner !== null) {
             this.lastFlush_.set(pathString, {
               rootNode: winner.record.node,
@@ -1838,15 +1905,24 @@ export class PersistenceManager {
       });
     }
 
-    // Identity-diff against the exact generation this tab restored/committed.
-    // A mismatch at commit time triggers one full-range retry instead of ever
-    // reusing records from another tab's manifest.
+    // Dirty ranges come from the changed paths the server already named
+    // (accumulateChangedPath_), consumed against the flush baseline; when
+    // the accumulated set is imprecise (null: a range merge, a listen
+    // completion, an unknown-path update, overflow) fall back to the
+    // identity diff of the two trees — the exact pre-accumulator behavior.
+    // Consume-on-read: whatever happens to this flush, the paths below are
+    // relative to the CURRENT baseline only once.
+    const accumulated = this.changedSinceFlush_.get(pathString);
+    this.changedSinceFlush_.set(pathString, []);
     let previousRanges: PersistedRange[] = [];
     let dirty: boolean[] = [];
     let tailDirty = false;
     let changed: string[][] | null = null;
     if (prev && prev.ranges.length > 0) {
-      changed = collectChangedSubtreePaths(prev.rootNode, node);
+      changed =
+        accumulated !== null && accumulated !== undefined
+          ? accumulated
+          : collectChangedSubtreePaths(prev.rootNode, node);
       if (changed !== null) {
         previousRanges = prev.ranges;
         if (changed.length === 0) {
@@ -2121,6 +2197,9 @@ export class PersistenceManager {
               }
             }).then(() =>
               this.readRecord_(pathString).then(winner => {
+                // Same imprecision as the refresh resync: the winner is a
+                // foreign baseline.
+                this.changedSinceFlush_.set(pathString, null);
                 if (winner !== null) {
                   this.lastFlush_.set(pathString, {
                     rootNode: winner.record.node,

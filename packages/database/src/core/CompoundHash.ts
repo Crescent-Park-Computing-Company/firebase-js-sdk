@@ -681,38 +681,38 @@ export function collectChangedSubtreePaths(
       changed.push(path.slice());
       return changed.length > maxPaths;
     }
-    const aKeys: string[] = [];
-    const bKeys: string[] = [];
-    a.forEachChild(KEY_INDEX, key => {
-      aKeys.push(key);
+    // Sorted merge over (key, child) PAIRS captured by the iteration itself.
+    // Re-resolving each common key through getImmediateChild would repeat an
+    // O(log n) nameCompare tree descent per key — measured as the dominant
+    // cost of the whole diff on wide roots — for nodes forEachChild already
+    // visited.
+    const aPairs: Array<[string, Node]> = [];
+    const bPairs: Array<[string, Node]> = [];
+    a.forEachChild(KEY_INDEX, (key, child) => {
+      aPairs.push([key, child]);
     });
-    b.forEachChild(KEY_INDEX, key => {
-      bKeys.push(key);
+    b.forEachChild(KEY_INDEX, (key, child) => {
+      bPairs.push([key, child]);
     });
     let i = 0;
     let j = 0;
-    while (i < aKeys.length || j < bKeys.length) {
+    while (i < aPairs.length || j < bPairs.length) {
       let key: string;
       let cmp: number;
-      if (i >= aKeys.length) {
+      if (i >= aPairs.length) {
         cmp = 1;
-        key = bKeys[j];
-      } else if (j >= bKeys.length) {
+        key = bPairs[j][0];
+      } else if (j >= bPairs.length) {
         cmp = -1;
-        key = aKeys[i];
+        key = aPairs[i][0];
       } else {
-        cmp = nameCompare(aKeys[i], bKeys[j]);
-        key = cmp <= 0 ? aKeys[i] : bKeys[j];
+        cmp = nameCompare(aPairs[i][0], bPairs[j][0]);
+        key = cmp <= 0 ? aPairs[i][0] : bPairs[j][0];
       }
       path.push(key);
       let overBudget = false;
       if (cmp === 0) {
-        overBudget = visit(
-          a.getImmediateChild(key),
-          b.getImmediateChild(key),
-          path,
-          depth + 1
-        );
+        overBudget = visit(aPairs[i][1], bPairs[j][1], path, depth + 1);
         i++;
         j++;
       } else {

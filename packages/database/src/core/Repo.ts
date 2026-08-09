@@ -83,7 +83,8 @@ import {
   Path,
   pathChild,
   pathGetFront,
-  pathPopFront
+  pathPopFront,
+  pathSlice
 } from './util/Path';
 import {
   generateWithValues,
@@ -540,7 +541,8 @@ function repoOnDataUpdate(
   }
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
   if (tag == null) {
-    repoPersistAfterServerUpdate(repo, path);
+    // Overwrite and merge both change only subtrees under `path`.
+    repoPersistAfterServerUpdate(repo, path, 'at-path');
   }
 }
 
@@ -606,7 +608,9 @@ export function repoStartServerListen(
     });
     if (repo.persistence_ !== null) {
       if (status === 'ok') {
-        repoPersistAfterServerUpdate(repo, query._path);
+        // The certification confirms state whose changes (pushes / range
+        // merges before it) were already reported individually.
+        repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
       } else {
         repo.persistence_.evict(query._path);
       }
@@ -930,7 +934,19 @@ export function repoDispose(repo: Repo): void {
  * complete server cache — the exact tree the SDK now holds as server truth —
  * so what is stored is always what was applied, never a re-derivation.
  */
-function repoPersistAfterServerUpdate(repo: Repo, path: Path): void {
+/**
+ * `preciseChange` distinguishes how much the caller knows about what this
+ * update touched, so the flush can mark dirty ranges from the server-named
+ * path instead of re-discovering it with a full identity diff:
+ *   'at-path'   — an ordinary data push changed exactly the subtree at `path`
+ *   'confirmed' — a listen certification: state already accounted, nothing new
+ *   'unknown'   — a range merge or any update whose shape isn't named here
+ */
+function repoPersistAfterServerUpdate(
+  repo: Repo,
+  path: Path,
+  preciseChange: 'at-path' | 'confirmed' | 'unknown'
+): void {
   const persistence = repo.persistence_;
   if (persistence === null) {
     return;
@@ -945,7 +961,13 @@ function repoPersistAfterServerUpdate(repo: Repo, path: Path): void {
     rootPath
   );
   if (serverCache !== null) {
-    persistence.serverCacheUpdated(rootPath, serverCache);
+    let changedPaths: string[][] | undefined;
+    if (preciseChange === 'at-path') {
+      changedPaths = [pathSlice(newRelativePath(rootPath, path))];
+    } else if (preciseChange === 'confirmed') {
+      changedPaths = [];
+    }
+    persistence.serverCacheUpdated(rootPath, serverCache, changedPaths);
   }
 }
 
@@ -1001,7 +1023,9 @@ function repoOnRangeMergeUpdate(
   }
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
   if (tag == null) {
-    repoPersistAfterServerUpdate(repo, path);
+    // A range merge names leaf INTERVALS, not subtrees; the flush falls back
+    // to the identity diff for this baseline.
+    repoPersistAfterServerUpdate(repo, path, 'unknown');
   }
 }
 

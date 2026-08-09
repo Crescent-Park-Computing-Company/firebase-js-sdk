@@ -242,4 +242,74 @@ describe('CompoundHash', () => {
     const changed = collectChangedSubtreePaths(before, after, 8, 4);
     expect(changed).to.deep.equal([['broad']]);
   });
+
+  it('finds randomized adds/removes/edits at their exact paths', () => {
+    // Ground-truth check for the sorted pair-merge: every mutation must be
+    // covered by some reported changed path (a reported path is a PREFIX of
+    // the mutation), and no report may cover an untouched sibling subtree.
+    const rand = (seed => () => {
+      seed |= 0;
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    })(20260809);
+    for (let round = 0; round < 30; round++) {
+      const beforeJson: Record<string, Record<string, unknown>> = {};
+      for (let c = 0; c < 12; c++) {
+        const child: Record<string, unknown> = {};
+        for (let g = 0; g < 6; g++) {
+          child['g' + g] = { v: c * 100 + g };
+        }
+        beforeJson['c' + c] = child;
+      }
+      const before = nodeFromJSON(beforeJson);
+      let after = before;
+      const mutations: string[][] = [];
+      const count = 1 + Math.floor(rand() * 4);
+      for (let m = 0; m < count; m++) {
+        const c = 'c' + Math.floor(rand() * 12);
+        const roll = rand();
+        if (roll < 0.4) {
+          const g = 'g' + Math.floor(rand() * 6);
+          after = after.updateChild(
+            new Path(c + '/' + g + '/v'),
+            nodeFromJSON(round * 1000 + m)
+          );
+          mutations.push([c, g, 'v']);
+        } else if (roll < 0.7) {
+          const added = 'added' + m;
+          after = after.updateChild(
+            new Path(c + '/' + added),
+            nodeFromJSON({ fresh: m })
+          );
+          mutations.push([c, added]);
+        } else {
+          const g = 'g' + Math.floor(rand() * 6);
+          after = after.updateChild(new Path(c + '/' + g), nodeFromJSON(null));
+          mutations.push([c, g]);
+        }
+      }
+      const changed = collectChangedSubtreePaths(before, after)!;
+      expect(changed).to.not.equal(null);
+      const covers = (report: string[], target: string[]) =>
+        report.length <= target.length &&
+        report.every((seg, i) => seg === target[i]);
+      for (const mutation of mutations) {
+        expect(
+          changed.some(report => covers(report, mutation)),
+          `round ${round}: ${mutation.join('/')} uncovered in ${JSON.stringify(
+            changed
+          )}`
+        ).to.equal(true);
+      }
+      const touchedTops = new Set(mutations.map(m => m[0]));
+      for (const report of changed) {
+        expect(
+          touchedTops.has(report[0]),
+          `round ${round}: spurious report ${report.join('/')}`
+        ).to.equal(true);
+      }
+    }
+  });
 });
