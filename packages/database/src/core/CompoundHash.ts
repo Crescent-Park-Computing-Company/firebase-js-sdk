@@ -217,8 +217,25 @@ export class CompoundHashBuilder {
   posts: string[] = [];
   hashes: string[] = [];
 
-  /** null when not currently inside a range. */
-  private currentHash_: string | null = null;
+  /**
+   * When set (by compoundHashFromNodeAsync), endRange_ collects each range's
+   * grammar text here and leaves a placeholder in `hashes` instead of
+   * running the pure-JS sha1 inline. The async driver then digests the
+   * texts with the platform's native SHA-1 (crypto.subtle + TextEncoder),
+   * which profiles an order of magnitude faster than the JS fallback and
+   * allocates nothing on the JS heap. The trailing empty hash is appended
+   * by finishHashing as usual and is never a placeholder.
+   */
+  rangeTexts: string[] | null = null;
+
+  /**
+   * The current range's grammar text, as parts joined once per range:
+   * per-leaf string concatenation builds a rope chain per append, and on a
+   * multi-megabyte tree the rope churn (allocation + flattening) costs more
+   * GC time than the hashing itself. null when not currently inside a range.
+   */
+  private currentParts_: string[] | null = null;
+  private currentLength_ = 0;
   /**
    * Key stack of the node being processed. Kept beyond currentDepth_ so the
    * path of the last processed leaf survives popping back out of its parent.
@@ -229,17 +246,21 @@ export class CompoundHashBuilder {
   private needsComma_ = true;
 
   private readonly splitState_: CompoundHashSplitState = {
-    hashLength: () =>
-      this.currentHash_ === null ? 0 : this.currentHash_.length,
+    hashLength: () => this.currentLength_,
     currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
   };
 
   constructor(private splitStrategy_: CompoundHashSplitStrategy) {}
 
+  private append_(text: string): void {
+    this.currentParts_!.push(text);
+    this.currentLength_ += text.length;
+  }
+
   processLeaf(node: LeafNode): void {
     this.ensureRange_();
     this.lastLeafDepth_ = this.currentDepth_;
-    this.currentHash_ += leafHashRepresentation(node);
+    this.append_(leafHashRepresentation(node));
     this.needsComma_ = true;
     if (this.splitStrategy_(this.splitState_)) {
       this.endRange_();
@@ -249,9 +270,9 @@ export class CompoundHashBuilder {
   startChild(key: string): void {
     this.ensureRange_();
     if (this.needsComma_) {
-      this.currentHash_ += ',';
+      this.append_(',');
     }
-    this.currentHash_ += hashQuotedString(key) + ':(';
+    this.append_(hashQuotedString(key) + ':(');
     if (this.currentDepth_ === this.currentPath_.length) {
       this.currentPath_.push(key);
     } else {
@@ -263,15 +284,15 @@ export class CompoundHashBuilder {
 
   endChild(): void {
     this.currentDepth_--;
-    if (this.currentHash_ !== null) {
+    if (this.currentParts_ !== null) {
       // Add closing parenthesis for the child that was just processed.
-      this.currentHash_ += ')';
+      this.append_(')');
     }
     this.needsComma_ = true;
   }
 
   finishHashing(): void {
-    if (this.currentHash_ !== null) {
+    if (this.currentParts_ !== null) {
       this.endRange_();
     }
     // Always close with the empty hash for the tail range to allow simple
@@ -280,26 +301,34 @@ export class CompoundHashBuilder {
   }
 
   private ensureRange_(): void {
-    if (this.currentHash_ === null) {
+    if (this.currentParts_ === null) {
+      this.currentParts_ = [];
+      this.currentLength_ = 0;
       let hash = '(';
       for (let i = 0; i < this.currentDepth_; i++) {
         hash += hashQuotedString(this.currentPath_[i]) + ':(';
       }
-      this.currentHash_ = hash;
+      this.append_(hash);
       this.needsComma_ = false;
     }
   }
 
   private endRange_(): void {
-    let hash = this.currentHash_!;
     for (let i = 0; i < this.currentDepth_; i++) {
-      hash += ')';
+      this.append_(')');
     }
-    hash += ')';
-    this.hashes.push(sha1(hash));
+    this.append_(')');
+    const hash = this.currentParts_!.join('');
+    if (this.rangeTexts !== null) {
+      this.rangeTexts.push(hash);
+      this.hashes.push('');
+    } else {
+      this.hashes.push(sha1(hash));
+    }
     const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
     this.posts.push(post === '' ? '/' : post);
-    this.currentHash_ = null;
+    this.currentParts_ = null;
+    this.currentLength_ = 0;
     this.needsComma_ = true;
   }
 }
@@ -512,21 +541,82 @@ export function compoundHashFromNodeAsync(
   }
   const strategy = splitStrategy || simpleSizeSplitStrategy(node);
   const builder = new CompoundHashBuilder(strategy);
+  const subtle =
+    typeof crypto !== 'undefined' && crypto.subtle ? crypto.subtle : null;
+  if (subtle !== null) {
+    // Defer range hashing to the platform's native SHA-1: the pure-JS
+    // fallback (stringToByteArray + compress_) profiles as two thirds of
+    // the whole hash cost on a large tree AND churns the GC; TextEncoder +
+    // crypto.subtle do the same work natively off the JS heap.
+    builder.rangeTexts = [];
+  }
   const walker = new CompoundHashWalker(node, builder);
+  const encoder = subtle !== null ? new TextEncoder() : null;
+  const pendingDigests: Array<Promise<void>> = [];
+  let digested = 0;
+  // Digest ranges AS THE WALK PRODUCES THEM: the native hash runs off-thread
+  // while the walk continues, and each range's (potentially large) grammar
+  // text is released right after encoding instead of accumulating until the
+  // end of the traversal.
+  const drainTexts = (): void => {
+    const texts = builder.rangeTexts!;
+    while (digested < texts.length) {
+      const index = digested++;
+      const text = texts[index];
+      texts[index] = '';
+      pendingDigests.push(
+        digestRangeText(subtle!, encoder!, text).then(hash => {
+          builder.hashes[index] = hash;
+        })
+      );
+    }
+  };
   return new Promise((resolve, reject) => {
     const step = (): void => {
       try {
         if (!walker.drainUntil(Date.now() + sliceMs)) {
+          if (builder.rangeTexts !== null) {
+            drainTexts();
+          }
           onProgress();
           scheduleSlice(step);
           return;
         }
         builder.finishHashing();
-        resolve(new CompoundHash(builder.posts, builder.hashes));
+        if (builder.rangeTexts === null) {
+          resolve(new CompoundHash(builder.posts, builder.hashes));
+          return;
+        }
+        drainTexts();
+        resolve(
+          Promise.all(pendingDigests).then(
+            () => new CompoundHash(builder.posts, builder.hashes)
+          )
+        );
       } catch (e) {
         reject(e);
       }
     };
     step();
+  });
+}
+
+/**
+ * base64(sha1(text)) via WebCrypto. Identical output to util.sha1 (locked
+ * in by the async-matches-sync test).
+ */
+function digestRangeText(
+  subtle: SubtleCrypto,
+  encoder: TextEncoder,
+  text: string
+): Promise<string> {
+  return subtle.digest('SHA-1', encoder.encode(text)).then(buffer => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    // btoa is universal in browsers; Node ≥16 has it global too.
+    return btoa(binary);
   });
 }
