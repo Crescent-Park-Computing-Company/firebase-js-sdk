@@ -63,23 +63,6 @@ interface Transaction {
 interface PendingSeedRestore {
     cancelled: boolean;
 }
-/** One server operation held during a manifest-first boot window. */
-type BootBufferedOp = {
-    kind: 'data';
-    pathString: string;
-    data: unknown;
-    isMerge: boolean;
-    tag: number | null;
-} | {
-    kind: 'rm';
-    pathString: string;
-    ranges: Array<{
-        s?: string;
-        e?: string;
-        m: unknown;
-    }>;
-    tag: number | null;
-};
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 export interface ListenOutcome {
@@ -126,14 +109,6 @@ export declare class Repo {
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
-    /**
-     * Server operations buffered during a manifest-first boot window: the
-     * range listen is on the wire before the cached base has been applied to
-     * SyncTree, so anything the server sends for that root (range merges —
-     * deltas against the base — or full pushes) is held, in arrival order,
-     * until the base applies, then replayed. Keyed by the listened root path.
-     */
-    bootBuffers_: Map<string, BootBufferedOp[]>;
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { SeedCompoundHash } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
 /**
@@ -30,18 +29,24 @@ export declare const PERSISTENCE_MAX_CACHE_BYTES: number;
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
+/**
+ * Serialized-text target for one persisted segment. Boundaries carry over
+ * across generations; only dirty runs reconsult this target.
+ * @internal
+ */
+export declare const PERSISTENCE_SEGMENT_TARGET_BYTES: number;
 /**
  * Maximum gap with NO restore progress before the listen attaches unseeded.
- * Progress (a completed manifest or tree read) resets this budget. The same
- * bound applies to each IndexedDB open/transaction, so a request that fires
- * neither success nor error can never hold the live listen forever.
+ * Progress (a completed read) resets this budget. The same bound applies to
+ * each IndexedDB open/transaction, so a request that fires neither success
+ * nor error can never hold the live listen forever.
  */
 export declare const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the tree record stays put) — so a tree that never
+ * a fresh timestamp (the segment records stay put) — so a tree that never
  * changes but is used daily never ages into the expiry cutoff.
  * @internal
  */
@@ -54,13 +59,20 @@ export declare const PERSISTENCE_REFRESH_AGE_MS: number;
  */
 export declare const PERSISTENCE_SWEEP_DELAY_MS = 15000;
 /**
- * What a restore resolves: the assembled tree, with the stored hashes joined
- * when they describe exactly this tree.
+ * Minimum age (from the timestamp embedded in the id) before the sweep may
+ * reclaim a segment record no manifest references. The guard keeps a sweep
+ * in one tab from deleting records another tab has staged for a generation
+ * whose manifest hasn't committed yet — staging and commit are seconds
+ * apart, never an hour.
+ * @internal
+ */
+export declare const PERSISTENCE_ORPHAN_MIN_AGE_MS: number;
+/**
+ * What a restore resolves: the assembled tree. The caller derives listen
+ * hashes from the node itself (boot-time hashing); storage carries none.
  */
 export interface PersistedRecord {
     node: Node;
-    hash?: string;
-    compoundHash?: SeedCompoundHash;
     updatedAt: number;
     /** The write token of the manifest this record was assembled from. */
     revision: string;
@@ -71,15 +83,6 @@ export interface PersistenceRestoreResult {
     reason?: PersistenceRestoreReason;
 }
 /**
- * The protocol hashes of a committed generation, as handed to
- * restoreForListen's onManifest callback — everything a range listen needs,
- * available long before the tree record has been read.
- */
-export interface PersistedSeedHashes {
-    hash: string;
-    compoundHash: SeedCompoundHash;
-}
-/**
  * Counters for observing persistence effectiveness.
  * @internal
  */
@@ -87,8 +90,8 @@ export declare const persistenceStats: {
     restoredRoots: string[];
     restoreMisses: string[];
     writeThroughs: number;
-    rangesHashed: number;
-    rangesReused: number;
+    segmentsWritten: number;
+    segmentsReused: number;
     evictions: number;
     storageFailures: number;
     events: Array<{
@@ -105,6 +108,7 @@ export declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private writeDelayMs_;
+    private segmentTargetBytes_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -123,18 +127,17 @@ export declare class PersistenceManager {
      */
     private lastFlush_;
     /**
-     * Distinguishes this manager's write tokens from every other tab's and
-     * session's — numeric counters restart at zero on reload, which would let
-     * a new data write pair up with a write token from another manager
-     * instance.
+     * Distinguishes this manager's revisions and record ids from every other
+     * tab's and session's — numeric counters restart at zero on reload.
      */
     private instanceId_;
     private writeCounter_;
+    private segmentCounter_;
     /**
-     * The single-flight coalescing window per root: `timer` is the pending
-     * (non-restarting) window; `rearm` marks a change that landed while the
-     * root's queue was busy flushing — exactly one follow-up window is armed
-     * when the queue drains, however many changes landed meanwhile.
+     * The single-flight coalescing window per root: `writeTimers_` holds the
+     * pending (non-restarting) window; `flushPending_` marks a change that
+     * landed while the root's queue was busy flushing — exactly one follow-up
+     * flush runs when the queue drains, however many changes landed meanwhile.
      */
     private writeTimers_;
     private flushPending_;
@@ -143,7 +146,7 @@ export declare class PersistenceManager {
     /**
      * One physical IndexedDB decode per root. The pre-auth peek and the
      * authenticated listener often overlap; without coalescing they each read
-     * the tree record and rebuilt the same large Node tree concurrently.
+     * the segment records and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
     private restoreReasons_;
@@ -151,11 +154,13 @@ export declare class PersistenceManager {
     private restoreQueue_;
     private writesDeferredUntilRestores_;
     private sweepTimer_;
+    private sweepInFlight_;
     private disposed_;
     private authScope_;
+    private authScopeConfigured_;
     private authGeneration_;
     setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, segmentTargetBytes_?: number);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -179,24 +184,13 @@ export declare class PersistenceManager {
      */
     trackedRootFor(pathString: string): string | null;
     private open_;
-    /**
-     * Test seam: runs the deferred expiry sweep immediately.
-     * @internal
-     */
-    sweepNow(): Promise<void>;
-    /**
-     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
-     * Expiry is decided by each root's manifest: the '#'-suffixed tree record
-     * carries no authority of its own and is dropped exactly when its
-     * manifest is dropped, is missing (an orphan), or belongs to a different
-     * revision. Scoped to this manager's key range and reading keys before
-     * values, where the platform allows, so foreign records are never
-     * materialized. Best-effort: any failure leaves the records for the next
-     * session's sweep.
-     */
-    private sweepExpired_;
     private openAtVersion_;
     private key_;
+    /**
+     * A fresh, never-reused segment record id. The leading base36 wall clock
+     * is what the sweep's orphan age guard reads (see sweepExpired_).
+     */
+    private newSegmentId_;
     /**
      * Runs `body` against the object store in a transaction of the given mode
      * and resolves with what `body` chose to deliver (via its `done` callback)
@@ -207,51 +201,48 @@ export declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's stored state: the manifest in a first short transaction —
-     * validated and surfaced to `onManifest` IMMEDIATELY, so a listen carrying
-     * the stored hashes can be on the wire while the tree record is still
-     * loading — then the tree record, decoded into a Node and joined with the
-     * manifest's hashes. A revision mismatch between the two (an interrupted
-     * or foreign write; single-transaction commits make this near-impossible,
-     * but the check is cheap) resolves null. Expired or format-mismatched
-     * records resolve null and are deleted best-effort.
+     * Coalesced physical read: one manifest+segments decode per root however
+     * many callers (pre-auth peek, authenticated listener) overlap on it.
      */
     private readRecord_;
+    /**
+     * One physical restore. A single readonly transaction reads the manifest
+     * and queues every referenced segment get; each segment's JSON text is
+     * parsed and its children built as results arrive (bounded work per
+     * event-loop turn by IndexedDB's own request cadence), and the split tree
+     * is assembled once the transaction completes.
+     */
     private readRecordOnce_;
     private deleteRecord_;
     private withRestoreSlot_;
     /**
-     * Exact-root optimistic peek. The completed decode is retained briefly so
-     * the authenticated listener can consume the same immutable Node instead of
-     * decoding a large IndexedDB record twice during boot.
+     * Projects an exact-path peek from a covering root that is already restored
+     * or actively restoring in this manager. This never starts a large ancestor
+     * read just to answer a tiny token lookup; it only reuses work the app is
+     * already paying for, preserving the exact-root fast path on direct boots.
+     */
+    private peekFromCoveringRead_;
+    /**
+     * Exact-root optimistic peek. The completed assembly is retained briefly
+     * so the authenticated listener consumes the same immutable Node instead
+     * of reconstructing the root twice during boot.
      */
     peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
-     * Listener restore with an idle (no-progress) bound. `onManifest` fires as
-     * soon as the stored generation's hashes are known — typically
-     * milliseconds — letting the caller send the range listen while the tree
-     * record is still being read and decoded. The callback is suppressed after
-     * a timeout/miss resolution, and never fires once the returned promise has
-     * settled null.
+     * Listener restore with an idle (no-progress) bound. Resolves with the
+     * assembled tree; the caller applies it and derives the listen hashes
+     * from the node itself (see repoStartServerListen).
      */
-    restoreForListen(pathString: string, onManifest?: (hashes: PersistedSeedHashes) => void): Promise<PersistenceRestoreResult>;
+    restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
-     * chunked restores reset the timer after every completed chunk; callers
+     * segment restores reset the timer after every completed request; callers
      * that pass an already-started Promise retain the old total-time bound.
      */
     private raceRestoreTimeout_;
-    /**
-     * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Coalesced per root under the single-flight window (see the
-     * file header): the first change arms a non-restarting timer; later
-     * changes coalesce; a change landing while a flush is in flight re-arms
-     * exactly one follow-up window when the queue drains. A tree the store is
-     * known to already hold — the warm boot's listen-'ok' certifying the
-     * restored tree unchanged — is skipped outright unless its stored
-     * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
-     */
     private flushWritesDeferredUntilRestores_;
+    /** Arms the non-restarting single-flight write window for a root. */
+    private armWriteWindow_;
     serverCacheUpdated(path: Path, node: Node): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
@@ -278,21 +269,34 @@ export declare class PersistenceManager {
     flushNow(pathString: string): Promise<void>;
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
-     * before the next flush or delete for that root starts, which is the
-     * whole storage consistency argument — no cross-operation races to
-     * reason about.
+     * time: a flush's segments and manifest commit before the next flush or
+     * delete for that root starts — no cross-operation races to reason about
+     * WITHIN a tab. (Cross-tab writers are last-writer-wins by design; see
+     * the file header.)
      */
     private enqueue_;
     /**
-     * One generation: identity-diff against the last known stored tree marks
-     * the dirty ranges; only those are re-serialized (between preserved
-     * boundary posts) and re-hashed; clean ranges carry over verbatim, their
-     * bytes never read. The manifest (ranges + hashes) and the tree record
-     * (structured-clone export tree) commit in ONE transaction, so every
-     * committed generation's hashes exactly describe its stored tree — which
-     * is what lets the next boot listen straight off the manifest with zero
-     * hashing.
+     * One generation: identity-diff against the last known stored tree maps
+     * the change set to dirty segments; only those are re-serialized (direct
+     * Node -> JSON text, no export objects) and written under fresh ids in
+     * bounded batches. Clean segment records carry over verbatim and are
+     * never read or cloned. The commit is one small last-writer-wins
+     * transaction: manifest put + retired-id deletes. No hashing anywhere —
+     * the next boot derives listen hashes from whatever tree it assembles.
      */
     private flush_;
+    sweepNow(): Promise<void>;
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) and
+     * reclaims unreferenced segment records. Expiry is decided by each root's
+     * manifest: a '#'-suffixed record carries no authority of its own and is
+     * dropped exactly when its manifest is dropped, is missing, or no longer
+     * references it — except that an unreferenced record younger than
+     * PERSISTENCE_ORPHAN_MIN_AGE_MS is left alone, because another tab may
+     * have staged it for a generation whose manifest hasn't committed yet.
+     * Scoped to this manager's key range and reading keys before values, so
+     * foreign records are never materialized. Best-effort: any failure leaves
+     * the records for the next session's sweep.
+     */
+    private sweepExpired_;
 }

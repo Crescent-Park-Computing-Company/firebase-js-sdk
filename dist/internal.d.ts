@@ -38,24 +38,6 @@ declare interface AuthTokenProvider {
     notifyForInvalidToken(): void;
 }
 
-/** One server operation held during a manifest-first boot window. */
-declare type BootBufferedOp = {
-    kind: 'data';
-    pathString: string;
-    data: unknown;
-    isMerge: boolean;
-    tag: number | null;
-} | {
-    kind: 'rm';
-    pathString: string;
-    ranges: Array<{
-        s?: string;
-        e?: string;
-        m: unknown;
-    }>;
-    tag: number | null;
-};
-
 /**
  * A cache node only stores complete children. Additionally it holds a flag whether the node can be considered fully
  * initialized in the sense that we know at one point in time this represented a valid state of the world, e.g.
@@ -1924,31 +1906,24 @@ declare interface PersistedRecord {
 }
 
 /**
- * The protocol hashes of a committed generation, as handed to
- * restoreForListen's onManifest callback — everything a range listen needs,
- * available long before the tree record has been read.
- */
-declare interface PersistedSeedHashes {
-    hash: string;
-    compoundHash: SeedCompoundHash;
-}
-
-/**
- * Default width of the flush coalescing window (see the write policy in the
- * file header). Configurable per manager (writeDelayMs). The window is
- * non-restarting: a root that churns continuously still flushes every
- * window, and never more often than one in-flight flush allows.
+ * How long after the last server update a root's write-through runs. The
+ * flush re-serializes the chunks the update dirtied, so it is deliberately
+ * coarse.
  * @internal
  */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
 
+/**
+ * One PersistenceManager per Repo. `prefix` namespaces records so multiple
+ * databases/apps sharing the page don't collide. `idbFactory` exists for
+ * tests (Node has no IndexedDB); production uses the global.
+ */
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
     private schemaKnownCurrent_;
     private operationTimeoutMs_;
     private cacheMaxBytes_;
-    private writeDelayMs_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -1956,38 +1931,36 @@ declare class PersistenceManager {
     private trackedRoots_;
     /**
      * Latest server tree per root. Revisions come from a single manager-wide
-     * counter, so no revision is ever reissued — an in-flight flush can never
-     * collide with a tree that arrived after its root was evicted and
-     * re-tracked.
+     * counter, so no revision is ever reissued — an in-flight hash recompute
+     * can never collide with a tree that arrived after its root was evicted
+     * and re-tracked.
      */
     private latest_;
     /**
      * What IndexedDB currently holds per root (see FlushedState) — the basis
-     * for identity-diff dirty marking and no-op flushes.
+     * for skipping clean chunks and no-op flushes.
      */
     private lastFlush_;
     /**
      * Distinguishes this manager's write tokens from every other tab's and
-     * session's — numeric counters restart at zero on reload, which would let
-     * a new data write pair up with a write token from another manager
-     * instance.
+     * session's — numeric counters restart at zero on reload, which let a new
+     * data write pair up with a write token from another manager instance.
      */
     private instanceId_;
     private writeCounter_;
-    /**
-     * The single-flight coalescing window per root: `timer` is the pending
-     * (non-restarting) window; `rearm` marks a change that landed while the
-     * root's queue was busy flushing — exactly one follow-up window is armed
-     * when the queue drains, however many changes landed meanwhile.
-     */
     private writeTimers_;
+    /**
+     * Roots whose throttle fired while their queue was busy: exactly one
+     * flush is re-enqueued when the queue drains, however many intervals
+     * elapsed meanwhile — the queue can never grow faster than it drains.
+     */
     private flushPending_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
     /**
      * One physical IndexedDB decode per root. The pre-auth peek and the
      * authenticated listener often overlap; without coalescing they each read
-     * the tree record and rebuilt the same large Node tree concurrently.
+     * every chunk and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
     private restoreReasons_;
@@ -1999,7 +1972,12 @@ declare class PersistenceManager {
     private authScope_;
     private authGeneration_;
     setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number);
+    /**
+     * A replacement manager for a different key prefix — used when emulator
+     * configuration changes the RepoInfo after persistence was enabled but
+     * before the repo started (no queues or tracked roots exist yet).
+     */
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -2030,13 +2008,13 @@ declare class PersistenceManager {
     sweepNow(): Promise<void>;
     /**
      * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
-     * Expiry is decided by each root's manifest: the '#'-suffixed tree record
-     * carries no authority of its own and is dropped exactly when its
-     * manifest is dropped, is missing (an orphan), or belongs to a different
-     * revision. Scoped to this manager's key range and reading keys before
-     * values, where the platform allows, so foreign records are never
-     * materialized. Best-effort: any failure leaves the records for the next
-     * session's sweep.
+     * Expiry is decided by each root's manifest (or legacy record): the
+     * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
+     * are dropped exactly when their manifest is dropped, is missing (orphans
+     * from an interrupted write), or no longer lists them. Scoped to this
+     * manager's key range and reading keys before values, where the platform
+     * allows, so foreign records are never materialized. Best-effort: any
+     * failure leaves the records for the next session's sweep.
      */
     private sweepExpired_;
     private openAtVersion_;
@@ -2051,18 +2029,30 @@ declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's stored state: the manifest in a first short transaction —
-     * validated and surfaced to `onManifest` IMMEDIATELY, so a listen carrying
-     * the stored hashes can be on the wire while the tree record is still
-     * loading — then the tree record, decoded into a Node and joined with the
-     * manifest's hashes. A revision mismatch between the two (an interrupted
-     * or foreign write; single-transaction commits make this near-impossible,
-     * but the check is cheap) resolves null. Expired or format-mismatched
-     * records resolve null and are deleted best-effort.
+     * Reads a root's stored state in one readonly transaction: the manifest
+     * the manifest first, then — for chunked records — each chunk in
+     * sequence, folded into the assembled tree as it arrives so only one
+     * chunk's parsed JSON is ever held at a time. The hash record joins only
+     * when its revision matches the manifest's; a chunk whose revision doesn't
+     * match the manifest's expectation (an interrupted or foreign write)
+     * resolves null, and the leftovers are deleted best-effort. Expired
+     * records also resolve null (and are deleted best-effort).
      */
     private readRecord_;
     private readRecordOnce_;
+    /**
+     * Deletes everything stored for a root: manifest, legacy hash record, and every
+     * chunk the manifest lists (plus, where the platform provides key ranges,
+     * any orphaned chunk tail beyond it).
+     */
     private deleteRecord_;
+    /**
+     * Restores the persisted record for a root. Resolves null on miss, expiry,
+     * storage failure, or timeout — the caller then attaches unseeded. A hit
+     * also primes the flush-skip state: the store is KNOWN to hold exactly
+     * this tree, so when the server certifies it unchanged (the common warm
+     * boot), the follow-up write-through skips without serializing anything.
+     */
     private withRestoreSlot_;
     /**
      * Exact-root optimistic peek. The completed decode is retained briefly so
@@ -2071,14 +2061,12 @@ declare class PersistenceManager {
      */
     peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
-     * Listener restore with an idle (no-progress) bound. `onManifest` fires as
-     * soon as the stored generation's hashes are known — typically
-     * milliseconds — letting the caller send the range listen while the tree
-     * record is still being read and decoded. The callback is suppressed after
-     * a timeout/miss resolution, and never fires once the returned promise has
-     * settled null.
+     * Listener restore with an idle (no-progress) bound. Healthy chunked reads
+     * can take arbitrarily long in total as long as each chunk advances; a stuck
+     * IndexedDB request returns null so Repo cancels the seeded listen and
+     * restarts once against the live in-memory cache.
      */
-    restoreForListen(pathString: string, onManifest?: (hashes: PersistedSeedHashes) => void): Promise<PersistenceRestoreResult>;
+    restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * chunked restores reset the timer after every completed chunk; callers
@@ -2087,23 +2075,19 @@ declare class PersistenceManager {
     private raceRestoreTimeout_;
     /**
      * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Coalesced per root under the single-flight window (see the
-     * file header): the first change arms a non-restarting timer; later
-     * changes coalesce; a change landing while a flush is in flight re-arms
-     * exactly one follow-up window when the queue drains. A tree the store is
-     * known to already hold — the warm boot's listen-'ok' certifying the
-     * restored tree unchanged — is skipped outright unless its stored
-     * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
+     * root `path`. Throttled per root; hashes recompute afterwards in idle
+     * slices against the same revision. A tree the store is known to already
+     * hold — the warm boot's listen-'ok' certifying the restored tree
+     * unchanged — is skipped outright unless its stored timestamp needs a
+     * refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     private flushWritesDeferredUntilRestores_;
     serverCacheUpdated(path: Path, node: Node_2): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
      * flush is marked pending and enqueued when the queue drains. Without the
-     * mark, a root whose flush takes longer than the window would queue
-     * flushes faster than they complete, unboundedly. This is the
-     * single-flight guarantee: at most one flush in flight per root, effective
-     * cadence max(writeDelayMs, flush duration).
+     * mark, a root whose flush takes longer than the throttle interval would
+     * queue flushes faster than they complete, unboundedly.
      */
     private scheduleFlush_;
     /** Drop an unusable persisted record but keep the live root tracked. */
@@ -2117,7 +2101,7 @@ declare class PersistenceManager {
     evict(path: Path): void;
     dispose(): void;
     /**
-     * Test seam: forces a pending flush window to fire now.
+     * Test seam: forces a pending throttled flush to run now.
      */
     flushNow(pathString: string): Promise<void>;
     /**
@@ -2128,16 +2112,6 @@ declare class PersistenceManager {
      * reason about.
      */
     private enqueue_;
-    /**
-     * One generation: identity-diff against the last known stored tree marks
-     * the dirty ranges; only those are re-serialized (between preserved
-     * boundary posts) and re-hashed; clean ranges carry over verbatim, their
-     * bytes never read. The manifest (ranges + hashes) and the tree record
-     * (structured-clone export tree) commit in ONE transaction, so every
-     * committed generation's hashes exactly describe its stored tree — which
-     * is what lets the next boot listen straight off the manifest with zero
-     * hashing.
-     */
     private flush_;
 }
 
@@ -2601,14 +2575,6 @@ declare class Repo {
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
-    /**
-     * Server operations buffered during a manifest-first boot window: the
-     * range listen is on the wire before the cached base has been applied to
-     * SyncTree, so anything the server sends for that root (range merges —
-     * deltas against the base — or full pushes) is held, in arrival order,
-     * until the base applies, then replayed. Keyed by the listened root path.
-     */
-    bootBuffers_: Map<string, BootBufferedOp[]>;
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters
