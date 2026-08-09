@@ -137,8 +137,15 @@ export declare function collectChangedSubtreePaths(before: Node, after: Node, ma
  */
 export declare function estimateSerializedNodeSize(node: Node): number;
 /**
- * Schedules the next slice of a background computation: idle time where the
- * platform offers it, a macrotask otherwise.
+ * Schedules the next slice of a background computation on the NEXT
+ * MACROTASK. A MessageChannel port message is used where available: it
+ * yields the thread (pending input, paint, and other queued tasks all run
+ * first) with near-zero added latency per slice. requestIdleCallback is
+ * deliberately NOT used — its per-slice idle wait multiplied across the
+ * hundreds of slices of a large tree added tens of seconds of wall clock on
+ * a throttled CPU — and repeated setTimeout(0) chains hit the browser's
+ * nested-timeout clamp (~4ms per slice), so setTimeout is only the
+ * fallback for environments without MessageChannel.
  */
 export declare function scheduleSlice(fn: () => void): void;
 /**
