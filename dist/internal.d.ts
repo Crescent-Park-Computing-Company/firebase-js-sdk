@@ -617,9 +617,9 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
-export declare function _getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -882,16 +882,22 @@ export declare interface ListenOptions {
     readonly onlyOnce?: boolean;
 }
 
-declare interface ListenOutcome {
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export declare interface ListenOutcome {
     mode: ListenOutcomeMode;
     certified: boolean;
     bytes: number;
     reason?: ListenOutcomeReason;
 }
 
-declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** How a persistent default listen started. @public */
+export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 
-declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+/** Why a restore fell back cold. @public */
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 
 declare interface ListenOutcomeState {
     outcome: ListenOutcome | null;
@@ -1739,9 +1745,9 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
  * one exact default listen. The callback is invoked first when the local path
  * choice is known (`certified: false`), then once the server responds.
  *
- * @internal
+ * @public
  */
-export declare function _onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 /**
  * Listens for data changes at a particular location.
@@ -1986,6 +1992,20 @@ declare class PersistenceManager {
      * collide with a tree that arrived after its root was evicted and
      * re-tracked.
      */
+    /**
+     * Changed subtree paths accumulated since the flush baseline
+     * (lastFlush_.rootNode), keyed by root. The server names the exact path of
+     * every ordinary data push, so steady-state flushes can mark dirty ranges
+     * from this list directly instead of re-discovering the same information
+     * with a full-width identity diff of two ~60MB trees (the diff's sorted
+     * child merges were the single largest CPU slice of a flush).
+     *
+     * `null` = imprecise: an update arrived whose changed path is unknown or
+     * at/above the root (range merges, listen completions, foreign rebases) —
+     * the flush falls back to the identity diff, which is exactly today's
+     * behavior. Entries reset to [] whenever lastFlush_ gains a fresh baseline.
+     */
+    private changedSinceFlush_;
     private latest_;
     /**
      * What IndexedDB currently holds per root (see FlushedState) — the basis
@@ -2130,7 +2150,17 @@ declare class PersistenceManager {
     private flushWritesDeferredUntilRestores_;
     /** Arms the non-restarting single-flight write window for a root. */
     private armWriteWindow_;
-    serverCacheUpdated(path: Path, node: Node_2): void;
+    private accumulateChangedPaths_;
+    /**
+     * `changedPaths` — the root-relative paths of the subtrees this update
+     * changed, when the caller knows them precisely: an ordinary server data
+     * push names its own path (`[relative]`), a listen certification confirms
+     * already-accounted state (`[]`, nothing new). Omitted/undefined marks the
+     * accumulated change-set imprecise — a range merge, or any update whose
+     * shape the caller cannot name — falling the next flush back to the
+     * identity diff.
+     */
+    serverCacheUpdated(path: Path, node: Node_2, changedPaths?: string[][]): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
      * flush is marked pending and enqueued when the queue drains. Without the
@@ -2844,8 +2874,11 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-/** Sets the identity scope used to read and write persisted cache records. @internal */
-export declare function _setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
 
 /**
  * Enables client-side persistence of the server cache for this Database
@@ -2858,12 +2891,15 @@ export declare function _setPersistenceAuthScope(db: Database, scope: string | n
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 
-/** Selects an exact default-listen root for persistence. @internal */
-export declare function _setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
+/**
+ * Selects an exact default-listen root for persistence.
+ * @public
+ */
+export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.

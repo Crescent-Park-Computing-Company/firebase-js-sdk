@@ -125,6 +125,20 @@ export declare class PersistenceManager {
      * collide with a tree that arrived after its root was evicted and
      * re-tracked.
      */
+    /**
+     * Changed subtree paths accumulated since the flush baseline
+     * (lastFlush_.rootNode), keyed by root. The server names the exact path of
+     * every ordinary data push, so steady-state flushes can mark dirty ranges
+     * from this list directly instead of re-discovering the same information
+     * with a full-width identity diff of two ~60MB trees (the diff's sorted
+     * child merges were the single largest CPU slice of a flush).
+     *
+     * `null` = imprecise: an update arrived whose changed path is unknown or
+     * at/above the root (range merges, listen completions, foreign rebases) —
+     * the flush falls back to the identity diff, which is exactly today's
+     * behavior. Entries reset to [] whenever lastFlush_ gains a fresh baseline.
+     */
+    private changedSinceFlush_;
     private latest_;
     /**
      * What IndexedDB currently holds per root (see FlushedState) — the basis
@@ -269,7 +283,17 @@ export declare class PersistenceManager {
     private flushWritesDeferredUntilRestores_;
     /** Arms the non-restarting single-flight write window for a root. */
     private armWriteWindow_;
-    serverCacheUpdated(path: Path, node: Node): void;
+    private accumulateChangedPaths_;
+    /**
+     * `changedPaths` — the root-relative paths of the subtrees this update
+     * changed, when the caller knows them precisely: an ordinary server data
+     * push names its own path (`[relative]`), a listen certification confirms
+     * already-accounted state (`[]`, nothing new). Omitted/undefined marks the
+     * accumulated change-set imprecise — a range merge, or any update whose
+     * shape the caller cannot name — falling the next flush back to the
+     * identity diff.
+     */
+    serverCacheUpdated(path: Path, node: Node, changedPaths?: string[][]): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
      * flush is marked pending and enqueued when the queue drains. Without the
