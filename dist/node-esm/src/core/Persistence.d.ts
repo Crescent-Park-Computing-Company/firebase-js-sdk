@@ -76,6 +76,16 @@ export interface PersistedRecord {
     updatedAt: number;
     /** The write token of the manifest this record was assembled from. */
     revision: string;
+    /**
+     * The memoized compound hash of exactly this generation, when a previous
+     * boot computed and stored it (see LISTEN_HASH_KEY_SUFFIX). Present ⇒ the
+     * caller can stamp and send the listen immediately instead of re-walking
+     * the tree.
+     */
+    listenHashes?: {
+        hashes: string[];
+        posts: string[];
+    };
 }
 export type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 export interface PersistenceRestoreResult {
@@ -234,6 +244,18 @@ export declare class PersistenceManager {
      * from the node itself (see repoStartServerListen).
      */
     restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
+    /**
+     * Memoizes the compound hash the boot path just computed for `revision`
+     * of this root, so the NEXT boot of the same generation skips the hash
+     * walk (see LISTEN_HASH_KEY_SUFFIX). Guarded: the memo only lands while
+     * the stored manifest still IS that revision — a flush that committed
+     * meanwhile just drops it (its next boot recomputes once). Fire-and-forget
+     * through the root's queue; never on any latency path.
+     */
+    storeListenHashes(pathString: string, revision: string, hashes: {
+        hashes: string[];
+        posts: string[];
+    }): void;
     /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
      * segment restores reset the timer after every completed request; callers
