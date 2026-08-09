@@ -790,6 +790,165 @@ describe('PersistenceManager', () => {
     }
   });
 
+  it('draining deferred writes re-arms the write window instead of flushing', async () => {
+    const shared = makeFakeIndexedDB();
+    // Real 60ms window: the deferral drain must go back BEHIND it.
+    const manager = new PersistenceManager(
+      'test-repo',
+      shared.factory,
+      true,
+      8000,
+      100 * 1024 * 1024,
+      60
+    );
+    manager.setAuthScope(null);
+    const path = new Path('deferred/root');
+    manager.track(path.toString());
+    const internals = manager as unknown as {
+      activeRestoreCount_: number;
+      flushWritesDeferredUntilRestores_: () => void;
+      queues_: Map<string, Promise<void>>;
+    };
+    internals.activeRestoreCount_ = 1;
+    manager.serverCacheUpdated(path, nodeFromJSON({ fresh: true }));
+    internals.activeRestoreCount_ = 0;
+    internals.flushWritesDeferredUntilRestores_();
+    // The drain is the cold-boot moment: nothing may hit IndexedDB yet.
+    await flushAsync();
+    expect(shared.data.has('test-repo|/deferred/root')).to.equal(false);
+    // After the window fires, the flush lands normally.
+    await new Promise(resolve => setTimeout(resolve, 90));
+    await flushAsync();
+    expect(shared.data.has('test-repo|/deferred/root')).to.equal(true);
+  });
+
+  it('an identical-tree refresh that loses its manifest rebuilds the record', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('refresh-lost/root');
+    const prefix = 'test-repo|/refresh-lost/root';
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const node = nodeFromJSON({ steady: true });
+    manager.serverCacheUpdated(path, node);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    expect(shared.data.has(prefix)).to.equal(true);
+
+    // Storage vanishes underneath (another identity, devtools clear, sweep).
+    for (const key of [...shared.data.keys()]) {
+      if (key.startsWith(prefix)) {
+        shared.data.delete(key);
+      }
+    }
+
+    // Same node, aged past the refresh threshold: the refresh path runs,
+    // finds no manifest, and must NOT leave lastFlush_ describing storage
+    // that no longer exists — that would skip every future write-through.
+    const internals = manager as unknown as {
+      lastFlush_: Map<string, { storedUpdatedAt: number }>;
+    };
+    const state = internals.lastFlush_.get(path.toString())!;
+    state.storedUpdatedAt = Date.now() - 25 * 60 * 60 * 1000;
+    manager.serverCacheUpdated(path, node);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    await flushAsync();
+    const restored = await restoreForTest(
+      scopedManager('test-repo', shared.factory),
+      path.toString()
+    );
+    expect(restored).to.not.equal(null);
+    expect(restored!.node.val()).to.deep.equal({ steady: true });
+  });
+
+  it('a new identity replaces a foreign-scope manifest without livelocking', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('scoped/root');
+    const prefix = 'test-repo|/scoped/root';
+
+    const alice = scopedManager('test-repo', shared.factory);
+    alice.setAuthScope('alice');
+    alice.track(path.toString());
+    alice.serverCacheUpdated(path, nodeFromJSON({ owner: 'alice' }));
+    await alice.flushNow(path.toString());
+    await flushAsync();
+    const aliceManifest = shared.data.get(prefix) as { authScope: string };
+    expect(aliceManifest.authScope).to.equal('alice');
+
+    // Bob signs in on the same browser profile. His first generation finds
+    // alice's manifest at the key. Strict absent-only CAS would conflict;
+    // the adopt-the-winner read then resolves null (auth mismatch, records
+    // are never cross-scope readable) and every coalesced retry re-stages
+    // the full tree and conflicts again — a permanent livelock. A foreign
+    // scope is replaceable instead.
+    const bob = scopedManager('test-repo', shared.factory);
+    bob.setAuthScope('bob');
+    bob.track(path.toString());
+    bob.serverCacheUpdated(path, nodeFromJSON({ owner: 'bob' }));
+    await bob.flushNow(path.toString());
+    await flushAsync();
+    await flushAsync();
+
+    const manifest = shared.data.get(prefix) as {
+      authScope: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(manifest.authScope).to.equal('bob');
+    for (const range of manifest.ranges) {
+      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
+        true
+      );
+    }
+    // No retry left pending: the generation settled cleanly.
+    const internals = bob as unknown as { flushPending_: Set<string> };
+    expect(internals.flushPending_.has(path.toString())).to.equal(false);
+
+    const restoredForBob = scopedManager('test-repo', shared.factory);
+    restoredForBob.setAuthScope('bob');
+    restoredForBob.track(path.toString());
+    const result = await restoredForBob.restoreForListen(path.toString());
+    expect(result.record).to.not.equal(null);
+    expect(result.record!.node.val()).to.deep.equal({ owner: 'bob' });
+  });
+
+  it('an identity change mid-staging converges to the new scope', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('switch/root');
+    const prefix = 'test-repo|/switch/root';
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.setAuthScope('alice');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ owner: 'alice' }));
+    // The scope flips while alice's generation is mid-flight; bob's own
+    // write-through queues behind it on the same root.
+    const flushing = manager.flushNow(path.toString());
+    manager.setAuthScope('bob');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ owner: 'bob' }));
+    await flushing;
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    await flushAsync();
+    // Alice's stale generation may have published into the empty key under
+    // her own label, but bob's generation must end up authoritative — and
+    // alice's label must never ride bob's session forward.
+    const manifest = shared.data.get(prefix) as {
+      authScope: string;
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(manifest.authScope).to.equal('bob');
+    for (const range of manifest.ranges) {
+      expect(shared.data.has(prefix + '#range:' + range.recordId)).to.equal(
+        true
+      );
+    }
+    const reader = scopedManager('test-repo', shared.factory);
+    reader.setAuthScope('bob');
+    reader.track(path.toString());
+    const result = await reader.restoreForListen(path.toString());
+    expect(result.record!.node.val()).to.deep.equal({ owner: 'bob' });
+  });
+
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const managerA = scopedManager('test-repo', factory);
