@@ -77,6 +77,9 @@ export function get(query: Query): Promise<DataSnapshot>;
 export function getDatabase(app?: FirebaseApp, url?: string): Database;
 
 // @public
+export function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+
+// @public
 export function goOffline(db: Database): void;
 
 // @public
@@ -101,6 +104,24 @@ export function limitToLast(limit: number): QueryConstraint;
 export interface ListenOptions {
     readonly onlyOnce?: boolean;
 }
+
+// @public
+export interface ListenOutcome {
+    // (undocumented)
+    bytes: number;
+    // (undocumented)
+    certified: boolean;
+    // (undocumented)
+    mode: ListenOutcomeMode;
+    // (undocumented)
+    reason?: ListenOutcomeReason;
+}
+
+// @public
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+
+// @public
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 
 // @public
 export function off(query: Query, eventType?: EventType, callback?: (snapshot: DataSnapshot, previousChildName?: string | null) => unknown): void;
@@ -152,6 +173,9 @@ export class OnDisconnect {
 
 // @public
 export function onDisconnect(ref: DatabaseReference): OnDisconnect;
+
+// @public
+export function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 // @public
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -213,6 +237,15 @@ export function serverTimestamp(): object;
 
 // @public
 export function set(ref: DatabaseReference, value: unknown): Promise<void>;
+
+// @public
+export function setPersistenceAuthScope(db: Database, scope: string | null): void;
+
+// @public
+export function setPersistenceEnabled(db: Database, enabled: boolean): void;
+
+// @public
+export function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 
 // @public
 export function setPriority(ref: DatabaseReference, priority: string | number | null): Promise<void>;
