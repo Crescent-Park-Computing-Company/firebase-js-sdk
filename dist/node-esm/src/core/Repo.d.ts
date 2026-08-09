@@ -63,8 +63,14 @@ interface Transaction {
 interface PendingSeedRestore {
     cancelled: boolean;
 }
+/** How a persistent default listen started. @public */
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** Why a restore fell back cold. @public */
 export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
 export interface ListenOutcome {
     mode: ListenOutcomeMode;
     certified: boolean;

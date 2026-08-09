@@ -316,7 +316,16 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  * @returns The `Database` instance of the provided app.
  */
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
-/* Excluded from this release type: _getPersistedValue */
+/**
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @public
+ */
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
  * Disconnects from the server (all Database operations will be completed
  * offline).
@@ -409,6 +418,20 @@ export declare interface ListenOptions {
     /** Whether to remove the listener after its first invocation. */
     readonly onlyOnce?: boolean;
 }
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export declare interface ListenOutcome {
+    mode: ListenOutcomeMode;
+    certified: boolean;
+    bytes: number;
+    reason?: ListenOutcomeReason;
+}
+/** How a persistent default listen started. @public */
+export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** Why a restore fell back cold. @public */
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 /**
  * Detaches a callback previously attached with the corresponding `on*()` (`onValue`, `onChildAdded`) listener.
  * Note: This is not the recommended way to remove a listener. Instead, please use the returned callback function from
@@ -871,7 +894,14 @@ export declare class OnDisconnect {
  * @param ref - The reference to add OnDisconnect triggers for.
  */
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
-/* Excluded from this release type: _onListenOutcome */
+/**
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
+ *
+ * @public
+ */
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
  * Listens for data changes at a particular location.
  *
@@ -1261,9 +1291,30 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
-/* Excluded from this release type: _setPersistenceAuthScope */
-/* Excluded from this release type: _setPersistenceEnabled */
-/* Excluded from this release type: _setPersistencePath */
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @public
+ */
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
+/**
+ * Selects an exact default-listen root for persistence.
+ * @public
+ */
+export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 /**
  * Sets a priority for the data at this Database location.
  *

@@ -596,9 +596,9 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
-export declare function _getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -861,16 +861,22 @@ export declare interface ListenOptions {
     readonly onlyOnce?: boolean;
 }
 
-declare interface ListenOutcome {
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export declare interface ListenOutcome {
     mode: ListenOutcomeMode;
     certified: boolean;
     bytes: number;
     reason?: ListenOutcomeReason;
 }
 
-declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** How a persistent default listen started. @public */
+export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 
-declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+/** Why a restore fell back cold. @public */
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 
 declare interface ListenOutcomeState {
     outcome: ListenOutcome | null;
@@ -1716,9 +1722,9 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
  * one exact default listen. The callback is invoked first when the local path
  * choice is known (`certified: false`), then once the server responds.
  *
- * @internal
+ * @public
  */
-export declare function _onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 /**
  * Listens for data changes at a particular location.
@@ -1893,37 +1899,43 @@ declare interface PendingSeedRestore {
 }
 
 /**
- * What a restore resolves: the assembled tree, with the stored hashes joined
- * when they describe exactly this tree.
+ * What a restore resolves: the assembled tree. The caller derives listen
+ * hashes from the node itself (boot-time hashing); storage carries none.
  */
 declare interface PersistedRecord {
     node: Node_2;
-    hash?: string;
-    compoundHash?: SeedCompoundHash;
     updatedAt: number;
     /** The write token of the manifest this record was assembled from. */
     revision: string;
+    /**
+     * The memoized compound hash of exactly this generation, when a previous
+     * boot computed and stored it (see LISTEN_HASH_KEY_SUFFIX). Present ⇒ the
+     * caller can stamp and send the listen immediately instead of re-walking
+     * the tree.
+     */
+    listenHashes?: {
+        hashes: string[];
+        posts: string[];
+    };
 }
 
 /**
- * How long after the last server update a root's write-through runs. The
- * flush re-serializes the chunks the update dirtied, so it is deliberately
- * coarse.
+ * Default width of the flush coalescing window (see the write policy in the
+ * file header). Configurable per manager (writeDelayMs). The window is
+ * non-restarting: a root that churns continuously still flushes every
+ * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 10000;
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
-/**
- * One PersistenceManager per Repo. `prefix` namespaces records so multiple
- * databases/apps sharing the page don't collide. `idbFactory` exists for
- * tests (Node has no IndexedDB); production uses the global.
- */
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
     private schemaKnownCurrent_;
     private operationTimeoutMs_;
     private cacheMaxBytes_;
+    private writeDelayMs_;
+    private segmentTargetBytes_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -1931,36 +1943,37 @@ declare class PersistenceManager {
     private trackedRoots_;
     /**
      * Latest server tree per root. Revisions come from a single manager-wide
-     * counter, so no revision is ever reissued — an in-flight hash recompute
-     * can never collide with a tree that arrived after its root was evicted
-     * and re-tracked.
+     * counter, so no revision is ever reissued — an in-flight flush can never
+     * collide with a tree that arrived after its root was evicted and
+     * re-tracked.
      */
     private latest_;
     /**
      * What IndexedDB currently holds per root (see FlushedState) — the basis
-     * for skipping clean chunks and no-op flushes.
+     * for identity-diff dirty marking and no-op flushes.
      */
     private lastFlush_;
     /**
-     * Distinguishes this manager's write tokens from every other tab's and
-     * session's — numeric counters restart at zero on reload, which let a new
-     * data write pair up with a write token from another manager instance.
+     * Distinguishes this manager's revisions and record ids from every other
+     * tab's and session's — numeric counters restart at zero on reload.
      */
     private instanceId_;
     private writeCounter_;
-    private writeTimers_;
+    private segmentCounter_;
     /**
-     * Roots whose throttle fired while their queue was busy: exactly one
-     * flush is re-enqueued when the queue drains, however many intervals
-     * elapsed meanwhile — the queue can never grow faster than it drains.
+     * The single-flight coalescing window per root: `writeTimers_` holds the
+     * pending (non-restarting) window; `flushPending_` marks a change that
+     * landed while the root's queue was busy flushing — exactly one follow-up
+     * flush runs when the queue drains, however many changes landed meanwhile.
      */
+    private writeTimers_;
     private flushPending_;
     /** In-flight storage operations per root (see enqueue_). */
     private queues_;
     /**
      * One physical IndexedDB decode per root. The pre-auth peek and the
      * authenticated listener often overlap; without coalescing they each read
-     * every chunk and rebuilt the same large Node tree concurrently.
+     * the segment records and rebuilt the same large Node tree concurrently.
      */
     private activeReads_;
     private restoreReasons_;
@@ -1968,16 +1981,13 @@ declare class PersistenceManager {
     private restoreQueue_;
     private writesDeferredUntilRestores_;
     private sweepTimer_;
+    private sweepInFlight_;
     private disposed_;
     private authScope_;
+    private authScopeConfigured_;
     private authGeneration_;
     setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number);
-    /**
-     * A replacement manager for a different key prefix — used when emulator
-     * configuration changes the RepoInfo after persistence was enabled but
-     * before the repo started (no queues or tracked roots exist yet).
-     */
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, segmentTargetBytes_?: number);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -2001,24 +2011,13 @@ declare class PersistenceManager {
      */
     trackedRootFor(pathString: string): string | null;
     private open_;
-    /**
-     * Test seam: runs the deferred expiry sweep immediately.
-     * @internal
-     */
-    sweepNow(): Promise<void>;
-    /**
-     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
-     * Expiry is decided by each root's manifest (or legacy record): the
-     * '#'-suffixed chunk and legacy-hash records carry no authority of their own and
-     * are dropped exactly when their manifest is dropped, is missing (orphans
-     * from an interrupted write), or no longer lists them. Scoped to this
-     * manager's key range and reading keys before values, where the platform
-     * allows, so foreign records are never materialized. Best-effort: any
-     * failure leaves the records for the next session's sweep.
-     */
-    private sweepExpired_;
     private openAtVersion_;
     private key_;
+    /**
+     * A fresh, never-reused segment record id. The leading base36 wall clock
+     * is what the sweep's orphan age guard reads (see sweepExpired_).
+     */
+    private newSegmentId_;
     /**
      * Runs `body` against the object store in a transaction of the given mode
      * and resolves with what `body` chose to deliver (via its `done` callback)
@@ -2029,65 +2028,68 @@ declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's stored state in one readonly transaction: the manifest
-     * the manifest first, then — for chunked records — each chunk in
-     * sequence, folded into the assembled tree as it arrives so only one
-     * chunk's parsed JSON is ever held at a time. The hash record joins only
-     * when its revision matches the manifest's; a chunk whose revision doesn't
-     * match the manifest's expectation (an interrupted or foreign write)
-     * resolves null, and the leftovers are deleted best-effort. Expired
-     * records also resolve null (and are deleted best-effort).
+     * Coalesced physical read: one manifest+segments decode per root however
+     * many callers (pre-auth peek, authenticated listener) overlap on it.
      */
     private readRecord_;
+    /**
+     * One physical restore. A single readonly transaction reads the manifest
+     * and queues every referenced segment get; each segment's JSON text is
+     * parsed and its children built as results arrive (bounded work per
+     * event-loop turn by IndexedDB's own request cadence), and the split tree
+     * is assembled once the transaction completes.
+     */
     private readRecordOnce_;
-    /**
-     * Deletes everything stored for a root: manifest, legacy hash record, and every
-     * chunk the manifest lists (plus, where the platform provides key ranges,
-     * any orphaned chunk tail beyond it).
-     */
     private deleteRecord_;
-    /**
-     * Restores the persisted record for a root. Resolves null on miss, expiry,
-     * storage failure, or timeout — the caller then attaches unseeded. A hit
-     * also primes the flush-skip state: the store is KNOWN to hold exactly
-     * this tree, so when the server certifies it unchanged (the common warm
-     * boot), the follow-up write-through skips without serializing anything.
-     */
     private withRestoreSlot_;
     /**
-     * Exact-root optimistic peek. The completed decode is retained briefly so
-     * the authenticated listener can consume the same immutable Node instead of
-     * decoding a large IndexedDB record twice during boot.
+     * Projects an exact-path peek from a covering root that is already restored
+     * or actively restoring in this manager. This never starts a large ancestor
+     * read just to answer a tiny token lookup; it only reuses work the app is
+     * already paying for, preserving the exact-root fast path on direct boots.
+     */
+    private peekFromCoveringRead_;
+    /**
+     * Exact-root optimistic peek. The completed assembly is retained briefly
+     * so the authenticated listener consumes the same immutable Node instead
+     * of reconstructing the root twice during boot.
      */
     peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
-     * Listener restore with an idle (no-progress) bound. Healthy chunked reads
-     * can take arbitrarily long in total as long as each chunk advances; a stuck
-     * IndexedDB request returns null so Repo cancels the seeded listen and
-     * restarts once against the live in-memory cache.
+     * Listener restore with an idle (no-progress) bound. Resolves with the
+     * assembled tree; the caller applies it and derives the listen hashes
+     * from the node itself (see repoStartServerListen).
      */
     restoreForListen(pathString: string): Promise<PersistenceRestoreResult>;
     /**
+     * Memoizes the compound hash the boot path just computed for `revision`
+     * of this root, so the NEXT boot of the same generation skips the hash
+     * walk (see LISTEN_HASH_KEY_SUFFIX). Guarded: the memo only lands while
+     * the stored manifest still IS that revision — a flush that committed
+     * meanwhile just drops it (its next boot recomputes once). Fire-and-forget
+     * through the root's queue; never on any latency path.
+     */
+    storeListenHashes(pathString: string, revision: string, hashes: {
+        hashes: string[];
+        posts: string[];
+    }): void;
+    /**
      * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
-     * chunked restores reset the timer after every completed chunk; callers
+     * segment restores reset the timer after every completed request; callers
      * that pass an already-started Promise retain the old total-time bound.
      */
     private raceRestoreTimeout_;
-    /**
-     * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Throttled per root; hashes recompute afterwards in idle
-     * slices against the same revision. A tree the store is known to already
-     * hold — the warm boot's listen-'ok' certifying the restored tree
-     * unchanged — is skipped outright unless its stored timestamp needs a
-     * refresh (see PERSISTENCE_REFRESH_AGE_MS).
-     */
     private flushWritesDeferredUntilRestores_;
+    /** Arms the non-restarting single-flight write window for a root. */
+    private armWriteWindow_;
     serverCacheUpdated(path: Path, node: Node_2): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
      * flush is marked pending and enqueued when the queue drains. Without the
-     * mark, a root whose flush takes longer than the throttle interval would
-     * queue flushes faster than they complete, unboundedly.
+     * mark, a root whose flush takes longer than the window would queue
+     * flushes faster than they complete, unboundedly. This is the
+     * single-flight guarantee: at most one flush in flight per root, effective
+     * cadence max(writeDelayMs, flush duration).
      */
     private scheduleFlush_;
     /** Drop an unusable persisted record but keep the live root tracked. */
@@ -2101,18 +2103,41 @@ declare class PersistenceManager {
     evict(path: Path): void;
     dispose(): void;
     /**
-     * Test seam: forces a pending throttled flush to run now.
+     * Test seam: forces a pending flush window to fire now.
      */
     flushNow(pathString: string): Promise<void>;
     /**
      * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
-     * before the next flush or delete for that root starts, which is the
-     * whole storage consistency argument — no cross-operation races to
-     * reason about.
+     * time: a flush's segments and manifest commit before the next flush or
+     * delete for that root starts — no cross-operation races to reason about
+     * WITHIN a tab. (Cross-tab writers are last-writer-wins by design; see
+     * the file header.)
      */
     private enqueue_;
+    /**
+     * One generation: identity-diff against the last known stored tree maps
+     * the change set to dirty segments; only those are re-serialized (direct
+     * Node -> JSON text, no export objects) and written under fresh ids in
+     * bounded batches. Clean segment records carry over verbatim and are
+     * never read or cloned. The commit is one small last-writer-wins
+     * transaction: manifest put + retired-id deletes. No hashing anywhere —
+     * the next boot derives listen hashes from whatever tree it assembles.
+     */
     private flush_;
+    sweepNow(): Promise<void>;
+    /**
+     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS) and
+     * reclaims unreferenced segment records. Expiry is decided by each root's
+     * manifest: a '#'-suffixed record carries no authority of its own and is
+     * dropped exactly when its manifest is dropped, is missing, or no longer
+     * references it — except that an unreferenced record younger than
+     * PERSISTENCE_ORPHAN_MIN_AGE_MS is left alone, because another tab may
+     * have staged it for a generation whose manifest hasn't committed yet.
+     * Scoped to this manager's key range and reading keys before values, so
+     * foreign records are never materialized. Best-effort: any failure leaves
+     * the records for the next session's sweep.
+     */
+    private sweepExpired_;
 }
 
 declare type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
@@ -2773,8 +2798,11 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-/** Sets the identity scope used to read and write persisted cache records. @internal */
-export declare function _setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
 
 /**
  * Enables client-side persistence of the server cache for this Database
@@ -2787,12 +2815,15 @@ export declare function _setPersistenceAuthScope(db: Database, scope: string | n
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 
-/** Selects an exact default-listen root for persistence. @internal */
-export declare function _setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
+/**
+ * Selects an exact default-listen root for persistence.
+ * @public
+ */
+export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.

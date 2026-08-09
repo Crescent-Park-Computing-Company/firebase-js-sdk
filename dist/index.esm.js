@@ -17083,7 +17083,7 @@ function goOffline(db) {
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
 function getPersistedValue(db, pathString, expectedAuthScope = null) {
     db = getModularInstance(db);
@@ -17122,7 +17122,7 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
 function setPersistenceEnabled(db, enabled) {
     db = getModularInstance(db);
@@ -17146,7 +17146,10 @@ function setPersistenceEnabled(db, enabled) {
         }
     }
 }
-/** Sets the identity scope used to read and write persisted cache records. @internal */
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
 function setPersistenceAuthScope(db, scope) {
     db = getModularInstance(db);
     db._checkNotDeleted('setPersistenceAuthScope');
@@ -17155,7 +17158,10 @@ function setPersistenceAuthScope(db, scope) {
         repoCancelPendingSeedRestores(repo);
     }
 }
-/** Selects an exact default-listen root for persistence. @internal */
+/**
+ * Selects an exact default-listen root for persistence.
+ * @public
+ */
 function setPersistencePath(db, pathString, enabled) {
     db = getModularInstance(db);
     db._checkNotDeleted('setPersistencePath');
@@ -17167,7 +17173,7 @@ function setPersistencePath(db, pathString, enabled) {
  * one exact default listen. The callback is invoked first when the local path
  * choice is known (`certified: false`), then once the server responds.
  *
- * @internal
+ * @public
  */
 function onListenOutcome(db, pathString, callback) {
     db = getModularInstance(db);
@@ -17464,5 +17470,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
  */
 registerDatabase();
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, getPersistedValue as _getPersistedValue, _initStandalone, onListenOutcome as _onListenOutcome, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setPersistenceAuthScope as _setPersistenceAuthScope, setPersistenceEnabled as _setPersistenceEnabled, setPersistencePath as _setPersistencePath, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, _initStandalone, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, getPersistedValue, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onListenOutcome, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPersistenceAuthScope, setPersistenceEnabled, setPersistencePath, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.esm.js.map

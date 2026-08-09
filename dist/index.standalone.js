@@ -17069,7 +17069,7 @@ function goOffline(db) {
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
 function getPersistedValue(db, pathString, expectedAuthScope = null) {
     db = util.getModularInstance(db);
@@ -17108,7 +17108,7 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
 function setPersistenceEnabled(db, enabled) {
     db = util.getModularInstance(db);
@@ -17132,7 +17132,10 @@ function setPersistenceEnabled(db, enabled) {
         }
     }
 }
-/** Sets the identity scope used to read and write persisted cache records. @internal */
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
 function setPersistenceAuthScope(db, scope) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceAuthScope');
@@ -17141,7 +17144,10 @@ function setPersistenceAuthScope(db, scope) {
         repoCancelPendingSeedRestores(repo);
     }
 }
-/** Selects an exact default-listen root for persistence. @internal */
+/**
+ * Selects an exact default-listen root for persistence.
+ * @public
+ */
 function setPersistencePath(db, pathString, enabled) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistencePath');
@@ -17153,7 +17159,7 @@ function setPersistencePath(db, pathString, enabled) {
  * one exact default listen. The callback is invoked first when the local path
  * choice is known (`certified: false`), then once the server responds.
  *
- * @internal
+ * @public
  */
 function onListenOutcome(db, pathString, callback) {
     db = util.getModularInstance(db);
@@ -17443,13 +17449,8 @@ exports._QueryParams = QueryParams;
 exports._ReferenceImpl = ReferenceImpl;
 exports._TEST_ACCESS_forceRestClient = forceRestClient;
 exports._TEST_ACCESS_hijackHash = hijackHash;
-exports._getPersistedValue = getPersistedValue;
 exports._initStandalone = _initStandalone;
-exports._onListenOutcome = onListenOutcome;
 exports._repoManagerDatabaseFromApp = repoManagerDatabaseFromApp;
-exports._setPersistenceAuthScope = setPersistenceAuthScope;
-exports._setPersistenceEnabled = setPersistenceEnabled;
-exports._setPersistencePath = setPersistencePath;
 exports._setSDKVersion = setSDKVersion;
 exports._validatePathString = validatePathString;
 exports._validateWritablePath = validateWritablePath;
@@ -17462,6 +17463,7 @@ exports.equalTo = equalTo;
 exports.forceLongPolling = forceLongPolling;
 exports.forceWebSockets = forceWebSockets;
 exports.get = get;
+exports.getPersistedValue = getPersistedValue;
 exports.goOffline = goOffline;
 exports.goOnline = goOnline;
 exports.increment = increment;
@@ -17473,6 +17475,7 @@ exports.onChildChanged = onChildChanged;
 exports.onChildMoved = onChildMoved;
 exports.onChildRemoved = onChildRemoved;
 exports.onDisconnect = onDisconnect;
+exports.onListenOutcome = onListenOutcome;
 exports.onValue = onValue;
 exports.orderByChild = orderByChild;
 exports.orderByKey = orderByKey;
@@ -17486,6 +17489,9 @@ exports.remove = remove;
 exports.runTransaction = runTransaction;
 exports.serverTimestamp = serverTimestamp;
 exports.set = set;
+exports.setPersistenceAuthScope = setPersistenceAuthScope;
+exports.setPersistenceEnabled = setPersistenceEnabled;
+exports.setPersistencePath = setPersistencePath;
 exports.setPriority = setPriority;
 exports.setWithPriority = setWithPriority;
 exports.startAfter = startAfter;
