@@ -664,11 +664,20 @@ export function repoStartServerListen(
         finish('fallback', 'corrupt');
         return;
       }
-      // The tree is painted; hash it in slices and send the listen. The
-      // few-hundred-ms hash window overlaps the websocket handshake on a
-      // cold start. A server update cannot arrive before the listen is
-      // sent, so the stamped node is still the listened cache when the
-      // hashes attach (stamps ride the node itself; see ServerCacheSeed).
+      // The tree is painted; attach hashes and send the listen. A memo from
+      // a previous boot of this exact generation (record.listenHashes,
+      // revision-validated inside the restore read) makes that immediate.
+      // Otherwise the compound hash is computed in slices — the window
+      // overlaps the websocket handshake on a cold start — and the result
+      // is memoized so the next boot of this generation skips the walk. A
+      // server update cannot arrive before the listen is sent, so the
+      // stamped node is still the listened cache when the hashes attach
+      // (stamps ride the node itself; see ServerCacheSeed).
+      if (record.listenHashes !== undefined) {
+        stampSeedHashes(record.node, '', record.listenHashes);
+        finish('restored');
+        return;
+      }
       void compoundHashFromNodeAsync(
         record.node,
         simpleSizeSplitStrategy(record.node)
@@ -677,10 +686,16 @@ export function repoStartServerListen(
           if (!isCurrent()) {
             return;
           }
-          stampSeedHashes(record.node, '', {
+          const listenHashes = {
             hashes: compoundHash.hashes,
             posts: compoundHash.posts
-          });
+          };
+          stampSeedHashes(record.node, '', listenHashes);
+          persistence.storeListenHashes(
+            pathString,
+            record.revision,
+            listenHashes
+          );
           finish('restored');
         },
         () => {

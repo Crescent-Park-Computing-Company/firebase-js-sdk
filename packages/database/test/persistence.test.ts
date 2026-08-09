@@ -933,6 +933,112 @@ describe('PersistenceManager', () => {
     expect(keysFor(data, 'test-repo|/warm/root').length).to.equal(before.size);
   });
 
+  it('memoizes listen hashes: the second boot of a generation skips the walk', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const path = new Path('memo/root');
+    const json = { a: 1, b: { c: 2 } };
+    const writer = scopedManager('test-repo', factory);
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON(json));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    // Boot 1: no memo yet — the caller computes and stores it.
+    const boot1 = scopedManager('test-repo', factory);
+    boot1.track(path.toString());
+    const first = (await boot1.restoreForListen(path.toString())).record!;
+    expect(first.listenHashes).to.equal(undefined);
+    const computed = computeCompoundHash(json);
+    boot1.storeListenHashes(path.toString(), first.revision, computed);
+    await flushAsync();
+    expect(data.has('test-repo|/memo/root#chash')).to.equal(true);
+
+    // Boot 2: the memo rides the restore — revision-matched, exact hashes.
+    const boot2 = scopedManager('test-repo', factory);
+    boot2.track(path.toString());
+    const second = (await boot2.restoreForListen(path.toString())).record!;
+    expect(second.listenHashes).to.deep.equal(computed);
+  });
+
+  it('a flushed new generation invalidates the listen-hash memo', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const path = new Path('memo-stale/root');
+    const writer = scopedManager('test-repo', factory);
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ v: 1 }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    const boot1 = scopedManager('test-repo', factory);
+    boot1.track(path.toString());
+    const first = (await boot1.restoreForListen(path.toString())).record!;
+    boot1.storeListenHashes(
+      path.toString(),
+      first.revision,
+      computeCompoundHash({ v: 1 })
+    );
+    await flushAsync();
+
+    // A new generation commits (same writer, new revision).
+    writer.serverCacheUpdated(
+      path,
+      first.node.updateChild(new Path('v'), nodeFromJSON(2))
+    );
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    // The stale memo is ignored — revision mismatch — never served.
+    const boot2 = scopedManager('test-repo', factory);
+    boot2.track(path.toString());
+    const second = (await boot2.restoreForListen(path.toString())).record!;
+    expect(second.node.val()).to.deep.equal({ v: 2 });
+    expect(second.listenHashes).to.equal(undefined);
+    // And storeListenHashes for the RETIRED revision is dropped by its guard.
+    boot2.storeListenHashes(
+      path.toString(),
+      first.revision,
+      computeCompoundHash({ v: 1 })
+    );
+    await flushAsync();
+    const memo = data.get('test-repo|/memo-stale/root#chash') as {
+      revision: string;
+    };
+    expect(memo.revision).to.equal(first.revision); // old memo, inert
+    const third = scopedManager('test-repo', factory);
+    third.track(path.toString());
+    expect(
+      (await third.restoreForListen(path.toString())).record!.listenHashes
+    ).to.equal(undefined);
+  });
+
+  it('the sweep keeps a live root listen-hash memo and drops an expired one', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const expired = Date.now() - 15 * 24 * 60 * 60 * 1000;
+    const liveGen = makeStoredGeneration({ live: true }, { revision: 'ext-9' });
+    installStoredGeneration(data, 'test-repo|/memo-live/root', liveGen);
+    data.set('test-repo|/memo-live/root#chash', {
+      formatVersion: 12,
+      revision: 'ext-9',
+      ...computeCompoundHash({ live: true })
+    });
+    const deadGen = makeStoredGeneration(
+      { dead: true },
+      { revision: 'ext-8', updatedAt: expired }
+    );
+    installStoredGeneration(data, 'test-repo|/memo-dead/root', deadGen);
+    data.set('test-repo|/memo-dead/root#chash', {
+      formatVersion: 12,
+      revision: 'ext-8',
+      ...computeCompoundHash({ dead: true })
+    });
+
+    const manager = scopedManager('test-repo', factory);
+    await manager.sweepNow();
+    await flushAsync();
+    expect(data.has('test-repo|/memo-live/root#chash')).to.equal(true);
+    expect(data.has('test-repo|/memo-dead/root#chash')).to.equal(false);
+  });
+
   it('coalesces an optimistic peek and listener restore onto one decode', async () => {
     const seeded = makeFakeIndexedDB();
     const path = new Path('coalesced/root');
@@ -2006,6 +2112,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       track: () => {},
       isPersistentPath: () => true,
       restoreForListen: () => recordPromise,
+      storeListenHashes: () => {},
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
       invalidate: () => {},

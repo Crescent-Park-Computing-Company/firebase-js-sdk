@@ -242,6 +242,13 @@ export interface PersistedRecord {
   updatedAt: number;
   /** The write token of the manifest this record was assembled from. */
   revision: string;
+  /**
+   * The memoized compound hash of exactly this generation, when a previous
+   * boot computed and stored it (see LISTEN_HASH_KEY_SUFFIX). Present ⇒ the
+   * caller can stamp and send the listen immediately instead of re-walking
+   * the tree.
+   */
+  listenHashes?: { hashes: string[]; posts: string[] };
 }
 
 export type PersistenceRestoreReason =
@@ -337,6 +344,28 @@ function recordPersistenceEvent(
 }
 
 const SEG_KEY_INFIX = '#seg:';
+
+/**
+ * The listen-hash memo sidecar's key suffix (`<prefix>|<path>#chash`). The
+ * compound hash a warm listen sends is a pure function of the stored
+ * generation, so once boot-time hashing has computed it the result is
+ * memoized here keyed by the manifest revision: every later boot of the
+ * SAME generation gets its listen hashes at restore-complete for one extra
+ * get, skipping the sliced hash walk entirely. A revision mismatch (the
+ * tree was flushed since) just recomputes and overwrites — the memo can
+ * never make a listen wrong, only make it early. NOTE this is a memo of
+ * work the boot path does anyway; nothing is hashed at write time.
+ */
+const LISTEN_HASH_KEY_SUFFIX = '#chash';
+
+/** The persisted listen-hash memo (see LISTEN_HASH_KEY_SUFFIX). */
+interface PersistedListenHashes {
+  formatVersion: number;
+  /** The manifest revision the hashes describe. */
+  revision: string;
+  hashes: string[];
+  posts: string[];
+}
 
 /** The joined result of one physical manifest+segments read. */
 interface ReadResult {
@@ -1433,10 +1462,22 @@ export class PersistenceManager {
     }
     let assembly: Assembly | null = null;
     let failed = false;
+    let memoizedHashes: PersistedListenHashes | null = null;
     return this.withStore_<boolean>(
       'readonly',
       false,
       (store, done, progress) => {
+        // The listen-hash memo rides the same transaction (one extra get on
+        // a tiny record). Validated against the manifest revision below.
+        try {
+          const hashReq = store.get(key + LISTEN_HASH_KEY_SUFFIX);
+          hashReq.onsuccess = () => {
+            memoizedHashes =
+              (hashReq.result as PersistedListenHashes | undefined) ?? null;
+          };
+        } catch (e) {
+          // Memo is an accelerator only; its absence changes nothing.
+        }
         const manifestReq = store.get(key);
         manifestReq.onsuccess = () => {
           progress();
@@ -1570,12 +1611,31 @@ export class PersistenceManager {
           void this.deleteRecord_(pathString);
           return null;
         }
+        const record: PersistedRecord = {
+          node,
+          updatedAt: assembly.manifest.updatedAt,
+          revision: assembly.manifest.revision
+        };
+        // A memo from a previous boot of this exact generation hands the
+        // caller its listen hashes with zero recompute. Any mismatch —
+        // stale revision, wrong shape — just means the caller hashes as
+        // usual and overwrites the memo.
+        const memo = memoizedHashes;
+        if (
+          memo !== null &&
+          typeof memo === 'object' &&
+          memo.formatVersion === PERSISTENCE_FORMAT_VERSION &&
+          memo.revision === assembly.manifest.revision &&
+          Array.isArray(memo.hashes) &&
+          Array.isArray(memo.posts) &&
+          memo.hashes.length === memo.posts.length + 1 &&
+          memo.hashes.every(hash => typeof hash === 'string') &&
+          memo.posts.every(post => typeof post === 'string')
+        ) {
+          record.listenHashes = { hashes: memo.hashes, posts: memo.posts };
+        }
         return {
-          record: {
-            node,
-            updatedAt: assembly.manifest.updatedAt,
-            revision: assembly.manifest.revision
-          },
+          record,
           splits: assembly.manifest.splits
         };
       } catch (e) {
@@ -1859,6 +1919,45 @@ export class PersistenceManager {
       );
       return record ? { record } : { record: null, reason };
     });
+  }
+
+  /**
+   * Memoizes the compound hash the boot path just computed for `revision`
+   * of this root, so the NEXT boot of the same generation skips the hash
+   * walk (see LISTEN_HASH_KEY_SUFFIX). Guarded: the memo only lands while
+   * the stored manifest still IS that revision — a flush that committed
+   * meanwhile just drops it (its next boot recomputes once). Fire-and-forget
+   * through the root's queue; never on any latency path.
+   */
+  storeListenHashes(
+    pathString: string,
+    revision: string,
+    hashes: { hashes: string[]; posts: string[] }
+  ): void {
+    if (this.disposed_ || !this.authScopeConfigured_) {
+      return;
+    }
+    const key = this.key_(pathString);
+    void this.enqueue_(pathString, () =>
+      this.withStore_<void>('readwrite', undefined, (store, _done, progress) => {
+        const manifestReq = store.get(key);
+        manifestReq.onsuccess = () => {
+          progress();
+          const manifest = manifestReq.result as PersistedManifest | undefined;
+          if (manifest === undefined || manifest.revision !== revision) {
+            return;
+          }
+          const memo: PersistedListenHashes = {
+            formatVersion: PERSISTENCE_FORMAT_VERSION,
+            revision,
+            hashes: hashes.hashes,
+            posts: hashes.posts
+          };
+          const put = store.put(memo, key + LISTEN_HASH_KEY_SUFFIX);
+          put.onsuccess = progress;
+        };
+      })
+    );
   }
 
   /**
@@ -2457,11 +2556,15 @@ export class PersistenceManager {
           for (const key of suffixedKeys) {
             const base = key.slice(0, key.indexOf('#', prefix.length));
             const decision = decisions.get(base);
-            const referenced =
-              decision !== undefined &&
-              !decision.expired &&
-              decision.liveSegKeys.has(key);
+            const live = decision !== undefined && !decision.expired;
+            const referenced = live && decision.liveSegKeys.has(key);
             if (referenced) {
+              continue;
+            }
+            // A live root's listen-hash memo is implicitly referenced by its
+            // manifest (revision-guarded at read time, so a stale one is
+            // inert); it dies with the root, not with a sweep.
+            if (live && key === base + LISTEN_HASH_KEY_SUFFIX) {
               continue;
             }
             // Unreferenced. A young segment may belong to a generation
