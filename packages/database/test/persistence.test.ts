@@ -1987,7 +1987,9 @@ describe('persistent listener options', () => {
 
   it('selects before subscribe and releases with the returned unsubscribe', () => {
     const { manager, path, query } = makeQueryHarness();
-    const unsubscribe = onValue(query, () => {}, { persistent: true });
+    const unsubscribe = onValue(query, () => {}, undefined, {
+      persistent: true
+    });
     expect(manager.isPersistentPath(path.toString())).to.equal(true);
     unsubscribe();
     expect(manager.isPersistentPath(path.toString())).to.equal(false);

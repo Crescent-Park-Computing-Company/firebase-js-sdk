@@ -836,7 +836,7 @@ An `onChildAdded` event will be triggered once for each initial child at this lo
 <b>Signature:</b>
 
 ```typescript
-export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 ```
 
 #### Parameters
@@ -845,7 +845,7 @@ export declare function onChildAdded(query: Query, callback: (snapshot: DataSnap
 |  --- | --- | --- |
 |  query | [Query](./database.query.md#query_interface) | The query to run. |
 |  callback | (snapshot: [DataSnapshot](./database.datasnapshot.md#datasnapshot_class)<!-- -->, previousChildName: string \| null) =&gt; unknown | A callback that fires when the specified event occurs. The callback will be passed a DataSnapshot and a string containing the key of the previous child, by sort order, or <code>null</code> if it is the first child. |
-|  cancelCallback | (error: Error) =&gt; unknown | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
+|  cancelCallback | ((error: Error) =&gt; unknown) \| undefined | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
 |  options | [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An object that can be used to configure <code>onlyOnce</code>, which then removes the listener after its first invocation. |
 
 <b>Returns:</b>
@@ -921,7 +921,7 @@ An `onChildChanged` event will be triggered when the data stored in a child (or 
 <b>Signature:</b>
 
 ```typescript
-export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 ```
 
 #### Parameters
@@ -930,7 +930,7 @@ export declare function onChildChanged(query: Query, callback: (snapshot: DataSn
 |  --- | --- | --- |
 |  query | [Query](./database.query.md#query_interface) | The query to run. |
 |  callback | (snapshot: [DataSnapshot](./database.datasnapshot.md#datasnapshot_class)<!-- -->, previousChildName: string \| null) =&gt; unknown | A callback that fires when the specified event occurs. The callback will be passed a DataSnapshot and a string containing the key of the previous child, by sort order, or <code>null</code> if it is the first child. |
-|  cancelCallback | (error: Error) =&gt; unknown | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
+|  cancelCallback | ((error: Error) =&gt; unknown) \| undefined | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
 |  options | [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An object that can be used to configure <code>onlyOnce</code>, which then removes the listener after its first invocation. |
 
 <b>Returns:</b>
@@ -1006,7 +1006,7 @@ An `onChildMoved` event will be triggered when a child's sort order changes such
 <b>Signature:</b>
 
 ```typescript
-export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 ```
 
 #### Parameters
@@ -1015,7 +1015,7 @@ export declare function onChildMoved(query: Query, callback: (snapshot: DataSnap
 |  --- | --- | --- |
 |  query | [Query](./database.query.md#query_interface) | The query to run. |
 |  callback | (snapshot: [DataSnapshot](./database.datasnapshot.md#datasnapshot_class)<!-- -->, previousChildName: string \| null) =&gt; unknown | A callback that fires when the specified event occurs. The callback will be passed a DataSnapshot and a string containing the key of the previous child, by sort order, or <code>null</code> if it is the first child. |
-|  cancelCallback | (error: Error) =&gt; unknown | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
+|  cancelCallback | ((error: Error) =&gt; unknown) \| undefined | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
 |  options | [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An object that can be used to configure <code>onlyOnce</code>, which then removes the listener after its first invocation. |
 
 <b>Returns:</b>
@@ -1097,7 +1097,7 @@ An `onChildRemoved` event will be triggered once every time a child is removed. 
 <b>Signature:</b>
 
 ```typescript
-export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 ```
 
 #### Parameters
@@ -1106,7 +1106,7 @@ export declare function onChildRemoved(query: Query, callback: (snapshot: DataSn
 |  --- | --- | --- |
 |  query | [Query](./database.query.md#query_interface) | The query to run. |
 |  callback | (snapshot: [DataSnapshot](./database.datasnapshot.md#datasnapshot_class)<!-- -->) =&gt; unknown | A callback that fires when the specified event occurs. The callback will be passed a DataSnapshot and a string containing the key of the previous child, by sort order, or <code>null</code> if it is the first child. |
-|  cancelCallback | (error: Error) =&gt; unknown | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
+|  cancelCallback | ((error: Error) =&gt; unknown) \| undefined | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
 |  options | [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An object that can be used to configure <code>onlyOnce</code>, which then removes the listener after its first invocation. |
 
 <b>Returns:</b>
@@ -1182,7 +1182,7 @@ An `onValue` event will trigger once with the initial data stored at this locati
 <b>Signature:</b>
 
 ```typescript
-export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 ```
 
 #### Parameters
@@ -1191,7 +1191,7 @@ export declare function onValue(query: Query, callback: (snapshot: DataSnapshot)
 |  --- | --- | --- |
 |  query | [Query](./database.query.md#query_interface) | The query to run. |
 |  callback | (snapshot: [DataSnapshot](./database.datasnapshot.md#datasnapshot_class)<!-- -->) =&gt; unknown | A callback that fires when the specified event occurs. The callback will be passed a DataSnapshot. |
-|  cancelCallback | (error: Error) =&gt; unknown | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
+|  cancelCallback | ((error: Error) =&gt; unknown) \| undefined | An optional callback that will be notified if your event subscription is ever canceled because your client does not have permission to read this data (or it had permission but has now lost it). This callback will be passed an <code>Error</code> object indicating why the failure occurred. |
 |  options | [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An object that can be used to configure <code>onlyOnce</code>, which then removes the listener after its first invocation. |
 
 <b>Returns:</b>

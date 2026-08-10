@@ -137,7 +137,7 @@ export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, pr
 export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -146,7 +146,7 @@ export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, 
 export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -155,7 +155,7 @@ export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, pr
 export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -164,7 +164,7 @@ export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) 
 export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export class OnDisconnect {
@@ -191,7 +191,7 @@ export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unkn
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function orderByChild(path: string): QueryConstraint;

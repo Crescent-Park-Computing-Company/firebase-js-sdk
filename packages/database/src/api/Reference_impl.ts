@@ -1134,7 +1134,7 @@ export function onValue(
 export function onValue(
   query: Query,
   callback: (snapshot: DataSnapshot) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1257,7 +1257,7 @@ export function onChildAdded(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1386,7 +1386,7 @@ export function onChildChanged(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1509,7 +1509,7 @@ export function onChildMoved(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1635,7 +1635,7 @@ export function onChildRemoved(
 export function onChildRemoved(
   query: Query,
   callback: (snapshot: DataSnapshot) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
