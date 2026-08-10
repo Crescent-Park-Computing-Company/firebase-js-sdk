@@ -1078,6 +1078,111 @@ describe('PersistenceManager', () => {
     expect(internals.changedSinceFlush_.get(path.toString())).to.equal(null);
   });
 
+  it('restore decode yields between slices and still assembles correctly', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('sliced/root');
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    // Enough data to span well past one decode slice (8 records/slice):
+    // ~7MB at the 256KiB range target = ~28 ranges = ~3 slices.
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < 60; i++) {
+      wide['child' + String(i).padStart(3, '0')] = {
+        body: 'x'.repeat(120000),
+        v: i
+      };
+    }
+    manager.serverCacheUpdated(path, nodeFromJSON(wide), [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = shared.data.get('test-repo|/sliced/root') as {
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(manifest.ranges.length).to.be.greaterThan(8);
+
+    // Count macrotask turns consumed by the restore: the sliced decode must
+    // yield at least floor(ranges/8) times (setTimeout(0) per slice).
+    let timerTurns = 0;
+    const originalSetTimeout = global.setTimeout;
+    const patched = ((
+      fn: (...a: unknown[]) => void,
+      ms?: number,
+      ...rest: unknown[]
+    ) => {
+      if (ms === 0) {
+        timerTurns++;
+      }
+      return originalSetTimeout(fn, ms, ...rest);
+    }) as typeof setTimeout;
+    global.setTimeout = patched;
+    try {
+      const restored = await restoreForTest(
+        scopedManager('test-repo', shared.factory),
+        path.toString()
+      );
+      expect(restored).to.not.equal(null);
+      expect(
+        Object.keys(restored!.node.val() as Record<string, unknown>).length
+      ).to.equal(60);
+      // The decoder yields before slices 8, 16, ... — exactly
+      // floor((ranges - 1) / 8) times (the timer patch may also see other
+      // 0ms timers, so >= not ===).
+      expect(timerTurns).to.be.at.least(
+        Math.floor((manifest.ranges.length - 1) / 8)
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  it('a dispose during the sliced decode neither corrupts nor deletes the record', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('sliced-dispose/root');
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < 40; i++) {
+      wide['child' + i] = { body: 'x'.repeat(30000), v: i };
+    }
+    manager.serverCacheUpdated(path, nodeFromJSON(wide), [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const keysBefore = [...shared.data.keys()].filter(k =>
+      k.startsWith('test-repo|/sliced-dispose/root')
+    );
+
+    const reader = scopedManager('test-repo', shared.factory);
+    reader.track(path.toString());
+    // Dispose exactly at the first decode-slice yield (the setTimeout(0)
+    // the sliced decoder awaits) — deterministically mid-decode.
+    const originalSetTimeout = global.setTimeout;
+    let fired = false;
+    const patched = ((
+      fn: (...a: unknown[]) => void,
+      ms?: number,
+      ...rest: unknown[]
+    ) => {
+      if (ms === 0 && !fired) {
+        fired = true;
+        reader.dispose();
+      }
+      return originalSetTimeout(fn, ms, ...rest);
+    }) as typeof setTimeout;
+    global.setTimeout = patched;
+    let result;
+    try {
+      result = await reader.restoreForListen(path.toString());
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+    expect(result.record).to.equal(null);
+    await flushAsync();
+    const keysAfter = [...shared.data.keys()].filter(k =>
+      k.startsWith('test-repo|/sliced-dispose/root')
+    );
+    expect(keysAfter.length).to.equal(keysBefore.length);
+  });
+
   it('a restored-then-certified unchanged tree flushes nothing', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const managerA = scopedManager('test-repo', factory);

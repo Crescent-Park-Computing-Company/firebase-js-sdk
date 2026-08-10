@@ -482,6 +482,17 @@ export const INTEGER_32_MAX = 2147483647;
  * If the string contains a 32-bit integer, return it.  Else return null.
  */
 export const tryParseInt = function (str: string): number | null {
+  // Fast reject before the regex: nameCompare calls this for EVERY key pair
+  // in every sorted-map operation, and real-world keys are overwhelmingly
+  // named (non-numeric). A single charCode check skips the regex engine for
+  // any key that cannot possibly be an integer.
+  const first = str.charCodeAt(0);
+  if (
+    (first < 48 /* '0' */ || first > 57) /* '9' */ &&
+    first !== 45 /* '-' */
+  ) {
+    return null;
+  }
   if (INTEGER_REGEXP_.test(str)) {
     const intVal = Number(str);
     if (intVal >= INTEGER_32_MIN && intVal <= INTEGER_32_MAX) {

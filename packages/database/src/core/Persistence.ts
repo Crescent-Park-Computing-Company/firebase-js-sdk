@@ -1141,7 +1141,12 @@ export class PersistenceManager {
     // immutable range records. The manifest callback fires after every range
     // request has been synchronously queued, but before those payloads finish
     // cloning, so the network comparison overlaps the complete local restore.
-    return this.withStore_<ReadResult | null>(
+    // The transaction itself only VALIDATES and collects raw structured
+    // clones; decode runs after it resolves, in yielded slices (below).
+    return this.withStore_<{
+      manifest: PersistedManifest;
+      rawTrees: Array<unknown | null>;
+    } | null>(
       'readonly',
       null,
       (store, done, progress) => {
@@ -1187,11 +1192,22 @@ export class PersistenceManager {
             return;
           }
 
-          let assembled: Node = ChildrenNode.EMPTY_NODE;
+          // The onsuccess callbacks only VALIDATE and collect the raw
+          // structured clones — decoding (nodeFromJSON + merge) is deferred
+          // to a yielded post-transaction loop below. Chrome coalesces
+          // same-transaction request callbacks into one task, so decoding
+          // inline produced multi-hundred-ms long tasks (and held every raw
+          // clone alive until the last record decoded). The deferred loop
+          // bounds task length and releases each clone as it is consumed —
+          // both matter on mobile WebKit, where a long-task + peak-memory
+          // spike at boot is what gets the page killed.
           let failed = false;
           let remaining = manifest.ranges.length;
           let previousPost: string | null = null;
-          manifest.ranges.forEach(range => {
+          const rawTrees: Array<unknown | null> = new Array(
+            manifest.ranges.length
+          ).fill(null);
+          manifest.ranges.forEach((range, index) => {
             const expectedStart = previousPost;
             previousPost = range.post;
             const req = store.get(key + RANGE_KEY_INFIX + range.recordId);
@@ -1210,31 +1226,12 @@ export class PersistenceManager {
                   failed = true;
                   this.restoreReasons_.set(pathString, 'corrupt');
                 } else {
-                  try {
-                    const fragment = nodeFromJSON(record.tree);
-                    assembled = mergePersistedFragment(assembled, fragment);
-                  } catch (e) {
-                    failed = true;
-                    this.restoreReasons_.set(pathString, 'corrupt');
-                  }
+                  rawTrees[index] = record.tree;
                 }
               }
               remaining--;
               if (remaining === 0) {
-                if (failed || assembled.isEmpty()) {
-                  done(null);
-                } else {
-                  done({
-                    record: {
-                      node: assembled,
-                      hash: manifest.hash,
-                      compoundHash: wireCompoundHashFromRanges(manifest.ranges),
-                      updatedAt: manifest.updatedAt,
-                      revision: manifest.revision
-                    },
-                    ranges: manifest.ranges
-                  });
-                }
+                done(failed ? null : { manifest, rawTrees });
               }
             };
           });
@@ -1248,7 +1245,35 @@ export class PersistenceManager {
         };
       },
       onProgress
-    ).then(result => {
+    ).then(async collected => {
+      let result: ReadResult | null = null;
+      if (collected !== null) {
+        const assembled = await this.decodeFragmentsSliced_(
+          collected.rawTrees,
+          onProgress
+        );
+        if (this.disposed_) {
+          // Disposed mid-decode: the record on disk is fine — do not mark it
+          // corrupt (which would delete it below).
+          return null;
+        }
+        if (assembled === null || assembled.isEmpty()) {
+          this.restoreReasons_.set(pathString, 'corrupt');
+        } else {
+          result = {
+            record: {
+              node: assembled,
+              hash: collected.manifest.hash,
+              compoundHash: wireCompoundHashFromRanges(
+                collected.manifest.ranges
+              ),
+              updatedAt: collected.manifest.updatedAt,
+              revision: collected.manifest.revision
+            },
+            ranges: collected.manifest.ranges
+          };
+        }
+      }
       if (result === null) {
         const reason = this.restoreReasons_.get(pathString);
         if (reason === 'corrupt' || reason === 'expired') {
@@ -1259,6 +1284,38 @@ export class PersistenceManager {
       }
       return result;
     });
+  }
+
+  /**
+   * Decodes and merges raw persisted range clones into one Node in yielded
+   * slices. Each slice decodes a few records, then yields a macrotask so the
+   * main thread can paint/GC between slices; consumed entries are nulled so
+   * the structured clones are collectable while later slices run. Returns
+   * null when any fragment fails to decode.
+   */
+  private async decodeFragmentsSliced_(
+    rawTrees: Array<unknown | null>,
+    progress: () => void
+  ): Promise<Node | null> {
+    const SLICE_SIZE = 8;
+    let assembled: Node = ChildrenNode.EMPTY_NODE;
+    for (let i = 0; i < rawTrees.length; i++) {
+      if (i > 0 && i % SLICE_SIZE === 0) {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        if (this.disposed_) {
+          return null;
+        }
+        progress();
+      }
+      const raw = rawTrees[i];
+      rawTrees[i] = null;
+      try {
+        assembled = mergePersistedFragment(assembled, nodeFromJSON(raw));
+      } catch (e) {
+        return null;
+      }
+    }
+    return assembled;
   }
 
   private deleteRecord_(pathString: string): Promise<void> {
