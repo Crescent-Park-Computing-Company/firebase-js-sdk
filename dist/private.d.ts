@@ -1371,7 +1371,7 @@ export declare function onChildAdded(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1460,7 +1460,7 @@ export declare function onChildChanged(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1543,7 +1543,7 @@ export declare function onChildMoved(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1638,7 +1638,7 @@ export declare function onChildRemoved(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * The `onDisconnect` class allows you to write or clear data when your client
@@ -1838,7 +1838,7 @@ export declare function onValue(query: Query, callback: (snapshot: DataSnapshot)
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Creates a new `QueryConstraint` that orders by the specified child key.
