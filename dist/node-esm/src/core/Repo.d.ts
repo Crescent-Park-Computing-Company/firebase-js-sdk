@@ -64,6 +64,15 @@ interface PendingSeedRestore {
     cancelled: boolean;
     authScopeUnsubscribe?: () => void;
     authScopeTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Tears down whatever this pending restore has already put on the wire /
+     * buffered, then re-enters repoStartServerListen for the SAME subscription
+     * without persistence. Installed by repoStartServerListen; called by the
+     * bulk cancel (an account switch) so no live registration is left silent
+     * behind a cancelled token — the restore is moot under the new identity,
+     * but the listen itself must still reach the server.
+     */
+    reattachCold?: () => void;
 }
 /** One server operation held during a manifest-first boot window. */
 type BootBufferedOp = {
@@ -189,7 +198,18 @@ export declare function repoStartServerListen(repo: Repo, query: QueryContext, t
 export declare function repoStopServerListen(repo: Repo, query: QueryContext, tag: number | null): void;
 /** Observe the outcome of one exact default listen. @internal */
 export declare function repoOnListenOutcome(repo: Repo, pathString: string, subscriber: (outcome: ListenOutcome) => void): () => void;
-export declare function repoCancelPendingSeedRestores(repo: Repo): void;
+/**
+ * Activates persistence for a `{ persistent: true }` registration that JOINED
+ * an already-listening default query (repoStartServerListen does not re-run
+ * for it, so nothing else would ever track the root). Tracking is idempotent;
+ * when the live listen has already certified a complete server cache, that
+ * exact tree is seeded through the normal write-through path so the root is
+ * warm on the next boot. A still-loading listen needs nothing here — its own
+ * listen-complete certification write-through covers the root once tracked.
+ * @internal
+ */
+export declare function repoActivatePersistenceForJoinedListen(repo: Repo, path: Path): void;
+export declare function repoCancelPendingSeedRestores(repo: Repo, reattach?: boolean): void;
 export declare function repoClearListenOutcomes(repo: Repo): void;
 export declare function repoNotifyPersistenceAuthScope(repo: Repo): void;
 export declare function repoDispose(repo: Repo): void;

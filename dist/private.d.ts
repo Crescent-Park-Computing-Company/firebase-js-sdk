@@ -210,6 +210,30 @@ export declare function connectDatabaseEmulator(db: Database, host: string, port
 }): void;
 
 /**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+export declare function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
+
+/**
  * Class representing a Firebase Realtime Database.
  */
 export declare class Database implements _FirebaseService {
@@ -1935,6 +1959,15 @@ declare interface PendingSeedRestore {
     cancelled: boolean;
     authScopeUnsubscribe?: () => void;
     authScopeTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Tears down whatever this pending restore has already put on the wire /
+     * buffered, then re-enters repoStartServerListen for the SAME subscription
+     * without persistence. Installed by repoStartServerListen; called by the
+     * bulk cancel (an account switch) so no live registration is left silent
+     * behind a cancelled token — the restore is moot under the new identity,
+     * but the listen itself must still reach the server.
+     */
+    reattachCold?: () => void;
 }
 
 /**

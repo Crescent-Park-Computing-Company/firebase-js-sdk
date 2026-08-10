@@ -21,6 +21,7 @@ export { DataSnapshot, EventType, IteratedDataSnapshot, QueryConstraint, QueryCo
 export { increment, serverTimestamp } from './api/ServerValue';
 export { runTransaction, TransactionOptions, TransactionResult } from './api/Transaction';
 export { getPersistedValue, onListenOutcome, setPersistenceEnabled, setPersistenceAuthScope } from './api/Database';
+export { consumePersistedMaterialization } from './api/Reference_impl';
 export type { ListenOutcome, ListenOutcomeMode, ListenOutcomeReason } from './core/Repo';
 export { setSDKVersion as _setSDKVersion } from './core/version';
 export { PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';

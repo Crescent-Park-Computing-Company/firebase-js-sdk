@@ -2442,12 +2442,13 @@ function getNodeCanonicalHash(node) {
  * of a large workspace alive at the peak of boot.
  *
  * The peek stamps each materialized value here, keyed by its Node instance;
- * `DataSnapshot.val()` consumes a stamp (get + delete) instead of walking
- * the node. Consume-once keeps the official fresh-objects-per-val() contract
- * for every later caller: only the single designed peek→listener handoff
- * ever receives shared objects (which is the point — the optimistic tree and
- * the live tree then share child identity, so downstream memoization sees
- * unchanged branches as unchanged).
+ * a consumer that OPTS IN via consumePersistedMaterialization() (api/
+ * Reference_impl) takes a stamp (get + delete) instead of walking the node.
+ * `DataSnapshot.val()` never consumes a stamp — its fresh-objects contract
+ * is untouched. Consume-once means only the single designed peek→listener
+ * handoff ever receives shared objects (which is the point — the optimistic
+ * tree and the live tree then share child identity, so downstream
+ * memoization sees unchanged branches as unchanged).
  *
  * Correctness is by construction: a Node is immutable, so a stamp can only
  * ever be returned for exactly the data it was computed from. Any server
@@ -5753,6 +5754,20 @@ class PersistenceManager {
             .catch(() => {
             persistenceStats.storageFailures++;
             recordPersistenceEvent(pathString, 'flush-range-stage-error');
+            // The flush consumed the accumulated changed-paths at its start, but
+            // nothing was committed: lastFlush_ still describes the stored
+            // baseline, so the paths this flush was covering must flow into the
+            // next diff or its ranges would be carried forward stale. Merge them
+            // back with whatever accrued since (either side already imprecise
+            // stays imprecise).
+            const since = this.changedSinceFlush_.get(pathString);
+            if (accumulated === null || since === null) {
+                this.changedSinceFlush_.set(pathString, null);
+            }
+            else if (accumulated !== undefined && accumulated.length > 0) {
+                const merged = accumulated.concat(since ?? []);
+                this.changedSinceFlush_.set(pathString, merged.length > MAX_ACCUMULATED_CHANGED_PATHS ? null : merged);
+            }
             // Staged immutable records are non-authoritative and are reclaimed by
             // the next successful full-generation GC or the deferred sweep.
             if (stagedIds.length > 0) {
@@ -14299,6 +14314,12 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         // or, worse, replay another account's record. A bounded timeout preserves
         // the normal live-listen liveness contract if Auth integration wedges.
         const token = { cancelled: false };
+        // Nothing is on the wire while waiting for the identity: a bulk cancel
+        // (account switch) just restarts this subscription as a plain cold
+        // listen so it cannot be stranded silent behind the cancelled token.
+        token.reattachCold = () => {
+            repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs);
+        };
         repo.pendingSeedRestores_.set(pathString, token);
         const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
         const cleanup = () => {
@@ -14334,6 +14355,19 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
     }
     persistence.track(pathString);
     const token = { cancelled: false };
+    // A bulk cancel (account switch) lands in one of two shapes: pre-manifest
+    // (no listen sent yet — just start cold), or manifest-first (a seeded wire
+    // listen is out and its boot buffer is about to be dropped — tear the
+    // seeded listen down first, then start cold). Restore resolution observes
+    // the cancelled token and exits without touching the new listen.
+    token.reattachCold = () => {
+        repo.pendingListenHashes_.clear(pathString);
+        if (repo.bootBuffers_.has(pathString)) {
+            repo.bootBuffers_.delete(pathString);
+            repo.server_.unlisten(query, tag);
+        }
+        repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs);
+    };
     repo.pendingSeedRestores_.set(pathString, token);
     const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
     const finish = (mode, reason) => {
@@ -14513,9 +14547,14 @@ function repoStopServerListen(repo, query, tag) {
 }
 /** Observe the outcome of one exact default listen. @internal */
 function repoOnListenOutcome(repo, pathString, subscriber) {
-    const state = repo.listenOutcomes_.get(pathString);
+    let state = repo.listenOutcomes_.get(pathString);
     if (!state) {
-        return () => { };
+        // Subscribing before the listen starts is the natural ordering for a
+        // caller that wires observability alongside its onValue().
+        // repoStartServerListen preserves the subscriber set from a prior state,
+        // so an empty pre-created state is carried into the real listen.
+        state = { outcome: null, subscribers: new Set() };
+        repo.listenOutcomes_.set(pathString, state);
     }
     state.subscribers.add(subscriber);
     if (state.outcome) {
@@ -14523,12 +14562,49 @@ function repoOnListenOutcome(repo, pathString, subscriber) {
     }
     return () => state.subscribers.delete(subscriber);
 }
-function repoCancelPendingSeedRestores(repo) {
-    repo.pendingListenHashes_.clearAll();
-    for (const pending of repo.pendingSeedRestores_.values()) {
-        repoCancelPendingSeedRestore(pending);
+/**
+ * Activates persistence for a `{ persistent: true }` registration that JOINED
+ * an already-listening default query (repoStartServerListen does not re-run
+ * for it, so nothing else would ever track the root). Tracking is idempotent;
+ * when the live listen has already certified a complete server cache, that
+ * exact tree is seeded through the normal write-through path so the root is
+ * warm on the next boot. A still-loading listen needs nothing here — its own
+ * listen-complete certification write-through covers the root once tracked.
+ * @internal
+ */
+function repoActivatePersistenceForJoinedListen(repo, path) {
+    const persistence = repo.persistence_;
+    const pathString = path.toString();
+    if (persistence === null ||
+        !persistence.isPersistentPath(pathString) ||
+        persistence.trackedRootFor(pathString) === pathString ||
+        repo.pendingSeedRestores_?.has(pathString)) {
+        // No manager, not selected, already tracked by its own start path, or the
+        // start path is still in flight (it will track on resolution).
+        return;
     }
+    persistence.track(pathString);
+    const serverCache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
+    if (serverCache !== null) {
+        persistence.serverCacheUpdated(path, serverCache);
+    }
+}
+function repoCancelPendingSeedRestores(repo, reattach = true) {
+    repo.pendingListenHashes_.clearAll();
+    const pendings = [...repo.pendingSeedRestores_.values()];
     repo.pendingSeedRestores_.clear();
+    for (const pending of pendings) {
+        repoCancelPendingSeedRestore(pending);
+        if (reattach) {
+            // The subscription outlives the cancelled restore (account switch,
+            // persistence disabled): a pre-manifest token never sent its listen, a
+            // manifest-first token has a seeded wire listen whose boot buffer is
+            // about to be dropped. Either way, restart it as one ordinary cold
+            // listen so the registration keeps receiving data. Dispose passes
+            // false — there is no live subscription left to serve.
+            pending.reattachCold?.();
+        }
+    }
 }
 function repoClearListenOutcomes(repo) {
     repo.listenOutcomes_.clear();
@@ -14540,7 +14616,7 @@ function repoNotifyPersistenceAuthScope(repo) {
 }
 function repoDispose(repo) {
     repoInterrupt(repo);
-    repoCancelPendingSeedRestores(repo);
+    repoCancelPendingSeedRestores(repo, false);
     repoClearListenOutcomes(repo);
     repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
@@ -16163,16 +16239,33 @@ class DataSnapshot {
      */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     val() {
-        // One-boot materialization handoff (see ServerCacheSeed): when the
-        // optimistic peek already materialized exactly this immutable Node, its
-        // stamped value is returned instead of walking the tree again. Consumed
-        // on first use — every subsequent val() takes the normal fresh path.
-        const stamped = consumeMaterializedValue(this._node);
-        if (stamped !== undefined) {
-            return stamped;
-        }
         return this._node.val();
     }
+}
+/**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+function consumePersistedMaterialization(snapshot) {
+    return consumeMaterializedValue(snapshot._node);
 }
 /**
  *
@@ -16610,6 +16703,17 @@ function addEventListener(query, eventType, callback, cancelCallbackOrListenOpti
     catch (error) {
         releasePersistence?.();
         throw error;
+    }
+    if (options?.persistent) {
+        // Selecting before registration covers the registration that CREATES the
+        // wire listen (repoStartServerListen tracks the root). When this
+        // registration JOINED an already-listening default query instead, that
+        // start path never re-runs — activate persistence against the live
+        // listen: track the root and seed write-through from the complete server
+        // cache the listen already certified (nothing to do while it is still
+        // loading; the listen-complete certification write-through covers that
+        // ordering once tracked).
+        repoActivatePersistenceForJoinedListen(query._repo, query._path);
     }
     return () => repoRemoveEventCallbackForQuery(query._repo, query, container);
 }
@@ -17451,10 +17555,11 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
         if (value !== null && typeof value === 'object') {
             // One-boot materialization handoff (see ServerCacheSeed): the
             // authenticated listener that adopts this same immutable Node replays
-            // it as a child_added burst; stamping each top-level child's slice of
-            // this materialization lets those snapshots' val() return the SAME
-            // objects instead of walking the tree a second time. Index access
-            // covers both object and array-coerced shapes.
+            // it as a child_added burst, and a caller that opts in via
+            // consumePersistedMaterialization() adopts each top-level child's
+            // slice of this single materialization instead of walking the tree a
+            // second time. snapshot.val() itself never returns these objects.
+            // Index access covers both object and array-coerced shapes.
             const byKey = value;
             record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
                 stampMaterializedValue(childNode, byKey[key]);
@@ -17511,8 +17616,9 @@ function setPersistenceAuthScope(db, scope) {
     if (repo.persistence_?.setAuthScope(scope) && persistenceWasScoped) {
         repoCancelPendingSeedRestores(repo);
     }
-    if (repo.persistenceAuthScope_ !== scope) {
-        repo.persistenceAuthScope_ = scope;
+    const scopeChanged = repo.persistenceAuthScope_ !== scope;
+    repo.persistenceAuthScope_ = scope;
+    if (scopeChanged || (!persistenceWasScoped && repo.persistence_ !== null)) {
         repoNotifyPersistenceAuthScope(repo);
     }
 }
@@ -17818,5 +17924,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
  */
 registerDatabase();
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, _initStandalone, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, getPersistedValue, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onListenOutcome, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPersistenceAuthScope, setPersistenceEnabled, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, _initStandalone, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, consumePersistedMaterialization, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, getPersistedValue, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onListenOutcome, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPersistenceAuthScope, setPersistenceEnabled, setPriority, setWithPriority, startAfter, startAt, update };
 //# sourceMappingURL=index.esm.js.map
