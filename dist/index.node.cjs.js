@@ -4723,6 +4723,9 @@ function mergePersistedFragment(base, fragment) {
     return result;
 }
 class PersistenceManager {
+    isAuthScopeConfigured() {
+        return this.authScopeConfigured_;
+    }
     setAuthScope(scope) {
         const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
         this.authScopeConfigured_ = true;
@@ -13990,6 +13993,13 @@ function emitPersistenceTrace(event) {
         exceptionGuard(() => sink(event));
     }
 }
+function repoCancelPendingSeedRestore(pending) {
+    pending.cancelled = true;
+    pending.authScopeUnsubscribe?.();
+    if (pending.authScopeTimer !== undefined) {
+        clearTimeout(pending.authScopeTimer);
+    }
+}
 class Repo {
     constructor(repoInfo_, forceRestClient_, authTokenProvider_, appCheckProvider_) {
         this.repoInfo_ = repoInfo_;
@@ -14210,7 +14220,7 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
         exceptionGuard(() => subscriber(outcome));
     }
 }
-function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
+function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
     if (isDefaultComplete) {
@@ -14287,10 +14297,51 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete) {
         });
     };
     const persistence = repo.persistence_;
-    if (persistence === null ||
+    if (skipPersistence ||
+        persistence === null ||
         !isDefaultComplete ||
         !persistence.isPersistentPath(pathString)) {
         sendListen('cold');
+        return;
+    }
+    if (!persistence.isAuthScopeConfigured()) {
+        // Identity hydration is local (Firebase Auth's persisted user), but it is
+        // asynchronous. Keep the subscription inside the SDK until that identity
+        // reaches persistence: restoring before then would either miss the cache
+        // or, worse, replay another account's record. A bounded timeout preserves
+        // the normal live-listen liveness contract if Auth integration wedges.
+        const token = { cancelled: false };
+        repo.pendingSeedRestores_.set(pathString, token);
+        const isCurrent = () => !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
+        const cleanup = () => {
+            token.authScopeUnsubscribe?.();
+            if (token.authScopeTimer !== undefined) {
+                clearTimeout(token.authScopeTimer);
+            }
+        };
+        const resume = () => {
+            if (!isCurrent() || !persistence.isAuthScopeConfigured()) {
+                return;
+            }
+            cleanup();
+            repo.pendingSeedRestores_.delete(pathString);
+            repoStartServerListen(repo, query, tag, currentHashFn, onComplete, false, authScopeTimeoutMs);
+        };
+        repo.persistenceAuthScopeListeners_.add(resume);
+        token.authScopeUnsubscribe = () => repo.persistenceAuthScopeListeners_.delete(resume);
+        token.authScopeTimer = setTimeout(() => {
+            if (!isCurrent()) {
+                return;
+            }
+            cleanup();
+            repo.pendingSeedRestores_.delete(pathString);
+            // No identity means no safe cache namespace. Fall open to the ordinary
+            // network listener rather than stranding the subscription forever.
+            repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs);
+        }, authScopeTimeoutMs);
+        // Close the check-to-subscribe race if a pre-auth peek configured the
+        // manager between the first readiness check and listener registration.
+        resume();
         return;
     }
     persistence.track(pathString);
@@ -14456,13 +14507,13 @@ function repoStopServerListen(repo, query, tag) {
     }
     const pending = repo.pendingSeedRestores_.get(pathString);
     if (pending && !repo.bootBuffers_.has(pathString)) {
-        // Still waiting on the manifest: the listen was never sent.
-        pending.cancelled = true;
+        // Still waiting on the auth scope or manifest: the listen was never sent.
+        repoCancelPendingSeedRestore(pending);
         repo.pendingSeedRestores_.delete(pathString);
     }
     else {
         if (pending) {
-            pending.cancelled = true;
+            repoCancelPendingSeedRestore(pending);
             repo.pendingSeedRestores_.delete(pathString);
         }
         repo.server_.unlisten(query, tag);
@@ -14487,7 +14538,7 @@ function repoOnListenOutcome(repo, pathString, subscriber) {
 function repoCancelPendingSeedRestores(repo) {
     repo.pendingListenHashes_.clearAll();
     for (const pending of repo.pendingSeedRestores_.values()) {
-        pending.cancelled = true;
+        repoCancelPendingSeedRestore(pending);
     }
     repo.pendingSeedRestores_.clear();
 }
@@ -14503,6 +14554,7 @@ function repoDispose(repo) {
     repoInterrupt(repo);
     repoCancelPendingSeedRestores(repo);
     repoClearListenOutcomes(repo);
+    repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
 }
 /**
@@ -17467,86 +17519,14 @@ function setPersistenceAuthScope(db, scope) {
     db = util.getModularInstance(db);
     db._checkNotDeleted('setPersistenceAuthScope');
     const repo = db._repoInternal;
-    if (repo.persistence_?.setAuthScope(scope)) {
+    const persistenceWasScoped = repo.persistence_?.isAuthScopeConfigured() ?? false;
+    if (repo.persistence_?.setAuthScope(scope) && persistenceWasScoped) {
         repoCancelPendingSeedRestores(repo);
     }
     if (repo.persistenceAuthScope_ !== scope) {
         repo.persistenceAuthScope_ = scope;
         repoNotifyPersistenceAuthScope(repo);
     }
-}
-/**
- * Returns the identity scope most recently supplied to
- * `setPersistenceAuthScope`. `undefined` means the application has not
- * resolved Auth yet; null means it resolved signed out.
- * @public
- */
-function getPersistenceAuthScope(db) {
-    db = util.getModularInstance(db);
-    db._checkNotDeleted('getPersistenceAuthScope');
-    return db._repoInternal.persistenceAuthScope_;
-}
-/**
- * Observes changes to the application-provided persistence identity scope.
- * @public
- */
-function onPersistenceAuthScopeChanged(db, callback) {
-    db = util.getModularInstance(db);
-    db._checkNotDeleted('onPersistenceAuthScopeChanged');
-    const listeners = db._repoInternal.persistenceAuthScopeListeners_;
-    listeners.add(callback);
-    return () => listeners.delete(callback);
-}
-/**
- * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
- * for component/subscription lifecycles so a stale identity wait cannot leak
- * across unmount or account switch.
- * @public
- */
-function waitForPersistenceAuthScope(db, expectedScope, options = {}) {
-    db = util.getModularInstance(db);
-    db._checkNotDeleted('waitForPersistenceAuthScope');
-    if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
-        return Promise.resolve();
-    }
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        let unsubscribe = () => { };
-        const finish = (error) => {
-            if (settled) {
-                return;
-            }
-            settled = true;
-            unsubscribe();
-            options.signal?.removeEventListener('abort', onAbort);
-            if (error) {
-                reject(error);
-            }
-            else {
-                resolve();
-            }
-        };
-        const onAbort = () => {
-            const error = new Error('Persistence auth-scope wait was aborted.');
-            error.name = 'AbortError';
-            finish(error);
-        };
-        const listeners = db._repoInternal.persistenceAuthScopeListeners_;
-        const onScopeChange = () => {
-            if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
-                finish();
-            }
-        };
-        unsubscribe = () => listeners.delete(onScopeChange);
-        listeners.add(onScopeChange);
-        if (options.signal?.aborted) {
-            onAbort();
-            return;
-        }
-        options.signal?.addEventListener('abort', onAbort, { once: true });
-        // Close the read-to-subscribe race if the scope changed synchronously.
-        onScopeChange();
-    });
 }
 /**
  * Observes the restore/cold/fallback state and final server certification for
@@ -17889,7 +17869,6 @@ exports.forceWebSockets = forceWebSockets;
 exports.get = get;
 exports.getDatabase = getDatabase;
 exports.getPersistedValue = getPersistedValue;
-exports.getPersistenceAuthScope = getPersistenceAuthScope;
 exports.goOffline = goOffline;
 exports.goOnline = goOnline;
 exports.increment = increment;
@@ -17902,7 +17881,6 @@ exports.onChildMoved = onChildMoved;
 exports.onChildRemoved = onChildRemoved;
 exports.onDisconnect = onDisconnect;
 exports.onListenOutcome = onListenOutcome;
-exports.onPersistenceAuthScopeChanged = onPersistenceAuthScopeChanged;
 exports.onValue = onValue;
 exports.orderByChild = orderByChild;
 exports.orderByKey = orderByKey;
@@ -17923,5 +17901,4 @@ exports.setWithPriority = setWithPriority;
 exports.startAfter = startAfter;
 exports.startAt = startAt;
 exports.update = update;
-exports.waitForPersistenceAuthScope = waitForPersistenceAuthScope;
 //# sourceMappingURL=index.node.cjs.js.map

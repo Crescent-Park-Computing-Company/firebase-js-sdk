@@ -62,6 +62,8 @@ interface Transaction {
  */
 interface PendingSeedRestore {
     cancelled: boolean;
+    authScopeUnsubscribe?: () => void;
+    authScopeTimer?: ReturnType<typeof setTimeout>;
 }
 /** One server operation held during a manifest-first boot window. */
 type BootBufferedOp = {
@@ -177,7 +179,7 @@ export declare function repoGenerateServerValues(repo: Repo): Indexable;
  */
 /** Test seam: drives a server data push exactly as the connection would. @internal */
 export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
-export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[]): void;
+export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may
  * still be waiting on its restore — cancel it so it never attaches — and its

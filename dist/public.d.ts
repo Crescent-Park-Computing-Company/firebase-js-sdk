@@ -327,13 +327,6 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  */
 export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
- * Returns the identity scope most recently supplied to
- * `setPersistenceAuthScope`. `undefined` means the application has not
- * resolved Auth yet; null means it resolved signed out.
- * @public
- */
-export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
-/**
  * Disconnects from the server (all Database operations will be completed
  * offline).
  *
@@ -918,11 +911,6 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
  */
 export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
- * Observes changes to the application-provided persistence identity scope.
- * @public
- */
-export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
-/**
  * Listens for data changes at a particular location.
  *
  * This is the primary way to read data from a Database. Your callback
@@ -1048,12 +1036,6 @@ export declare function orderByPriority(): QueryConstraint;
  * {@link https://firebase.google.com/docs/database/web/lists-of-data#sort_data | Sort data}.
  */
 export declare function orderByValue(): QueryConstraint;
-/* Excluded from this release type: _PERSISTENCE_WRITE_DEBOUNCE_MS */
-/** Options for waiting on a persistence identity scope. @public */
-export declare interface PersistenceAuthScopeWaitOptions {
-    /** Cancels the wait and releases its scope-change subscription. */
-    signal?: AbortSignal;
-}
 /**
  * Generates a new child location using a unique key and returns its
  * `Reference`.
@@ -1479,11 +1461,4 @@ export declare type Unsubscribe = () => void;
  * @returns Resolves when update on server is complete.
  */
 export declare function update(ref: DatabaseReference, values: object): Promise<void>;
-/**
- * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
- * for component/subscription lifecycles so a stale identity wait cannot leak
- * across unmount or account switch.
- * @public
- */
-export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 export {};

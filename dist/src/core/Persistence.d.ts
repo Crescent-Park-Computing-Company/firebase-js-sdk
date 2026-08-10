@@ -179,6 +179,7 @@ export declare class PersistenceManager {
     private authScope_;
     private authScopeConfigured_;
     private authGeneration_;
+    isAuthScopeConfigured(): boolean;
     setAuthScope(scope: string | null): boolean;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number);
     rebindTo(prefix: string): PersistenceManager;

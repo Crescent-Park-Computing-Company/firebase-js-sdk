@@ -624,14 +624,6 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
 export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 /**
- * Returns the identity scope most recently supplied to
- * `setPersistenceAuthScope`. `undefined` means the application has not
- * resolved Auth yet; null means it resolved signed out.
- * @public
- */
-export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
-
-/**
  * Disconnects from the server (all Database operations will be completed
  * offline).
  *
@@ -1768,12 +1760,6 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
 export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 /**
- * Observes changes to the application-provided persistence identity scope.
- * @public
- */
-export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
-
-/**
  * Listens for data changes at a particular location.
  *
  * This is the primary way to read data from a Database. Your callback
@@ -1963,6 +1949,8 @@ declare class PendingListenHashStore {
  */
 declare interface PendingSeedRestore {
     cancelled: boolean;
+    authScopeUnsubscribe?: () => void;
+    authScopeTimer?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -1996,12 +1984,6 @@ declare interface PersistedSeedHashes {
  * @internal
  */
 export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
-
-/** Options for waiting on a persistence identity scope. @public */
-export declare interface PersistenceAuthScopeWaitOptions {
-    /** Cancels the wait and releases its scope-change subscription. */
-    signal?: AbortSignal;
-}
 
 declare class PersistenceManager {
     private prefix_;
@@ -2076,6 +2058,7 @@ declare class PersistenceManager {
     private authScope_;
     private authScopeConfigured_;
     private authGeneration_;
+    isAuthScopeConfigured(): boolean;
     setAuthScope(scope: string | null): boolean;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number);
     rebindTo(prefix: string): PersistenceManager;
@@ -3452,14 +3435,6 @@ declare interface ViewCache {
 declare interface ViewProcessor {
     readonly filter: NodeFilter_2;
 }
-
-/**
- * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
- * for component/subscription lifecycles so a stale identity wait cannot leak
- * across unmount or account switch.
- * @public
- */
-export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 
 /**
  * Defines a single user-initiated write operation. May be the result of a set(), transaction(), or update() call. In
