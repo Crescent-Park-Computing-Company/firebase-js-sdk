@@ -1487,17 +1487,30 @@ function estimateSerializedNodeSize(node) {
     }
 }
 /**
- * Schedules the next slice of a background computation on the NEXT
- * MACROTASK. A MessageChannel port message is used where available: it
- * yields the thread (pending input, paint, and other queued tasks all run
- * first) with near-zero added latency per slice. requestIdleCallback is
- * deliberately NOT used — its per-slice idle wait multiplied across the
- * hundreds of slices of a large tree added tens of seconds of wall clock on
- * a throttled CPU — and repeated setTimeout(0) chains hit the browser's
- * nested-timeout clamp (~4ms per slice), so setTimeout is only the
- * fallback for environments without MessageChannel.
+ * Schedules the next slice of a background computation.
+ *
+ * Priority matters more than latency here: the sliced hash walk runs DURING
+ * BOOT, concurrently with paint, input, get() responses, and image loads —
+ * and back-to-back MessageChannel self-posts saturate the macrotask queue,
+ * visibly starving that boot-critical work (a home-screen widget's
+ * background image stalling until the hash finished). Where the platform
+ * has it, scheduler.postTask at 'background' priority is exactly the right
+ * primitive: slices run continuously whenever the thread is otherwise idle
+ * (none of requestIdleCallback's fixed per-slice idle wait, which added
+ * tens of seconds of wall clock across hundreds of slices on a throttled
+ * CPU) but everything user-visible preempts them.
+ *
+ * Fallbacks: a MessageChannel port message (yields the thread with
+ * near-zero added latency, at normal priority), then setTimeout — last
+ * because repeated zero-timeout chains hit the browser's nested-timeout
+ * clamp (~4ms per slice).
  */
 function scheduleSlice(fn) {
+    const taskScheduler = globalThis.scheduler;
+    if (taskScheduler && typeof taskScheduler.postTask === 'function') {
+        void taskScheduler.postTask(fn, { priority: 'background' });
+        return;
+    }
     if (typeof MessageChannel === 'function') {
         const channel = new MessageChannel();
         channel.port1.onmessage = () => {
@@ -4686,6 +4699,11 @@ class PersistenceManager {
                 hashReq.onsuccess = () => {
                     memoizedHashes =
                         hashReq.result ?? null;
+                };
+                hashReq.onerror = event => {
+                    // An unhandled request error aborts the WHOLE transaction — the
+                    // memo is an accelerator and must never cost the restore itself.
+                    event.preventDefault?.();
                 };
             }
             catch (e) {
