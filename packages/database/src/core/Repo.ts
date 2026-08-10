@@ -28,7 +28,10 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
-import { PersistenceManager } from './Persistence';
+import {
+  PERSISTENCE_RESTORE_TIMEOUT_MS,
+  PersistenceManager
+} from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
@@ -176,6 +179,8 @@ interface Transaction {
  */
 interface PendingSeedRestore {
   cancelled: boolean;
+  authScopeUnsubscribe?: () => void;
+  authScopeTimer?: ReturnType<typeof setTimeout>;
 }
 
 /** One server operation held during a manifest-first boot window. */
@@ -259,6 +264,14 @@ function emitPersistenceTrace(event: PersistenceTraceEvent): void {
     .__firebaseDatabasePersistenceTrace;
   if (typeof sink === 'function') {
     exceptionGuard(() => sink(event));
+  }
+}
+
+function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
+  pending.cancelled = true;
+  pending.authScopeUnsubscribe?.();
+  if (pending.authScopeTimer !== undefined) {
+    clearTimeout(pending.authScopeTimer);
   }
 }
 
@@ -608,7 +621,9 @@ export function repoStartServerListen(
   query: QueryContext,
   tag: number | null,
   currentHashFn: ListenHashFn,
-  onComplete: (status: string, data?: unknown) => Event[]
+  onComplete: (status: string, data?: unknown) => Event[],
+  skipPersistence = false,
+  authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS
 ): void {
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
@@ -704,11 +719,71 @@ export function repoStartServerListen(
 
   const persistence = repo.persistence_;
   if (
+    skipPersistence ||
     persistence === null ||
     !isDefaultComplete ||
     !persistence.isPersistentPath(pathString)
   ) {
     sendListen('cold');
+    return;
+  }
+
+  if (!persistence.isAuthScopeConfigured()) {
+    // Identity hydration is local (Firebase Auth's persisted user), but it is
+    // asynchronous. Keep the subscription inside the SDK until that identity
+    // reaches persistence: restoring before then would either miss the cache
+    // or, worse, replay another account's record. A bounded timeout preserves
+    // the normal live-listen liveness contract if Auth integration wedges.
+    const token: PendingSeedRestore = { cancelled: false };
+    repo.pendingSeedRestores_.set(pathString, token);
+    const isCurrent = () =>
+      !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
+    const cleanup = () => {
+      token.authScopeUnsubscribe?.();
+      if (token.authScopeTimer !== undefined) {
+        clearTimeout(token.authScopeTimer);
+      }
+    };
+    const resume = () => {
+      if (!isCurrent() || !persistence.isAuthScopeConfigured()) {
+        return;
+      }
+      cleanup();
+      repo.pendingSeedRestores_.delete(pathString);
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        false,
+        authScopeTimeoutMs
+      );
+    };
+    repo.persistenceAuthScopeListeners_.add(resume);
+    token.authScopeUnsubscribe = () =>
+      repo.persistenceAuthScopeListeners_.delete(resume);
+    token.authScopeTimer = setTimeout(() => {
+      if (!isCurrent()) {
+        return;
+      }
+      cleanup();
+      repo.pendingSeedRestores_.delete(pathString);
+      // No identity means no safe cache namespace. Fall open to the ordinary
+      // network listener rather than stranding the subscription forever.
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        true,
+        authScopeTimeoutMs
+      );
+    }, authScopeTimeoutMs);
+    // Close the check-to-subscribe race if a pre-auth peek configured the
+    // manager between the first readiness check and listener registration.
+    resume();
     return;
   }
 
@@ -907,12 +982,12 @@ export function repoStopServerListen(
   }
   const pending = repo.pendingSeedRestores_.get(pathString);
   if (pending && !repo.bootBuffers_.has(pathString)) {
-    // Still waiting on the manifest: the listen was never sent.
-    pending.cancelled = true;
+    // Still waiting on the auth scope or manifest: the listen was never sent.
+    repoCancelPendingSeedRestore(pending);
     repo.pendingSeedRestores_.delete(pathString);
   } else {
     if (pending) {
-      pending.cancelled = true;
+      repoCancelPendingSeedRestore(pending);
       repo.pendingSeedRestores_.delete(pathString);
     }
     repo.server_.unlisten(query, tag);
@@ -943,7 +1018,7 @@ export function repoOnListenOutcome(
 export function repoCancelPendingSeedRestores(repo: Repo): void {
   repo.pendingListenHashes_.clearAll();
   for (const pending of repo.pendingSeedRestores_.values()) {
-    pending.cancelled = true;
+    repoCancelPendingSeedRestore(pending);
   }
   repo.pendingSeedRestores_.clear();
 }
@@ -962,6 +1037,7 @@ export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo);
   repoClearListenOutcomes(repo);
+  repo.persistenceAuthScopeListeners_.clear();
   repo.persistence_?.dispose();
 }
 

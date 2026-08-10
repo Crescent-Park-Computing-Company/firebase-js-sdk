@@ -20,11 +20,8 @@ import { expect } from 'chai';
 
 import {
   getPersistedValue,
-  getPersistenceAuthScope,
-  onPersistenceAuthScopeChanged,
   setPersistenceAuthScope,
-  setPersistenceEnabled,
-  waitForPersistenceAuthScope
+  setPersistenceEnabled
 } from '../src/api/Database';
 import {
   DataSnapshot,
@@ -2062,6 +2059,8 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       bootBuffers_: new Map(),
       listenOutcomes_: new Map(),
       persistence_: manager,
+      persistenceAuthScope_: null,
+      persistenceAuthScopeListeners_: new Set<() => void>(),
       eventQueue_: new EventQueue(),
       serverSyncTree_: new SyncTree({
         startListening: () => [],
@@ -2115,7 +2114,8 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       hashFns,
       serverCallbacks,
       serverProgress,
-      data
+      data,
+      factory
     };
   }
 
@@ -2158,6 +2158,78 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
+  });
+
+  it('waits inside the SDK for the initial auth scope, then restores/listens', async () => {
+    const harness = makeListenHarness();
+    const manager = new PersistenceManager('test-repo', harness.factory);
+    manager.setPersistentPath(harness.path.toString(), true);
+    harness.repo.persistence_ = manager;
+    harness.repo.persistenceAuthScope_ = undefined;
+    const db = {
+      _checkNotDeleted: () => {},
+      _repoInternal: harness.repo
+    };
+
+    repoStartServerListen(
+      harness.repo,
+      harness.query,
+      null,
+      harness.hashFn,
+      harness.onComplete
+    );
+    await Promise.resolve();
+    expect(harness.calls).to.deep.equal([]);
+
+    setPersistenceAuthScope(db as never, 'viewer');
+    await flushAsync();
+    expect(harness.calls).to.deep.equal(['listen']);
+  });
+
+  it('cancels an auth-scope wait when the subscription stops', async () => {
+    const harness = makeListenHarness();
+    const manager = new PersistenceManager('test-repo', harness.factory);
+    manager.setPersistentPath(harness.path.toString(), true);
+    harness.repo.persistence_ = manager;
+    harness.repo.persistenceAuthScope_ = undefined;
+
+    repoStartServerListen(
+      harness.repo,
+      harness.query,
+      null,
+      harness.hashFn,
+      harness.onComplete
+    );
+    repoStopServerListen(harness.repo, harness.query, null);
+    manager.setAuthScope('viewer');
+    harness.repo.persistenceAuthScope_ = 'viewer';
+    for (const listener of harness.repo.persistenceAuthScopeListeners_) {
+      listener();
+    }
+    await flushAsync();
+    expect(harness.calls).to.deep.equal([]);
+    expect(harness.repo.persistenceAuthScopeListeners_.size).to.equal(0);
+  });
+
+  it('falls open to a cold listen if auth scope hydration stalls', async () => {
+    const harness = makeListenHarness();
+    const manager = new PersistenceManager('test-repo', harness.factory);
+    manager.setPersistentPath(harness.path.toString(), true);
+    harness.repo.persistence_ = manager;
+    harness.repo.persistenceAuthScope_ = undefined;
+
+    repoStartServerListen(
+      harness.repo,
+      harness.query,
+      null,
+      harness.hashFn,
+      harness.onComplete,
+      false,
+      5
+    );
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(harness.calls).to.deep.equal(['listen']);
+    expect(harness.repo.persistenceAuthScopeListeners_.size).to.equal(0);
   });
 
   it('a stop during the restore cancels the listen instead of orphaning it', async () => {
@@ -2373,6 +2445,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       restoreForListen: () => recordPromise,
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
@@ -2416,6 +2489,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       restoreForListen: async (
         _path: string,
         onManifest: (h: PersistedSeedHashes) => void
@@ -2477,6 +2551,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       restoreForListen: (
         _path: string,
         onManifest: (h: PersistedSeedHashes) => void
@@ -2515,6 +2590,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       restoreForListen: async (
         _path: string,
         onManifest: (h: PersistedSeedHashes) => void
@@ -2579,6 +2655,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       restoreForListen: async (
         _path: string,
         onManifest: (h: PersistedSeedHashes) => void
@@ -2708,6 +2785,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repo.persistence_ = {
       track: () => {},
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       // Missing/mismatched/malformed chunks, storage failure, or an idle
       // timeout all take the same cold-listen fallback.
       restoreForListen: () =>
@@ -2825,6 +2903,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       restoreForListen: () =>
         Promise.resolve({ record: null, reason: 'corrupt' }),
       isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
       trackedRootFor: () => null,
       serverCacheUpdated: () => {},
       invalidate: () => {},
@@ -3165,66 +3244,6 @@ describe('DataSnapshot restored-value semantics', () => {
     first.nested.value = 99;
     expect(snapshot.val()).to.deep.equal({ nested: { value: 1 } });
     expect(node.getChild(new Path('nested/value')).val()).to.equal(1);
-  });
-});
-
-describe('persistence auth-scope state', () => {
-  function makeScopedDatabase() {
-    const manager = scopedManager('test-repo', makeFakeIndexedDB().factory);
-    const repo = {
-      persistence_: manager,
-      persistenceAuthScope_: undefined as string | null | undefined,
-      persistenceAuthScopeListeners_: new Set<() => void>(),
-      pendingListenHashes_: new PendingListenHashStore(),
-      pendingSeedRestores_: new Map<string, { cancelled: boolean }>()
-    };
-    const db = {
-      _checkNotDeleted: () => {},
-      _repoInternal: repo
-    };
-    return { db, repo };
-  }
-
-  it('publishes the scope only after setPersistenceAuthScope updates the manager', () => {
-    const { db } = makeScopedDatabase();
-    let changes = 0;
-    const unsubscribe = onPersistenceAuthScopeChanged(
-      db as never,
-      () => changes++
-    );
-    expect(getPersistenceAuthScope(db as never)).to.equal(undefined);
-    setPersistenceAuthScope(db as never, 'viewer');
-    expect(getPersistenceAuthScope(db as never)).to.equal('viewer');
-    expect(changes).to.equal(1);
-    setPersistenceAuthScope(db as never, 'viewer');
-    expect(changes).to.equal(1);
-    unsubscribe();
-  });
-
-  it('aborts a mismatched wait and removes its listener', async () => {
-    const { db, repo } = makeScopedDatabase();
-    const controller = new AbortController();
-    const waiting = waitForPersistenceAuthScope(db as never, 'viewer', {
-      signal: controller.signal
-    });
-    expect(repo.persistenceAuthScopeListeners_.size).to.equal(1);
-    controller.abort();
-    let name = '';
-    try {
-      await waiting;
-    } catch (error) {
-      name = (error as Error).name;
-    }
-    expect(name).to.equal('AbortError');
-    expect(repo.persistenceAuthScopeListeners_.size).to.equal(0);
-  });
-
-  it('resolves a wait when the expected scope arrives', async () => {
-    const { db, repo } = makeScopedDatabase();
-    const waiting = waitForPersistenceAuthScope(db as never, 'viewer');
-    setPersistenceAuthScope(db as never, 'viewer');
-    await waiting;
-    expect(repo.persistenceAuthScopeListeners_.size).to.equal(0);
   });
 });
 

@@ -21,16 +21,13 @@ Firebase Realtime Database
 |  <b>function(db, ...)</b> |
 |  [connectDatabaseEmulator(db, host, port, options)](./database.md#connectdatabaseemulator_27b9e93) | Modify the provided instance to communicate with the Realtime Database emulator.<p>Note: This method must be called before performing any other operation. |
 |  [getPersistedValue(db, pathString, expectedAuthScope)](./database.md#getpersistedvalue_ebbed26) | Reads the exact persisted server cache root at <code>path</code> WITHOUT attaching a listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in completes can render the persisted tree, then let the real (authenticated) listener attach and reconcile. Resolves null when persistence is disabled, nothing is stored, or the record expired. |
-|  [getPersistenceAuthScope(db)](./database.md#getpersistenceauthscope_732b338) | Returns the identity scope most recently supplied to <code>setPersistenceAuthScope</code>. <code>undefined</code> means the application has not resolved Auth yet; null means it resolved signed out. |
 |  [goOffline(db)](./database.md#gooffline_732b338) | Disconnects from the server (all Database operations will be completed offline).<!-- -->The client automatically maintains a persistent connection to the Database server, which will remain active indefinitely and reconnect when disconnected. However, the <code>goOffline()</code> and <code>goOnline()</code> methods may be used to control the client connection in cases where a persistent connection is undesirable.<!-- -->While offline, the client will no longer receive data updates from the Database. However, all Database operations performed locally will continue to immediately fire events, allowing your application to continue behaving normally. Additionally, each operation performed locally will automatically be queued and retried upon reconnection to the Database server.<!-- -->To reconnect to the Database and begin receiving remote events, see <code>goOnline()</code>. |
 |  [goOnline(db)](./database.md#goonline_732b338) | Reconnects to the server and synchronizes the offline Database state with the server state.<!-- -->This method should be used after disabling the active connection with <code>goOffline()</code>. Once reconnected, the client will transmit the proper data and fire the appropriate events so that your client "catches up" automatically. |
 |  [onListenOutcome(db, pathString, callback)](./database.md#onlistenoutcome_3c6ebe9) | Observes the restore/cold/fallback state and final server certification for one exact default listen. The callback is invoked first when the local path choice is known (<code>certified: false</code>), then once the server responds. |
-|  [onPersistenceAuthScopeChanged(db, callback)](./database.md#onpersistenceauthscopechanged_23c96fd) | Observes changes to the application-provided persistence identity scope. |
 |  [ref(db, path)](./database.md#ref_5f88fa2) | Returns a <code>Reference</code> representing the location in the Database corresponding to the provided path. If no path is provided, the <code>Reference</code> will point to the root of the Database. |
 |  [refFromURL(db, url)](./database.md#reffromurl_98d95ad) | Returns a <code>Reference</code> representing the location in the Database corresponding to the provided Firebase URL.<!-- -->An exception is thrown if the URL is not a valid Firebase Database URL or it has a different domain than the current <code>Database</code> instance.<!-- -->Note that all query parameters (<code>orderBy</code>, <code>limitToLast</code>, etc.) are ignored and are not applied to the returned <code>Reference</code>. |
 |  [setPersistenceAuthScope(db, scope)](./database.md#setpersistenceauthscope_3f98c64) | Sets the identity scope used to read and write persisted cache records. |
 |  [setPersistenceEnabled(db, enabled)](./database.md#setpersistenceenabled_66bd578) | Enables client-side persistence of the server cache for this Database instance (see core/Persistence.ts): listened roots are stored in IndexedDB and restored on the next startup, where they paint immediately and revalidate with the server via the hash protocol — an unchanged tree costs a handshake, a changed one costs range-merge deltas.<!-- -->Must be called before the first listener attaches (matching the mobile SDKs' setPersistenceEnabled contract); listens attached earlier simply bypass persistence. No-ops where IndexedDB is unavailable. |
-|  [waitForPersistenceAuthScope(db, expectedScope, options)](./database.md#waitforpersistenceauthscope_92d8452) | Resolves when persistence is bound to <code>expectedScope</code>. Pass an AbortSignal for component/subscription lifecycles so a stale identity wait cannot leak across unmount or account switch. |
 |  <b>function()</b> |
 |  [forceLongPolling()](./database.md#forcelongpolling) | Force the use of longPolling instead of websockets. This will be ignored if websocket protocol is used in databaseURL. |
 |  [forceWebSockets()](./database.md#forcewebsockets) | Force the use of websockets instead of longPolling. |
@@ -104,7 +101,6 @@ Firebase Realtime Database
 |  [IteratedDataSnapshot](./database.iterateddatasnapshot.md#iterateddatasnapshot_interface) | Represents a child snapshot of a <code>Reference</code> that is being iterated over. The key will never be undefined. |
 |  [ListenOptions](./database.listenoptions.md#listenoptions_interface) | An options objects that can be used to customize a listener. |
 |  [ListenOutcome](./database.listenoutcome.md#listenoutcome_interface) | Restore/certification state of one persistent default listen. |
-|  [PersistenceAuthScopeWaitOptions](./database.persistenceauthscopewaitoptions.md#persistenceauthscopewaitoptions_interface) | Options for waiting on a persistence identity scope. |
 |  [Query](./database.query.md#query_interface) | A <code>Query</code> sorts and filters the data at a Database location so only a subset of the child data is included. This can be used to order a collection of data by some attribute (for example, height of dinosaurs) as well as to restrict a large list of items (for example, chat messages) down to a number suitable for synchronizing to the client. Queries are created by chaining together one or more of the filter methods defined here.<!-- -->Just as with a <code>DatabaseReference</code>, you can receive data from a <code>Query</code> by using the <code>on*()</code> methods. You will only receive events and <code>DataSnapshot</code>s for the subset of the data that matches your query.<!-- -->See [https://firebase.google.com/docs/database/web/lists-of-data\#sorting\_and\_filtering\_data](https://firebase.google.com/docs/database/web/lists-of-data#sorting_and_filtering_data) for more information. |
 |  [ThenableReference](./database.thenablereference.md#thenablereference_interface) | A <code>Promise</code> that can also act as a <code>DatabaseReference</code> when returned by [push()](./database.md#push_c74661c)<!-- -->. The reference is available immediately and the <code>Promise</code> resolves as the write to the backend completes. |
 |  [TransactionOptions](./database.transactionoptions.md#transactionoptions_interface) | An options object to configure transactions. |
@@ -195,26 +191,6 @@ export declare function getPersistedValue(db: Database, pathString: string, expe
 
 Promise&lt;unknown \| null&gt;
 
-### getPersistenceAuthScope(db) {:#getpersistenceauthscope_732b338}
-
-Returns the identity scope most recently supplied to `setPersistenceAuthScope`<!-- -->. `undefined` means the application has not resolved Auth yet; null means it resolved signed out.
-
-<b>Signature:</b>
-
-```typescript
-export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
-```
-
-#### Parameters
-
-|  Parameter | Type | Description |
-|  --- | --- | --- |
-|  db | [Database](./database.database.md#database_class) |  |
-
-<b>Returns:</b>
-
-string \| null \| undefined
-
 ### goOffline(db) {:#gooffline_732b338}
 
 Disconnects from the server (all Database operations will be completed offline).
@@ -280,27 +256,6 @@ export declare function onListenOutcome(db: Database, pathString: string, callba
 |  db | [Database](./database.database.md#database_class) |  |
 |  pathString | string |  |
 |  callback | (outcome: [ListenOutcome](./database.listenoutcome.md#listenoutcome_interface)<!-- -->) =&gt; void |  |
-
-<b>Returns:</b>
-
-() =&gt; void
-
-### onPersistenceAuthScopeChanged(db, callback) {:#onpersistenceauthscopechanged_23c96fd}
-
-Observes changes to the application-provided persistence identity scope.
-
-<b>Signature:</b>
-
-```typescript
-export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
-```
-
-#### Parameters
-
-|  Parameter | Type | Description |
-|  --- | --- | --- |
-|  db | [Database](./database.database.md#database_class) |  |
-|  callback | () =&gt; void |  |
 
 <b>Returns:</b>
 
@@ -399,28 +354,6 @@ export declare function setPersistenceEnabled(db: Database, enabled: boolean): v
 <b>Returns:</b>
 
 void
-
-### waitForPersistenceAuthScope(db, expectedScope, options) {:#waitforpersistenceauthscope_92d8452}
-
-Resolves when persistence is bound to `expectedScope`<!-- -->. Pass an AbortSignal for component/subscription lifecycles so a stale identity wait cannot leak across unmount or account switch.
-
-<b>Signature:</b>
-
-```typescript
-export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
-```
-
-#### Parameters
-
-|  Parameter | Type | Description |
-|  --- | --- | --- |
-|  db | [Database](./database.database.md#database_class) |  |
-|  expectedScope | string \| null |  |
-|  options | [PersistenceAuthScopeWaitOptions](./database.persistenceauthscopewaitoptions.md#persistenceauthscopewaitoptions_interface) |  |
-
-<b>Returns:</b>
-
-Promise&lt;void&gt;
 
 ## function()
 

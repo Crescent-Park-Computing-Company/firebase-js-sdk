@@ -469,6 +469,10 @@ export class PersistenceManager {
   private authScopeConfigured_ = false;
   private authGeneration_ = 0;
 
+  isAuthScopeConfigured(): boolean {
+    return this.authScopeConfigured_;
+  }
+
   setAuthScope(scope: string | null): boolean {
     const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
     this.authScopeConfigured_ = true;

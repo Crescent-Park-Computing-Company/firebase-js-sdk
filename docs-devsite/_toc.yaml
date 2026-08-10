@@ -455,8 +455,6 @@ toc:
     path: /docs/reference/js/database.listenoutcome.md
   - title: OnDisconnect
     path: /docs/reference/js/database.ondisconnect.md
-  - title: PersistenceAuthScopeWaitOptions
-    path: /docs/reference/js/database.persistenceauthscopewaitoptions.md
   - title: Query
     path: /docs/reference/js/database.query.md
   - title: QueryConstraint

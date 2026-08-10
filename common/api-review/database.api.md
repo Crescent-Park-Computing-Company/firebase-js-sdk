@@ -80,9 +80,6 @@ export function getDatabase(app?: FirebaseApp, url?: string): Database;
 export function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 // @public
-export function getPersistenceAuthScope(db: Database): string | null | undefined;
-
-// @public
 export function goOffline(db: Database): void;
 
 // @public
@@ -182,9 +179,6 @@ export function onDisconnect(ref: DatabaseReference): OnDisconnect;
 export function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 // @public
-export function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
-
-// @public
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
 
 // @public
@@ -204,11 +198,6 @@ export function orderByPriority(): QueryConstraint;
 
 // @public
 export function orderByValue(): QueryConstraint;
-
-// @public
-export interface PersistenceAuthScopeWaitOptions {
-    signal?: AbortSignal;
-}
 
 // @public
 export function push(parent: DatabaseReference, value?: unknown): ThenableReference;
@@ -293,9 +282,6 @@ export type Unsubscribe = () => void;
 
 // @public
 export function update(ref: DatabaseReference, values: object): Promise<void>;
-
-// @public
-export function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 
 
 ```
