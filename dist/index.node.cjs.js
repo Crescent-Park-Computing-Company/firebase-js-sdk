@@ -3013,6 +3013,45 @@ function getNodeCanonicalHash(node) {
     return nodeCanonicalHashes.get(node);
 }
 /**
+ * One-boot materialization handoff. The optimistic pre-auth peek
+ * (getPersistedValue) materializes the restored tree to JS objects once;
+ * the authenticated listener that adopts the SAME immutable Node then
+ * replays it as a child_added burst whose per-child `snapshot.val()` calls
+ * would materialize the identical tree a second time — two full JS copies
+ * of a large workspace alive at the peak of boot.
+ *
+ * The peek stamps each materialized value here, keyed by its Node instance;
+ * `DataSnapshot.val()` consumes a stamp (get + delete) instead of walking
+ * the node. Consume-once keeps the official fresh-objects-per-val() contract
+ * for every later caller: only the single designed peek→listener handoff
+ * ever receives shared objects (which is the point — the optimistic tree and
+ * the live tree then share child identity, so downstream memoization sees
+ * unchanged branches as unchanged).
+ *
+ * Correctness is by construction: a Node is immutable, so a stamp can only
+ * ever be returned for exactly the data it was computed from. Any server
+ * delta between peek and replay produces a NEW child Node instance, which
+ * misses the WeakMap and materializes fresh.
+ *
+ * Only non-null object values are stamped (a leaf's val() is O(1) already),
+ * and never on an empty node — the empty ChildrenNode is a shared singleton
+ * and stamping it would leak one boot's subtree to unrelated paths.
+ */
+const nodeMaterializedValues = new WeakMap();
+function stampMaterializedValue(node, value) {
+    if (value === null || typeof value !== 'object' || node.isEmpty()) {
+        return;
+    }
+    nodeMaterializedValues.set(node, value);
+}
+function consumeMaterializedValue(node) {
+    const value = nodeMaterializedValues.get(node);
+    if (value !== undefined) {
+        nodeMaterializedValues.delete(node);
+    }
+    return value;
+}
+/**
  * Repo-scoped manifest-first hash registry. Different Database instances can
  * listen to the same relative path while holding different caches; keeping
  * this store on Repo prevents one restore from overwriting or clearing
@@ -16084,6 +16123,14 @@ class DataSnapshot {
      */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     val() {
+        // One-boot materialization handoff (see ServerCacheSeed): when the
+        // optimistic peek already materialized exactly this immutable Node, its
+        // stamped value is returned instead of walking the tree again. Consumed
+        // on first use — every subsequent val() takes the normal fresh path.
+        const stamped = consumeMaterializedValue(this._node);
+        if (stamped !== undefined) {
+            return stamped;
+        }
         return this._node.val();
     }
 }
@@ -17356,7 +17403,26 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
     // exact listener's initial replay.
     return persistence
         .peek(new Path(pathString).toString(), expectedAuthScope)
-        .then(record => (record === null ? null : record.node.val()));
+        .then(record => {
+        if (record === null) {
+            return null;
+        }
+        const value = record.node.val();
+        if (value !== null && typeof value === 'object') {
+            // One-boot materialization handoff (see ServerCacheSeed): the
+            // authenticated listener that adopts this same immutable Node replays
+            // it as a child_added burst; stamping each top-level child's slice of
+            // this materialization lets those snapshots' val() return the SAME
+            // objects instead of walking the tree a second time. Index access
+            // covers both object and array-coerced shapes.
+            const byKey = value;
+            record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+                stampMaterializedValue(childNode, byKey[key]);
+            });
+            stampMaterializedValue(record.node, value);
+        }
+        return value;
+    });
 }
 /**
  * Enables client-side persistence of the server cache for this Database

@@ -58,6 +58,8 @@ export declare function getNodeCompoundHash(node: Node): SeedCompoundHash | unde
  * permanently retain one SHA string per node.
  */
 export declare function getNodeCanonicalHash(node: Node): string | undefined;
+export declare function stampMaterializedValue(node: Node, value: unknown): void;
+export declare function consumeMaterializedValue(node: Node): object | undefined;
 /** The hash pair a manifest-first listen can consume before its Node exists. */
 export interface PendingListenHashes {
     hash: string;
