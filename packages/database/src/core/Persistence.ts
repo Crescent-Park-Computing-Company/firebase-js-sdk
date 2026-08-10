@@ -1475,6 +1475,11 @@ export class PersistenceManager {
             memoizedHashes =
               (hashReq.result as PersistedListenHashes | undefined) ?? null;
           };
+          hashReq.onerror = event => {
+            // An unhandled request error aborts the WHOLE transaction — the
+            // memo is an accelerator and must never cost the restore itself.
+            event.preventDefault?.();
+          };
         } catch (e) {
           // Memo is an accelerator only; its absence changes nothing.
         }
