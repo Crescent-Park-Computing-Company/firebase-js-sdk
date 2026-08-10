@@ -130,6 +130,12 @@ export declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
+     * The application-provided identity scope currently bound to persistence.
+     * `undefined` means Auth has not resolved yet; null means signed out.
+     */
+    persistenceAuthScope_: string | null | undefined;
+    persistenceAuthScopeListeners_: Set<() => void>;
+    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
@@ -183,6 +189,7 @@ export declare function repoStopServerListen(repo: Repo, query: QueryContext, ta
 export declare function repoOnListenOutcome(repo: Repo, pathString: string, subscriber: (outcome: ListenOutcome) => void): () => void;
 export declare function repoCancelPendingSeedRestores(repo: Repo): void;
 export declare function repoClearListenOutcomes(repo: Repo): void;
+export declare function repoNotifyPersistenceAuthScope(repo: Repo): void;
 export declare function repoDispose(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**

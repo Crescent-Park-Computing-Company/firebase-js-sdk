@@ -569,6 +569,8 @@ declare interface EventRegistration {
      *
      */
     hasAnyCallback(): boolean;
+    /** Called exactly once when this concrete registration leaves its View. */
+    onRemove?(): void;
 }
 
 /**
@@ -620,6 +622,14 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  * @public
  */
 export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+
+/**
+ * Returns the identity scope most recently supplied to
+ * `setPersistenceAuthScope`. `undefined` means the application has not
+ * resolved Auth yet; null means it resolved signed out.
+ * @public
+ */
+export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
 
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -880,6 +890,14 @@ declare interface ListenHashFn {
 export declare interface ListenOptions {
     /** Whether to remove the listener after its first invocation. */
     readonly onlyOnce?: boolean;
+    /**
+     * Whether the complete, unfiltered path listened to by this registration
+     * should be retained in IndexedDB for cache-first startup. Selection is
+     * reference-counted across registrations and released automatically when
+     * this registration is removed, including `off()`, `onlyOnce`, and server
+     * cancellation paths.
+     */
+    readonly persistent?: boolean;
 }
 
 /**
@@ -1750,6 +1768,12 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
 export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 /**
+ * Observes changes to the application-provided persistence identity scope.
+ * @public
+ */
+export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
+
+/**
  * Listens for data changes at a particular location.
  *
  * This is the primary way to read data from a Database. Your callback
@@ -1973,6 +1997,12 @@ declare interface PersistedSeedHashes {
  */
 export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
+/** Options for waiting on a persistence identity scope. @public */
+export declare interface PersistenceAuthScopeWaitOptions {
+    /** Cancels the wait and releases its scope-change subscription. */
+    signal?: AbortSignal;
+}
+
 declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
@@ -2107,6 +2137,14 @@ declare class PersistenceManager {
      */
     private readRecord_;
     private readRecordOnce_;
+    /**
+     * Decodes and merges raw persisted range clones into one Node in yielded
+     * slices. Each slice decodes a few records, then yields a macrotask so the
+     * main thread can paint/GC between slices; consumed entries are nulled so
+     * the structured clones are collectable while later slices run. Returns
+     * null when any fragment fails to decode.
+     */
+    private decodeFragmentsSliced_;
     private deleteRecord_;
     private withRestoreSlot_;
     /**
@@ -2661,6 +2699,12 @@ declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
+     * The application-provided identity scope currently bound to persistence.
+     * `undefined` means Auth has not resolved yet; null means signed out.
+     */
+    persistenceAuthScope_: string | null | undefined;
+    persistenceAuthScopeListeners_: Set<() => void>;
+    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
@@ -2894,12 +2938,6 @@ export declare function setPersistenceAuthScope(db: Database, scope: string | nu
  * @public
  */
 export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
-
-/**
- * Selects an exact default-listen root for persistence.
- * @public
- */
-export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.
@@ -3414,6 +3452,14 @@ declare interface ViewCache {
 declare interface ViewProcessor {
     readonly filter: NodeFilter_2;
 }
+
+/**
+ * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
+ * for component/subscription lifecycles so a stale identity wait cannot leak
+ * across unmount or account switch.
+ * @public
+ */
+export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 
 /**
  * Defines a single user-initiated write operation. May be the result of a set(), transaction(), or update() call. In

@@ -240,6 +240,14 @@ export declare class PersistenceManager {
      */
     private readRecord_;
     private readRecordOnce_;
+    /**
+     * Decodes and merges raw persisted range clones into one Node in yielded
+     * slices. Each slice decodes a few records, then yields a macrotask so the
+     * main thread can paint/GC between slices; consumed entries are nulled so
+     * the structured clones are collectable while later slices run. Returns
+     * null when any fragment fails to decode.
+     */
+    private decodeFragmentsSliced_;
     private deleteRecord_;
     private withRestoreSlot_;
     /**

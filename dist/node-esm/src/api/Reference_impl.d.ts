@@ -405,7 +405,8 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  */
 export declare class ValueEventRegistration implements EventRegistration {
     private callbackContext;
-    constructor(callbackContext: CallbackContext);
+    readonly onRemove?: () => void;
+    constructor(callbackContext: CallbackContext, onRemove?: () => void);
     respondsTo(eventType: string): boolean;
     createEvent(change: Change, query: QueryContext): DataEvent;
     getEventRunner(eventData: CancelEvent | DataEvent): () => void;
@@ -419,7 +420,8 @@ export declare class ValueEventRegistration implements EventRegistration {
 export declare class ChildEventRegistration implements EventRegistration {
     private eventType;
     private callbackContext;
-    constructor(eventType: string, callbackContext: CallbackContext | null);
+    readonly onRemove?: () => void;
+    constructor(eventType: string, callbackContext: CallbackContext | null, onRemove?: () => void);
     respondsTo(eventType: string): boolean;
     createCancelEvent(error: Error, path: Path): CancelEvent | null;
     createEvent(change: Change, query: QueryContext): DataEvent;

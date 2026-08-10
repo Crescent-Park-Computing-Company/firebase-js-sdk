@@ -139,10 +139,29 @@ export declare function setPersistenceEnabled(db: Database, enabled: boolean): v
  */
 export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
 /**
- * Selects an exact default-listen root for persistence.
+ * Returns the identity scope most recently supplied to
+ * `setPersistenceAuthScope`. `undefined` means the application has not
+ * resolved Auth yet; null means it resolved signed out.
  * @public
  */
-export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
+export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
+/**
+ * Observes changes to the application-provided persistence identity scope.
+ * @public
+ */
+export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
+/** Options for waiting on a persistence identity scope. @public */
+export interface PersistenceAuthScopeWaitOptions {
+    /** Cancels the wait and releases its scope-change subscription. */
+    signal?: AbortSignal;
+}
+/**
+ * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
+ * for component/subscription lifecycles so a stale identity wait cannot leak
+ * across unmount or account switch.
+ * @public
+ */
+export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 /**
  * Observes the restore/cold/fallback state and final server certification for
  * one exact default listen. The callback is invoked first when the local path

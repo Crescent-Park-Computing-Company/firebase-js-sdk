@@ -327,6 +327,13 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  */
 export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
+ * Returns the identity scope most recently supplied to
+ * `setPersistenceAuthScope`. `undefined` means the application has not
+ * resolved Auth yet; null means it resolved signed out.
+ * @public
+ */
+export declare function getPersistenceAuthScope(db: Database): string | null | undefined;
+/**
  * Disconnects from the server (all Database operations will be completed
  * offline).
  *
@@ -417,6 +424,14 @@ export declare function limitToLast(limit: number): QueryConstraint;
 export declare interface ListenOptions {
     /** Whether to remove the listener after its first invocation. */
     readonly onlyOnce?: boolean;
+    /**
+     * Whether the complete, unfiltered path listened to by this registration
+     * should be retained in IndexedDB for cache-first startup. Selection is
+     * reference-counted across registrations and released automatically when
+     * this registration is removed, including `off()`, `onlyOnce`, and server
+     * cancellation paths.
+     */
+    readonly persistent?: boolean;
 }
 /**
  * Restore/certification state of one persistent default listen.
@@ -903,6 +918,11 @@ export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
  */
 export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
+ * Observes changes to the application-provided persistence identity scope.
+ * @public
+ */
+export declare function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
+/**
  * Listens for data changes at a particular location.
  *
  * This is the primary way to read data from a Database. Your callback
@@ -1028,6 +1048,12 @@ export declare function orderByPriority(): QueryConstraint;
  * {@link https://firebase.google.com/docs/database/web/lists-of-data#sort_data | Sort data}.
  */
 export declare function orderByValue(): QueryConstraint;
+/* Excluded from this release type: _PERSISTENCE_WRITE_DEBOUNCE_MS */
+/** Options for waiting on a persistence identity scope. @public */
+export declare interface PersistenceAuthScopeWaitOptions {
+    /** Cancels the wait and releases its scope-change subscription. */
+    signal?: AbortSignal;
+}
 /**
  * Generates a new child location using a unique key and returns its
  * `Reference`.
@@ -1311,11 +1337,6 @@ export declare function setPersistenceAuthScope(db: Database, scope: string | nu
  */
 export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 /**
- * Selects an exact default-listen root for persistence.
- * @public
- */
-export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
-/**
  * Sets a priority for the data at this Database location.
  *
  * Applications need not use priority but can order collections by
@@ -1458,4 +1479,11 @@ export declare type Unsubscribe = () => void;
  * @returns Resolves when update on server is complete.
  */
 export declare function update(ref: DatabaseReference, values: object): Promise<void>;
+/**
+ * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
+ * for component/subscription lifecycles so a stale identity wait cannot leak
+ * across unmount or account switch.
+ * @public
+ */
+export declare function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 export {};

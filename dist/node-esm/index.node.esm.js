@@ -582,6 +582,15 @@ const INTEGER_32_MAX = 2147483647;
  * If the string contains a 32-bit integer, return it.  Else return null.
  */
 const tryParseInt = function (str) {
+    // Fast reject before the regex: nameCompare calls this for EVERY key pair
+    // in every sorted-map operation, and real-world keys are overwhelmingly
+    // named (non-numeric). A single charCode check skips the regex engine for
+    // any key that cannot possibly be an integer.
+    const first = str.charCodeAt(0);
+    if ((first < 48 /* '0' */ || first > 57) /* '9' */ &&
+        first !== 45 /* '-' */) {
+        return null;
+    }
     if (INTEGER_REGEXP_.test(str)) {
         const intVal = Number(str);
         if (intVal >= INTEGER_32_MIN && intVal <= INTEGER_32_MAX) {
@@ -4055,7 +4064,12 @@ class ChildrenNode {
         this.forEachChild(PRIORITY_INDEX, (key, childNode) => {
             obj[key] = childNode.val(exportFormat);
             numKeys++;
-            if (allIntegerKeys && ChildrenNode.INTEGER_REGEXP_.test(key)) {
+            // charCode fast-reject: named keys can never be integers; skip the
+            // regex for them (val() over a large workspace calls this per key).
+            if (allIntegerKeys &&
+                key.charCodeAt(0) >= 48 /* '0' */ &&
+                key.charCodeAt(0) <= 57 /* '9' */ &&
+                ChildrenNode.INTEGER_REGEXP_.test(key)) {
                 maxKey = Math.max(maxKey, Number(key));
             }
             else {
@@ -5293,6 +5307,8 @@ class PersistenceManager {
         // immutable range records. The manifest callback fires after every range
         // request has been synchronously queued, but before those payloads finish
         // cloning, so the network comparison overlaps the complete local restore.
+        // The transaction itself only VALIDATES and collects raw structured
+        // clones; decode runs after it resolves, in yielded slices (below).
         return this.withStore_('readonly', null, (store, done, progress) => {
             const manifestReq = store.get(key);
             manifestReq.onsuccess = () => {
@@ -5330,11 +5346,20 @@ class PersistenceManager {
                     done(null);
                     return;
                 }
-                let assembled = ChildrenNode.EMPTY_NODE;
+                // The onsuccess callbacks only VALIDATE and collect the raw
+                // structured clones — decoding (nodeFromJSON + merge) is deferred
+                // to a yielded post-transaction loop below. Chrome coalesces
+                // same-transaction request callbacks into one task, so decoding
+                // inline produced multi-hundred-ms long tasks (and held every raw
+                // clone alive until the last record decoded). The deferred loop
+                // bounds task length and releases each clone as it is consumed —
+                // both matter on mobile WebKit, where a long-task + peak-memory
+                // spike at boot is what gets the page killed.
                 let failed = false;
                 let remaining = manifest.ranges.length;
                 let previousPost = null;
-                manifest.ranges.forEach(range => {
+                const rawTrees = new Array(manifest.ranges.length).fill(null);
+                manifest.ranges.forEach((range, index) => {
                     const expectedStart = previousPost;
                     previousPost = range.post;
                     const req = store.get(key + RANGE_KEY_INFIX + range.recordId);
@@ -5352,33 +5377,12 @@ class PersistenceManager {
                                 this.restoreReasons_.set(pathString, 'corrupt');
                             }
                             else {
-                                try {
-                                    const fragment = nodeFromJSON(record.tree);
-                                    assembled = mergePersistedFragment(assembled, fragment);
-                                }
-                                catch (e) {
-                                    failed = true;
-                                    this.restoreReasons_.set(pathString, 'corrupt');
-                                }
+                                rawTrees[index] = record.tree;
                             }
                         }
                         remaining--;
                         if (remaining === 0) {
-                            if (failed || assembled.isEmpty()) {
-                                done(null);
-                            }
-                            else {
-                                done({
-                                    record: {
-                                        node: assembled,
-                                        hash: manifest.hash,
-                                        compoundHash: wireCompoundHashFromRanges(manifest.ranges),
-                                        updatedAt: manifest.updatedAt,
-                                        revision: manifest.revision
-                                    },
-                                    ranges: manifest.ranges
-                                });
-                            }
+                            done(failed ? null : { manifest, rawTrees });
                         }
                     };
                 });
@@ -5389,7 +5393,31 @@ class PersistenceManager {
                     compoundHash: wireCompoundHashFromRanges(manifest.ranges)
                 });
             };
-        }, onProgress).then(result => {
+        }, onProgress).then(async (collected) => {
+            let result = null;
+            if (collected !== null) {
+                const assembled = await this.decodeFragmentsSliced_(collected.rawTrees, onProgress);
+                if (this.disposed_) {
+                    // Disposed mid-decode: the record on disk is fine — do not mark it
+                    // corrupt (which would delete it below).
+                    return null;
+                }
+                if (assembled === null || assembled.isEmpty()) {
+                    this.restoreReasons_.set(pathString, 'corrupt');
+                }
+                else {
+                    result = {
+                        record: {
+                            node: assembled,
+                            hash: collected.manifest.hash,
+                            compoundHash: wireCompoundHashFromRanges(collected.manifest.ranges),
+                            updatedAt: collected.manifest.updatedAt,
+                            revision: collected.manifest.revision
+                        },
+                        ranges: collected.manifest.ranges
+                    };
+                }
+            }
             if (result === null) {
                 const reason = this.restoreReasons_.get(pathString);
                 if (reason === 'corrupt' || reason === 'expired') {
@@ -5400,6 +5428,35 @@ class PersistenceManager {
             }
             return result;
         });
+    }
+    /**
+     * Decodes and merges raw persisted range clones into one Node in yielded
+     * slices. Each slice decodes a few records, then yields a macrotask so the
+     * main thread can paint/GC between slices; consumed entries are nulled so
+     * the structured clones are collectable while later slices run. Returns
+     * null when any fragment fails to decode.
+     */
+    async decodeFragmentsSliced_(rawTrees, progress) {
+        const SLICE_SIZE = 8;
+        let assembled = ChildrenNode.EMPTY_NODE;
+        for (let i = 0; i < rawTrees.length; i++) {
+            if (i > 0 && i % SLICE_SIZE === 0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+                if (this.disposed_) {
+                    return null;
+                }
+                progress();
+            }
+            const raw = rawTrees[i];
+            rawTrees[i] = null;
+            try {
+                assembled = mergePersistedFragment(assembled, nodeFromJSON(raw));
+            }
+            catch (e) {
+                return null;
+            }
+        }
+        return assembled;
     }
     deleteRecord_(pathString) {
         const key = this.key_(pathString);
@@ -12085,15 +12142,21 @@ function viewRemoveEventRegistration(view, eventRegistration, cancelError) {
             if (!existing.matches(eventRegistration)) {
                 remaining.push(existing);
             }
-            else if (eventRegistration.hasAnyCallback()) {
-                // We're removing just this one
-                remaining = remaining.concat(view.eventRegistrations_.slice(i + 1));
-                break;
+            else {
+                existing.onRemove?.();
+                if (eventRegistration.hasAnyCallback()) {
+                    // We're removing just this one
+                    remaining = remaining.concat(view.eventRegistrations_.slice(i + 1));
+                    break;
+                }
             }
         }
         view.eventRegistrations_ = remaining;
     }
     else {
+        for (const existing of view.eventRegistrations_) {
+            existing.onRemove?.();
+        }
         view.eventRegistrations_ = [];
     }
     return cancelEvents;
@@ -13873,6 +13936,13 @@ function repoBootBufferRootFor(repo, pathString) {
     }
     return null;
 }
+function emitPersistenceTrace(event) {
+    const sink = globalThis
+        .__firebaseDatabasePersistenceTrace;
+    if (typeof sink === 'function') {
+        exceptionGuard(() => sink(event));
+    }
+}
 class Repo {
     constructor(repoInfo_, forceRestClient_, authTokenProvider_, appCheckProvider_) {
         this.repoInfo_ = repoInfo_;
@@ -13895,6 +13965,12 @@ class Repo {
          * enabled it before this Repo's first listen.
          */
         this.persistence_ = null;
+        /**
+         * The application-provided identity scope currently bound to persistence.
+         * `undefined` means Auth has not resolved yet; null means signed out.
+         */
+        this.persistenceAuthScope_ = undefined;
+        this.persistenceAuthScopeListeners_ = new Set();
         /**
          * Listens held back while their persisted root restores, keyed by path.
          * stopListening flips the token so a listen whose last registration was
@@ -14081,6 +14157,7 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
         return;
     }
     state.outcome = outcome;
+    emitPersistenceTrace({ type: 'listen-outcome', path: pathString, outcome });
     for (const subscriber of state.subscribers) {
         // Observability callbacks must never abort authoritative wire processing.
         exceptionGuard(() => subscriber(outcome));
@@ -14369,6 +14446,11 @@ function repoCancelPendingSeedRestores(repo) {
 }
 function repoClearListenOutcomes(repo) {
     repo.listenOutcomes_.clear();
+}
+function repoNotifyPersistenceAuthScope(repo) {
+    for (const listener of repo.persistenceAuthScopeListeners_) {
+        exceptionGuard(listener);
+    }
 }
 function repoDispose(repo) {
     repoInterrupt(repo);
@@ -16293,8 +16375,9 @@ function get(query) {
  * Represents registration for 'value' events.
  */
 class ValueEventRegistration {
-    constructor(callbackContext) {
+    constructor(callbackContext, onRemove) {
         this.callbackContext = callbackContext;
+        this.onRemove = onRemove;
     }
     respondsTo(eventType) {
         return eventType === 'value';
@@ -16339,9 +16422,10 @@ class ValueEventRegistration {
  * Represents the registration of a child_x event.
  */
 class ChildEventRegistration {
-    constructor(eventType, callbackContext) {
+    constructor(eventType, callbackContext, onRemove) {
         this.eventType = eventType;
         this.callbackContext = callbackContext;
+        this.onRemove = onRemove;
     }
     respondsTo(eventType) {
         let eventToCheck = eventType === 'children_added' ? 'child_added' : eventType;
@@ -16393,6 +16477,9 @@ function addEventListener(query, eventType, callback, cancelCallbackOrListenOpti
     if (typeof cancelCallbackOrListenOptions === 'function') {
         cancelCallback = cancelCallbackOrListenOptions;
     }
+    if (options?.persistent && query._queryIdentifier !== 'default') {
+        throw new Error('persistent listener option is only supported for complete, unfiltered references.');
+    }
     if (options && options.onlyOnce) {
         const userCallback = callback;
         const onceCallback = (dataSnapshot, previousChildName) => {
@@ -16403,11 +16490,32 @@ function addEventListener(query, eventType, callback, cancelCallbackOrListenOpti
         onceCallback.context = callback.context;
         callback = onceCallback;
     }
+    let persistenceReleased = false;
+    const releasePersistence = options?.persistent
+        ? () => {
+            if (persistenceReleased) {
+                return;
+            }
+            persistenceReleased = true;
+            query._repo.persistence_?.setPersistentPath(query._path.toString(), false);
+        }
+        : undefined;
+    if (options?.persistent) {
+        // Select before adding the registration: the first registration starts
+        // the wire listen synchronously, and persistence must already own it.
+        query._repo.persistence_?.setPersistentPath(query._path.toString(), true);
+    }
     const callbackContext = new CallbackContext(callback, cancelCallback || undefined);
     const container = eventType === 'value'
-        ? new ValueEventRegistration(callbackContext)
-        : new ChildEventRegistration(eventType, callbackContext);
-    repoAddEventCallbackForQuery(query._repo, query, container);
+        ? new ValueEventRegistration(callbackContext, releasePersistence)
+        : new ChildEventRegistration(eventType, callbackContext, releasePersistence);
+    try {
+        repoAddEventCallbackForQuery(query._repo, query, container);
+    }
+    catch (error) {
+        releasePersistence?.();
+        throw error;
+    }
     return () => repoRemoveEventCallbackForQuery(query._repo, query, container);
 }
 function onValue(query, callback, cancelCallbackOrListenOptions, options) {
@@ -17288,16 +17396,83 @@ function setPersistenceAuthScope(db, scope) {
     if (repo.persistence_?.setAuthScope(scope)) {
         repoCancelPendingSeedRestores(repo);
     }
+    if (repo.persistenceAuthScope_ !== scope) {
+        repo.persistenceAuthScope_ = scope;
+        repoNotifyPersistenceAuthScope(repo);
+    }
 }
 /**
- * Selects an exact default-listen root for persistence.
+ * Returns the identity scope most recently supplied to
+ * `setPersistenceAuthScope`. `undefined` means the application has not
+ * resolved Auth yet; null means it resolved signed out.
  * @public
  */
-function setPersistencePath(db, pathString, enabled) {
+function getPersistenceAuthScope(db) {
     db = getModularInstance(db);
-    db._checkNotDeleted('setPersistencePath');
-    validateRootPathString('setPersistencePath', 'path', pathString, false);
-    db._repoInternal.persistence_?.setPersistentPath(new Path(pathString).toString(), enabled);
+    db._checkNotDeleted('getPersistenceAuthScope');
+    return db._repoInternal.persistenceAuthScope_;
+}
+/**
+ * Observes changes to the application-provided persistence identity scope.
+ * @public
+ */
+function onPersistenceAuthScopeChanged(db, callback) {
+    db = getModularInstance(db);
+    db._checkNotDeleted('onPersistenceAuthScopeChanged');
+    const listeners = db._repoInternal.persistenceAuthScopeListeners_;
+    listeners.add(callback);
+    return () => listeners.delete(callback);
+}
+/**
+ * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
+ * for component/subscription lifecycles so a stale identity wait cannot leak
+ * across unmount or account switch.
+ * @public
+ */
+function waitForPersistenceAuthScope(db, expectedScope, options = {}) {
+    db = getModularInstance(db);
+    db._checkNotDeleted('waitForPersistenceAuthScope');
+    if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let unsubscribe = () => { };
+        const finish = (error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            unsubscribe();
+            options.signal?.removeEventListener('abort', onAbort);
+            if (error) {
+                reject(error);
+            }
+            else {
+                resolve();
+            }
+        };
+        const onAbort = () => {
+            const error = new Error('Persistence auth-scope wait was aborted.');
+            error.name = 'AbortError';
+            finish(error);
+        };
+        const listeners = db._repoInternal.persistenceAuthScopeListeners_;
+        const onScopeChange = () => {
+            if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
+                finish();
+            }
+        };
+        unsubscribe = () => listeners.delete(onScopeChange);
+        listeners.add(onScopeChange);
+        if (options.signal?.aborted) {
+            onAbort();
+            return;
+        }
+        options.signal?.addEventListener('abort', onAbort, { once: true });
+        // Close the read-to-subscribe race if the scope changed synchronously.
+        onScopeChange();
+    });
 }
 /**
  * Observes the restore/cold/fallback state and final server certification for
@@ -17613,5 +17788,5 @@ function _initStandalone({ app, url, version, customAuthImpl, customAppCheckImpl
 setWebSocketImpl(Websocket.Client);
 registerDatabase('node');
 
-export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, _initStandalone, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, getPersistedValue, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onListenOutcome, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPersistenceAuthScope, setPersistenceEnabled, setPersistencePath, setPriority, setWithPriority, startAfter, startAt, update };
+export { DataSnapshot, Database, OnDisconnect, QueryConstraint, TransactionResult, PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS, QueryImpl as _QueryImpl, QueryParams as _QueryParams, ReferenceImpl as _ReferenceImpl, forceRestClient as _TEST_ACCESS_forceRestClient, hijackHash as _TEST_ACCESS_hijackHash, _initStandalone, repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp, setSDKVersion as _setSDKVersion, validatePathString as _validatePathString, validateWritablePath as _validateWritablePath, child, connectDatabaseEmulator, enableLogging, endAt, endBefore, equalTo, forceLongPolling, forceWebSockets, get, getDatabase, getPersistedValue, getPersistenceAuthScope, goOffline, goOnline, increment, limitToFirst, limitToLast, off, onChildAdded, onChildChanged, onChildMoved, onChildRemoved, onDisconnect, onListenOutcome, onPersistenceAuthScopeChanged, onValue, orderByChild, orderByKey, orderByPriority, orderByValue, push, query, ref, refFromURL, remove, runTransaction, serverTimestamp, set, setPersistenceAuthScope, setPersistenceEnabled, setPriority, setWithPriority, startAfter, startAt, update, waitForPersistenceAuthScope };
 //# sourceMappingURL=index.node.esm.js.map
