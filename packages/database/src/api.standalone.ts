@@ -81,11 +81,14 @@ export {
 // consumers call these like any other database API.
 export {
   getPersistedValue,
+  getPersistenceAuthScope,
   onListenOutcome,
+  onPersistenceAuthScopeChanged,
   setPersistenceEnabled,
   setPersistenceAuthScope,
-  setPersistencePath
+  waitForPersistenceAuthScope
 } from './api/Database';
+export type { PersistenceAuthScopeWaitOptions } from './api/Database';
 export type {
   ListenOutcome,
   ListenOutcomeMode,

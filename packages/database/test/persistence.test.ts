@@ -18,8 +18,20 @@
 import { stringify } from '@firebase/util';
 import { expect } from 'chai';
 
-import { getPersistedValue, setPersistenceEnabled } from '../src/api/Database';
-import { DataSnapshot, QueryImpl } from '../src/api/Reference_impl';
+import {
+  getPersistedValue,
+  getPersistenceAuthScope,
+  onPersistenceAuthScopeChanged,
+  setPersistenceAuthScope,
+  setPersistenceEnabled,
+  waitForPersistenceAuthScope
+} from '../src/api/Database';
+import {
+  DataSnapshot,
+  off,
+  onValue,
+  QueryImpl
+} from '../src/api/Reference_impl';
 import {
   CompoundHashBuilder,
   canonicalHashFromNodeAsync,
@@ -58,7 +70,8 @@ import {
   SyncTree,
   syncTreeAddEventRegistration,
   syncTreeApplyServerOverwrite,
-  syncTreeGetCompleteServerCache
+  syncTreeGetCompleteServerCache,
+  syncTreeRemoveEventRegistration
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
 import { sha1 } from '../src/core/util/util';
@@ -1954,6 +1967,78 @@ describe('explicit persistent roots', () => {
   });
 });
 
+describe('persistent listener options', () => {
+  function makeQueryHarness() {
+    const manager = scopedManager('test-repo', makeFakeIndexedDB().factory);
+    const syncTree = new SyncTree({
+      startListening: () => [],
+      stopListening: () => {}
+    });
+    const repo = {
+      persistence_: manager,
+      serverSyncTree_: syncTree,
+      infoSyncTree_: syncTree,
+      eventQueue_: new EventQueue()
+    } as unknown as Repo;
+    const path = new Path('selected/root');
+    const query = new QueryImpl(repo, path, new QueryParams(), false);
+    return { manager, path, query, syncTree };
+  }
+
+  it('selects before subscribe and releases with the returned unsubscribe', () => {
+    const { manager, path, query } = makeQueryHarness();
+    const unsubscribe = onValue(query, () => {}, { persistent: true });
+    expect(manager.isPersistentPath(path.toString())).to.equal(true);
+    unsubscribe();
+    expect(manager.isPersistentPath(path.toString())).to.equal(false);
+  });
+
+  it('releases selection when off() removes the registration', () => {
+    const { manager, path, query } = makeQueryHarness();
+    const callback = () => {};
+    onValue(query, callback, { persistent: true });
+    off(query, 'value', callback);
+    expect(manager.isPersistentPath(path.toString())).to.equal(false);
+  });
+
+  it('rejects persistence on a filtered query instead of silently missing', () => {
+    const { manager, path, query } = makeQueryHarness();
+    const filtered = new QueryImpl(
+      query._repo,
+      path,
+      queryParamsLimitToFirst(new QueryParams(), 1),
+      false
+    );
+    expect(() => onValue(filtered, () => {}, { persistent: true })).to.throw(
+      /complete, unfiltered/i
+    );
+    expect(manager.isPersistentPath(path.toString())).to.equal(false);
+  });
+
+  it('reference-counts registrations at the same path', () => {
+    const { manager, path, query } = makeQueryHarness();
+    const unsubscribeA = onValue(query, () => {}, { persistent: true });
+    const unsubscribeB = onValue(query, () => {}, { persistent: true });
+    unsubscribeA();
+    expect(manager.isPersistentPath(path.toString())).to.equal(true);
+    unsubscribeB();
+    expect(manager.isPersistentPath(path.toString())).to.equal(false);
+  });
+
+  it('releases selection when the SDK cancels every registration', () => {
+    const { manager, path, query, syncTree } = makeQueryHarness();
+    onValue(query, () => {}, { persistent: true });
+    expect(manager.isPersistentPath(path.toString())).to.equal(true);
+    syncTreeRemoveEventRegistration(
+      syncTree,
+      query,
+      null,
+      new Error('permission denied')
+    );
+    expect(manager.isPersistentPath(path.toString())).to.equal(false);
+  });
+});
+
 describe('repoStartServerListen / repoStopServerListen', () => {
   /**
    * The minimal Repo surface the two functions touch. `listen` records calls;
@@ -2818,6 +2903,32 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoClearListenOutcomes(repo);
     expect(repo.listenOutcomes_.size).to.equal(0);
   });
+
+  it('emits generic persistence traces without an app-side wrapper', async () => {
+    const traced: unknown[] = [];
+    const traceGlobal = globalThis as typeof globalThis & {
+      __firebaseDatabasePersistenceTrace?: (event: unknown) => void;
+    };
+    traceGlobal.__firebaseDatabasePersistenceTrace = event =>
+      traced.push(event);
+    try {
+      const { repo, query, path, hashFn, onComplete } = makeListenHarness();
+      repoStartServerListen(repo, query, null, hashFn, onComplete);
+      await flushAsync();
+      expect(traced).to.deep.include({
+        type: 'listen-outcome',
+        path: path.toString(),
+        outcome: {
+          mode: 'cold',
+          certified: false,
+          bytes: 0,
+          reason: 'missing'
+        }
+      });
+    } finally {
+      delete traceGlobal.__firebaseDatabasePersistenceTrace;
+    }
+  });
 });
 
 describe('stale restore vs live server data', () => {
@@ -3052,6 +3163,66 @@ describe('DataSnapshot restored-value semantics', () => {
     first.nested.value = 99;
     expect(snapshot.val()).to.deep.equal({ nested: { value: 1 } });
     expect(node.getChild(new Path('nested/value')).val()).to.equal(1);
+  });
+});
+
+describe('persistence auth-scope state', () => {
+  function makeScopedDatabase() {
+    const manager = scopedManager('test-repo', makeFakeIndexedDB().factory);
+    const repo = {
+      persistence_: manager,
+      persistenceAuthScope_: undefined as string | null | undefined,
+      persistenceAuthScopeListeners_: new Set<() => void>(),
+      pendingListenHashes_: new PendingListenHashStore(),
+      pendingSeedRestores_: new Map<string, { cancelled: boolean }>()
+    };
+    const db = {
+      _checkNotDeleted: () => {},
+      _repoInternal: repo
+    };
+    return { db, repo };
+  }
+
+  it('publishes the scope only after setPersistenceAuthScope updates the manager', () => {
+    const { db } = makeScopedDatabase();
+    let changes = 0;
+    const unsubscribe = onPersistenceAuthScopeChanged(
+      db as never,
+      () => changes++
+    );
+    expect(getPersistenceAuthScope(db as never)).to.equal(undefined);
+    setPersistenceAuthScope(db as never, 'viewer');
+    expect(getPersistenceAuthScope(db as never)).to.equal('viewer');
+    expect(changes).to.equal(1);
+    setPersistenceAuthScope(db as never, 'viewer');
+    expect(changes).to.equal(1);
+    unsubscribe();
+  });
+
+  it('aborts a mismatched wait and removes its listener', async () => {
+    const { db, repo } = makeScopedDatabase();
+    const controller = new AbortController();
+    const waiting = waitForPersistenceAuthScope(db as never, 'viewer', {
+      signal: controller.signal
+    });
+    expect(repo.persistenceAuthScopeListeners_.size).to.equal(1);
+    controller.abort();
+    let name = '';
+    try {
+      await waiting;
+    } catch (error) {
+      name = (error as Error).name;
+    }
+    expect(name).to.equal('AbortError');
+    expect(repo.persistenceAuthScopeListeners_.size).to.equal(0);
+  });
+
+  it('resolves a wait when the expected scope arrives', async () => {
+    const { db, repo } = makeScopedDatabase();
+    const waiting = waitForPersistenceAuthScope(db as never, 'viewer');
+    setPersistenceAuthScope(db as never, 'viewer');
+    await waiting;
+    expect(repo.persistenceAuthScopeListeners_.size).to.equal(0);
   });
 });
 

@@ -244,6 +244,24 @@ interface ListenOutcomeState {
   subscribers: Set<(outcome: ListenOutcome) => void>;
 }
 
+interface PersistenceTraceEvent {
+  type: 'listen-outcome';
+  path: string;
+  outcome: ListenOutcome;
+}
+
+type PersistenceTraceGlobal = typeof globalThis & {
+  __firebaseDatabasePersistenceTrace?: (event: PersistenceTraceEvent) => void;
+};
+
+function emitPersistenceTrace(event: PersistenceTraceEvent): void {
+  const sink = (globalThis as PersistenceTraceGlobal)
+    .__firebaseDatabasePersistenceTrace;
+  if (typeof sink === 'function') {
+    exceptionGuard(() => sink(event));
+  }
+}
+
 export class Repo {
   /** Key for uniquely identifying this repo, used in RepoManager */
   readonly key: string;
@@ -275,6 +293,13 @@ export class Repo {
    * enabled it before this Repo's first listen.
    */
   persistence_: PersistenceManager | null = null;
+
+  /**
+   * The application-provided identity scope currently bound to persistence.
+   * `undefined` means Auth has not resolved yet; null means signed out.
+   */
+  persistenceAuthScope_: string | null | undefined = undefined;
+  persistenceAuthScopeListeners_ = new Set<() => void>();
 
   /**
    * Listens held back while their persisted root restores, keyed by path.
@@ -571,6 +596,7 @@ function repoPublishListenOutcome(
     return;
   }
   state.outcome = outcome;
+  emitPersistenceTrace({ type: 'listen-outcome', path: pathString, outcome });
   for (const subscriber of state.subscribers) {
     // Observability callbacks must never abort authoritative wire processing.
     exceptionGuard(() => subscriber(outcome));
@@ -924,6 +950,12 @@ export function repoCancelPendingSeedRestores(repo: Repo): void {
 
 export function repoClearListenOutcomes(repo: Repo): void {
   repo.listenOutcomes_.clear();
+}
+
+export function repoNotifyPersistenceAuthScope(repo: Repo): void {
+  for (const listener of repo.persistenceAuthScopeListeners_) {
+    exceptionGuard(listener);
+  }
 }
 
 export function repoDispose(repo: Repo): void {

@@ -77,6 +77,12 @@ export function get(query: Query): Promise<DataSnapshot>;
 export function getDatabase(app?: FirebaseApp, url?: string): Database;
 
 // @public
+export function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+
+// @public
+export function getPersistenceAuthScope(db: Database): string | null | undefined;
+
+// @public
 export function goOffline(db: Database): void;
 
 // @public
@@ -100,7 +106,26 @@ export function limitToLast(limit: number): QueryConstraint;
 // @public
 export interface ListenOptions {
     readonly onlyOnce?: boolean;
+    readonly persistent?: boolean;
 }
+
+// @public
+export interface ListenOutcome {
+    // (undocumented)
+    bytes: number;
+    // (undocumented)
+    certified: boolean;
+    // (undocumented)
+    mode: ListenOutcomeMode;
+    // (undocumented)
+    reason?: ListenOutcomeReason;
+}
+
+// @public
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+
+// @public
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 
 // @public
 export function off(query: Query, eventType?: EventType, callback?: (snapshot: DataSnapshot, previousChildName?: string | null) => unknown): void;
@@ -154,6 +179,12 @@ export class OnDisconnect {
 export function onDisconnect(ref: DatabaseReference): OnDisconnect;
 
 // @public
+export function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
+
+// @public
+export function onPersistenceAuthScopeChanged(db: Database, callback: () => void): () => void;
+
+// @public
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
 
 // @public
@@ -173,6 +204,11 @@ export function orderByPriority(): QueryConstraint;
 
 // @public
 export function orderByValue(): QueryConstraint;
+
+// @public
+export interface PersistenceAuthScopeWaitOptions {
+    signal?: AbortSignal;
+}
 
 // @public
 export function push(parent: DatabaseReference, value?: unknown): ThenableReference;
@@ -215,6 +251,12 @@ export function serverTimestamp(): object;
 export function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
 // @public
+export function setPersistenceAuthScope(db: Database, scope: string | null): void;
+
+// @public
+export function setPersistenceEnabled(db: Database, enabled: boolean): void;
+
+// @public
 export function setPriority(ref: DatabaseReference, priority: string | number | null): Promise<void>;
 
 // @public
@@ -251,6 +293,9 @@ export type Unsubscribe = () => void;
 
 // @public
 export function update(ref: DatabaseReference, values: object): Promise<void>;
+
+// @public
+export function waitForPersistenceAuthScope(db: Database, expectedScope: string | null, options?: PersistenceAuthScopeWaitOptions): Promise<void>;
 
 
 ```

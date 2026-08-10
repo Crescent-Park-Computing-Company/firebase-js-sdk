@@ -832,7 +832,10 @@ export function get(query: Query): Promise<DataSnapshot> {
  * Represents registration for 'value' events.
  */
 export class ValueEventRegistration implements EventRegistration {
-  constructor(private callbackContext: CallbackContext) {}
+  constructor(
+    private callbackContext: CallbackContext,
+    readonly onRemove?: () => void
+  ) {}
 
   respondsTo(eventType: string): boolean {
     return eventType === 'value';
@@ -891,7 +894,8 @@ export class ValueEventRegistration implements EventRegistration {
 export class ChildEventRegistration implements EventRegistration {
   constructor(
     private eventType: string,
-    private callbackContext: CallbackContext | null
+    private callbackContext: CallbackContext | null,
+    readonly onRemove?: () => void
   ) {}
 
   respondsTo(eventType: string): boolean {
@@ -972,6 +976,12 @@ function addEventListener(
     cancelCallback = cancelCallbackOrListenOptions;
   }
 
+  if (options?.persistent && query._queryIdentifier !== 'default') {
+    throw new Error(
+      'persistent listener option is only supported for complete, unfiltered references.'
+    );
+  }
+
   if (options && options.onlyOnce) {
     const userCallback = callback;
     const onceCallback: UserCallback = (dataSnapshot, previousChildName) => {
@@ -983,15 +993,43 @@ function addEventListener(
     callback = onceCallback;
   }
 
+  let persistenceReleased = false;
+  const releasePersistence = options?.persistent
+    ? () => {
+        if (persistenceReleased) {
+          return;
+        }
+        persistenceReleased = true;
+        query._repo.persistence_?.setPersistentPath(
+          query._path.toString(),
+          false
+        );
+      }
+    : undefined;
+  if (options?.persistent) {
+    // Select before adding the registration: the first registration starts
+    // the wire listen synchronously, and persistence must already own it.
+    query._repo.persistence_?.setPersistentPath(query._path.toString(), true);
+  }
+
   const callbackContext = new CallbackContext(
     callback,
     cancelCallback || undefined
   );
   const container =
     eventType === 'value'
-      ? new ValueEventRegistration(callbackContext)
-      : new ChildEventRegistration(eventType, callbackContext);
-  repoAddEventCallbackForQuery(query._repo, query, container);
+      ? new ValueEventRegistration(callbackContext, releasePersistence)
+      : new ChildEventRegistration(
+          eventType,
+          callbackContext,
+          releasePersistence
+        );
+  try {
+    repoAddEventCallbackForQuery(query._repo, query, container);
+  } catch (error) {
+    releasePersistence?.();
+    throw error;
+  }
   return () => repoRemoveEventCallbackForQuery(query._repo, query, container);
 }
 

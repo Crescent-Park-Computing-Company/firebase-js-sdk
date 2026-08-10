@@ -48,6 +48,7 @@ import {
   repoInterrupt,
   ListenOutcome,
   repoOnListenOutcome,
+  repoNotifyPersistenceAuthScope,
   repoResume,
   repoStart
 } from '../core/Repo';
@@ -538,24 +539,101 @@ export function setPersistenceAuthScope(
   if (repo.persistence_?.setAuthScope(scope)) {
     repoCancelPendingSeedRestores(repo);
   }
+  if (repo.persistenceAuthScope_ !== scope) {
+    repo.persistenceAuthScope_ = scope;
+    repoNotifyPersistenceAuthScope(repo);
+  }
 }
 
 /**
- * Selects an exact default-listen root for persistence.
+ * Returns the identity scope most recently supplied to
+ * `setPersistenceAuthScope`. `undefined` means the application has not
+ * resolved Auth yet; null means it resolved signed out.
  * @public
  */
-export function setPersistencePath(
-  db: Database,
-  pathString: string,
-  enabled: boolean
-): void {
+export function getPersistenceAuthScope(
+  db: Database
+): string | null | undefined {
   db = getModularInstance(db);
-  db._checkNotDeleted('setPersistencePath');
-  validateRootPathString('setPersistencePath', 'path', pathString, false);
-  db._repoInternal.persistence_?.setPersistentPath(
-    new Path(pathString).toString(),
-    enabled
-  );
+  db._checkNotDeleted('getPersistenceAuthScope');
+  return db._repoInternal.persistenceAuthScope_;
+}
+
+/**
+ * Observes changes to the application-provided persistence identity scope.
+ * @public
+ */
+export function onPersistenceAuthScopeChanged(
+  db: Database,
+  callback: () => void
+): () => void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('onPersistenceAuthScopeChanged');
+  const listeners = db._repoInternal.persistenceAuthScopeListeners_;
+  listeners.add(callback);
+  return () => listeners.delete(callback);
+}
+
+/** Options for waiting on a persistence identity scope. @public */
+export interface PersistenceAuthScopeWaitOptions {
+  /** Cancels the wait and releases its scope-change subscription. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Resolves when persistence is bound to `expectedScope`. Pass an AbortSignal
+ * for component/subscription lifecycles so a stale identity wait cannot leak
+ * across unmount or account switch.
+ * @public
+ */
+export function waitForPersistenceAuthScope(
+  db: Database,
+  expectedScope: string | null,
+  options: PersistenceAuthScopeWaitOptions = {}
+): Promise<void> {
+  db = getModularInstance(db);
+  db._checkNotDeleted('waitForPersistenceAuthScope');
+  if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let unsubscribe = () => {};
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      unsubscribe();
+      options.signal?.removeEventListener('abort', onAbort);
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const onAbort = () => {
+      const error = new Error('Persistence auth-scope wait was aborted.');
+      error.name = 'AbortError';
+      finish(error);
+    };
+    const listeners = db._repoInternal.persistenceAuthScopeListeners_;
+    const onScopeChange = () => {
+      if (db._repoInternal.persistenceAuthScope_ === expectedScope) {
+        finish();
+      }
+    };
+    unsubscribe = () => listeners.delete(onScopeChange);
+    listeners.add(onScopeChange);
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    // Close the read-to-subscribe race if the scope changed synchronously.
+    onScopeChange();
+  });
 }
 
 /**
