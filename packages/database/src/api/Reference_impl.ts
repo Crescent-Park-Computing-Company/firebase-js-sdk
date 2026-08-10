@@ -19,6 +19,7 @@ import { assert, getModularInstance, Deferred } from '@firebase/util';
 
 import {
   Repo,
+  repoActivatePersistenceForJoinedListen,
   repoAddEventCallbackForQuery,
   repoGetValue,
   repoRemoveEventCallbackForQuery,
@@ -460,16 +461,36 @@ export class DataSnapshot {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   val(): any {
-    // One-boot materialization handoff (see ServerCacheSeed): when the
-    // optimistic peek already materialized exactly this immutable Node, its
-    // stamped value is returned instead of walking the tree again. Consumed
-    // on first use — every subsequent val() takes the normal fresh path.
-    const stamped = consumeMaterializedValue(this._node);
-    if (stamped !== undefined) {
-      return stamped;
-    }
     return this._node.val();
   }
+}
+
+/**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+export function consumePersistedMaterialization(
+  snapshot: DataSnapshot
+): unknown | undefined {
+  return consumeMaterializedValue(snapshot._node);
 }
 
 /**
@@ -1038,6 +1059,17 @@ function addEventListener(
   } catch (error) {
     releasePersistence?.();
     throw error;
+  }
+  if (options?.persistent) {
+    // Selecting before registration covers the registration that CREATES the
+    // wire listen (repoStartServerListen tracks the root). When this
+    // registration JOINED an already-listening default query instead, that
+    // start path never re-runs — activate persistence against the live
+    // listen: track the root and seed write-through from the complete server
+    // cache the listen already certified (nothing to do while it is still
+    // loading; the listen-complete certification write-through covers that
+    // ordering once tracked).
+    repoActivatePersistenceForJoinedListen(query._repo, query._path);
   }
   return () => repoRemoveEventCallbackForQuery(query._repo, query, container);
 }

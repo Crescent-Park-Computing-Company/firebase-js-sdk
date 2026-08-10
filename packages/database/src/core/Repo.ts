@@ -181,6 +181,15 @@ interface PendingSeedRestore {
   cancelled: boolean;
   authScopeUnsubscribe?: () => void;
   authScopeTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Tears down whatever this pending restore has already put on the wire /
+   * buffered, then re-enters repoStartServerListen for the SAME subscription
+   * without persistence. Installed by repoStartServerListen; called by the
+   * bulk cancel (an account switch) so no live registration is left silent
+   * behind a cancelled token — the restore is moot under the new identity,
+   * but the listen itself must still reach the server.
+   */
+  reattachCold?: () => void;
 }
 
 /** One server operation held during a manifest-first boot window. */
@@ -735,6 +744,20 @@ export function repoStartServerListen(
     // or, worse, replay another account's record. A bounded timeout preserves
     // the normal live-listen liveness contract if Auth integration wedges.
     const token: PendingSeedRestore = { cancelled: false };
+    // Nothing is on the wire while waiting for the identity: a bulk cancel
+    // (account switch) just restarts this subscription as a plain cold
+    // listen so it cannot be stranded silent behind the cancelled token.
+    token.reattachCold = () => {
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        true,
+        authScopeTimeoutMs
+      );
+    };
     repo.pendingSeedRestores_.set(pathString, token);
     const isCurrent = () =>
       !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
@@ -789,6 +812,27 @@ export function repoStartServerListen(
 
   persistence.track(pathString);
   const token: PendingSeedRestore = { cancelled: false };
+  // A bulk cancel (account switch) lands in one of two shapes: pre-manifest
+  // (no listen sent yet — just start cold), or manifest-first (a seeded wire
+  // listen is out and its boot buffer is about to be dropped — tear the
+  // seeded listen down first, then start cold). Restore resolution observes
+  // the cancelled token and exits without touching the new listen.
+  token.reattachCold = () => {
+    repo.pendingListenHashes_.clear(pathString);
+    if (repo.bootBuffers_.has(pathString)) {
+      repo.bootBuffers_.delete(pathString);
+      repo.server_.unlisten(query, tag);
+    }
+    repoStartServerListen(
+      repo,
+      query,
+      tag,
+      currentHashFn,
+      onComplete,
+      true,
+      authScopeTimeoutMs
+    );
+  };
   repo.pendingSeedRestores_.set(pathString, token);
   const isCurrent = () =>
     !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
@@ -1004,9 +1048,14 @@ export function repoOnListenOutcome(
   pathString: string,
   subscriber: (outcome: ListenOutcome) => void
 ): () => void {
-  const state = repo.listenOutcomes_.get(pathString);
+  let state = repo.listenOutcomes_.get(pathString);
   if (!state) {
-    return () => {};
+    // Subscribing before the listen starts is the natural ordering for a
+    // caller that wires observability alongside its onValue().
+    // repoStartServerListen preserves the subscriber set from a prior state,
+    // so an empty pre-created state is carried into the real listen.
+    state = { outcome: null, subscribers: new Set() };
+    repo.listenOutcomes_.set(pathString, state);
   }
   state.subscribers.add(subscriber);
   if (state.outcome) {
@@ -1015,12 +1064,61 @@ export function repoOnListenOutcome(
   return () => state.subscribers.delete(subscriber);
 }
 
-export function repoCancelPendingSeedRestores(repo: Repo): void {
-  repo.pendingListenHashes_.clearAll();
-  for (const pending of repo.pendingSeedRestores_.values()) {
-    repoCancelPendingSeedRestore(pending);
+/**
+ * Activates persistence for a `{ persistent: true }` registration that JOINED
+ * an already-listening default query (repoStartServerListen does not re-run
+ * for it, so nothing else would ever track the root). Tracking is idempotent;
+ * when the live listen has already certified a complete server cache, that
+ * exact tree is seeded through the normal write-through path so the root is
+ * warm on the next boot. A still-loading listen needs nothing here — its own
+ * listen-complete certification write-through covers the root once tracked.
+ * @internal
+ */
+export function repoActivatePersistenceForJoinedListen(
+  repo: Repo,
+  path: Path
+): void {
+  const persistence = repo.persistence_;
+  const pathString = path.toString();
+  if (
+    persistence === null ||
+    !persistence.isPersistentPath(pathString) ||
+    persistence.trackedRootFor(pathString) === pathString ||
+    repo.pendingSeedRestores_?.has(pathString)
+  ) {
+    // No manager, not selected, already tracked by its own start path, or the
+    // start path is still in flight (it will track on resolution).
+    return;
   }
+  persistence.track(pathString);
+  const serverCache = syncTreeGetCompleteServerCache(
+    repo.serverSyncTree_,
+    path
+  );
+  if (serverCache !== null) {
+    persistence.serverCacheUpdated(path, serverCache);
+  }
+}
+
+export function repoCancelPendingSeedRestores(
+  repo: Repo,
+  reattach = true
+): void {
+  repo.pendingListenHashes_.clearAll();
+  const pendings = [...repo.pendingSeedRestores_.values()];
   repo.pendingSeedRestores_.clear();
+  for (const pending of pendings) {
+    repoCancelPendingSeedRestore(pending);
+    if (reattach) {
+      // The subscription outlives the cancelled restore (account switch,
+      // persistence disabled): a pre-manifest token never sent its listen, a
+      // manifest-first token has a seeded wire listen whose boot buffer is
+      // about to be dropped. Either way, restart it as one ordinary cold
+      // listen so the registration keeps receiving data. Dispose passes
+      // false — there is no live subscription left to serve.
+      pending.reattachCold?.();
+    }
+  }
 }
 
 export function repoClearListenOutcomes(repo: Repo): void {
@@ -1035,7 +1133,7 @@ export function repoNotifyPersistenceAuthScope(repo: Repo): void {
 
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
-  repoCancelPendingSeedRestores(repo);
+  repoCancelPendingSeedRestores(repo, false);
   repoClearListenOutcomes(repo);
   repo.persistenceAuthScopeListeners_.clear();
   repo.persistence_?.dispose();

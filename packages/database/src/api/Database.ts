@@ -495,10 +495,11 @@ export function getPersistedValue(
       if (value !== null && typeof value === 'object') {
         // One-boot materialization handoff (see ServerCacheSeed): the
         // authenticated listener that adopts this same immutable Node replays
-        // it as a child_added burst; stamping each top-level child's slice of
-        // this materialization lets those snapshots' val() return the SAME
-        // objects instead of walking the tree a second time. Index access
-        // covers both object and array-coerced shapes.
+        // it as a child_added burst, and a caller that opts in via
+        // consumePersistedMaterialization() adopts each top-level child's
+        // slice of this single materialization instead of walking the tree a
+        // second time. snapshot.val() itself never returns these objects.
+        // Index access covers both object and array-coerced shapes.
         const byKey = value as Record<string, unknown>;
         record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
           stampMaterializedValue(childNode, byKey[key]);

@@ -16,6 +16,9 @@ export function connectDatabaseEmulator(db: Database, host: string, port: number
 }): void;
 
 // @public
+export function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
+
+// @public
 export class Database {
     readonly app: FirebaseApp;
     readonly 'type' = "database";

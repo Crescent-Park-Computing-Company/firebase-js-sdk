@@ -2302,6 +2302,22 @@ export class PersistenceManager {
       .catch(() => {
         persistenceStats.storageFailures++;
         recordPersistenceEvent(pathString, 'flush-range-stage-error');
+        // The flush consumed the accumulated changed-paths at its start, but
+        // nothing was committed: lastFlush_ still describes the stored
+        // baseline, so the paths this flush was covering must flow into the
+        // next diff or its ranges would be carried forward stale. Merge them
+        // back with whatever accrued since (either side already imprecise
+        // stays imprecise).
+        const since = this.changedSinceFlush_.get(pathString);
+        if (accumulated === null || since === null) {
+          this.changedSinceFlush_.set(pathString, null);
+        } else if (accumulated !== undefined && accumulated.length > 0) {
+          const merged = accumulated.concat(since ?? []);
+          this.changedSinceFlush_.set(
+            pathString,
+            merged.length > MAX_ACCUMULATED_CHANGED_PATHS ? null : merged
+          );
+        }
         // Staged immutable records are non-authoritative and are reclaimed by
         // the next successful full-generation GC or the deferred sweep.
         if (stagedIds.length > 0) {

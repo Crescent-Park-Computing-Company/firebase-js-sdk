@@ -24,6 +24,7 @@ import {
   setPersistenceEnabled
 } from '../src/api/Database';
 import {
+  consumePersistedMaterialization,
   DataSnapshot,
   off,
   onValue,
@@ -1015,6 +1016,76 @@ describe('PersistenceManager', () => {
     expect(reused).to.be.greaterThan(manifest.ranges.length - 3);
     // Consumed: the accumulator reset to empty for the new baseline.
     expect(internals.changedSinceFlush_.get(path.toString())).to.deep.equal([]);
+  });
+
+  it('a failed range stage preserves the consumed changed paths', async () => {
+    const shared = makeFakeIndexedDB();
+    const path = new Path('accum-fail/root');
+    const prefix = 'test-repo|/accum-fail/root';
+    const manager = scopedManager('test-repo', shared.factory);
+    manager.track(path.toString());
+    const base: Record<string, unknown> = {};
+    for (let i = 0; i < 40; i++) {
+      base['child' + i] = { body: 'x'.repeat(40000), v: i };
+    }
+    const baseNode = nodeFromJSON(base);
+    manager.serverCacheUpdated(path, baseNode, [[]]);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = shared.data.get(prefix) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+
+    // A named change, then a flush whose range staging fails transiently
+    // (the fake store's put throws once).
+    const internals = manager as unknown as {
+      changedSinceFlush_: Map<string, string[][] | null>;
+    };
+    const updated = baseNode.updateChild(
+      new Path('child3/v'),
+      nodeFromJSON(999)
+    );
+    manager.serverCacheUpdated(path, updated, [['child3', 'v']]);
+    const store = shared.data;
+    const realSet = store.set.bind(store);
+    let failed = false;
+    store.set = (key: string, value: unknown) => {
+      if (!failed && key.includes('#')) {
+        failed = true;
+        throw new Error('simulated transient IndexedDB failure');
+      }
+      return realSet(key, value);
+    };
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    store.set = realSet;
+    // Nothing committed; the stored manifest is still the base generation.
+    expect((shared.data.get(prefix) as { revision: string }).revision).to.equal(
+      manifest.revision
+    );
+
+    // The consumed paths flowed back: WITHOUT them, the next flush would
+    // diff its own last-known baseline, see nothing new for child3, and
+    // publish a manifest whose child3 range record was never re-staged.
+    const preserved = internals.changedSinceFlush_.get(path.toString());
+    expect(preserved === null || preserved!.length > 0).to.equal(true);
+
+    // And the recovery flush persists the change end-to-end.
+    manager.serverCacheUpdated(
+      path,
+      updated.updateChild(new Path('child5/v'), nodeFromJSON(555)),
+      [['child5', 'v']]
+    );
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const restored = await restoreForTest(
+      scopedManager('test-repo', shared.factory),
+      path.toString()
+    );
+    const val = restored!.node.val() as Record<string, { v: number }>;
+    expect(val['child3'].v).to.equal(999);
+    expect(val['child5'].v).to.equal(555);
   });
 
   it('an unnamed update falls the flush back to the identity diff', async () => {
@@ -2024,6 +2095,27 @@ describe('persistent listener options', () => {
     expect(manager.isPersistentPath(path.toString())).to.equal(false);
   });
 
+  it('activates persistence when joining an existing non-persistent listen', async () => {
+    const { manager, path, query, syncTree } = makeQueryHarness();
+    // A plain registration creates the wire listen first; the start path ran
+    // without persistence (not selected), so nothing tracked the root.
+    onValue(query, () => {});
+    // The listen certifies a complete server cache.
+    syncTreeApplyServerOverwrite(syncTree, path, nodeFromJSON({ a: 1 }));
+    expect(manager.trackedRootFor(path.toString())).to.equal(null);
+
+    // A second registration joins the SAME live listen with { persistent }.
+    // repoStartServerListen does not re-run — activation must happen against
+    // the aggregated listen: tracked + write-through seeded from the
+    // certified cache.
+    onValue(query, () => {}, { persistent: true });
+    expect(manager.trackedRootFor(path.toString())).to.equal(path.toString());
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const record = await manager.peek(path.toString());
+    expect(record?.node.val()).to.deep.equal({ a: 1 });
+  });
+
   it('releases selection when the SDK cancels every registration', () => {
     const { manager, path, query, syncTree } = makeQueryHarness();
     onValue(query, () => {}, { persistent: true });
@@ -2150,6 +2242,22 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
   }
+
+  it('outcome subscribers registered before the listen still receive outcomes', async () => {
+    const { repo, query, path, hashFn, onComplete, serverCallbacks } =
+      makeListenHarness();
+    const outcomes: ListenOutcome[] = [];
+    // Natural ordering: observability wired BEFORE onValue starts the listen.
+    const unsubscribe = repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    serverCallbacks[0]('ok');
+    expect(outcomes.length).to.be.greaterThan(0);
+    expect(outcomes[outcomes.length - 1].certified).to.equal(true);
+    unsubscribe();
+  });
 
   it('sends the listen after the restore resolves', async () => {
     const { repo, query, hashFn, onComplete, calls } = makeListenHarness();
@@ -2475,6 +2583,86 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     serverCallbacks[0]('ok');
     await flushAsync();
     expect(outcomes.at(-1)?.certified).to.equal(true);
+  });
+
+  it('account switch mid-restore reattaches the listen cold (pre-manifest)', async () => {
+    const { repo, query, path, hashFn, onComplete, calls } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, { a: 1 });
+    // Hold the restore forever: the manifest never arrives, so no listen has
+    // been sent when the account switches.
+    repo.persistence_ = {
+      track: () => {},
+      isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
+      restoreForListen: () => new Promise(() => {}),
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      invalidate: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    expect(calls).to.deep.equal([]);
+
+    // The account changes: the restore is moot, but the live registration
+    // must still reach the server — as one ordinary cold listen.
+    repoCancelPendingSeedRestores(repo);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
+    expect(repo.bootBuffers_.size).to.equal(0);
+  });
+
+  it('account switch mid-restore reattaches the listen cold (post-manifest)', async () => {
+    const { repo, query, path, hashFn, onComplete, calls } =
+      makeListenHarness();
+    const node = nodeFromJSON({ a: 1, b: 2 });
+    const compoundHash = computeCompoundHash(node.val(true));
+    // Manifest arrives (the seeded listen goes out), then the range restore
+    // hangs — the exact window an account switch can land in.
+    repo.persistence_ = {
+      track: () => {},
+      isPersistentPath: () => true,
+      isAuthScopeConfigured: () => true,
+      restoreForListen: (
+        _path: string,
+        onManifest: (h: PersistedSeedHashes) => void
+      ) => {
+        onManifest({ hash: '', compoundHash });
+        return new Promise(() => {});
+      },
+      trackedRootFor: () => null,
+      serverCacheUpdated: () => {},
+      invalidate: () => {},
+      evict: () => {},
+      untrack: () => {}
+    } as unknown as PersistenceManager;
+    const realQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      realQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await Promise.resolve();
+    expect(calls).to.deep.equal(['listen']); // the seeded manifest-first send
+    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+
+    // The account changes: the seeded wire listen is torn down (its buffered
+    // base can never be applied) and exactly one cold listen replaces it.
+    repoCancelPendingSeedRestores(repo);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
+    expect(repo.bootBuffers_.size).to.equal(0);
+    expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
+    expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
   it('manifest-first: sends the listen before range restore resolves', async () => {
@@ -3320,7 +3508,7 @@ describe('getPersistedValue', () => {
     });
   });
 
-  it('hands the peek materialization to the first replayed val() by identity', async () => {
+  it('hands the peek materialization only to the explicit consumer', async () => {
     const { db, manager } = makeDatabaseWithPersistence();
     const root = new Path('users/alice');
     manager.track(root.toString());
@@ -3344,9 +3532,8 @@ describe('getPersistedValue', () => {
     const record = await manager.peek(root.toString());
     expect(record).to.not.equal(null);
 
-    // The replay burst wraps each top-level child Node in a DataSnapshot;
-    // its first val() must return the peek's exact objects — one JS tree
-    // per boot, and shared child identity for downstream memoization.
+    // The replay burst wraps each top-level child Node in a DataSnapshot.
+    // val() NEVER returns the peek's objects (fresh-objects contract) …
     const profileNode = record!.node.getImmediateChild('profile');
     const burstSnap = new DataSnapshot(
       profileNode,
@@ -3354,22 +3541,47 @@ describe('getPersistedValue', () => {
       null as any,
       PRIORITY_INDEX
     );
-    expect(burstSnap.val()).to.equal(value.profile);
+    const plain = burstSnap.val();
+    expect(plain).to.not.equal(value.profile);
+    expect(plain).to.deep.equal(value.profile);
 
-    // Consume-once: the handoff must not change fresh-objects-per-val()
-    // semantics for any later caller.
-    const laterSnap = new DataSnapshot(
-      profileNode,
+    // … the explicit opt-in consumer receives them by identity, exactly once.
+    const adopted = consumePersistedMaterialization(burstSnap);
+    expect(adopted).to.equal(value.profile);
+    expect(consumePersistedMaterialization(burstSnap)).to.equal(undefined);
+  });
+
+  it('a caller mutation of the peek result never flows through val()', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('users/alice');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(
+      root,
+      nodeFromJSON({ inbox: { unread: 2 }, sent: { b: 1 } })
+    );
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    const value = (await getPersistedValue(db as never, '/users/alice')) as {
+      inbox: { unread: number };
+    };
+    // The application mutates the optimistic object it was handed (it owns
+    // that object) before the listener replay.
+    value.inbox.unread = 999;
+
+    const record = await manager.peek(root.toString());
+    const inboxSnap = new DataSnapshot(
+      record!.node.getImmediateChild('inbox'),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       null as any,
       PRIORITY_INDEX
     );
-    const later = laterSnap.val();
-    expect(later).to.not.equal(value.profile);
-    expect(later).to.deep.equal(value.profile);
+    // val() walks the immutable Node — the mutation cannot leak into the
+    // SDK's replayed data.
+    expect(inboxSnap.val()).to.deep.equal({ unread: 2 });
   });
 
-  it('a child changed after the peek misses the handoff and materializes fresh', async () => {
+  it('a child changed after the peek misses the explicit consumer', async () => {
     const { db, manager } = makeDatabaseWithPersistence();
     const root = new Path('users/alice');
     manager.track(root.toString());
@@ -3380,9 +3592,7 @@ describe('getPersistedValue', () => {
     await manager.flushNow(root.toString());
     await flushAsync();
 
-    const value = (await getPersistedValue(db as never, '/users/alice')) as {
-      inbox: object;
-    };
+    await getPersistedValue(db as never, '/users/alice');
     // A server delta between peek and replay produces a NEW child Node; the
     // stamp is keyed on instance identity, so the fresh node can never
     // return the stale materialization.
@@ -3393,8 +3603,8 @@ describe('getPersistedValue', () => {
       null as any,
       PRIORITY_INDEX
     );
+    expect(consumePersistedMaterialization(snap)).to.equal(undefined);
     expect(snap.val()).to.deep.equal({ a: 1, c: 3 });
-    expect(snap.val()).to.not.equal(value.inbox);
   });
 
   it('rejects persistence reconfiguration after the Database starts', () => {

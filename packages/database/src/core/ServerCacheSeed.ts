@@ -114,12 +114,13 @@ export function getNodeCanonicalHash(node: Node): string | undefined {
  * of a large workspace alive at the peak of boot.
  *
  * The peek stamps each materialized value here, keyed by its Node instance;
- * `DataSnapshot.val()` consumes a stamp (get + delete) instead of walking
- * the node. Consume-once keeps the official fresh-objects-per-val() contract
- * for every later caller: only the single designed peek→listener handoff
- * ever receives shared objects (which is the point — the optimistic tree and
- * the live tree then share child identity, so downstream memoization sees
- * unchanged branches as unchanged).
+ * a consumer that OPTS IN via consumePersistedMaterialization() (api/
+ * Reference_impl) takes a stamp (get + delete) instead of walking the node.
+ * `DataSnapshot.val()` never consumes a stamp — its fresh-objects contract
+ * is untouched. Consume-once means only the single designed peek→listener
+ * handoff ever receives shared objects (which is the point — the optimistic
+ * tree and the live tree then share child identity, so downstream
+ * memoization sees unchanged branches as unchanged).
  *
  * Correctness is by construction: a Node is immutable, so a stamp can only
  * ever be returned for exactly the data it was computed from. Any server

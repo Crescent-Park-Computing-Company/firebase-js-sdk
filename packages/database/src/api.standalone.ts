@@ -85,6 +85,7 @@ export {
   setPersistenceEnabled,
   setPersistenceAuthScope
 } from './api/Database';
+export { consumePersistedMaterialization } from './api/Reference_impl';
 export type {
   ListenOutcome,
   ListenOutcomeMode,
