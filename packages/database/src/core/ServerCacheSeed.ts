@@ -105,6 +105,48 @@ export function getNodeCanonicalHash(node: Node): string | undefined {
   return nodeCanonicalHashes.get(node);
 }
 
+/**
+ * One-boot materialization handoff. The optimistic pre-auth peek
+ * (getPersistedValue) materializes the restored tree to JS objects once;
+ * the authenticated listener that adopts the SAME immutable Node then
+ * replays it as a child_added burst whose per-child `snapshot.val()` calls
+ * would materialize the identical tree a second time — two full JS copies
+ * of a large workspace alive at the peak of boot.
+ *
+ * The peek stamps each materialized value here, keyed by its Node instance;
+ * `DataSnapshot.val()` consumes a stamp (get + delete) instead of walking
+ * the node. Consume-once keeps the official fresh-objects-per-val() contract
+ * for every later caller: only the single designed peek→listener handoff
+ * ever receives shared objects (which is the point — the optimistic tree and
+ * the live tree then share child identity, so downstream memoization sees
+ * unchanged branches as unchanged).
+ *
+ * Correctness is by construction: a Node is immutable, so a stamp can only
+ * ever be returned for exactly the data it was computed from. Any server
+ * delta between peek and replay produces a NEW child Node instance, which
+ * misses the WeakMap and materializes fresh.
+ *
+ * Only non-null object values are stamped (a leaf's val() is O(1) already),
+ * and never on an empty node — the empty ChildrenNode is a shared singleton
+ * and stamping it would leak one boot's subtree to unrelated paths.
+ */
+const nodeMaterializedValues = new WeakMap<object, object>();
+
+export function stampMaterializedValue(node: Node, value: unknown): void {
+  if (value === null || typeof value !== 'object' || node.isEmpty()) {
+    return;
+  }
+  nodeMaterializedValues.set(node, value);
+}
+
+export function consumeMaterializedValue(node: Node): object | undefined {
+  const value = nodeMaterializedValues.get(node);
+  if (value !== undefined) {
+    nodeMaterializedValues.delete(node);
+  }
+  return value;
+}
+
 /** The hash pair a manifest-first listen can consume before its Node exists. */
 export interface PendingListenHashes {
   hash: string;

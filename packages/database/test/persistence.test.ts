@@ -3299,6 +3299,83 @@ describe('getPersistedValue', () => {
     });
   });
 
+  it('hands the peek materialization to the first replayed val() by identity', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('users/alice');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(
+      root,
+      nodeFromJSON({
+        profile: { name: 'alice', langs: { en: true, fa: true } },
+        posts: { p1: { title: 'hi' } },
+        count: 3
+      })
+    );
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    const value = (await getPersistedValue(db as never, '/users/alice')) as {
+      profile: object;
+      posts: object;
+    };
+    // The retained read hands the SAME record (hence the same immutable
+    // Node instances) to the adopting listener; model that adoption.
+    const record = await manager.peek(root.toString());
+    expect(record).to.not.equal(null);
+
+    // The replay burst wraps each top-level child Node in a DataSnapshot;
+    // its first val() must return the peek's exact objects — one JS tree
+    // per boot, and shared child identity for downstream memoization.
+    const profileNode = record!.node.getImmediateChild('profile');
+    const burstSnap = new DataSnapshot(
+      profileNode,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      PRIORITY_INDEX
+    );
+    expect(burstSnap.val()).to.equal(value.profile);
+
+    // Consume-once: the handoff must not change fresh-objects-per-val()
+    // semantics for any later caller.
+    const laterSnap = new DataSnapshot(
+      profileNode,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      PRIORITY_INDEX
+    );
+    const later = laterSnap.val();
+    expect(later).to.not.equal(value.profile);
+    expect(later).to.deep.equal(value.profile);
+  });
+
+  it('a child changed after the peek misses the handoff and materializes fresh', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('users/alice');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(
+      root,
+      nodeFromJSON({ inbox: { a: 1 }, sent: { b: 2 } })
+    );
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    const value = (await getPersistedValue(db as never, '/users/alice')) as {
+      inbox: object;
+    };
+    // A server delta between peek and replay produces a NEW child Node; the
+    // stamp is keyed on instance identity, so the fresh node can never
+    // return the stale materialization.
+    const freshInbox = nodeFromJSON({ a: 1, c: 3 });
+    const snap = new DataSnapshot(
+      freshInbox,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      PRIORITY_INDEX
+    );
+    expect(snap.val()).to.deep.equal({ a: 1, c: 3 });
+    expect(snap.val()).to.not.equal(value.inbox);
+  });
+
   it('rejects persistence reconfiguration after the Database starts', () => {
     const { db } = makeDatabaseWithPersistence();
     (db as any)._instanceStarted = true;

@@ -26,6 +26,7 @@ import {
   repoSetWithPriority,
   repoUpdate
 } from '../core/Repo';
+import { consumeMaterializedValue } from '../core/ServerCacheSeed';
 import { ChildrenNode } from '../core/snap/ChildrenNode';
 import { Index } from '../core/snap/indexes/Index';
 import { KEY_INDEX } from '../core/snap/indexes/KeyIndex';
@@ -459,6 +460,14 @@ export class DataSnapshot {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   val(): any {
+    // One-boot materialization handoff (see ServerCacheSeed): when the
+    // optimistic peek already materialized exactly this immutable Node, its
+    // stamped value is returned instead of walking the tree again. Consumed
+    // on first use — every subsequent val() takes the normal fresh path.
+    const stamped = consumeMaterializedValue(this._node);
+    if (stamped !== undefined) {
+      return stamped;
+    }
     return this._node.val();
   }
 }

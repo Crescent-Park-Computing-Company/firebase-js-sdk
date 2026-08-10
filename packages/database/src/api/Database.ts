@@ -53,6 +53,8 @@ import {
   repoStart
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
+import { stampMaterializedValue } from '../core/ServerCacheSeed';
+import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
@@ -485,7 +487,26 @@ export function getPersistedValue(
   // exact listener's initial replay.
   return persistence
     .peek(new Path(pathString).toString(), expectedAuthScope)
-    .then(record => (record === null ? null : record.node.val()));
+    .then(record => {
+      if (record === null) {
+        return null;
+      }
+      const value = record.node.val();
+      if (value !== null && typeof value === 'object') {
+        // One-boot materialization handoff (see ServerCacheSeed): the
+        // authenticated listener that adopts this same immutable Node replays
+        // it as a child_added burst; stamping each top-level child's slice of
+        // this materialization lets those snapshots' val() return the SAME
+        // objects instead of walking the tree a second time. Index access
+        // covers both object and array-coerced shapes.
+        const byKey = value as Record<string, unknown>;
+        record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+          stampMaterializedValue(childNode, byKey[key]);
+        });
+        stampMaterializedValue(record.node, value);
+      }
+      return value;
+    });
 }
 
 /**
