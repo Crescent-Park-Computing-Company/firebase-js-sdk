@@ -390,60 +390,33 @@ export const bindCallback = function (
  * @param v - A double
  *
  */
+const ieee754Buffer = new DataView(new ArrayBuffer(8));
+const ieee754HexBytes: string[] = [];
+for (let i = 0; i < 256; i++) {
+  ieee754HexBytes.push((i < 16 ? '0' : '') + i.toString(16));
+}
+
+/**
+ * Converts a double to the big-endian hex string of its IEEE 754 bits, as
+ * used by the wire hash grammar. Implemented with DataView.setFloat64 — the
+ * engine performs the exact IEEE 754 encoding, including -0 and denormals —
+ * instead of the historical bit-by-bit Math.pow reconstruction, which was
+ * ~34x slower and dominated compound hashing on number-heavy trees.
+ */
 export const doubleToIEEE754String = function (v: number): string {
   assert(!isInvalidJSONNumber(v), 'Invalid JSON number'); // MJL
 
-  const ebits = 11,
-    fbits = 52;
-  const bias = (1 << (ebits - 1)) - 1;
-  let s, e, f, ln, i;
-
-  // Compute sign, exponent, fraction
-  // Skip NaN / Infinity handling --MJL.
-  if (v === 0) {
-    e = 0;
-    f = 0;
-    s = 1 / v === -Infinity ? 1 : 0;
-  } else {
-    s = v < 0;
-    v = Math.abs(v);
-
-    if (v >= Math.pow(2, 1 - bias)) {
-      // Normalized
-      ln = Math.min(Math.floor(Math.log(v) / Math.LN2), bias);
-      e = ln + bias;
-      f = Math.round(v * Math.pow(2, fbits - ln) - Math.pow(2, fbits));
-    } else {
-      // Denormalized
-      e = 0;
-      f = Math.round(v / Math.pow(2, 1 - bias - fbits));
-    }
-  }
-
-  // Pack sign, exponent, fraction
-  const bits = [];
-  for (i = fbits; i; i -= 1) {
-    bits.push(f % 2 ? 1 : 0);
-    f = Math.floor(f / 2);
-  }
-  for (i = ebits; i; i -= 1) {
-    bits.push(e % 2 ? 1 : 0);
-    e = Math.floor(e / 2);
-  }
-  bits.push(s ? 1 : 0);
-  bits.reverse();
-  const str = bits.join('');
-
-  // Return the data as a hex string. --MJL
-  let hexByteString = '';
-  for (i = 0; i < 64; i += 8) {
-    let hexByte = parseInt(str.substr(i, 8), 2).toString(16);
-    if (hexByte.length === 1) {
-      hexByte = '0' + hexByte;
-    }
-    hexByteString = hexByteString + hexByte;
-  }
-  return hexByteString.toLowerCase();
+  ieee754Buffer.setFloat64(0, v); // big-endian by default
+  return (
+    ieee754HexBytes[ieee754Buffer.getUint8(0)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(1)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(2)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(3)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(4)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(5)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(6)] +
+    ieee754HexBytes[ieee754Buffer.getUint8(7)]
+  );
 };
 
 /**
@@ -509,6 +482,17 @@ export const INTEGER_32_MAX = 2147483647;
  * If the string contains a 32-bit integer, return it.  Else return null.
  */
 export const tryParseInt = function (str: string): number | null {
+  // Fast reject before the regex: nameCompare calls this for EVERY key pair
+  // in every sorted-map operation, and real-world keys are overwhelmingly
+  // named (non-numeric). A single charCode check skips the regex engine for
+  // any key that cannot possibly be an integer.
+  const first = str.charCodeAt(0);
+  if (
+    (first < 48 /* '0' */ || first > 57) /* '9' */ &&
+    first !== 45 /* '-' */
+  ) {
+    return null;
+  }
   if (INTEGER_REGEXP_.test(str)) {
     const intVal = Number(str);
     if (intVal >= INTEGER_32_MIN && intVal <= INTEGER_32_MAX) {

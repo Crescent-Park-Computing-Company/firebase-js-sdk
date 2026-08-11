@@ -131,6 +131,14 @@ export type Unsubscribe = () => void;
 export interface ListenOptions {
   /** Whether to remove the listener after its first invocation. */
   readonly onlyOnce?: boolean;
+  /**
+   * Whether the complete, unfiltered path listened to by this registration
+   * should be retained in IndexedDB for cache-first startup. Selection is
+   * reference-counted across registrations and released automatically when
+   * this registration is removed, including `off()`, `onlyOnce`, and server
+   * cancellation paths.
+   */
+  readonly persistent?: boolean;
 }
 
 export interface ReferenceConstructor {

@@ -16,6 +16,9 @@ export function connectDatabaseEmulator(db: Database, host: string, port: number
 }): void;
 
 // @public
+export function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
+
+// @public
 export class Database {
     readonly app: FirebaseApp;
     readonly 'type' = "database";
@@ -77,6 +80,9 @@ export function get(query: Query): Promise<DataSnapshot>;
 export function getDatabase(app?: FirebaseApp, url?: string): Database;
 
 // @public
+export function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+
+// @public
 export function goOffline(db: Database): void;
 
 // @public
@@ -100,7 +106,26 @@ export function limitToLast(limit: number): QueryConstraint;
 // @public
 export interface ListenOptions {
     readonly onlyOnce?: boolean;
+    readonly persistent?: boolean;
 }
+
+// @public
+export interface ListenOutcome {
+    // (undocumented)
+    bytes: number;
+    // (undocumented)
+    certified: boolean;
+    // (undocumented)
+    mode: ListenOutcomeMode;
+    // (undocumented)
+    reason?: ListenOutcomeReason;
+}
+
+// @public
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+
+// @public
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
 
 // @public
 export function off(query: Query, eventType?: EventType, callback?: (snapshot: DataSnapshot, previousChildName?: string | null) => unknown): void;
@@ -112,7 +137,7 @@ export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, pr
 export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -121,7 +146,7 @@ export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, 
 export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -130,7 +155,7 @@ export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, pr
 export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
@@ -139,7 +164,7 @@ export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) 
 export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export class OnDisconnect {
@@ -154,13 +179,16 @@ export class OnDisconnect {
 export function onDisconnect(ref: DatabaseReference): OnDisconnect;
 
 // @public
+export function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
+
+// @public
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback?: (error: Error) => unknown): Unsubscribe;
 
 // @public
 export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, options: ListenOptions): Unsubscribe;
 
 // @public
-export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 // @public
 export function orderByChild(path: string): QueryConstraint;
@@ -213,6 +241,12 @@ export function serverTimestamp(): object;
 
 // @public
 export function set(ref: DatabaseReference, value: unknown): Promise<void>;
+
+// @public
+export function setPersistenceAuthScope(db: Database, scope: string | null): void;
+
+// @public
+export function setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 // @public
 export function setPriority(ref: DatabaseReference, priority: string | number | null): Promise<void>;

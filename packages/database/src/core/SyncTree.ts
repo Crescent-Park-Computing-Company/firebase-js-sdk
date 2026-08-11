@@ -29,8 +29,15 @@ import {
   Operation
 } from './operation/Operation';
 import { Overwrite } from './operation/Overwrite';
+import {
+  ListenHashFn,
+  PendingListenHashes,
+  getNodeCanonicalHash,
+  getNodeCompoundHash
+} from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
+import { RangeMerge } from './snap/RangeMerge';
 import {
   SyncPoint,
   syncPointAddEventRegistration,
@@ -51,13 +58,19 @@ import {
   newRelativePath,
   Path,
   pathGetFront,
+  pathGetLength,
   pathIsEmpty
 } from './util/Path';
 import { each, errorForServerCode } from './util/util';
 import { CacheNode } from './view/CacheNode';
 import { Event } from './view/Event';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
-import { View, viewGetCompleteNode, viewGetServerCache } from './view/View';
+import {
+  View,
+  viewGetCompleteNode,
+  viewGetCompleteServerCache,
+  viewGetServerCache
+} from './view/View';
 import {
   newWriteTree,
   WriteTree,
@@ -92,11 +105,16 @@ export interface ListenProvider {
   startListening(
     query: QueryContext,
     tag: number | null,
-    hashFn: () => string,
+    hashFn: ListenHashFn,
     onComplete: (a: string, b?: unknown) => Event[]
   ): Event[];
 
   stopListening(a: QueryContext, b: number | null): void;
+
+  /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
+  getPendingListenHashes?: (
+    pathString: string
+  ) => PendingListenHashes | undefined;
 }
 
 /**
@@ -312,6 +330,156 @@ export function syncTreeApplyTaggedListenComplete(
     // We've already removed the query. No big deal, ignore the update
     return [];
   }
+}
+
+/**
+ * The complete (default) view's server cache at `path`, or null when no
+ * complete view exists there. Used by persistence write-through to read the
+ * tree the server just confirmed.
+ */
+export function syncTreeGetCompleteServerCache(
+  syncTree: SyncTree,
+  path: Path
+): Node | null {
+  const syncPoint = syncTree.syncPointTree_.get(path);
+  if (!syncPoint) {
+    return null;
+  }
+  const view = syncPointGetCompleteView(syncPoint);
+  if (!view) {
+    return null;
+  }
+  // The CERTIFIED cache only (fully server-initialized) — never a seeded or
+  // child-assembled partial tree: this feeds the persistence write-through,
+  // and persisting uncertified data would surface it as server truth on the
+  // next boot.
+  return viewGetCompleteServerCache(view, newEmptyPath());
+}
+
+/**
+ * The server-cache state of every view at or below `path`, except the
+ * complete default view at `path` itself (the caller's own). Used by the
+ * persistence restore path to decide what a stored tree may be applied
+ * over: a view with a COMPLETE server cache contributes its certified tree
+ * (to graft over the restored bytes); a view holding server data it cannot
+ * certify as complete — a filtered query, a partially filled cache — is
+ * reported as partial, because grafting it is impossible and overwriting it
+ * would replace live server data with stale bytes.
+ *
+ * Ordered shallowest-first, so grafting in order lets deeper (more
+ * specific) trees win where they nest.
+ */
+export function syncTreeGetDescendantServerCacheStates(
+  syncTree: SyncTree,
+  path: Path
+): Array<{ path: Path; complete: Node | null; hasPartialData: boolean }> {
+  const states: Array<{
+    path: Path;
+    complete: Node | null;
+    hasPartialData: boolean;
+  }> = [];
+  syncTree.syncPointTree_.subtree(path).foreach((relativePath, syncPoint) => {
+    for (const view of syncPoint.views.values()) {
+      if (pathIsEmpty(relativePath) && view.query._queryParams.loadsAllData()) {
+        // The default view at `path` is the one being restored into; the
+        // caller checks its state separately.
+        continue;
+      }
+      const complete = viewGetCompleteServerCache(view, newEmptyPath());
+      if (complete !== null) {
+        states.push({ path: relativePath, complete, hasPartialData: false });
+      } else {
+        const raw = viewGetServerCache(view);
+        if (
+          raw !== null &&
+          (!raw.isEmpty() || !view.query._queryParams.loadsAllData())
+        ) {
+          states.push({
+            path: relativePath,
+            complete: null,
+            hasPartialData: true
+          });
+        }
+      }
+    }
+  });
+  states.sort((a, b) => pathGetLength(a.path) - pathGetLength(b.path));
+  return states;
+}
+
+/**
+ * Applies server range merges against the complete (default) view at the
+ * given path and promotes the merged tree through the standard
+ * server-overwrite path.
+ *
+ * @returns Events to raise.
+ */
+export function syncTreeApplyServerRangeMerges(
+  syncTree: SyncTree,
+  path: Path,
+  merges: RangeMerge[]
+): Event[] {
+  const syncPoint = syncTree.syncPointTree_.get(path);
+  if (!syncPoint) {
+    // Removed view, so it's safe to just ignore this update
+    return [];
+  }
+  const view = syncPointGetCompleteView(syncPoint);
+  if (!view) {
+    // No complete view for this update: it was removed, ignore
+    return [];
+  }
+  return syncTreeApplyServerOverwrite(
+    syncTree,
+    path,
+    applyRangeMergesToView(view, merges)
+  );
+}
+
+/**
+ * Applies tagged-query server range merges against the query's view.
+ *
+ * @returns Events to raise.
+ */
+export function syncTreeApplyTaggedRangeMerges(
+  syncTree: SyncTree,
+  path: Path,
+  merges: RangeMerge[],
+  tag: number
+): Event[] {
+  const queryKey = syncTreeQueryKeyForTag_(syncTree, tag);
+  if (queryKey === undefined) {
+    // Query was removed. No big deal, ignore the update
+    return [];
+  }
+  const r = syncTreeParseQueryKey_(queryKey);
+  const syncPoint = syncTree.syncPointTree_.get(r.path);
+  if (!syncPoint) {
+    return [];
+  }
+  const view = syncPoint.views.get(r.queryId);
+  if (!view) {
+    return [];
+  }
+  return syncTreeApplyTaggedQueryOverwrite(
+    syncTree,
+    r.path,
+    applyRangeMergesToView(view, merges),
+    tag
+  );
+}
+
+/**
+ * Folds server range merges over a view's raw server cache — the tree the
+ * listen's hashes were computed from, certified or not — producing the tree
+ * the overwrite paths then promote.
+ */
+function applyRangeMergesToView(view: View, merges: RangeMerge[]): Node {
+  let serverNode = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+  for (const merge of merges) {
+    serverNode = merge.applyTo(serverNode);
+  }
+  return serverNode;
 }
 
 /**
@@ -534,6 +702,10 @@ export function syncTreeAddEventRegistration(
     serverCacheComplete = true;
   } else {
     serverCacheComplete = false;
+    // If the app registered persisted data for this path, install it as the
+    // INCOMPLETE initial server cache: the listen then carries the seeded
+    // tree's hash instead of the empty hash, but no value event is raised
+    // until the server certifies it (see ServerCacheSeed).
     serverCache = ChildrenNode.EMPTY_NODE;
     const subtree = syncTree.syncPointTree_.subtree(path);
     subtree.foreachChild((childName, childSyncPoint) => {
@@ -782,15 +954,37 @@ function syncTreeApplyOperationDescendantsHelper_(
 function syncTreeCreateListenerForView_(
   syncTree: SyncTree,
   view: View
-): { hashFn(): string; onComplete(a: string, b?: unknown): Event[] } {
+): { hashFn: ListenHashFn; onComplete(a: string, b?: unknown): Event[] } {
   const query = view.query;
   const tag = syncTreeTagForQuery(syncTree, query);
+  const pathString = query._path.toString();
+  const hashFn: ListenHashFn = () => {
+    // Manifest-first boot: the persisted hashes are stamped for this path
+    // before the restored tree exists in SyncTree (see stampNextListenHashes).
+    const pending =
+      syncTree.listenProvider_.getPendingListenHashes?.(pathString);
+    if (pending !== undefined) {
+      return pending.hash;
+    }
+    const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+    return getNodeCanonicalHash(cache) ?? cache.hash();
+  };
+  // The compound hash rides as a property on hashFn so it threads through
+  // the existing listen-provider chain untouched. Only a seeded node carries
+  // one; once a server update replaces the cache it is gone, and re-listens
+  // send only the simple hash.
+  hashFn.compoundHash = () => {
+    const pending =
+      syncTree.listenProvider_.getPendingListenHashes?.(pathString);
+    if (pending !== undefined) {
+      return pending.compoundHash;
+    }
+    const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+    return getNodeCompoundHash(cache);
+  };
 
   return {
-    hashFn: () => {
-      const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-      return cache.hash();
-    },
+    hashFn,
     onComplete: (status: string): Event[] => {
       if (status === 'ok') {
         if (tag) {

@@ -15,7 +15,13 @@
  * limitations under the License.
  */
 
-import { assert, isNodeSdk, jsonEval, stringify } from '@firebase/util';
+import {
+  stringLength,
+  assert,
+  isNodeSdk,
+  jsonEval,
+  stringify
+} from '@firebase/util';
 
 import { RepoInfo, repoInfoConnectionURL } from '../core/RepoInfo';
 import { StatsCollection } from '../core/stats/StatsCollection';
@@ -66,7 +72,8 @@ export class WebSocketConnection implements Transport {
   bytesReceived = 0;
   connURL: string;
   onDisconnect: (a?: boolean) => void;
-  onMessage: (msg: {}) => void;
+  onMessage: (msg: {}, bytes?: number) => void;
+  private pendingMessageBytes_ = 0;
   mySock: WebSocket | null;
   private log_: (...a: unknown[]) => void;
   private stats_: StatsCollection;
@@ -151,7 +158,10 @@ export class WebSocketConnection implements Transport {
    * @param onMessage - Callback when messages arrive
    * @param onDisconnect - Callback with connection lost.
    */
-  open(onMessage: (msg: {}) => void, onDisconnect: (a?: boolean) => void) {
+  open(
+    onMessage: (msg: {}, bytes?: number) => void,
+    onDisconnect: (a?: boolean) => void
+  ) {
     this.onDisconnect = onDisconnect;
     this.onMessage = onMessage;
 
@@ -296,8 +306,12 @@ export class WebSocketConnection implements Transport {
       this.frames = null;
       const jsonMess = jsonEval(fullMess) as object;
 
-      //handle the message
-      this.onMessage(jsonMess);
+      // Deliver the parsed message with its original frame bytes. Keeping the
+      // byte count beside the message avoids re-stringifying large payloads
+      // solely for diagnostics.
+      const bytes = this.pendingMessageBytes_;
+      this.pendingMessageBytes_ = 0;
+      this.onMessage(jsonMess, bytes);
     }
   }
 
@@ -337,8 +351,10 @@ export class WebSocketConnection implements Transport {
       return; // Chrome apparently delivers incoming packets even after we .close() the connection sometimes.
     }
     const data = mess['data'] as string;
-    this.bytesReceived += data.length;
-    this.stats_.incrementCounter('bytes_received', data.length);
+    const wireBytes = stringLength(data);
+    this.pendingMessageBytes_ += wireBytes;
+    this.bytesReceived += wireBytes;
+    this.stats_.incrementCounter('bytes_received', wireBytes);
 
     this.resetKeepAlive();
 
@@ -362,8 +378,9 @@ export class WebSocketConnection implements Transport {
     this.resetKeepAlive();
 
     const dataStr = stringify(data);
-    this.bytesSent += dataStr.length;
-    this.stats_.incrementCounter('bytes_sent', dataStr.length);
+    const wireBytes = stringLength(dataStr);
+    this.bytesSent += wireBytes;
+    this.stats_.incrementCounter('bytes_sent', wireBytes);
 
     //We can only fit a certain amount in each websocket frame, so we need to split this request
     //up into multiple pieces if it doesn't fit in one request.

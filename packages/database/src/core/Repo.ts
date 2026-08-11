@@ -28,13 +28,23 @@ import { ValueEventRegistration } from '../api/Reference_impl';
 
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
+import {
+  PERSISTENCE_RESTORE_TIMEOUT_MS,
+  PersistenceManager
+} from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
+import {
+  ListenHashFn,
+  PendingListenHashStore,
+  stampSeedHashes
+} from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
+import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
 import {
   newSparseSnapshotTree,
@@ -56,11 +66,15 @@ import {
   syncTreeAddEventRegistration,
   syncTreeApplyServerMerge,
   syncTreeApplyServerOverwrite,
+  syncTreeApplyServerRangeMerges,
   syncTreeApplyTaggedQueryMerge,
   syncTreeApplyTaggedQueryOverwrite,
+  syncTreeApplyTaggedRangeMerges,
   syncTreeApplyUserMerge,
   syncTreeApplyUserOverwrite,
   syncTreeCalcCompleteEventCache,
+  syncTreeGetCompleteServerCache,
+  syncTreeGetDescendantServerCacheStates,
   syncTreeGetServerValue,
   syncTreeRemoveEventRegistration,
   syncTreeTagForQuery
@@ -72,7 +86,8 @@ import {
   Path,
   pathChild,
   pathGetFront,
-  pathPopFront
+  pathPopFront,
+  pathSlice
 } from './util/Path';
 import {
   generateWithValues,
@@ -162,6 +177,113 @@ interface Transaction {
 /**
  * A connection to a single data repository.
  */
+interface PendingSeedRestore {
+  cancelled: boolean;
+  authScopeUnsubscribe?: () => void;
+  authScopeTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Tears down whatever this pending restore has already put on the wire /
+   * buffered, then re-enters repoStartServerListen for the SAME subscription
+   * without persistence. Installed by repoStartServerListen; called by the
+   * bulk cancel (an account switch) so no live registration is left silent
+   * behind a cancelled token — the restore is moot under the new identity,
+   * but the listen itself must still reach the server.
+   */
+  reattachCold?: () => void;
+}
+
+/** One server operation held during a manifest-first boot window. */
+type BootBufferedOp =
+  | {
+      kind: 'data';
+      pathString: string;
+      data: unknown;
+      isMerge: boolean;
+      tag: number | null;
+    }
+  | {
+      kind: 'rm';
+      pathString: string;
+      ranges: Array<{ s?: string; e?: string; m: unknown }>;
+      tag: number | null;
+    }
+  | {
+      kind: 'complete';
+      apply: () => void;
+    };
+
+/**
+ * The boot-buffer root covering `pathString`, if any: operations at or under
+ * a buffering root are held until its cached base applies.
+ */
+function repoBootBufferRootFor(repo: Repo, pathString: string): string | null {
+  if (repo.bootBuffers_.size === 0) {
+    return null;
+  }
+  for (const root of repo.bootBuffers_.keys()) {
+    if (
+      pathString === root ||
+      root === '/' ||
+      (pathString.length > root.length && pathString.startsWith(root + '/'))
+    ) {
+      return root;
+    }
+  }
+  return null;
+}
+
+/** How a persistent default listen started. @public */
+export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** Why a restore fell back cold. @public */
+export type ListenOutcomeReason =
+  | 'missing'
+  | 'expired'
+  | 'auth'
+  | 'corrupt'
+  | 'timeout';
+
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export interface ListenOutcome {
+  mode: ListenOutcomeMode;
+  certified: boolean;
+  bytes: number;
+  reason?: ListenOutcomeReason;
+}
+
+interface ListenOutcomeState {
+  outcome: ListenOutcome | null;
+  subscribers: Set<(outcome: ListenOutcome) => void>;
+}
+
+interface PersistenceTraceEvent {
+  type: 'listen-outcome';
+  path: string;
+  outcome: ListenOutcome;
+}
+
+type PersistenceTraceGlobal = typeof globalThis & {
+  __firebaseDatabasePersistenceTrace?: (event: PersistenceTraceEvent) => void;
+};
+
+function emitPersistenceTrace(event: PersistenceTraceEvent): void {
+  const sink = (globalThis as PersistenceTraceGlobal)
+    .__firebaseDatabasePersistenceTrace;
+  if (typeof sink === 'function') {
+    exceptionGuard(() => sink(event));
+  }
+}
+
+function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
+  pending.cancelled = true;
+  pending.authScopeUnsubscribe?.();
+  if (pending.authScopeTimer !== undefined) {
+    clearTimeout(pending.authScopeTimer);
+  }
+}
+
 export class Repo {
   /** Key for uniquely identifying this repo, used in RepoManager */
   readonly key: string;
@@ -187,6 +309,45 @@ export class Repo {
 
   // TODO: This should be @private but it's used by test_access.js and internal.js
   persistentConnection_: PersistentConnection | null = null;
+
+  /**
+   * Server-cache persistence (see core/Persistence.ts); null unless the app
+   * enabled it before this Repo's first listen.
+   */
+  persistence_: PersistenceManager | null = null;
+
+  /**
+   * The application-provided identity scope currently bound to persistence.
+   * `undefined` means Auth has not resolved yet; null means signed out.
+   */
+  persistenceAuthScope_: string | null | undefined = undefined;
+  persistenceAuthScopeListeners_ = new Set<() => void>();
+
+  /**
+   * Listens held back while their persisted root restores, keyed by path.
+   * stopListening flips the token so a listen whose last registration was
+   * removed mid-restore is never sent (see repoStartServerListen).
+   */
+  pendingSeedRestores_ = new Map<string, PendingSeedRestore>();
+
+  /** Manifest-first hashes scoped to this Repo, never process-global. */
+  pendingListenHashes_ = new PendingListenHashStore();
+
+  /**
+   * Server operations buffered during a manifest-first boot window: the
+   * range listen is on the wire before the cached base has been applied to
+   * SyncTree, so anything the server sends for that root (range merges —
+   * deltas against the base — or full pushes) is held, in arrival order,
+   * until the base applies, then replayed. Keyed by the listened root path.
+   */
+  bootBuffers_ = new Map<string, BootBufferedOp[]>();
+
+  /**
+   * Listen-complete state per default complete listen, keyed by path: whether
+   * the current listen has received its initial server response, and waiters
+   * to publish its certification outcome (see onListenOutcome in api/Database.ts).
+   */
+  listenOutcomes_ = new Map<string, ListenOutcomeState>();
 
   constructor(
     public repoInfo_: RepoInfo,
@@ -266,7 +427,14 @@ export function repoStart(
       },
       repo.authTokenProvider_,
       repo.appCheckProvider_,
-      authOverride
+      authOverride,
+      (
+        pathString: string,
+        ranges: Array<{ s?: string; e?: string; m: unknown }>,
+        tag: number | null
+      ) => {
+        repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
+      }
     );
 
     repo.server_ = repo.persistentConnection_;
@@ -313,20 +481,15 @@ export function repoStart(
 
   repo.serverSyncTree_ = new SyncTree({
     startListening: (query, tag, currentHashFn, onComplete) => {
-      repo.server_.listen(query, currentHashFn, tag, (status, data) => {
-        const events = onComplete(status, data);
-        eventQueueRaiseEventsForChangedPath(
-          repo.eventQueue_,
-          query._path,
-          events
-        );
-      });
+      repoStartServerListen(repo, query, tag, currentHashFn, onComplete);
       // No synchronous events for network-backed sync trees
       return [];
     },
     stopListening: (query, tag) => {
-      repo.server_.unlisten(query, tag);
-    }
+      repoStopServerListen(repo, query, tag);
+    },
+    getPendingListenHashes: pathString =>
+      repo.pendingListenHashes_.get(pathString)
   });
 }
 
@@ -351,6 +514,17 @@ export function repoGenerateServerValues(repo: Repo): Indexable {
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: drives a server data push exactly as the connection would. @internal */
+export function repoOnDataUpdateForTest(
+  repo: Repo,
+  pathString: string,
+  data: unknown,
+  isMerge: boolean,
+  tag: number | null
+): void {
+  repoOnDataUpdate(repo, pathString, data, isMerge, tag);
+}
+
 function repoOnDataUpdate(
   repo: Repo,
   pathString: string,
@@ -360,6 +534,18 @@ function repoOnDataUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
+  {
+    // Manifest-first boot window: the listen went out before the cached base
+    // applied. Hold server data for that root — in arrival order with range
+    // merges — until the base is in SyncTree (see repoStartServerListen).
+    const bufferRoot = repoBootBufferRootFor(repo, pathString);
+    if (bufferRoot !== null) {
+      repo.bootBuffers_
+        .get(bufferRoot)!
+        .push({ kind: 'data', pathString, data, isMerge, tag });
+      return;
+    }
+  }
   const path = new Path(pathString);
   data = repo.interceptServerDataCallback_
     ? repo.interceptServerDataCallback_(pathString, data)
@@ -407,6 +593,652 @@ function repoOnDataUpdate(
     affectedPath = repoRerunTransactions(repo, path);
   }
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  if (tag == null) {
+    // Overwrite and merge both change only subtrees under `path`.
+    repoPersistAfterServerUpdate(repo, path, 'at-path');
+  }
+}
+
+/**
+ * Sends a listen for the server sync tree, restoring the persisted server
+ * cache first where applicable: a complete default listen on a persisted
+ * root is held until the stored tree restores (bounded inside restore()),
+ * the restored tree is applied as server data — raising cached events
+ * immediately, mobile-persistence semantics — and the listen then goes out
+ * carrying the restored tree's hashes. Roots that were never persisted
+ * resolve null instantly and attach exactly as before.
+ */
+function repoPublishListenOutcome(
+  repo: Repo,
+  pathString: string,
+  outcome: ListenOutcome
+): void {
+  const state = repo.listenOutcomes_.get(pathString);
+  if (!state) {
+    return;
+  }
+  state.outcome = outcome;
+  emitPersistenceTrace({ type: 'listen-outcome', path: pathString, outcome });
+  for (const subscriber of state.subscribers) {
+    // Observability callbacks must never abort authoritative wire processing.
+    exceptionGuard(() => subscriber(outcome));
+  }
+}
+
+export function repoStartServerListen(
+  repo: Repo,
+  query: QueryContext,
+  tag: number | null,
+  currentHashFn: ListenHashFn,
+  onComplete: (status: string, data?: unknown) => Event[],
+  skipPersistence = false,
+  authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS
+): void {
+  const pathString = query._path.toString();
+  const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
+  if (isDefaultComplete) {
+    const prior = repo.listenOutcomes_.get(pathString);
+    repo.listenOutcomes_.set(pathString, {
+      outcome: null,
+      subscribers: prior?.subscribers ?? new Set()
+    });
+  }
+
+  let activeMode: ListenOutcomeMode = 'cold';
+  let activeReason: ListenOutcomeReason | undefined;
+  const processListenComplete = (
+    status: string,
+    data: unknown,
+    wire: ListenWireResult
+  ) => {
+    const events = onComplete(status, data);
+    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+    if (!isDefaultComplete) {
+      return;
+    }
+    repoPublishListenOutcome(repo, pathString, {
+      mode: activeMode,
+      certified: status === 'ok',
+      bytes: wire.bytes,
+      reason: status === 'ok' ? activeReason : 'auth'
+    });
+    if (repo.persistence_ !== null) {
+      if (status === 'ok') {
+        // The certification confirms state whose changes (pushes / range
+        // merges before it) were already reported individually.
+        repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
+      } else {
+        repo.persistence_.evict(query._path);
+      }
+    }
+  };
+
+  const sendListen = (
+    mode: ListenOutcomeMode,
+    reason?: ListenOutcomeReason
+  ) => {
+    activeMode = mode;
+    activeReason = reason;
+    if (isDefaultComplete) {
+      repoPublishListenOutcome(repo, pathString, {
+        mode,
+        certified: false,
+        bytes: 0,
+        reason
+      });
+    }
+    repo.server_.listen(
+      query,
+      currentHashFn,
+      tag,
+      (status, data, wire) => {
+        const bufferRoot = repoBootBufferRootFor(repo, pathString);
+        if (bufferRoot !== null) {
+          repo.bootBuffers_.get(bufferRoot)!.push({
+            kind: 'complete',
+            apply: () => processListenComplete(status, data, wire)
+          });
+          return;
+        }
+        processListenComplete(status, data, wire);
+      },
+      wire => {
+        if (!isDefaultComplete) {
+          return;
+        }
+        // Range merges preserve the restored base (incremental/cyan). A normal
+        // data push replaces it, so expose a full authoritative fallback
+        // (amber) before the listen response arrives.
+        if (
+          activeMode === 'restored' &&
+          wire.dataReceived &&
+          !wire.rangeMerged
+        ) {
+          activeMode = 'fallback';
+        }
+        repoPublishListenOutcome(repo, pathString, {
+          mode: activeMode,
+          certified: false,
+          bytes: wire.bytes,
+          reason
+        });
+      }
+    );
+  };
+
+  const persistence = repo.persistence_;
+  if (
+    skipPersistence ||
+    persistence === null ||
+    !isDefaultComplete ||
+    !persistence.isPersistentPath(pathString)
+  ) {
+    sendListen('cold');
+    return;
+  }
+
+  if (!persistence.isAuthScopeConfigured()) {
+    // Identity hydration is local (Firebase Auth's persisted user), but it is
+    // asynchronous. Keep the subscription inside the SDK until that identity
+    // reaches persistence: restoring before then would either miss the cache
+    // or, worse, replay another account's record. A bounded timeout preserves
+    // the normal live-listen liveness contract if Auth integration wedges.
+    const token: PendingSeedRestore = { cancelled: false };
+    // Nothing is on the wire while waiting for the identity: a bulk cancel
+    // (account switch) just restarts this subscription as a plain cold
+    // listen so it cannot be stranded silent behind the cancelled token.
+    token.reattachCold = () => {
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        true,
+        authScopeTimeoutMs
+      );
+    };
+    repo.pendingSeedRestores_.set(pathString, token);
+    const isCurrent = () =>
+      !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
+    const cleanup = () => {
+      token.authScopeUnsubscribe?.();
+      if (token.authScopeTimer !== undefined) {
+        clearTimeout(token.authScopeTimer);
+      }
+    };
+    const resume = () => {
+      if (!isCurrent() || !persistence.isAuthScopeConfigured()) {
+        return;
+      }
+      cleanup();
+      repo.pendingSeedRestores_.delete(pathString);
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        false,
+        authScopeTimeoutMs
+      );
+    };
+    repo.persistenceAuthScopeListeners_.add(resume);
+    token.authScopeUnsubscribe = () =>
+      repo.persistenceAuthScopeListeners_.delete(resume);
+    token.authScopeTimer = setTimeout(() => {
+      if (!isCurrent()) {
+        return;
+      }
+      cleanup();
+      repo.pendingSeedRestores_.delete(pathString);
+      // No identity means no safe cache namespace. Fall open to the ordinary
+      // network listener rather than stranding the subscription forever.
+      repoStartServerListen(
+        repo,
+        query,
+        tag,
+        currentHashFn,
+        onComplete,
+        true,
+        authScopeTimeoutMs
+      );
+    }, authScopeTimeoutMs);
+    // Close the check-to-subscribe race if a pre-auth peek configured the
+    // manager between the first readiness check and listener registration.
+    resume();
+    return;
+  }
+
+  persistence.track(pathString);
+  const token: PendingSeedRestore = { cancelled: false };
+  // A bulk cancel (account switch) lands in one of two shapes: pre-manifest
+  // (no listen sent yet — just start cold), or manifest-first (a seeded wire
+  // listen is out and its boot buffer is about to be dropped — tear the
+  // seeded listen down first, then start cold). Restore resolution observes
+  // the cancelled token and exits without touching the new listen.
+  token.reattachCold = () => {
+    repo.pendingListenHashes_.clear(pathString);
+    if (repo.bootBuffers_.has(pathString)) {
+      repo.bootBuffers_.delete(pathString);
+      repo.server_.unlisten(query, tag);
+    }
+    repoStartServerListen(
+      repo,
+      query,
+      tag,
+      currentHashFn,
+      onComplete,
+      true,
+      authScopeTimeoutMs
+    );
+  };
+  repo.pendingSeedRestores_.set(pathString, token);
+  const isCurrent = () =>
+    !token.cancelled && repo.pendingSeedRestores_.get(pathString) === token;
+  const finish = (mode: ListenOutcomeMode, reason?: ListenOutcomeReason) => {
+    if (!isCurrent()) {
+      return;
+    }
+    repo.pendingSeedRestores_.delete(pathString);
+    sendListen(mode, reason);
+  };
+
+  // MANIFEST-FIRST LISTEN. The stored manifest alone carries the protocol
+  // hashes, so the listen goes out the moment it is read (milliseconds) —
+  // the server's round-trip overlaps the tree record's read and Node
+  // construction. Server pushes that arrive before the cached base has been
+  // applied are buffered (repoOnDataUpdate/repoOnRangeMergeUpdate) and
+  // replayed against the base, preserving arrival order. If anything about
+  // the restore then fails, the buffered data is authoritative anyway — it
+  // is applied and the listen simply behaves as an unseeded one.
+  let sentFromManifest = false;
+  let restartedCold = false;
+  const restartCold = (reason: ListenOutcomeReason = 'corrupt') => {
+    if (!sentFromManifest || restartedCold || !isCurrent()) {
+      return;
+    }
+    restartedCold = true;
+    repo.pendingSeedRestores_.delete(pathString);
+    repo.pendingListenHashes_.clear(pathString);
+    repo.bootBuffers_.delete(pathString);
+    // The compound response may omit every matching range, so buffered data
+    // cannot reconstruct a missing base. Tear down the seeded listen and send
+    // exactly one ordinary full listen.
+    repo.server_.unlisten(query, tag);
+    sendListen('fallback', reason);
+  };
+  const onManifest = () => {
+    if (!isCurrent() || sentFromManifest) {
+      return;
+    }
+    if (
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+        null ||
+      syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)
+        .length > 0
+    ) {
+      // Existing server-cache state changes the exact tree the persisted
+      // hashes describe; let the restore resolution pick the cold path.
+      return;
+    }
+    sentFromManifest = true;
+    repo.bootBuffers_.set(pathString, []);
+    // Keep the pending token until range assembly finishes. A stop after this
+    // send must cancel replay/restart as well as unlisten the wire request.
+    sendListen('restored');
+  };
+
+  const drainBootBuffer = () => {
+    const buffered = repo.bootBuffers_.get(pathString);
+    if (buffered === undefined) {
+      return;
+    }
+    repo.bootBuffers_.delete(pathString);
+    for (const op of buffered) {
+      if (op.kind === 'data') {
+        repoOnDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+      } else if (op.kind === 'rm') {
+        repoOnRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+      } else {
+        op.apply();
+      }
+    }
+  };
+
+  void persistence
+    .restoreForListen(pathString, hashes => {
+      repo.pendingListenHashes_.set(
+        pathString,
+        hashes.hash,
+        hashes.compoundHash
+      );
+      onManifest();
+    })
+    .then(
+      result => {
+        if (!isCurrent()) {
+          repo.pendingListenHashes_.clear(pathString);
+          repo.bootBuffers_.delete(pathString);
+          return;
+        }
+        const { record, reason } = result;
+        if (record === null) {
+          // A manifest-first listen may have omitted matching ranges. If
+          // any referenced local payload is missing/corrupt, buffered deltas
+          // are not a complete base: restart exactly once with a cold listen.
+          repo.pendingListenHashes_.clear(pathString);
+          if (sentFromManifest) {
+            restartCold(reason ?? 'corrupt');
+            return;
+          }
+          const fallback = reason === 'corrupt' || reason === 'timeout';
+          finish(fallback ? 'fallback' : 'cold', reason);
+          return;
+        }
+        if (!sentFromManifest) {
+          // Manifest callback never fired usable (pre-existing server cache,
+          // or a race); apply-then-listen, the pre-manifest-first sequence.
+          if (
+            syncTreeGetCompleteServerCache(
+              repo.serverSyncTree_,
+              query._path
+            ) !== null ||
+            syncTreeGetDescendantServerCacheStates(
+              repo.serverSyncTree_,
+              query._path
+            ).length > 0
+          ) {
+            repo.pendingListenHashes_.clear(pathString);
+            finish('cold');
+            return;
+          }
+        }
+        try {
+          const restored = stampSeedHashes(
+            record.node,
+            record.hash,
+            record.compoundHash
+          );
+          const events = syncTreeApplyServerOverwrite(
+            repo.serverSyncTree_,
+            query._path,
+            restored
+          );
+          eventQueueRaiseEventsForChangedPath(
+            repo.eventQueue_,
+            query._path,
+            events
+          );
+          if (!isCurrent()) {
+            repo.pendingListenHashes_.clear(pathString);
+            repo.bootBuffers_.delete(pathString);
+            return;
+          }
+          if (sentFromManifest) {
+            repo.pendingSeedRestores_.delete(pathString);
+          }
+          // The hashes ride the seeded node from here on; the pending stamp
+          // must not outlive the boot window (a re-listen after real server
+          // updates must send the CURRENT tree's hashes, not the stored ones).
+          repo.pendingListenHashes_.clear(pathString);
+          if (sentFromManifest) {
+            drainBootBuffer();
+          } else {
+            finish('restored');
+          }
+        } catch {
+          repo.pendingListenHashes_.clear(pathString);
+          persistence.invalidate(query._path);
+          if (sentFromManifest) {
+            restartCold('corrupt');
+          } else {
+            finish('fallback', 'corrupt');
+          }
+        }
+      },
+      () => {
+        repo.pendingListenHashes_.clear(pathString);
+        if (sentFromManifest) {
+          drainBootBuffer();
+        } else {
+          finish('fallback', 'corrupt');
+        }
+      }
+    );
+}
+
+/**
+ * Stops a server listen. With persistence, a complete default listen may
+ * still be waiting on its restore — cancel it so it never attaches — and its
+ * root leaves write-through tracking (flushing the final tree to IndexedDB),
+ * releasing the in-memory copy that only live listens need.
+ */
+export function repoStopServerListen(
+  repo: Repo,
+  query: QueryContext,
+  tag: number | null
+): void {
+  const pathString = query._path.toString();
+  if (tag != null || !query._queryParams.loadsAllData()) {
+    repo.server_.unlisten(query, tag);
+    return;
+  }
+  const pending = repo.pendingSeedRestores_.get(pathString);
+  if (pending && !repo.bootBuffers_.has(pathString)) {
+    // Still waiting on the auth scope or manifest: the listen was never sent.
+    repoCancelPendingSeedRestore(pending);
+    repo.pendingSeedRestores_.delete(pathString);
+  } else {
+    if (pending) {
+      repoCancelPendingSeedRestore(pending);
+      repo.pendingSeedRestores_.delete(pathString);
+    }
+    repo.server_.unlisten(query, tag);
+  }
+  repo.bootBuffers_.delete(pathString);
+  repo.pendingListenHashes_.clear(pathString);
+  repo.listenOutcomes_.delete(pathString);
+  repo.persistence_?.untrack(pathString);
+}
+
+/** Observe the outcome of one exact default listen. @internal */
+export function repoOnListenOutcome(
+  repo: Repo,
+  pathString: string,
+  subscriber: (outcome: ListenOutcome) => void
+): () => void {
+  let state = repo.listenOutcomes_.get(pathString);
+  if (!state) {
+    // Subscribing before the listen starts is the natural ordering for a
+    // caller that wires observability alongside its onValue().
+    // repoStartServerListen preserves the subscriber set from a prior state,
+    // so an empty pre-created state is carried into the real listen.
+    state = { outcome: null, subscribers: new Set() };
+    repo.listenOutcomes_.set(pathString, state);
+  }
+  state.subscribers.add(subscriber);
+  if (state.outcome) {
+    subscriber(state.outcome);
+  }
+  return () => state.subscribers.delete(subscriber);
+}
+
+/**
+ * Activates persistence for a `{ persistent: true }` registration that JOINED
+ * an already-listening default query (repoStartServerListen does not re-run
+ * for it, so nothing else would ever track the root). Tracking is idempotent;
+ * when the live listen has already certified a complete server cache, that
+ * exact tree is seeded through the normal write-through path so the root is
+ * warm on the next boot. A still-loading listen needs nothing here — its own
+ * listen-complete certification write-through covers the root once tracked.
+ * @internal
+ */
+export function repoActivatePersistenceForJoinedListen(
+  repo: Repo,
+  path: Path
+): void {
+  const persistence = repo.persistence_;
+  const pathString = path.toString();
+  if (
+    persistence === null ||
+    !persistence.isPersistentPath(pathString) ||
+    persistence.trackedRootFor(pathString) === pathString ||
+    repo.pendingSeedRestores_?.has(pathString)
+  ) {
+    // No manager, not selected, already tracked by its own start path, or the
+    // start path is still in flight (it will track on resolution).
+    return;
+  }
+  persistence.track(pathString);
+  const serverCache = syncTreeGetCompleteServerCache(
+    repo.serverSyncTree_,
+    path
+  );
+  if (serverCache !== null) {
+    persistence.serverCacheUpdated(path, serverCache);
+  }
+}
+
+export function repoCancelPendingSeedRestores(
+  repo: Repo,
+  reattach = true
+): void {
+  repo.pendingListenHashes_.clearAll();
+  const pendings = [...repo.pendingSeedRestores_.values()];
+  repo.pendingSeedRestores_.clear();
+  for (const pending of pendings) {
+    repoCancelPendingSeedRestore(pending);
+    if (reattach) {
+      // The subscription outlives the cancelled restore (account switch,
+      // persistence disabled): a pre-manifest token never sent its listen, a
+      // manifest-first token has a seeded wire listen whose boot buffer is
+      // about to be dropped. Either way, restart it as one ordinary cold
+      // listen so the registration keeps receiving data. Dispose passes
+      // false — there is no live subscription left to serve.
+      pending.reattachCold?.();
+    }
+  }
+}
+
+export function repoClearListenOutcomes(repo: Repo): void {
+  repo.listenOutcomes_.clear();
+}
+
+export function repoNotifyPersistenceAuthScope(repo: Repo): void {
+  for (const listener of repo.persistenceAuthScopeListeners_) {
+    exceptionGuard(listener);
+  }
+}
+
+export function repoDispose(repo: Repo): void {
+  repoInterrupt(repo);
+  repoCancelPendingSeedRestores(repo, false);
+  repoClearListenOutcomes(repo);
+  repo.persistenceAuthScopeListeners_.clear();
+  repo.persistence_?.dispose();
+}
+
+/**
+ * Persistence write-through: after the server updated `path` (overwrite,
+ * merge, range merge, or listen-complete certification), re-persist the
+ * nearest persistence-tracked root containing it. Reads the SyncTree's own
+ * complete server cache — the exact tree the SDK now holds as server truth —
+ * so what is stored is always what was applied, never a re-derivation.
+ */
+/**
+ * `preciseChange` distinguishes how much the caller knows about what this
+ * update touched, so the flush can mark dirty ranges from the server-named
+ * path instead of re-discovering it with a full identity diff:
+ *   'at-path'   — an ordinary data push changed exactly the subtree at `path`
+ *   'confirmed' — a listen certification: state already accounted, nothing new
+ *   'unknown'   — a range merge or any update whose shape isn't named here
+ */
+function repoPersistAfterServerUpdate(
+  repo: Repo,
+  path: Path,
+  preciseChange: 'at-path' | 'confirmed' | 'unknown'
+): void {
+  const persistence = repo.persistence_;
+  if (persistence === null) {
+    return;
+  }
+  const rootString = persistence.trackedRootFor(path.toString());
+  if (rootString === null) {
+    return;
+  }
+  const rootPath = new Path(rootString);
+  const serverCache = syncTreeGetCompleteServerCache(
+    repo.serverSyncTree_,
+    rootPath
+  );
+  if (serverCache !== null) {
+    let changedPaths: string[][] | undefined;
+    if (preciseChange === 'at-path') {
+      changedPaths = [pathSlice(newRelativePath(rootPath, path))];
+    } else if (preciseChange === 'confirmed') {
+      changedPaths = [];
+    }
+    persistence.serverCacheUpdated(rootPath, serverCache, changedPaths);
+  }
+}
+
+/**
+ * Handles a server range-merge push: the listen carried a compound hash and
+ * only some of its ranges differed. Each wire range is
+ * `{ s?, e?, m }` — exclusive-start path, inclusive-end path (either bound
+ * may be missing, meaning open), and the update tree for that range —
+ * applied in order against the locally cached server data.
+ */
+function repoOnRangeMergeUpdate(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  tag: number | null
+): void {
+  // For testing.
+  repo.dataUpdateCount++;
+  {
+    const bufferRoot = repoBootBufferRootFor(repo, pathString);
+    if (bufferRoot !== null) {
+      repo.bootBuffers_
+        .get(bufferRoot)!
+        .push({ kind: 'rm', pathString, ranges, tag });
+      return;
+    }
+  }
+  const path = new Path(pathString);
+  const merges = ranges.map(
+    range =>
+      new RangeMerge(
+        typeof range.s === 'string' ? new Path(range.s) : null,
+        typeof range.e === 'string' ? new Path(range.e) : null,
+        nodeFromJSON(range.m)
+      )
+  );
+  let events: Event[];
+  if (tag) {
+    events = syncTreeApplyTaggedRangeMerges(
+      repo.serverSyncTree_,
+      path,
+      merges,
+      tag
+    );
+  } else {
+    events = syncTreeApplyServerRangeMerges(repo.serverSyncTree_, path, merges);
+  }
+  let affectedPath = path;
+  if (events.length > 0) {
+    // Since we have a listener outstanding for each transaction, receiving any events
+    // is a proxy for some change having occurred.
+    affectedPath = repoRerunTransactions(repo, path);
+  }
+  eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  if (tag == null) {
+    // A range merge names leaf INTERVALS, not subtrees; the flush falls back
+    // to the identity diff for this baseline.
+    repoPersistAfterServerUpdate(repo, path, 'unknown');
+  }
 }
 
 // TODO: This should be @private but it's used by test_access.js and internal.js

@@ -125,6 +125,14 @@ export interface Node {
   hash(): string;
 
   /**
+   * Installs a precomputed value for hash() — used by server-cache seeding
+   * to stamp a hash computed off the main thread (see ServerCacheSeed). No
+   * effect once a hash has been computed or stamped: nodes are immutable,
+   * so the first hash is the only hash.
+   */
+  stampLazyHash(hash: string): void;
+
+  /**
    * @param other - Another node
    * @returns -1 for less than, 0 for equal, 1 for greater than other
    */

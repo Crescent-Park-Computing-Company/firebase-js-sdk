@@ -40,17 +40,30 @@ import {
   EmulatorTokenProvider,
   FirebaseAuthTokenProvider
 } from '../core/AuthTokenProvider';
-import { Repo, repoInterrupt, repoResume, repoStart } from '../core/Repo';
+import { PersistenceManager } from '../core/Persistence';
+import {
+  Repo,
+  repoCancelPendingSeedRestores,
+  repoDispose,
+  repoInterrupt,
+  ListenOutcome,
+  repoOnListenOutcome,
+  repoNotifyPersistenceAuthScope,
+  repoResume,
+  repoStart
+} from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
+import { stampMaterializedValue } from '../core/ServerCacheSeed';
+import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
 import { parseRepoInfo } from '../core/util/libs/parser';
-import { newEmptyPath, pathIsEmpty } from '../core/util/Path';
+import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
   warn,
   fatal,
   log,
   enableLogging as enableLoggingImpl
 } from '../core/util/util';
-import { validateUrl } from '../core/util/validation';
+import { validateRootPathString, validateUrl } from '../core/util/validation';
 import { BrowserPollConnection } from '../realtime/BrowserPollConnection';
 import { TransportManager } from '../realtime/TransportManager';
 import { WebSocketConnection } from '../realtime/WebSocketConnection';
@@ -186,7 +199,7 @@ function repoManagerDeleteRepo(repo: Repo, appName: string): void {
   if (!appRepos || appRepos[repo.key] !== repo) {
     fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
   }
-  repoInterrupt(repo);
+  repoDispose(repo);
   delete appRepos[repo.key];
 }
 
@@ -397,6 +410,17 @@ export function connectDatabaseEmulator(
 
   // Modify the repo to apply emulator settings
   repoManagerApplyEmulatorSettings(repo, hostAndPort, options, tokenProvider);
+
+  // Persistence enabled before this call captured the production URL as its
+  // storage prefix; rebind it to the emulator's so emulator sessions never
+  // restore production records or write emulator data under the production
+  // namespace. (Emulator config only happens pre-start, so no listens or
+  // tracked roots exist yet.)
+  if (repo.persistence_ !== null) {
+    repo.persistence_ = repo.persistence_.rebindTo(
+      repo.repoInfo_.toURLString()
+    );
+  }
 }
 
 /**
@@ -424,6 +448,148 @@ export function goOffline(db: Database): void {
   db = getModularInstance(db);
   db._checkNotDeleted('goOffline');
   repoInterrupt(db._repo);
+}
+
+/**
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @public
+ */
+export function getPersistedValue(
+  db: Database,
+  pathString: string,
+  expectedAuthScope: string | null = null
+): Promise<unknown | null> {
+  db = getModularInstance(db);
+  db._checkNotDeleted('getPersistedValue');
+  validateRootPathString('getPersistedValue', 'path', pathString, false);
+  // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
+  // and reading a stored record must not start the instance (which would
+  // lock out later transport/emulator configuration).
+  const repo = db._repoInternal;
+  const persistence = repo.persistence_;
+  if (persistence === null) {
+    return Promise.resolve(null);
+  }
+  // Prime the manager with the trusted expected identity so the later auth
+  // callback for that same user can reuse this physical decode. A different
+  // real auth uid changes scope and cancels it before any listener consumes it.
+  if (expectedAuthScope !== null) {
+    persistence.setAuthScope(expectedAuthScope);
+  }
+  // Exact-root by design: callers peek the same path they are about to
+  // listen to. This lets the authenticated listener consume the same decoded
+  // Node and prevents a fresher ancestor record from being mistaken for the
+  // exact listener's initial replay.
+  return persistence
+    .peek(new Path(pathString).toString(), expectedAuthScope)
+    .then(record => {
+      if (record === null) {
+        return null;
+      }
+      const value = record.node.val();
+      if (value !== null && typeof value === 'object') {
+        // One-boot materialization handoff (see ServerCacheSeed): the
+        // authenticated listener that adopts this same immutable Node replays
+        // it as a child_added burst, and a caller that opts in via
+        // consumePersistedMaterialization() adopts each top-level child's
+        // slice of this single materialization instead of walking the tree a
+        // second time. snapshot.val() itself never returns these objects.
+        // Index access covers both object and array-coerced shapes.
+        const byKey = value as Record<string, unknown>;
+        record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+          stampMaterializedValue(childNode, byKey[key]);
+        });
+        stampMaterializedValue(record.node, value);
+      }
+      return value;
+    });
+}
+
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @public
+ */
+export function setPersistenceEnabled(db: Database, enabled: boolean): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceEnabled');
+  if (db._instanceStarted) {
+    fatal(
+      'setPersistenceEnabled() must be called before the first Database operation.'
+    );
+  }
+  // _repoInternal, not the _repo getter: configuration must not start the
+  // instance, or a later connectDatabaseEmulator() would refuse to run.
+  const repo = db._repoInternal;
+  if (enabled) {
+    if (repo.persistence_ === null) {
+      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+    }
+  } else {
+    if (repo.persistence_ !== null) {
+      repoCancelPendingSeedRestores(repo);
+      repo.persistence_.dispose();
+      repo.persistence_ = null;
+    }
+  }
+}
+
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export function setPersistenceAuthScope(
+  db: Database,
+  scope: string | null
+): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceAuthScope');
+  const repo = db._repoInternal;
+  const persistenceWasScoped =
+    repo.persistence_?.isAuthScopeConfigured() ?? false;
+  if (repo.persistence_?.setAuthScope(scope) && persistenceWasScoped) {
+    repoCancelPendingSeedRestores(repo);
+  }
+  const scopeChanged = repo.persistenceAuthScope_ !== scope;
+  repo.persistenceAuthScope_ = scope;
+  if (scopeChanged || (!persistenceWasScoped && repo.persistence_ !== null)) {
+    repoNotifyPersistenceAuthScope(repo);
+  }
+}
+
+/**
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
+ *
+ * @public
+ */
+export function onListenOutcome(
+  db: Database,
+  pathString: string,
+  callback: (outcome: ListenOutcome) => void
+): () => void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('onListenOutcome');
+  validateRootPathString('onListenOutcome', 'path', pathString, false);
+  return repoOnListenOutcome(
+    db._repoInternal,
+    new Path(pathString).toString(),
+    callback
+  );
 }
 
 /**

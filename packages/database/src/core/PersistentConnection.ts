@@ -34,7 +34,8 @@ import { Connection } from '../realtime/Connection';
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
 import { RepoInfo } from './RepoInfo';
-import { ServerActions } from './ServerActions';
+import { ListenWireResult, ServerActions } from './ServerActions';
+import { ListenHashFn } from './ServerCacheSeed';
 import { OnlineMonitor } from './util/OnlineMonitor';
 import { Path } from './util/Path';
 import { error, log, logWrapper, warn, ObjectToUniqueKey } from './util/util';
@@ -53,9 +54,19 @@ const SERVER_KILL_INTERRUPT_REASON = 'server_kill';
 const INVALID_TOKEN_THRESHOLD = 3;
 
 interface ListenSpec {
-  onComplete(s: string, p?: unknown): void;
+  onComplete(s: string, p: unknown, result: ListenWireResult): void;
+  onProgress?: (result: ListenWireResult) => void;
 
-  hashFn(): string;
+  hashFn: ListenHashFn;
+  bytes: number;
+  // Captured once when the listen request is serialized. The wire result
+  // must never call back into hashFn(): recomputing the canonical hash of a
+  // large post-merge cache is a full-tree serialize+SHA-1 walk, and the
+  // progress callback runs on every incoming frame.
+  hadHash: boolean;
+  hadCompoundHash: boolean;
+  dataReceived: boolean;
+  rangeMerged: boolean;
 
   query: QueryContext;
   tag: number | null;
@@ -112,7 +123,9 @@ export class PersistentConnection extends ServerActions {
   private visible_: boolean = false;
 
   // Before we get connected, we keep a queue of pending messages to send.
-  private requestCBHash_: { [k: number]: (a: unknown) => void } = {};
+  private requestCBHash_: {
+    [k: number]: (a: unknown, bytes?: number) => void;
+  } = {};
   private requestNumber_ = 0;
 
   private realtime_: {
@@ -155,7 +168,12 @@ export class PersistentConnection extends ServerActions {
     private onServerInfoUpdate_: (a: unknown) => void,
     private authTokenProvider_: AuthTokenProvider,
     private appCheckTokenProvider_: AppCheckTokenProvider,
-    private authOverride_?: object | null
+    private authOverride_?: object | null,
+    private onRangeMergeUpdate_?: (
+      path: string,
+      ranges: Array<{ s?: string; e?: string; m: unknown }>,
+      tag: number | null
+    ) => void
   ) {
     super();
 
@@ -175,7 +193,7 @@ export class PersistentConnection extends ServerActions {
   protected sendRequest(
     action: string,
     body: unknown,
-    onResponse?: (a: unknown) => void
+    onResponse?: (a: unknown, bytes?: number) => void
   ) {
     const curReqNum = ++this.requestNumber_;
 
@@ -224,9 +242,10 @@ export class PersistentConnection extends ServerActions {
 
   listen(
     query: QueryContext,
-    currentHashFn: () => string,
+    currentHashFn: ListenHashFn,
     tag: number | null,
-    onComplete: (a: string, b: unknown) => void
+    onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
+    onProgress?: (result: ListenWireResult) => void
   ) {
     this.initConnection_();
 
@@ -246,9 +265,15 @@ export class PersistentConnection extends ServerActions {
     );
     const listenSpec: ListenSpec = {
       onComplete,
+      onProgress,
       hashFn: currentHashFn,
       query,
-      tag
+      tag,
+      bytes: 0,
+      hadHash: false,
+      hadCompoundHash: false,
+      dataReceived: false,
+      rangeMerged: false
     };
     this.listens.get(pathString)!.set(queryId, listenSpec);
 
@@ -288,29 +313,50 @@ export class PersistentConnection extends ServerActions {
 
     req[/*hash*/ 'h'] = listenSpec.hashFn();
 
-    this.sendRequest(action, req, (message: { [k: string]: unknown }) => {
-      const payload: unknown = message[/*data*/ 'd'];
-      const status = message[/*status*/ 's'] as string;
+    // When the server cache was seeded from app-persisted data, send its
+    // compound hash too: a miss on the simple hash then downgrades to
+    // range merges covering only the changed ranges instead of a full
+    // download (see ServerCacheSeed).
+    const compoundHash = listenSpec.hashFn.compoundHash?.();
+    if (compoundHash) {
+      req['ch'] = { hs: compoundHash.hashes, ps: compoundHash.posts };
+    }
+    listenSpec.hadHash = req['h'] !== '';
+    listenSpec.hadCompoundHash = compoundHash !== undefined;
+    listenSpec.bytes = 0;
+    listenSpec.dataReceived = false;
+    listenSpec.rangeMerged = false;
 
-      // print warnings in any case...
-      PersistentConnection.warnOnListenWarnings_(payload, query);
+    this.sendRequest(
+      action,
+      req,
+      (message: { [k: string]: unknown }, responseBytes = 0) => {
+        const payload: unknown = message[/*data*/ 'd'];
+        const status = message[/*status*/ 's'] as string;
 
-      const currentListenSpec =
-        this.listens.get(pathString) &&
-        this.listens.get(pathString)!.get(queryId);
-      // only trigger actions if the listen hasn't been removed and readded
-      if (currentListenSpec === listenSpec) {
-        this.log_('listen response', message);
+        // print warnings in any case...
+        PersistentConnection.warnOnListenWarnings_(payload, query);
 
-        if (status !== 'ok') {
-          this.removeListen_(pathString, queryId);
-        }
+        const currentListenSpec =
+          this.listens.get(pathString) &&
+          this.listens.get(pathString)!.get(queryId);
+        // only trigger actions if the listen hasn't been removed and readded
+        if (currentListenSpec === listenSpec) {
+          this.log_('listen response', message);
 
-        if (listenSpec.onComplete) {
-          listenSpec.onComplete(status, payload);
+          if (status !== 'ok') {
+            this.removeListen_(pathString, queryId);
+          }
+
+          if (listenSpec.onComplete) {
+            listenSpec.onComplete(status, payload, {
+              ...this.listenWireResult_(listenSpec),
+              bytes: listenSpec.bytes + responseBytes
+            });
+          }
         }
       }
-    });
+    );
   }
 
   private static warnOnListenWarnings_(payload: unknown, query: QueryContext) {
@@ -639,7 +685,7 @@ export class PersistentConnection extends ServerActions {
     }
   }
 
-  private onDataMessage_(message: { [k: string]: unknown }) {
+  private onDataMessage_(message: { [k: string]: unknown }, bytes = 0) {
     if ('r' in message) {
       // this is a response
       this.log_('from server: ' + stringify(message));
@@ -647,18 +693,50 @@ export class PersistentConnection extends ServerActions {
       const onResponse = this.requestCBHash_[reqNum];
       if (onResponse) {
         delete this.requestCBHash_[reqNum];
-        onResponse(message[/*body*/ 'b']);
+        onResponse(message[/*body*/ 'b'], bytes);
       }
     } else if ('error' in message) {
       throw 'A server-side error has occurred: ' + message['error'];
     } else if ('a' in message) {
       // a and b are action and body, respectively
-      this.onDataPush_(message['a'] as string, message['b'] as {});
+      this.onDataPush_(message['a'] as string, message['b'] as {}, bytes);
     }
   }
 
-  private onDataPush_(action: string, body: { [k: string]: unknown }) {
+  private listenWireResult_(listen: ListenSpec): ListenWireResult {
+    return {
+      bytes: listen.bytes,
+      hadHash: listen.hadHash,
+      hadCompoundHash: listen.hadCompoundHash,
+      dataReceived: listen.dataReceived,
+      rangeMerged: listen.rangeMerged
+    };
+  }
+
+  private onDataPush_(
+    action: string,
+    body: { [k: string]: unknown },
+    bytes: number
+  ) {
     this.log_('handleServerMessage', action, body);
+    if (
+      (action === 'd' || action === 'm' || action === 'rm') &&
+      body &&
+      body['p'] !== undefined
+    ) {
+      const pushPath = new Path(body['p'] as string).toString();
+      const listensAtPath = this.listens.get(pushPath);
+      if (listensAtPath) {
+        for (const listen of listensAtPath.values()) {
+          listen.bytes += bytes;
+          listen.dataReceived = true;
+          if (action === 'rm') {
+            listen.rangeMerged = true;
+          }
+          listen.onProgress?.(this.listenWireResult_(listen));
+        }
+      }
+    }
     if (action === 'd') {
       this.onDataUpdate_(
         body[/*path*/ 'p'] as string,
@@ -672,6 +750,14 @@ export class PersistentConnection extends ServerActions {
         body[/*data*/ 'd'],
         /*isMerge=*/ true,
         body['t'] as number
+      );
+    } else if (action === 'rm') {
+      // Range merge: the listen carried a compound hash and only some of its
+      // ranges differed — the server resends just those ranges.
+      this.onRangeMergeUpdate_?.(
+        body[/*path*/ 'p'] as string,
+        body[/*ranges*/ 'd'] as Array<{ s?: string; e?: string; m: unknown }>,
+        body['t'] as number | null
       );
     } else if (action === 'c') {
       this.onListenRevoked_(
@@ -961,7 +1047,13 @@ export class PersistentConnection extends ServerActions {
     }
     const listen = this.removeListen_(pathString, queryId);
     if (listen && listen.onComplete) {
-      listen.onComplete('permission_denied');
+      listen.onComplete('permission_denied', null, {
+        bytes: listen.bytes,
+        hadHash: listen.hadHash,
+        hadCompoundHash: listen.hadCompoundHash,
+        dataReceived: listen.dataReceived,
+        rangeMerged: listen.rangeMerged
+      });
     }
   }
 

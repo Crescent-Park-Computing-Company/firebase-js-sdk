@@ -365,7 +365,9 @@ export const validateRootPathString = function (
   pathString: string,
   optional: boolean
 ) {
-  if (pathString) {
+  // Non-string input falls through to validatePathString's descriptive
+  // error instead of throwing a bare TypeError here.
+  if (typeof pathString === 'string' && pathString) {
     // Allow '/.info/' at the beginning.
     pathString = pathString.replace(/^\/*\.info(\/|$)/, '/');
   }
