@@ -477,9 +477,15 @@ export function getPersistedValue(
   }
   // Prime the manager with the trusted expected identity so the later auth
   // callback for that same user can reuse this physical decode. A different
-  // real auth uid changes scope and cancels it before any listener consumes it.
+  // real auth uid changes scope and cancels it before any listener consumes
+  // it. Priming is NOT app confirmation (confirmedByApp=false): until real
+  // auth confirms this scope via setPersistenceAuthScope, the peek's decoded
+  // tree is retained under the long pre-auth backstop instead of the short
+  // handoff grace — auth hydration can be arbitrarily slow, and expiring the
+  // handoff before it completes forces a full second restore alongside the
+  // first (the double-tree boot-memory spike).
   if (expectedAuthScope !== null) {
-    persistence.setAuthScope(expectedAuthScope);
+    persistence.setAuthScope(expectedAuthScope, false);
   }
   // Exact-root by design: callers peek the same path they are about to
   // listen to. This lets the authenticated listener consume the same decoded

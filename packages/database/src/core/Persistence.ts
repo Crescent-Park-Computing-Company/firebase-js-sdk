@@ -167,8 +167,28 @@ export const PERSISTENCE_RANGE_TARGET_BYTES = 256 * 1024;
  */
 export const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 
-/** How long a completed optimistic peek waits for its real listener. */
+/**
+ * How long a completed optimistic peek's decoded tree stays retained for its
+ * real (authenticated) listener AFTER the app has confirmed the auth scope.
+ * From that moment the listener is normally milliseconds away, so a short
+ * grace suffices.
+ */
 const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
+
+/**
+ * The same retention while the auth scope is only PRIMED by the peek itself
+ * (getPersistedValue's trusted expected identity) and real app auth has not
+ * confirmed it yet. Auth hydration is local but can be arbitrarily slow on a
+ * loaded profile (service-worker congestion, IndexedDB contention); racing it
+ * with a short wall-clock timer silently defeats the one-decode-per-boot
+ * handoff exactly on the machines that need it most — the listener then
+ * re-reads and re-decodes the full tree while the peek's copy is still alive,
+ * doubling peak boot memory. A mismatching or signed-out identity still
+ * clears the retained read IMMEDIATELY via setAuthScope; this long backstop
+ * only bounds the true leak case (auth never resolving at all), where the
+ * page is stuck on its auth spinner anyway.
+ */
+const PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS = 5 * 60 * 1000;
 
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
@@ -467,15 +487,39 @@ export class PersistenceManager {
   private disposed_ = false;
   private authScope_: string | null = null;
   private authScopeConfigured_ = false;
+  /**
+   * True once the APP's auth integration (setPersistenceAuthScope) has
+   * confirmed the scope — as opposed to a pre-auth peek merely priming it
+   * with a trusted expected identity. Selects the peek-retention budget:
+   * a primed-only scope holds the long pre-auth backstop, a confirmed one
+   * the short handoff grace (see PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS).
+   */
+  private authScopeConfirmed_ = false;
   private authGeneration_ = 0;
 
   isAuthScopeConfigured(): boolean {
     return this.authScopeConfigured_;
   }
 
-  setAuthScope(scope: string | null): boolean {
+  setAuthScope(scope: string | null, confirmedByApp = true): boolean {
     const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
     this.authScopeConfigured_ = true;
+    if (confirmedByApp) {
+      if (!this.authScopeConfirmed_) {
+        this.authScopeConfirmed_ = true;
+        if (!changed) {
+          // Real auth confirmed the exact scope a pre-auth peek primed: the
+          // handoff window is open NOW. Retained reads waiting under the
+          // long pre-auth backstop drop to the short post-auth grace —
+          // counted from this moment, not from when the read finished.
+          this.rearmRetainedReads_();
+        }
+      }
+    } else if (changed) {
+      // A prime that CHANGES the scope describes an identity the app has not
+      // confirmed yet; its retentions must run under the pre-auth backstop.
+      this.authScopeConfirmed_ = false;
+    }
     if (!changed) {
       return false;
     }
@@ -489,6 +533,14 @@ export class PersistenceManager {
     this.latest_.clear();
     this.lastFlush_.clear();
     this.changedSinceFlush_.clear();
+    // Clear retention timers BEFORE dropping the map: a pending cleanupTimer's
+    // closure otherwise keeps the entry (and its decoded tree) alive until it
+    // fires — minutes, under the pre-auth backstop.
+    for (const read of this.activeReads_.values()) {
+      if (read.cleanupTimer !== null) {
+        clearTimeout(read.cleanupTimer);
+      }
+    }
     this.activeReads_.clear();
     this.restoreReasons_.clear();
     this.authScope_ = scope;
@@ -509,7 +561,9 @@ export class PersistenceManager {
     private operationTimeoutMs_: number = PERSISTENCE_RESTORE_TIMEOUT_MS,
     private cacheMaxBytes_: number = PERSISTENCE_MAX_CACHE_BYTES,
     private writeDelayMs_: number = PERSISTENCE_WRITE_DEBOUNCE_MS,
-    private rangeTargetBytes_: number = PERSISTENCE_RANGE_TARGET_BYTES
+    private rangeTargetBytes_: number = PERSISTENCE_RANGE_TARGET_BYTES,
+    private peekHandoffMs_: number = PERSISTENCE_PEEK_HANDOFF_MS,
+    private peekPreAuthHandoffMs_: number = PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS
   ) {
     if (!this.schemaKnownCurrent_) {
       // Do not put the cold server listen behind a potentially slow Safari
@@ -530,10 +584,12 @@ export class PersistenceManager {
       this.operationTimeoutMs_,
       this.cacheMaxBytes_,
       this.writeDelayMs_,
-      this.rangeTargetBytes_
+      this.rangeTargetBytes_,
+      this.peekHandoffMs_,
+      this.peekPreAuthHandoffMs_
     );
     if (this.authScopeConfigured_) {
-      rebound.setAuthScope(scope);
+      rebound.setAuthScope(scope, this.authScopeConfirmed_);
     }
     for (const [pathString, count] of selectedRoots) {
       rebound.persistentRoots_.set(pathString, count);
@@ -1114,7 +1170,7 @@ export class PersistenceManager {
     );
     entry.promise = promise;
     this.activeReads_.set(pathString, entry);
-    const release = () => {
+    const release = (result: ReadResult | null) => {
       entry.progress.clear();
       entry.manifestCallbacks.clear();
       if (this.activeReads_.get(pathString) !== entry) {
@@ -1124,14 +1180,43 @@ export class PersistenceManager {
         this.activeReads_.delete(pathString);
         return;
       }
+      // Only a completed DECODE earns the long pre-auth budget: it is the
+      // one-tree-per-boot handoff auth must not race. A miss/failed read
+      // retains nothing worth waiting for — keep the short expiry so a
+      // record written meanwhile (another tab) is re-read fresh.
+      entry.cleanupTimer = setTimeout(
+        () => {
+          if (this.activeReads_.get(pathString) === entry) {
+            this.activeReads_.delete(pathString);
+          }
+        },
+        result !== null && !this.authScopeConfirmed_
+          ? this.peekPreAuthHandoffMs_
+          : this.peekHandoffMs_
+      );
+    };
+    void promise.then(release, () => release(null));
+    return promise;
+  }
+
+  /**
+   * Auth just confirmed the scope a pre-auth peek primed: every retained
+   * completed read waiting under the long pre-auth backstop switches to the
+   * short post-auth grace, counted from now. Entries still resolving (no
+   * cleanupTimer yet) pick the right budget in their own release().
+   */
+  private rearmRetainedReads_(): void {
+    for (const [pathString, entry] of this.activeReads_) {
+      if (entry.cleanupTimer === null || !entry.retainAfterResolve) {
+        continue;
+      }
+      clearTimeout(entry.cleanupTimer);
       entry.cleanupTimer = setTimeout(() => {
         if (this.activeReads_.get(pathString) === entry) {
           this.activeReads_.delete(pathString);
         }
-      }, PERSISTENCE_PEEK_HANDOFF_MS);
-    };
-    void promise.then(release, release);
-    return promise;
+      }, this.peekHandoffMs_);
+    }
   }
 
   private readRecordOnce_(
