@@ -1250,7 +1250,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3-cache-seeding.54";
+const version = "1.1.3";
 
 /**
  * @license
@@ -4742,6 +4742,35 @@ function mergePersistedFragment(base, fragment) {
     }
     return result;
 }
+/**
+ * Structural validation of a stored manifest: current format, string
+ * revision, and a non-empty, well-formed range list. Shared by the full
+ * restore read and the manifest-only baseline adoption.
+ */
+function structurallyValidManifest(manifest) {
+    return (manifest !== null &&
+        manifest !== undefined &&
+        manifest.formatVersion === PERSISTENCE_FORMAT_VERSION &&
+        typeof manifest.revision === 'string' &&
+        typeof manifest.updatedAt === 'number' &&
+        typeof manifest.hash === 'string' &&
+        Array.isArray(manifest.ranges) &&
+        manifest.ranges.length > 0 &&
+        manifest.ranges.every(range => range !== null &&
+            typeof range === 'object' &&
+            typeof range.recordId === 'string' &&
+            range.recordId.length > 0 &&
+            typeof range.post === 'string' &&
+            typeof range.hash === 'string' &&
+            typeof range.size === 'number'));
+}
+function webLocks() {
+    if (typeof navigator === 'undefined') {
+        return null;
+    }
+    const locks = navigator.locks;
+    return locks && typeof locks.request === 'function' ? locks : null;
+}
 class PersistenceManager {
     isAuthScopeConfigured() {
         return this.authScopeConfigured_;
@@ -4861,6 +4890,8 @@ class PersistenceManager {
          */
         this.activeReads_ = new Map();
         this.restoreReasons_ = new Map();
+        /** Cross-tab write leases per tracked root (see WriteLease). */
+        this.writeLeases_ = new Map();
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
         this.writesDeferredUntilRestores_ = new Set();
@@ -4920,6 +4951,75 @@ class PersistenceManager {
      */
     track(pathString) {
         this.trackedRoots_.add(pathString);
+        this.acquireWriteLease_(pathString);
+    }
+    /**
+     * True when this manager may write the root: it holds the root's
+     * cross-tab lease, or leases are unenforceable here (no Web Locks — the
+     * manifest CAS remains the correctness backstop).
+     */
+    holdsWriteLease_(pathString) {
+        const lease = this.writeLeases_.get(pathString);
+        return lease === undefined ? true : lease.held;
+    }
+    /**
+     * Requests the root's cross-tab write lease (never blocks; flushes stay
+     * gated on holdsWriteLease_ until the browser grants it). Idempotent per
+     * root. Where Web Locks are unavailable no lease entry is created and
+     * holdsWriteLease_ fails open.
+     */
+    acquireWriteLease_(pathString) {
+        const existing = this.writeLeases_.get(pathString);
+        if (existing !== undefined) {
+            existing.wanted = true;
+            return;
+        }
+        if (this.disposed_) {
+            return;
+        }
+        const locks = webLocks();
+        if (locks === null) {
+            return;
+        }
+        const lease = { held: false, wanted: true, release: null };
+        this.writeLeases_.set(pathString, lease);
+        const name = 'firebase-database-persistence-write|' + this.key_(pathString);
+        void locks
+            .request(name, { mode: 'exclusive' }, () => {
+            if (!lease.wanted || this.disposed_) {
+                // Released (or the manager died) while queued: hand the lock
+                // straight back so the next tab's request is granted.
+                return Promise.resolve();
+            }
+            lease.held = true;
+            // Writes were skipped while another tab held the lease; whatever is
+            // pending in memory enters the ordinary write window now. A stale
+            // baseline (the old holder committed) resolves through the flush
+            // CAS + adoptCommittedBaseline_, exactly once.
+            if (this.trackedRoots_.has(pathString) && this.latest_.has(pathString)) {
+                this.armWriteWindow_(pathString);
+            }
+            return new Promise(resolve => {
+                lease.release = resolve;
+            });
+        })
+            .catch(() => {
+            // Lock API failure — fail open rather than never persisting.
+            if (this.writeLeases_.get(pathString) === lease) {
+                this.writeLeases_.delete(pathString);
+            }
+        });
+    }
+    /** Returns the root's write lease to the browser (idempotent). */
+    releaseWriteLease_(pathString) {
+        const lease = this.writeLeases_.get(pathString);
+        if (lease === undefined) {
+            return;
+        }
+        this.writeLeases_.delete(pathString);
+        lease.wanted = false;
+        lease.held = false;
+        lease.release?.();
     }
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
@@ -4945,6 +5045,7 @@ class PersistenceManager {
             this.latest_.delete(pathString);
             this.lastFlush_.delete(pathString);
             this.changedSinceFlush_.delete(pathString);
+            this.releaseWriteLease_(pathString);
             void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
             return;
         }
@@ -4957,6 +5058,9 @@ class PersistenceManager {
                 this.latest_.delete(pathString);
                 this.lastFlush_.delete(pathString);
                 this.changedSinceFlush_.delete(pathString);
+                // After the final flush so a lease-holding tab still writes the
+                // last tree before the lease transfers.
+                this.releaseWriteLease_(pathString);
             }
         };
         void this.flushNow(pathString).then(release, release);
@@ -5448,20 +5552,7 @@ class PersistenceManager {
                     done(null);
                     return;
                 }
-                const structurallyValid = manifest.formatVersion === PERSISTENCE_FORMAT_VERSION &&
-                    typeof manifest.revision === 'string' &&
-                    typeof manifest.updatedAt === 'number' &&
-                    typeof manifest.hash === 'string' &&
-                    Array.isArray(manifest.ranges) &&
-                    manifest.ranges.length > 0 &&
-                    manifest.ranges.every(range => range !== null &&
-                        typeof range === 'object' &&
-                        typeof range.recordId === 'string' &&
-                        range.recordId.length > 0 &&
-                        typeof range.post === 'string' &&
-                        typeof range.hash === 'string' &&
-                        typeof range.size === 'number');
-                if (!structurallyValid) {
+                if (!structurallyValidManifest(manifest)) {
                     this.restoreReasons_.set(pathString, 'corrupt');
                     done(null);
                     return;
@@ -5671,13 +5762,15 @@ class PersistenceManager {
             }
         }
         for (const [root, state] of this.lastFlush_) {
-            if (pathString !== root &&
+            if (state.rootNode !== null &&
+                pathString !== root &&
                 (root === '/' || pathString.startsWith(root + '/')) &&
                 (bestRoot === null || root.length > bestRoot.length)) {
+                const rootNode = state.rootNode;
                 bestRoot = root;
                 source = Promise.resolve({
                     record: {
-                        node: state.rootNode,
+                        node: rootNode,
                         updatedAt: state.storedUpdatedAt,
                         revision: state.revision
                     },
@@ -5974,6 +6067,7 @@ class PersistenceManager {
             clearTimeout(timer);
             this.writeTimers_.delete(pathString);
         }
+        this.releaseWriteLease_(pathString);
         persistenceStats.evictions++;
         recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
         // Through the queue: a flush already running for this root finishes its
@@ -5982,6 +6076,9 @@ class PersistenceManager {
     }
     dispose() {
         this.disposed_ = true;
+        for (const pathString of [...this.writeLeases_.keys()]) {
+            this.releaseWriteLease_(pathString);
+        }
         for (const timer of this.writeTimers_.values()) {
             clearTimeout(timer);
         }
@@ -6043,6 +6140,60 @@ class PersistenceManager {
         return next;
     }
     /**
+     * Adopts the currently COMMITTED generation as the next flush baseline
+     * WITHOUT reading or decoding its range payloads — a manifest-only read.
+     *
+     * Used when this manager discovers its baseline is stale (the flush CAS
+     * lost to another writer, or the stored generation vanished): the
+     * winner's revision + ranges are all the next CAS needs, while its tree
+     * stays undecoded (rootNode: null). The follow-up flush cannot diff
+     * against an absent tree, so it stages a fresh self-contained generation
+     * — the same write the old adopt-and-diff produced anyway (a freshly
+     * decoded tree shares no identity with the live one, so its identity
+     * diff marked every range dirty) minus the full IndexedDB read and Node
+     * decode of the entire root that made every cross-tab conflict as
+     * expensive as a cold restore.
+     *
+     * The retry enters the ordinary NON-RESTARTING write window instead of
+     * re-flushing immediately: under sustained cross-tab churn an immediate
+     * retry conflicts again back-to-back — full-tree work with no pause
+     * between attempts (the multi-tab thrash the write leases exist to
+     * prevent, kept bounded here for lease-less environments too).
+     */
+    adoptCommittedBaseline_(pathString) {
+        const key = this.key_(pathString);
+        return this.withStore_('readonly', null, (store, done) => {
+            const req = store.get(key);
+            req.onsuccess = () => {
+                done(req.result ?? null);
+            };
+        }).then(manifest => {
+            if (this.disposed_) {
+                return;
+            }
+            // The adopted baseline is another generation's tree; paths named
+            // against our own chain do not describe diffs from it.
+            this.changedSinceFlush_.set(pathString, null);
+            if (structurallyValidManifest(manifest) &&
+                manifest.authScope === this.authScope_) {
+                this.lastFlush_.set(pathString, {
+                    rootNode: null,
+                    revision: manifest.revision,
+                    ranges: manifest.ranges,
+                    storedUpdatedAt: manifest.updatedAt
+                });
+            }
+            else {
+                // Missing, foreign-scope, or unreadable: the next flush stages
+                // under the absent / replaceable-foreign CAS arm instead.
+                this.lastFlush_.delete(pathString);
+            }
+            if (this.trackedRoots_.has(pathString)) {
+                this.armWriteWindow_(pathString);
+            }
+        });
+    }
+    /**
      * One generation: identity-diff against the last known stored tree marks
      * the dirty ranges; only those are re-serialized (between preserved
      * boundary posts), re-hashed, and written under new immutable ids. Clean
@@ -6058,6 +6209,12 @@ class PersistenceManager {
         }
         const entry = this.latest_.get(pathString);
         if (!entry || this.disposed_ || !this.authScopeConfigured_) {
+            return Promise.resolve();
+        }
+        if (!this.holdsWriteLease_(pathString)) {
+            // Another tab is this root's writer. latest_ keeps the newest tree in
+            // memory; if the lease ever transfers here, the grant callback
+            // re-enters the ordinary write window.
             return Promise.resolve();
         }
         const { node, revision, authScope } = entry;
@@ -6103,27 +6260,9 @@ class PersistenceManager {
                 // sweep, or manual storage clearing). lastFlush_ no longer describes
                 // storage; left in place, every future identical-node write-through
                 // would skip against it and the root would stay unpersisted for the
-                // whole session. Resync from storage and rebuild once.
-                return this.readRecord_(pathString).then(winner => {
-                    if (this.disposed_) {
-                        return;
-                    }
-                    // The adopted baseline is another generation's tree; paths named
-                    // against our own chain do not describe diffs from it.
-                    this.changedSinceFlush_.set(pathString, null);
-                    if (winner !== null) {
-                        this.lastFlush_.set(pathString, {
-                            rootNode: winner.record.node,
-                            revision: winner.record.revision,
-                            ranges: winner.ranges,
-                            storedUpdatedAt: winner.record.updatedAt
-                        });
-                    }
-                    else {
-                        this.lastFlush_.delete(pathString);
-                    }
-                    this.flushPending_.add(pathString);
-                });
+                // whole session. Resync from the committed manifest — never a full
+                // range read/decode — and rebuild once, through the write window.
+                return this.adoptCommittedBaseline_(pathString);
             });
         }
         // Dirty ranges come from the changed paths the server already named
@@ -6139,7 +6278,13 @@ class PersistenceManager {
         let dirty = [];
         let tailDirty = false;
         let changed = null;
-        if (prev && prev.ranges.length > 0) {
+        // An adopted baseline (rootNode null — another writer's committed
+        // manifest) has UNKNOWN content: neither the identity diff nor paths
+        // accumulated against our own chain describe differences from it, and
+        // carrying any of its ranges over unverified would splice two server
+        // snapshots into one stored tree. Stage a fresh full generation; its
+        // revision still CASes against the adopted manifest.
+        if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
             changed =
                 accumulated !== null && accumulated !== undefined
                     ? accumulated
@@ -6369,29 +6514,14 @@ class PersistenceManager {
                     }
                     // A different tab committed while we staged, or a concurrent
                     // sweep reclaimed our still-unreferenced staged records. Remove
-                    // our immutable ids, adopt the winning manifest/base, then diff
-                    // the current live Node against it on one coalesced retry.
+                    // our immutable ids and adopt the winning manifest as the CAS
+                    // baseline (manifest-only — no range read, no decode); the next
+                    // window stages one fresh self-contained generation against it.
                     return this.withStore_('readwrite', undefined, store => {
                         for (const recordId of stagedIds) {
                             store.delete(key + RANGE_KEY_INFIX + recordId);
                         }
-                    }).then(() => this.readRecord_(pathString).then(winner => {
-                        // Same imprecision as the refresh resync: the winner is a
-                        // foreign baseline.
-                        this.changedSinceFlush_.set(pathString, null);
-                        if (winner !== null) {
-                            this.lastFlush_.set(pathString, {
-                                rootNode: winner.record.node,
-                                revision: winner.record.revision,
-                                ranges: winner.ranges,
-                                storedUpdatedAt: winner.record.updatedAt
-                            });
-                        }
-                        else {
-                            this.lastFlush_.delete(pathString);
-                        }
-                        this.flushPending_.add(pathString);
-                    }));
+                    }).then(() => this.adoptCommittedBaseline_(pathString));
                 }
                 persistenceStats.rangesHashed += dirtyPlans.length;
                 persistenceStats.rangesReused += ranges.length - dirtyPlans.length;

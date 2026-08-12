@@ -2061,6 +2061,8 @@ declare class PersistenceManager {
      */
     private activeReads_;
     private restoreReasons_;
+    /** Cross-tab write leases per tracked root (see WriteLease). */
+    private writeLeases_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
@@ -2089,6 +2091,21 @@ declare class PersistenceManager {
      * tracked roots (and their descendants' updates).
      */
     track(pathString: string): void;
+    /**
+     * True when this manager may write the root: it holds the root's
+     * cross-tab lease, or leases are unenforceable here (no Web Locks — the
+     * manifest CAS remains the correctness backstop).
+     */
+    private holdsWriteLease_;
+    /**
+     * Requests the root's cross-tab write lease (never blocks; flushes stay
+     * gated on holdsWriteLease_ until the browser grants it). Idempotent per
+     * root. Where Web Locks are unavailable no lease entry is created and
+     * holdsWriteLease_ fails open.
+     */
+    private acquireWriteLease_;
+    /** Returns the root's write lease to the browser (idempotent). */
+    private releaseWriteLease_;
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
      * root, its record — which contains this subtree and keeps flushing — is
@@ -2236,6 +2253,28 @@ declare class PersistenceManager {
      * reason about.
      */
     private enqueue_;
+    /**
+     * Adopts the currently COMMITTED generation as the next flush baseline
+     * WITHOUT reading or decoding its range payloads — a manifest-only read.
+     *
+     * Used when this manager discovers its baseline is stale (the flush CAS
+     * lost to another writer, or the stored generation vanished): the
+     * winner's revision + ranges are all the next CAS needs, while its tree
+     * stays undecoded (rootNode: null). The follow-up flush cannot diff
+     * against an absent tree, so it stages a fresh self-contained generation
+     * — the same write the old adopt-and-diff produced anyway (a freshly
+     * decoded tree shares no identity with the live one, so its identity
+     * diff marked every range dirty) minus the full IndexedDB read and Node
+     * decode of the entire root that made every cross-tab conflict as
+     * expensive as a cold restore.
+     *
+     * The retry enters the ordinary NON-RESTARTING write window instead of
+     * re-flushing immediately: under sustained cross-tab churn an immediate
+     * retry conflicts again back-to-back — full-tree work with no pause
+     * between attempts (the multi-tab thrash the write leases exist to
+     * prevent, kept bounded here for lease-less environments too).
+     */
+    private adoptCommittedBaseline_;
     /**
      * One generation: identity-diff against the last known stored tree marks
      * the dirty ranges; only those are re-serialized (between preserved
