@@ -1337,6 +1337,165 @@ describe('PersistenceManager', () => {
     expect(treeGets).to.equal(manifest.ranges.length);
   });
 
+  it('holds a completed pre-auth peek for its listener across slow auth (one decode per boot)', async () => {
+    // The regression behind the staging OOM/loading-ring reports: Firebase
+    // Auth hydration can take arbitrarily long on a loaded profile, and the
+    // peek's retained decode used to expire on a fixed short timer racing
+    // it. The listener then re-read and re-decoded the full tree while the
+    // peek's copy was still alive — two ~60 MB JS trees at the peak of boot.
+    const seeded = makeFakeIndexedDB();
+    const path = new Path('slow-auth/root');
+    const writer = scopedManager('test-repo', seeded.factory);
+    writer.setAuthScope('user-a');
+    writer.track(path.toString());
+    writer.serverCacheUpdated(
+      path,
+      nodeFromJSON({ a: bigLeaf('a'), b: bigLeaf('b'), c: 1 })
+    );
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    let rangeGets = 0;
+    const readerFactory = makeFakeIndexedDB({
+      onGet: key => {
+        if (key.startsWith('test-repo|/slow-auth/root#range:')) {
+          rangeGets++;
+        }
+      }
+    });
+    for (const [key, value] of seeded.data) {
+      readerFactory.data.set(key, value);
+    }
+    // Short post-auth grace (1 ms), long pre-auth backstop. The peek primes
+    // the scope WITHOUT app confirmation — exactly getPersistedValue's shape.
+    const reader = new PersistenceManager(
+      'test-repo',
+      readerFactory.factory,
+      true,
+      undefined,
+      undefined,
+      0,
+      undefined,
+      1,
+      60_000
+    );
+    reader.setAuthScope('user-a', false);
+    const peeked = await reader.peek(path.toString(), 'user-a');
+    expect(peeked).to.not.equal(null);
+    const getsAfterPeek = rangeGets;
+
+    // Auth "hydrates slowly": far longer than the 1 ms post-auth grace.
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+    // Real auth confirms the primed identity, and the listener attaches.
+    reader.setAuthScope('user-a');
+    reader.track(path.toString());
+    const restored = await reader.restoreForListen(path.toString());
+
+    // The SAME decoded tree is handed off — no second physical range read.
+    expect(restored.record).to.not.equal(null);
+    expect(restored.record!.node).to.equal(peeked!.node);
+    expect(rangeGets).to.equal(getsAfterPeek);
+  });
+
+  it('drops peek retention to the short grace once real auth confirms the primed scope', async () => {
+    const seeded = makeFakeIndexedDB();
+    const path = new Path('confirmed/root');
+    const writer = scopedManager('test-repo', seeded.factory);
+    writer.setAuthScope('user-a');
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 2 }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    let rangeGets = 0;
+    const readerFactory = makeFakeIndexedDB({
+      onGet: key => {
+        if (key.startsWith('test-repo|/confirmed/root#range:')) {
+          rangeGets++;
+        }
+      }
+    });
+    for (const [key, value] of seeded.data) {
+      readerFactory.data.set(key, value);
+    }
+    const reader = new PersistenceManager(
+      'test-repo',
+      readerFactory.factory,
+      true,
+      undefined,
+      undefined,
+      0,
+      undefined,
+      1,
+      60_000
+    );
+    reader.setAuthScope('user-a', false);
+    const peeked = await reader.peek(path.toString(), 'user-a');
+    expect(peeked).to.not.equal(null);
+
+    // Confirmation of the SAME primed scope re-arms retention down to the
+    // short grace, counted from now — the memory bound is restored the
+    // moment the handoff window actually opens.
+    reader.setAuthScope('user-a');
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+    const getsBeforeRestore = rangeGets;
+    reader.track(path.toString());
+    const restored = await reader.restoreForListen(path.toString());
+    expect(restored.record).to.not.equal(null);
+    // Retention expired: this restore performed its own physical read.
+    expect(rangeGets).to.be.greaterThan(getsBeforeRestore);
+    expect(restored.record!.node).to.not.equal(peeked!.node);
+  });
+
+  it('bounds a never-confirmed peek with the pre-auth backstop', async () => {
+    const seeded = makeFakeIndexedDB();
+    const path = new Path('unconfirmed/root');
+    const writer = scopedManager('test-repo', seeded.factory);
+    writer.setAuthScope('user-a');
+    writer.track(path.toString());
+    writer.serverCacheUpdated(path, nodeFromJSON({ a: 1 }));
+    await writer.flushNow(path.toString());
+    await flushAsync();
+
+    let rangeGets = 0;
+    const readerFactory = makeFakeIndexedDB({
+      onGet: key => {
+        if (key.startsWith('test-repo|/unconfirmed/root#range:')) {
+          rangeGets++;
+        }
+      }
+    });
+    for (const [key, value] of seeded.data) {
+      readerFactory.data.set(key, value);
+    }
+    // Pre-auth backstop of 1 ms: auth never confirming must still release
+    // the retained tree (the true leak case the timer exists for).
+    const reader = new PersistenceManager(
+      'test-repo',
+      readerFactory.factory,
+      true,
+      undefined,
+      undefined,
+      0,
+      undefined,
+      60_000,
+      1
+    );
+    reader.setAuthScope('user-a', false);
+    const peeked = await reader.peek(path.toString(), 'user-a');
+    expect(peeked).to.not.equal(null);
+
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+    const getsBefore = rangeGets;
+    // The retained entry expired; a second peek re-reads physically.
+    const again = await reader.peek(path.toString(), 'user-a');
+    expect(again).to.not.equal(null);
+    expect(rangeGets).to.be.greaterThan(getsBefore);
+  });
+
   it('does not repopulate in-memory state after the root is untracked', async () => {
     const seeded = makeFakeIndexedDB();
     const path = new Path('late/root');
