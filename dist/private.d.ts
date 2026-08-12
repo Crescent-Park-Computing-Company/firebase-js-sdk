@@ -2003,6 +2003,8 @@ declare class PersistenceManager {
     private cacheMaxBytes_;
     private writeDelayMs_;
     private rangeTargetBytes_;
+    private peekHandoffMs_;
+    private peekPreAuthHandoffMs_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -2067,10 +2069,18 @@ declare class PersistenceManager {
     private disposed_;
     private authScope_;
     private authScopeConfigured_;
+    /**
+     * True once the APP's auth integration (setPersistenceAuthScope) has
+     * confirmed the scope — as opposed to a pre-auth peek merely priming it
+     * with a trusted expected identity. Selects the peek-retention budget:
+     * a primed-only scope holds the long pre-auth backstop, a confirmed one
+     * the short handoff grace (see PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS).
+     */
+    private authScopeConfirmed_;
     private authGeneration_;
     isAuthScopeConfigured(): boolean;
-    setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number);
+    setAuthScope(scope: string | null, confirmedByApp?: boolean): boolean;
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -2125,6 +2135,13 @@ declare class PersistenceManager {
      * whole restore; Repo then performs the structural-failure cold relisten.
      */
     private readRecord_;
+    /**
+     * Auth just confirmed the scope a pre-auth peek primed: every retained
+     * completed read waiting under the long pre-auth backstop switches to the
+     * short post-auth grace, counted from now. Entries still resolving (no
+     * cleanupTimer yet) pick the right budget in their own release().
+     */
+    private rearmRetainedReads_;
     private readRecordOnce_;
     /**
      * Decodes and merges raw persisted range clones into one Node in yielded

@@ -1242,7 +1242,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3";
+const version = "1.1.3-cache-seeding.54";
 
 /**
  * @license
@@ -4608,8 +4608,27 @@ const PERSISTENCE_RANGE_TARGET_BYTES = 256 * 1024;
  * neither success nor error can never hold the live listen forever.
  */
 const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
-/** How long a completed optimistic peek waits for its real listener. */
+/**
+ * How long a completed optimistic peek's decoded tree stays retained for its
+ * real (authenticated) listener AFTER the app has confirmed the auth scope.
+ * From that moment the listener is normally milliseconds away, so a short
+ * grace suffices.
+ */
 const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
+/**
+ * The same retention while the auth scope is only PRIMED by the peek itself
+ * (getPersistedValue's trusted expected identity) and real app auth has not
+ * confirmed it yet. Auth hydration is local but can be arbitrarily slow on a
+ * loaded profile (service-worker congestion, IndexedDB contention); racing it
+ * with a short wall-clock timer silently defeats the one-decode-per-boot
+ * handoff exactly on the machines that need it most — the listener then
+ * re-reads and re-decodes the full tree while the peek's copy is still alive,
+ * doubling peak boot memory. A mismatching or signed-out identity still
+ * clears the retained read IMMEDIATELY via setAuthScope; this long backstop
+ * only bounds the true leak case (auth never resolving at all), where the
+ * page is stuck on its auth spinner anyway.
+ */
+const PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS = 5 * 60 * 1000;
 /**
  * A stored tree whose content hasn't changed is left untouched by flushes
  * until its manifest is this old, then the manifest alone is rewritten with
@@ -4719,9 +4738,26 @@ class PersistenceManager {
     isAuthScopeConfigured() {
         return this.authScopeConfigured_;
     }
-    setAuthScope(scope) {
+    setAuthScope(scope, confirmedByApp = true) {
         const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
         this.authScopeConfigured_ = true;
+        if (confirmedByApp) {
+            if (!this.authScopeConfirmed_) {
+                this.authScopeConfirmed_ = true;
+                if (!changed) {
+                    // Real auth confirmed the exact scope a pre-auth peek primed: the
+                    // handoff window is open NOW. Retained reads waiting under the
+                    // long pre-auth backstop drop to the short post-auth grace —
+                    // counted from this moment, not from when the read finished.
+                    this.rearmRetainedReads_();
+                }
+            }
+        }
+        else if (changed) {
+            // A prime that CHANGES the scope describes an identity the app has not
+            // confirmed yet; its retentions must run under the pre-auth backstop.
+            this.authScopeConfirmed_ = false;
+        }
         if (!changed) {
             return false;
         }
@@ -4735,6 +4771,14 @@ class PersistenceManager {
         this.latest_.clear();
         this.lastFlush_.clear();
         this.changedSinceFlush_.clear();
+        // Clear retention timers BEFORE dropping the map: a pending cleanupTimer's
+        // closure otherwise keeps the entry (and its decoded tree) alive until it
+        // fires — minutes, under the pre-auth backstop.
+        for (const read of this.activeReads_.values()) {
+            if (read.cleanupTimer !== null) {
+                clearTimeout(read.cleanupTimer);
+            }
+        }
         this.activeReads_.clear();
         this.restoreReasons_.clear();
         this.authScope_ = scope;
@@ -4743,7 +4787,7 @@ class PersistenceManager {
     }
     constructor(prefix_, idbFactory_ = isIndexedDBAvailable()
         ? indexedDB
-        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS, cacheMaxBytes_ = PERSISTENCE_MAX_CACHE_BYTES, writeDelayMs_ = PERSISTENCE_WRITE_DEBOUNCE_MS, rangeTargetBytes_ = PERSISTENCE_RANGE_TARGET_BYTES) {
+        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS, cacheMaxBytes_ = PERSISTENCE_MAX_CACHE_BYTES, writeDelayMs_ = PERSISTENCE_WRITE_DEBOUNCE_MS, rangeTargetBytes_ = PERSISTENCE_RANGE_TARGET_BYTES, peekHandoffMs_ = PERSISTENCE_PEEK_HANDOFF_MS, peekPreAuthHandoffMs_ = PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS) {
         this.prefix_ = prefix_;
         this.idbFactory_ = idbFactory_;
         this.schemaKnownCurrent_ = schemaKnownCurrent_;
@@ -4751,6 +4795,8 @@ class PersistenceManager {
         this.cacheMaxBytes_ = cacheMaxBytes_;
         this.writeDelayMs_ = writeDelayMs_;
         this.rangeTargetBytes_ = rangeTargetBytes_;
+        this.peekHandoffMs_ = peekHandoffMs_;
+        this.peekPreAuthHandoffMs_ = peekPreAuthHandoffMs_;
         this.db_ = null;
         /** Roots explicitly selected by the application (keepSynced semantics). */
         this.persistentRoots_ = new Map();
@@ -4815,6 +4861,14 @@ class PersistenceManager {
         this.disposed_ = false;
         this.authScope_ = null;
         this.authScopeConfigured_ = false;
+        /**
+         * True once the APP's auth integration (setPersistenceAuthScope) has
+         * confirmed the scope — as opposed to a pre-auth peek merely priming it
+         * with a trusted expected identity. Selects the peek-retention budget:
+         * a primed-only scope holds the long pre-auth backstop, a confirmed one
+         * the short handoff grace (see PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS).
+         */
+        this.authScopeConfirmed_ = false;
         this.authGeneration_ = 0;
         if (!this.schemaKnownCurrent_) {
             // Do not put the cold server listen behind a potentially slow Safari
@@ -4827,9 +4881,9 @@ class PersistenceManager {
         const scope = this.authScope_;
         const selectedRoots = [...this.persistentRoots_];
         this.dispose();
-        const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_, this.writeDelayMs_, this.rangeTargetBytes_);
+        const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_, this.writeDelayMs_, this.rangeTargetBytes_, this.peekHandoffMs_, this.peekPreAuthHandoffMs_);
         if (this.authScopeConfigured_) {
-            rebound.setAuthScope(scope);
+            rebound.setAuthScope(scope, this.authScopeConfirmed_);
         }
         for (const [pathString, count] of selectedRoots) {
             rebound.persistentRoots_.set(pathString, count);
@@ -5325,7 +5379,7 @@ class PersistenceManager {
         });
         entry.promise = promise;
         this.activeReads_.set(pathString, entry);
-        const release = () => {
+        const release = (result) => {
             entry.progress.clear();
             entry.manifestCallbacks.clear();
             if (this.activeReads_.get(pathString) !== entry) {
@@ -5335,14 +5389,39 @@ class PersistenceManager {
                 this.activeReads_.delete(pathString);
                 return;
             }
+            // Only a completed DECODE earns the long pre-auth budget: it is the
+            // one-tree-per-boot handoff auth must not race. A miss/failed read
+            // retains nothing worth waiting for — keep the short expiry so a
+            // record written meanwhile (another tab) is re-read fresh.
             entry.cleanupTimer = setTimeout(() => {
                 if (this.activeReads_.get(pathString) === entry) {
                     this.activeReads_.delete(pathString);
                 }
-            }, PERSISTENCE_PEEK_HANDOFF_MS);
+            }, result !== null && !this.authScopeConfirmed_
+                ? this.peekPreAuthHandoffMs_
+                : this.peekHandoffMs_);
         };
-        void promise.then(release, release);
+        void promise.then(release, () => release(null));
         return promise;
+    }
+    /**
+     * Auth just confirmed the scope a pre-auth peek primed: every retained
+     * completed read waiting under the long pre-auth backstop switches to the
+     * short post-auth grace, counted from now. Entries still resolving (no
+     * cleanupTimer yet) pick the right budget in their own release().
+     */
+    rearmRetainedReads_() {
+        for (const [pathString, entry] of this.activeReads_) {
+            if (entry.cleanupTimer === null || !entry.retainAfterResolve) {
+                continue;
+            }
+            clearTimeout(entry.cleanupTimer);
+            entry.cleanupTimer = setTimeout(() => {
+                if (this.activeReads_.get(pathString) === entry) {
+                    this.activeReads_.delete(pathString);
+                }
+            }, this.peekHandoffMs_);
+        }
     }
     readRecordOnce_(pathString, onProgress, expectedAuthScope = this.authScope_, onManifest = () => { }) {
         const key = this.key_(pathString);
@@ -17541,9 +17620,15 @@ function getPersistedValue(db, pathString, expectedAuthScope = null) {
     }
     // Prime the manager with the trusted expected identity so the later auth
     // callback for that same user can reuse this physical decode. A different
-    // real auth uid changes scope and cancels it before any listener consumes it.
+    // real auth uid changes scope and cancels it before any listener consumes
+    // it. Priming is NOT app confirmation (confirmedByApp=false): until real
+    // auth confirms this scope via setPersistenceAuthScope, the peek's decoded
+    // tree is retained under the long pre-auth backstop instead of the short
+    // handoff grace — auth hydration can be arbitrarily slow, and expiring the
+    // handoff before it completes forces a full second restore alongside the
+    // first (the double-tree boot-memory spike).
     if (expectedAuthScope !== null) {
-        persistence.setAuthScope(expectedAuthScope);
+        persistence.setAuthScope(expectedAuthScope, false);
     }
     // Exact-root by design: callers peek the same path they are about to
     // listen to. This lets the authenticated listener consume the same decoded
