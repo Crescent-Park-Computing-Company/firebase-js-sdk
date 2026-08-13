@@ -1669,12 +1669,18 @@ export function repoInterrupt(repo: Repo): void {
   if (repo.persistentConnection_) {
     repo.persistentConnection_.interrupt(INTERRUPT_REASON);
   }
+  // Liveness is not eligibility: an offline tab keeps running (and
+  // heartbeating), but its server cache is frozen — it must stop being any
+  // root's persisted writer so an online tab can take over. Roots stay
+  // tracked; repoResume re-acquires (see setNetworkSuspended).
+  repo.persistence_?.setNetworkSuspended(true);
 }
 
 export function repoResume(repo: Repo): void {
   if (repo.persistentConnection_) {
     repo.persistentConnection_.resume(INTERRUPT_REASON);
   }
+  repo.persistence_?.setNetworkSuspended(false);
 }
 
 export function repoStats(repo: Repo, showDelta: boolean = false): void {

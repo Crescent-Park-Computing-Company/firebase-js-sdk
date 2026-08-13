@@ -19,4 +19,8 @@ evictions purge immediately in one scope-guarded transaction — so a stale or
 lease-less writer can never delete a generation the current writer just
 committed, and revoked data never outlives the access that produced it.
 Heartbeat takeover only triggers on a present-but-stale heartbeat; storage
-that throws disables the channel and degrades to page-death handoff.
+that throws disables the channel and degrades to page-death handoff. A tab
+whose repo is deliberately interrupted (goOffline) releases its leases and
+closes its write gate — liveness is not eligibility — so an online tab
+persists the newest server state; resuming re-queues politely and flushes
+what was pending.

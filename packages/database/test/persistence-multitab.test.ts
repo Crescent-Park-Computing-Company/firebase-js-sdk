@@ -38,6 +38,7 @@ import {
   persistenceStats,
   _setWebLocksForTesting
 } from '../src/core/Persistence';
+import { Repo, repoInterrupt, repoResume } from '../src/core/Repo';
 import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
@@ -1064,6 +1065,178 @@ describe('PersistenceManager multi-tab write economics', () => {
       'a malformed-scope record is dropped at eviction'
     );
     again.dispose();
+  });
+
+  it('an offline holder hands the writer lease to an online follower', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const gen1 = shared.data.get(MANIFEST_KEY) as { revision: string };
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+
+    // A goes deliberately offline: its JS keeps running (it would keep
+    // heartbeating), but its server cache is frozen — liveness is not
+    // eligibility. The lease must transfer to the online tab.
+    tabA.setNetworkSuspended(true);
+    await flushAsync(6);
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+    expect(
+      (
+        tabB as unknown as { writerLeases_: Map<string, { state: string }> }
+      ).writerLeases_.get(ROOT)?.state
+    ).to.equal('held', 'the online follower must become the writer');
+
+    // B persists the newer server state A never saw.
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('online-b'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    await tabB.flushNow(ROOT);
+    await flushAsync();
+    const gen2 = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(gen2.revision).to.not.equal(gen1.revision);
+
+    // The suspended tab is INELIGIBLE, not merely lease-less: its stale
+    // tree must not overwrite B's fresh generation.
+    const writeThroughs0 = persistenceStats.writeThroughs;
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('stale-a'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync(6);
+    expect(persistenceStats.writeThroughs).to.equal(writeThroughs0);
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
+    ).to.equal(gen2.revision, 'an offline tab must never write');
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('a resumed tab re-queues politely and persists what it saw before suspending', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    expect((await tabB.restoreForListen(ROOT)).record).to.not.equal(null);
+
+    // A: one more update lands, then A suspends before its window fires —
+    // the pending tree stays in memory and must persist after resume.
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('pre-offline'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    tabA.setNetworkSuspended(true);
+    await flushAsync(6); // B is granted
+
+    // Resume: A re-queues BEHIND B — never seizes.
+    tabA.setNetworkSuspended(false);
+    await flushAsync(4);
+    const leasesA = (
+      tabA as unknown as { writerLeases_: Map<string, { state: string }> }
+    ).writerLeases_;
+    expect(leasesA.get(ROOT)?.state).to.equal('requested');
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+
+    // B leaves; A is granted and its pre-offline data flushes (bounded).
+    const before = (shared.data.get(MANIFEST_KEY) as { revision: string })
+      .revision;
+    tabB.dispose();
+    const flushedBy = Date.now() + 2000;
+    while (Date.now() < flushedBy) {
+      await flushAsync(2);
+      const current = shared.data.get(MANIFEST_KEY) as { revision: string };
+      if (current.revision !== before) {
+        break;
+      }
+    }
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeA);
+    tabA.dispose();
+  });
+
+  it('offline ineligibility holds where Web Locks do not exist; the flag survives a rebind', async () => {
+    // CAS-only environment (the suite default): the gate is the ONLY
+    // eligibility mechanism, and it must close while suspended — an
+    // offline tab's adopt-then-restage would otherwise overwrite an online
+    // writer's fresh generation with stale data.
+    const shared = makeFakeIndexedDB();
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    let tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    const gen1 = shared.data.get(MANIFEST_KEY) as { revision: string };
+
+    manager.setNetworkSuspended(true);
+    tree = tree.updateChild(new Path(CHURN_REL), nodeFromJSON('while-off'));
+    manager.serverCacheUpdated(ROOT_PATH, tree, [CHURN_REL.split('/')]);
+    await manager.flushNow(ROOT);
+    await flushAsync(4);
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
+    ).to.equal(gen1.revision, 'no writes while suspended, even lock-less');
+
+    // Resume re-arms the window: the data seen while suspended persists.
+    manager.setNetworkSuspended(false);
+    const flushedBy = Date.now() + 2000;
+    while (Date.now() < flushedBy) {
+      await flushAsync(2);
+      const current = shared.data.get(MANIFEST_KEY) as { revision: string };
+      if (current.revision !== gen1.revision) {
+        break;
+      }
+    }
+    await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
+
+    // A rebind (auth-scope change) while suspended must stay suspended.
+    manager.setNetworkSuspended(true);
+    const rebound = manager.rebindTo('test-repo-2');
+    expect(
+      (rebound as unknown as { networkSuspended_: boolean }).networkSuspended_
+    ).to.equal(true, 'rebind must carry the suspension');
+    rebound.dispose();
+  });
+
+  it('repoInterrupt/repoResume drive persistence eligibility', () => {
+    const shared = makeFakeIndexedDB();
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    const connectionCalls: string[] = [];
+    const repo = {
+      persistentConnection_: {
+        interrupt: (reason: string) => connectionCalls.push('i:' + reason),
+        resume: (reason: string) => connectionCalls.push('r:' + reason)
+      },
+      persistence_: manager
+    } as unknown as Repo;
+
+    repoInterrupt(repo);
+    expect(
+      (manager as unknown as { networkSuspended_: boolean }).networkSuspended_
+    ).to.equal(true);
+    repoResume(repo);
+    expect(
+      (manager as unknown as { networkSuspended_: boolean }).networkSuspended_
+    ).to.equal(false);
+    expect(connectionCalls).to.deep.equal([
+      'i:repo_interrupt',
+      'r:repo_interrupt'
+    ]);
+    manager.dispose();
   });
 
   it('an absent heartbeat never justifies a steal', async () => {

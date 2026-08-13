@@ -3321,16 +3321,23 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     const pending = repo.pendingSeedRestores_.get(path.toString())!;
     let disposed = false;
+    const suspensions: boolean[] = [];
     repo.persistence_ = {
       dispose: () => {
         disposed = true;
+      },
+      // repoDispose interrupts the repo first, which suspends persistence
+      // (an offline tab must stop being any root's writer) before dispose.
+      setNetworkSuspended: (suspended: boolean) => {
+        suspensions.push(suspended);
       }
-    } as PersistenceManager;
+    } as unknown as PersistenceManager;
     repoDispose(repo);
     await flushAsync();
     expect(pending.cancelled).to.equal(true);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
     expect(repo.listenOutcomes_.size).to.equal(0);
+    expect(suspensions).to.deep.equal([true]);
     expect(disposed).to.equal(true);
   });
 

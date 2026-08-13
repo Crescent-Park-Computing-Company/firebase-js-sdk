@@ -650,6 +650,24 @@ export class PersistenceManager {
   private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
   /** One writer lease per TRACKED root (see the WriterLease notes). */
   private writerLeases_ = new Map<string, WriterLease>();
+  /**
+   * True while the repo's network is deliberately interrupted (goOffline /
+   * repoInterrupt). LIVENESS is not ELIGIBILITY: an offline tab's JS keeps
+   * running and heartbeating, but its server cache is frozen — if it kept
+   * its leases (or the fail-open gate), an online tab receiving newer
+   * server state could never persist it, and storage would hold the
+   * disconnected tab's stale tree. While suspended this manager holds no
+   * leases, queues none, steals none, and the write gate is CLOSED even
+   * where Web Locks don't exist — a stale flush from an offline tab must
+   * not overwrite an online writer's fresh generation in the CAS-only
+   * environment either. Roots stay tracked; trees stay in memory; resume
+   * re-acquires and the armed write windows flush whatever was pending.
+   * (Deliberate-offline only: an involuntary network drop hits every tab
+   * on the machine alike — no online follower exists to starve — and the
+   * connection self-reconnects, so leases follow repoInterrupt/repoResume,
+   * not transient socket state.)
+   */
+  private networkSuspended_ = false;
   /** One timer for all leases: held → heartbeat, requested → steal check. */
   private leaseTimer_: ReturnType<typeof setInterval> | null = null;
   private heartbeatStore_: HeartbeatStore | null;
@@ -769,6 +787,7 @@ export class PersistenceManager {
       this.leaseStaleMs_,
       this.heartbeatStore_
     );
+    rebound.networkSuspended_ = this.networkSuspended_;
     if (this.authScopeConfigured_) {
       rebound.setAuthScope(scope, this.authScopeConfirmed_);
     }
@@ -804,11 +823,42 @@ export class PersistenceManager {
   }
 
   /**
+   * Follows the repo's DELIBERATE network state (repoInterrupt/repoResume,
+   * i.e. goOffline/goOnline — see networkSuspended_). Suspending returns
+   * every lease so an online tab becomes each root's writer; roots stay
+   * tracked and trees stay in memory. Resuming re-queues politely (never
+   * steals) and re-arms the write windows, so data seen before or during
+   * the offline stretch persists once this tab is eligible again — in the
+   * lock-less environment the re-armed window is the whole story, since
+   * eligibility there is only the gate.
+   */
+  setNetworkSuspended(suspended: boolean): void {
+    if (this.networkSuspended_ === suspended || this.disposed_) {
+      return;
+    }
+    this.networkSuspended_ = suspended;
+    if (suspended) {
+      this.releaseAllWriterLeases_();
+      return;
+    }
+    for (const pathString of this.trackedRoots_) {
+      this.ensureWriterLease_(pathString);
+      this.armWriteWindowIfPending_(pathString);
+    }
+  }
+
+  /**
    * True when this manager may write the root: it holds the root's writer
    * lease, or leases are unenforceable here (no Web Locks, or the root has
    * no lease entry — the manifest CAS remains the correctness backstop).
    */
   private holdsWriterLease_(pathString: string): boolean {
+    if (this.networkSuspended_) {
+      // Ineligible, not merely lease-less: with no lease entry the gate
+      // would fail OPEN, and an offline tab's adopt-then-restage would
+      // overwrite an online writer's fresh generation with stale data.
+      return false;
+    }
     const lease = this.writerLeases_.get(pathString);
     return lease === undefined ? true : lease.state === 'held';
   }
@@ -890,7 +940,11 @@ export class PersistenceManager {
 
   /** Requests the root's writer lease once (idempotent per root). */
   private ensureWriterLease_(pathString: string): void {
-    if (this.writerLeases_.has(pathString) || this.disposed_) {
+    if (
+      this.writerLeases_.has(pathString) ||
+      this.disposed_ ||
+      this.networkSuspended_
+    ) {
       return;
     }
     const locks = webLocks();
