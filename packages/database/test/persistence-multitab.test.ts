@@ -30,10 +30,7 @@
  */
 import { expect } from 'chai';
 
-import {
-  PersistenceManager,
-  persistenceStats
-} from '../src/core/Persistence';
+import { PersistenceManager, persistenceStats } from '../src/core/Persistence';
 import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
@@ -376,7 +373,10 @@ describe('PersistenceManager multi-tab write economics', () => {
   let savedDocument: PropertyDescriptor | undefined;
   let savedWindow: PropertyDescriptor | undefined;
 
-  const stubGlobal = (name: 'navigator' | 'document' | 'window', value: unknown) => {
+  const stubGlobal = (
+    name: 'navigator' | 'document' | 'window',
+    value: unknown
+  ) => {
     Object.defineProperty(globalThis, name, {
       value,
       configurable: true,
@@ -690,7 +690,10 @@ describe('PersistenceManager multi-tab write economics', () => {
     // must be released so live tabs are not starved of writes indefinitely.
     lifecycleA.dispatch('freeze');
     await flushAsync(4);
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-takes-over'));
+    treeB = treeB.updateChild(
+      new Path(CHURN_REL),
+      nodeFromJSON('b-takes-over')
+    );
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
     await tabB.flushNow(ROOT);
     await flushAsync(30);
@@ -753,7 +756,11 @@ describe('PersistenceManager multi-tab write economics', () => {
     // A's access is revoked WHILE a slow flush of A's is still in flight —
     // the queued delete lands behind it, holding the hazard window open.
     // (A fresh-identity tree forces a full restage: many macrotasks.)
-    tabA.serverCacheUpdated(ROOT_PATH, nodeFromJSON(makeWorkspace()), undefined);
+    tabA.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
     void tabA.flushNow(ROOT); // deliberately not awaited: in flight at evict
     // The purge is unconditional, but the lease must be held THROUGH the
     // queued delete: B may only be granted (and commit) after the delete
@@ -816,7 +823,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     const survivor = shared.data.get(CHILD_KEY) as { revision: string };
     expect(survivor).to.not.equal(
       undefined,
-      'another writer\'s fresh generation must survive the housekeeping delete'
+      "another writer's fresh generation must survive the housekeeping delete"
     );
     expect(survivor.revision).to.equal(w2.revision);
 
@@ -847,7 +854,10 @@ describe('PersistenceManager multi-tab write economics', () => {
     await flushAsync(8);
     tabA.track(CHILD);
     let treeOwn: Node = (await tabA.restoreForListen(CHILD)).record!.node;
-    treeOwn = treeOwn.updateChild(new Path(childRel.join('/')), nodeFromJSON('a-own'));
+    treeOwn = treeOwn.updateChild(
+      new Path(childRel.join('/')),
+      nodeFromJSON('a-own')
+    );
     tabA.serverCacheUpdated(CHILD_PATH, treeOwn, [childRel]);
     await tabA.flushNow(CHILD);
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -859,7 +869,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     await flushAsync(8);
     expect(shared.data.get(CHILD_KEY)).to.equal(
       undefined,
-      'the manager\'s own stale shadow is still cleaned up'
+      "the manager's own stale shadow is still cleaned up"
     );
     writer.dispose();
     tabA.dispose();
@@ -897,9 +907,9 @@ describe('PersistenceManager multi-tab write economics', () => {
     const inFlight = tabB.flushNow(ROOT); // CAS conflict -> adopt
     treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b2'));
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    (
-      tabB as unknown as { scheduleFlush_: (p: string) => void }
-    ).scheduleFlush_(ROOT);
+    (tabB as unknown as { scheduleFlush_: (p: string) => void }).scheduleFlush_(
+      ROOT
+    );
     await inFlight;
     puts.length = 0;
     await flushAsync(10); // ample for an immediate (undeferred) retry to stage

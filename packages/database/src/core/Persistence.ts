@@ -744,8 +744,7 @@ export class PersistenceManager {
         typeof AbortController !== 'undefined' ? new AbortController() : null
     };
     this.writeLeases_.set(pathString, lease);
-    const name =
-      'firebase-database-persistence-write|' + this.key_(pathString);
+    const name = 'firebase-database-persistence-write|' + this.key_(pathString);
     const failOpen = () => {
       // An intentional cancellation (releaseWriteLease_ aborted a queued
       // request) already removed the entry — the guard makes it a no-op,
