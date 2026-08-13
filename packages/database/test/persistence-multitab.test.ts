@@ -350,6 +350,7 @@ function mkManager(
       getItem(k: string): string | null;
       setItem(k: string, v: string): void;
     } | null;
+    scope?: string;
   } = {}
 ): PersistenceManager {
   const manager = new PersistenceManager(
@@ -366,7 +367,7 @@ function mkManager(
     options.staleMs ?? 600_000,
     options.store ?? null
   );
-  manager.setAuthScope('u1');
+  manager.setAuthScope(options.scope ?? 'u1');
   return manager;
 }
 
@@ -569,51 +570,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabB.dispose();
   });
 
-  it("a follower's eviction purge waits for the lease; the holder's generation survives until then", async () => {
-    const fakeLocks = makeFakeWebLocks();
-    _setWebLocksForTesting(fakeLocks.locks);
-    const shared = makeFakeIndexedDB();
-
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    let treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-
-    const tabB = mkManager(shared.factory);
-    tabB.track(ROOT);
-    expect((await tabB.restoreForListen(ROOT)).record).to.not.equal(null);
-
-    // B (a follower) is evicted. Its purge must NOT run while A holds the
-    // lease and has a live generation — A's lastFlush_ still describes
-    // storage and identical rewrites would silently short-circuit.
-    tabB.evict(ROOT_PATH);
-    await flushAsync(10);
-    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
-      undefined,
-      "a follower's eviction must not delete the holder's live generation"
-    );
-    // A (the holder) keeps committing normally meanwhile.
-    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-still-on'));
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    expect(
-      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
-    ).to.be.a('string');
-
-    // The lease transfers to B: the recorded purge executes on grant.
-    tabA.dispose();
-    await flushAsync(20);
-    expect(shared.data.get(MANIFEST_KEY)).to.equal(
-      undefined,
-      'the pending eviction purge must execute once the lease is granted'
-    );
-    tabB.dispose();
-  });
-
-  it('re-tracking a root cancels its pending eviction purge', async () => {
+  it('eviction purges the revoked record immediately, even while another tab holds the writer lease', async () => {
     const fakeLocks = makeFakeWebLocks();
     _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
@@ -624,21 +581,56 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
     await tabA.flushNow(ROOT);
     await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
 
     const tabB = mkManager(shared.factory);
     tabB.track(ROOT);
     expect((await tabB.restoreForListen(ROOT)).record).to.not.equal(null);
-    tabB.evict(ROOT_PATH); // pending purge (B is a follower)
-    tabB.track(ROOT); // access restored: the stale intent must be DROPPED,
-    tabB.untrack(ROOT); // even if the root is later untracked again
-    await flushAsync(8);
-    tabA.dispose(); // lease transfers to B
-    await flushAsync(20);
+
+    // B (a follower) is evicted. The purge must NOT wait for the writer
+    // lease: A holds it for its tab's lifetime, and if A were not listening
+    // to this root it would never receive the revocation — the revoked
+    // bytes would outlive the access that produced them for as long as A's
+    // tab lived. Same-scope record -> deleted immediately.
+    tabB.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'a revoked record must be purged immediately, not behind the lease'
+    );
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true); // A still the writer
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it("eviction leaves another identity's record alone", async () => {
+    // No locks needed: the guard under test is the SCOPE check inside the
+    // purge transaction. u2's committed generation does not contain u1's
+    // revoked bytes (the record was overwritten wholesale), and u2's access
+    // is its own — u1's eviction must not delete it.
+    const shared = makeFakeIndexedDB();
+
+    const other = mkManager(shared.factory, { scope: 'u2' });
+    other.track(ROOT);
+    other.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await other.flushNow(ROOT);
+    await flushAsync();
+    other.dispose();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+
+    const mine = mkManager(shared.factory, { scope: 'u1' });
+    mine.track(ROOT);
+    mine.evict(ROOT_PATH);
+    await flushAsync(10);
     expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
       undefined,
-      'a re-tracked root must not be purged by a stale eviction intent'
+      "u1's eviction must not delete u2's record"
     );
-    tabB.dispose();
+    mine.dispose();
   });
 
   it('corrupt-record cleanup deletes only the generation the verdict was reached on', async () => {
@@ -754,6 +746,217 @@ describe('PersistenceManager multi-tab write economics', () => {
     writer.dispose();
     reader.dispose();
     reader2.dispose();
+  });
+
+  it('an empty-tree flush is a CAS commit: it never deletes a successor generation', async () => {
+    // Lock-less (CAS-only), mirroring the stolen-holder resume: the lease
+    // gate runs BEFORE async work, so by the time the empty-branch
+    // transaction executes, another writer may have committed. The delete
+    // must CAS against the baseline revision inside that transaction and
+    // treat a mismatch exactly like a losing commit (adopt manifest-only,
+    // defer to the write window — where the lease gate runs again).
+    const shared = makeFakeIndexedDB();
+
+    // A establishes its baseline rev1.
+    const tabA = mkManager(shared.factory, { writeDelay: 60_000 });
+    tabA.track(ROOT);
+    const treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    // B commits the successor rev2.
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('successor'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    await tabB.flushNow(ROOT);
+    await flushAsync();
+    const successor = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(successor).to.not.equal(undefined);
+
+    // A's server tree goes EMPTY; its baseline is stale rev1.
+    tabA.serverCacheUpdated(ROOT_PATH, nodeFromJSON(null), undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string })?.revision
+    ).to.equal(
+      successor.revision,
+      'an empty flush with a stale baseline must not delete the successor'
+    );
+    // ...and it adopted the winner exactly like a losing commit.
+    const baselines = (
+      tabA as unknown as {
+        lastFlush_: Map<string, { rootNode: unknown; revision: string }>;
+      }
+    ).lastFlush_;
+    expect(baselines.get(ROOT)?.rootNode).to.equal(null);
+    expect(baselines.get(ROOT)?.revision).to.equal(successor.revision);
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('an empty-tree flush without a baseline adopts a same-scope record instead of deleting it', async () => {
+    const shared = makeFakeIndexedDB();
+
+    const writer = mkManager(shared.factory);
+    writer.track(ROOT);
+    writer.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await writer.flushNow(ROOT);
+    await flushAsync();
+    const committed = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(committed).to.not.equal(undefined);
+
+    // A fresh manager (no baseline: nothing restored, nothing flushed)
+    // whose server tree is empty. Mirroring the commit arms, only an
+    // absent record or a replaceable-foreign manifest may be removed; a
+    // same-scope current-format record is a CAS conflict.
+    const fresh = mkManager(shared.factory, { writeDelay: 60_000 });
+    fresh.track(ROOT);
+    fresh.serverCacheUpdated(ROOT_PATH, nodeFromJSON(null), undefined);
+    await fresh.flushNow(ROOT);
+    await flushAsync();
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string })?.revision
+    ).to.equal(
+      committed.revision,
+      'a baseline-less empty flush must not delete a same-scope record'
+    );
+    fresh.dispose();
+    writer.dispose();
+  });
+
+  it('an empty-tree flush deletes exactly its own baseline generation', async () => {
+    const shared = makeFakeIndexedDB();
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    manager.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+
+    manager.serverCacheUpdated(ROOT_PATH, nodeFromJSON(null), undefined);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'the empty generation commits: the owned record is removed'
+    );
+    for (const key of shared.data.keys()) {
+      expect(key.startsWith(MANIFEST_KEY + '#')).to.equal(
+        false,
+        'range sidecars are removed with the manifest'
+      );
+    }
+    manager.dispose();
+  });
+
+  it('an absent heartbeat never justifies a steal', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+    // One shared underlying map; the HOLDER's store throws on write
+    // (storage-disabled document), so no heartbeat is ever stamped. The
+    // follower reads the absence and must NOT steal: silence means the
+    // liveness protocol is not operating, not that the holder is dead —
+    // stealing here would seize from a healthy writer over and over.
+    const data = new Map<string, string>();
+    const throwingWrites = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: () => {
+        throw new Error('storage denied');
+      }
+    };
+    const readable = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        data.set(k, v);
+      }
+    };
+
+    const holder = mkManager(shared.factory, {
+      store: throwingWrites,
+      heartbeatMs: 100_000,
+      staleMs: 100_000
+    });
+    holder.track(ROOT);
+    holder.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await flushAsync();
+
+    const follower = mkManager(shared.factory, {
+      store: readable,
+      heartbeatMs: 15,
+      staleMs: 40
+    });
+    follower.track(ROOT);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await flushAsync();
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+    expect(
+      (holder as unknown as { writerLease_: { state: string } }).writerLease_
+        .state
+    ).to.equal('held', 'the healthy holder must keep the lease');
+    // The holder's first failed stamp disabled its dead channel.
+    expect(
+      (holder as unknown as { heartbeatStore_: unknown }).heartbeatStore_
+    ).to.equal(null);
+    holder.dispose();
+    follower.dispose();
+  });
+
+  it('a throwing heartbeat read disables stealing for this manager', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const holder = mkManager(shared.factory, {
+      store: makeFakeHeartbeatStore(),
+      heartbeatMs: 100_000,
+      staleMs: 100_000
+    });
+    holder.track(ROOT);
+    await flushAsync();
+
+    const denied = {
+      getItem: () => {
+        throw new Error('storage denied');
+      },
+      setItem: () => {
+        throw new Error('storage denied');
+      }
+    };
+    const follower = mkManager(shared.factory, {
+      store: denied,
+      heartbeatMs: 15,
+      staleMs: 40
+    });
+    follower.track(ROOT);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await flushAsync();
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+    expect(
+      (holder as unknown as { writerLease_: { state: string } }).writerLease_
+        .state
+    ).to.equal('held');
+    expect(
+      (follower as unknown as { heartbeatStore_: unknown }).heartbeatStore_
+    ).to.equal(null, 'the first read failure kills the channel for good');
+    holder.dispose();
+    follower.dispose();
   });
 
   it('dispose aborts a still-queued lease request', async () => {
