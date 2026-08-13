@@ -40,7 +40,7 @@ import { Path } from '../src/core/util/Path';
 
 // ── minimal fake Web Locks manager (exclusive mode, FIFO grants, abortable
 //    pending requests — mirrors the platform contract the manager relies on) ─
-function makeFakeWebLocks(): {
+function makeFakeWebLocks(events: string[] = []): {
   locks: {
     request: (
       name: string,
@@ -72,6 +72,7 @@ function makeFakeWebLocks(): {
     }
     busy.add(name);
     holders.set(name, (holders.get(name) ?? 0) + 1);
+    events.push('grant:' + holders.get(name));
     void Promise.resolve()
       .then(() => next.callback({ name, mode: 'exclusive' }))
       .catch(() => {})
@@ -151,6 +152,7 @@ function makeFakeIndexedDB(
   options: {
     onGet?: (key: string) => void;
     onPut?: (key: string, value: unknown) => void;
+    onDelete?: (key: string) => void;
   } = {}
 ): { factory: IDBFactory; data: Map<string, unknown> } {
   const data = new Map<string, unknown>();
@@ -201,10 +203,12 @@ function makeFakeIndexedDB(
     delete: (key: string | IDBKeyRange) => {
       if (typeof key === 'string') {
         data.delete(key);
+        options.onDelete?.(key);
       } else if (key && typeof (key as IDBKeyRange).includes === 'function') {
         for (const storedKey of [...data.keys()]) {
           if ((key as IDBKeyRange).includes(storedKey)) {
             data.delete(storedKey);
+            options.onDelete?.(storedKey);
           }
         }
       }
@@ -708,5 +712,194 @@ describe('PersistenceManager multi-tab write economics', () => {
     // dispose removes the lifecycle handlers it installed.
     tabA.dispose();
     expect(lifecycleA.listenerCount()).to.equal(0);
+  });
+
+  it('evict holds the lease through its queued delete; a successor commits only after it', async () => {
+    const events: string[] = [];
+    const fakeLocks = makeFakeWebLocks(events);
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB({
+      onDelete: key => events.push('del:' + key)
+    });
+    const MANIFEST_KEY = 'test-repo|' + ROOT;
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    const treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+
+    // Tab B queues behind A and already has pending data to write.
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-pending'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+
+    // A's access is revoked WHILE a slow flush of A's is still in flight —
+    // the queued delete lands behind it, holding the hazard window open.
+    // (A fresh-identity tree forces a full restage: many macrotasks.)
+    tabA.serverCacheUpdated(ROOT_PATH, nodeFromJSON(makeWorkspace()), undefined);
+    void tabA.flushNow(ROOT); // deliberately not awaited: in flight at evict
+    // The purge is unconditional, but the lease must be held THROUGH the
+    // queued delete: B may only be granted (and commit) after the delete
+    // has run, so the delete can never erase B's fresh generation.
+    events.length = 0;
+    tabA.evict(ROOT_PATH);
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+
+    const deleteIndex = events.indexOf('del:' + MANIFEST_KEY);
+    const grantIndex = events.findIndex(e => e.startsWith('grant:'));
+    expect(deleteIndex).to.not.equal(-1, 'the evict purge must run');
+    expect(grantIndex).to.not.equal(-1, 'the successor must be granted');
+    expect(deleteIndex).to.be.lessThan(
+      grantIndex,
+      'the lease must not transfer until the queued delete settled'
+    );
+    // B then committed a fresh, self-contained generation that survived.
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
+    tabB.dispose();
+    tabA.dispose();
+  });
+
+  it('the ancestor-covered untrack delete only removes generations this manager verified or wrote', async () => {
+    // No Web Locks (Node default): the revision guard alone must protect a
+    // follower's housekeeping delete from erasing another writer's fresh
+    // generation — no lease ordering involved.
+    const shared = makeFakeIndexedDB();
+    const CHILD_PATH = new Path('tabs/file-system/sub-app');
+    const CHILD = CHILD_PATH.toString();
+    const CHILD_KEY = 'test-repo|' + CHILD;
+    const childRel = ['data', 'entries', 'entry-0', 'body'];
+
+    // Writer W owns the child root and commits generation W1.
+    const writer = mkManager(shared.factory);
+    writer.track(CHILD);
+    let treeW: Node = nodeFromJSON(makeWorkspace());
+    writer.serverCacheUpdated(CHILD_PATH, treeW, undefined);
+    await writer.flushNow(CHILD);
+    await flushAsync();
+
+    // Tab A tracks the ancestor AND the child, and restored W1.
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    tabA.track(CHILD);
+    expect((await tabA.restoreForListen(CHILD)).record).to.not.equal(null);
+
+    // W commits a NEWER generation W2; A's knowledge (W1) is now stale.
+    treeW = treeW.updateChild(new Path(childRel.join('/')), nodeFromJSON('w2'));
+    writer.serverCacheUpdated(CHILD_PATH, treeW, [childRel]);
+    await writer.flushNow(CHILD);
+    await flushAsync();
+    const w2 = shared.data.get(CHILD_KEY) as { revision: string };
+
+    // A untracks the child (covered by the tracked ancestor). Its
+    // housekeeping delete must NOT erase W2 — a generation it never saw.
+    tabA.untrack(CHILD);
+    await flushAsync(8);
+    const survivor = shared.data.get(CHILD_KEY) as { revision: string };
+    expect(survivor).to.not.equal(
+      undefined,
+      'another writer\'s fresh generation must survive the housekeeping delete'
+    );
+    expect(survivor.revision).to.equal(w2.revision);
+
+    // An ADOPTED (undecoded) baseline carries W's revision for content A
+    // never saw — it must not authorize the delete either.
+    tabA.track(CHILD);
+    let treeB: Node = (await tabA.restoreForListen(CHILD)).record!.node;
+    treeW = treeW.updateChild(new Path(childRel.join('/')), nodeFromJSON('w3'));
+    writer.serverCacheUpdated(CHILD_PATH, treeW, [childRel]);
+    await writer.flushNow(CHILD);
+    await flushAsync();
+    treeB = treeB.updateChild(new Path(childRel.join('/')), nodeFromJSON('w3'));
+    tabA.serverCacheUpdated(CHILD_PATH, treeB, [childRel]);
+    await tabA.flushNow(CHILD); // CAS conflict -> adopts W's manifest (rootNode null)
+    // Untrack synchronously, BEFORE the deferred retry's timer fires: the
+    // baseline is still the adopted (undecoded) one, and the store still
+    // carries W's generation — exactly the state that must not be deleted.
+    tabA.untrack(CHILD);
+    await flushAsync(8);
+    expect(shared.data.get(CHILD_KEY)).to.not.equal(
+      undefined,
+      'an adopted baseline must not authorize the housekeeping delete'
+    );
+
+    // The guard must not kill the cleanup either: a generation this manager
+    // itself wrote IS removed when it untracks under a covering ancestor.
+    writer.untrack(CHILD); // W leaves; A becomes the sole writer
+    await flushAsync(8);
+    tabA.track(CHILD);
+    let treeOwn: Node = (await tabA.restoreForListen(CHILD)).record!.node;
+    treeOwn = treeOwn.updateChild(new Path(childRel.join('/')), nodeFromJSON('a-own'));
+    tabA.serverCacheUpdated(CHILD_PATH, treeOwn, [childRel]);
+    await tabA.flushNow(CHILD);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    expect(
+      (shared.data.get(CHILD_KEY) as { revision: string }).revision
+    ).to.not.equal(w2.revision);
+    tabA.untrack(CHILD);
+    await flushAsync(8);
+    expect(shared.data.get(CHILD_KEY)).to.equal(
+      undefined,
+      'the manager\'s own stale shadow is still cleaned up'
+    );
+    writer.dispose();
+    tabA.dispose();
+  });
+
+  it('re-arms the write window when lock acquisition fails open', async () => {
+    // A lock manager that rejects (non-abort) AFTER the write window has
+    // already fired and been skipped.
+    let rejectRequest: ((error: Error) => void) | null = null;
+    stubNavigator({
+      locks: {
+        request: () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectRequest = reject;
+          })
+      }
+    });
+    const shared = makeFakeIndexedDB();
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    const tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT); // skipped: request still pending
+    await flushAsync();
+    expect(shared.data.get('test-repo|' + ROOT)).to.equal(undefined);
+
+    // The request now fails for a non-cancellation reason. Failing open
+    // must restore the consumed write window, not just drop the gate.
+    rejectRequest!(new Error('lock manager failure'));
+    await flushAsync(4);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
+    manager.dispose();
+
+    // A synchronously-throwing request() must not break track(), and the
+    // root still persists through the fail-open gate.
+    stubNavigator({
+      locks: {
+        request: () => {
+          throw new Error('synchronous lock failure');
+        }
+      }
+    });
+    const manager2 = mkManager(shared.factory);
+    const ROOT2_PATH = new Path('tabs/file-system-2');
+    const ROOT2 = ROOT2_PATH.toString();
+    expect(() => manager2.track(ROOT2)).to.not.throw();
+    manager2.serverCacheUpdated(ROOT2_PATH, tree, undefined);
+    await manager2.flushNow(ROOT2);
+    await flushAsync();
+    expect(shared.data.get('test-repo|' + ROOT2)).to.not.equal(undefined);
+    manager2.dispose();
   });
 });
