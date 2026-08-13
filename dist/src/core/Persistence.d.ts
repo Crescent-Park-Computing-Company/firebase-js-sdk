@@ -196,11 +196,9 @@ export declare class PersistenceManager {
      */
     private activeReads_;
     private restoreReasons_;
-    /** The manager-wide writer lease (see the WriterLease pattern notes). */
-    private writerLease_;
-    /** When the current lease request was queued (anchors staleness checks). */
-    private writerLeaseRequestedAt_;
-    /** One timer, role by state: held → heartbeat, requested → steal check. */
+    /** One writer lease per TRACKED root (see the WriterLease notes). */
+    private writerLeases_;
+    /** One timer for all leases: held → heartbeat, requested → steal check. */
     private leaseTimer_;
     private heartbeatStore_;
     private activeRestoreCount_;
@@ -232,12 +230,12 @@ export declare class PersistenceManager {
      */
     track(pathString: string): void;
     /**
-     * True when this manager may write: it holds the manager-wide writer
-     * lease, or leases are unenforceable here (no Web Locks — the manifest
-     * CAS remains the correctness backstop).
+     * True when this manager may write the root: it holds the root's writer
+     * lease, or leases are unenforceable here (no Web Locks, or the root has
+     * no lease entry — the manifest CAS remains the correctness backstop).
      */
     private holdsWriterLease_;
-    /** The shared heartbeat key for this manager's database prefix. */
+    /** The root's shared heartbeat key. */
     private heartbeatKey_;
     private writeHeartbeat_;
     private readHeartbeat_;
@@ -258,16 +256,29 @@ export declare class PersistenceManager {
      * stealing within the staleness budget of first joining the queue.
      */
     private onLeaseTick_;
-    /** Requests the manager-wide writer lease once (idempotent). */
+    /** Requests the root's writer lease once (idempotent per root). */
     private ensureWriterLease_;
     /**
-     * Puts a lease request in the browser's queue, superseding any current
-     * one (`steal` preempts a stale holder; see onLeaseTick_).
+     * Puts a lease request for the root in the browser's queue, superseding
+     * any current one (`steal` preempts a stale holder; see onLeaseTick_).
      */
     private requestWriterLease_;
     private writerLeaseName_;
-    /** Returns the writer lease to the browser (dispose only). */
+    /** Returns the root's writer lease to the browser (idempotent). */
     private releaseWriterLease_;
+    /**
+     * Cleanup-completion rule shared by untrack paths: return the root's
+     * lease unless the root was re-tracked meanwhile — the new listen owns
+     * it now.
+     */
+    private releaseWriterLeaseIfUntracked_;
+    /** Returns every lease (dispose). */
+    private releaseAllWriterLeases_;
+    /**
+     * A tab tracking nothing must neither heartbeat nor evaluate steals: the
+     * tick stops with the last lease and restarts with the next track().
+     */
+    private stopLeaseTimerIfIdle_;
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
      * root, its record — which contains this subtree and keeps flushing — is
@@ -334,7 +345,13 @@ export declare class PersistenceManager {
      * null when any fragment fails to decode.
      */
     private decodeFragmentsSliced_;
-    private deleteRecord_;
+    /**
+     * Cleanup for a manifest judged structurally invalid: the verdict is
+     * re-reached INSIDE the readwrite transaction, so a valid generation a
+     * concurrent writer committed after the (readonly) judgement is never
+     * touched. Still-invalid garbage — whatever garbage it is by now — goes.
+     */
+    private deleteRecordIfInvalid_;
     /**
      * Housekeeping variant of deleteRecord_: deletes the root's record only
      * while the committed manifest still carries `expectedRevision` — the one
@@ -432,9 +449,13 @@ export declare class PersistenceManager {
     evict(path: Path): void;
     /**
      * Eviction's delete: manifest + sidecars in one transaction, gated on the
-     * stored manifest belonging to THIS manager's auth scope (see evict). A
-     * manifest too malformed to carry a scope is removed — no live writer
-     * produced it, and eviction is exactly the moment to drop it.
+     * stored manifest belonging to THIS manager's auth scope (see evict).
+     * `null` is a REAL scope — the anonymous identity — not malformation:
+     * an anonymous user's valid record must survive a signed-in tab's
+     * eviction exactly like any other identity's. The unconditional purge is
+     * reserved for records whose scope field is actually malformed (neither
+     * string nor null) or whose manifest is structurally invalid — no live
+     * writer produced those, and eviction is exactly the moment to drop them.
      */
     private purgeEvictedRecord_;
     dispose(): void;

@@ -4911,11 +4911,9 @@ class PersistenceManager {
          */
         this.activeReads_ = new Map();
         this.restoreReasons_ = new Map();
-        /** The manager-wide writer lease (see the WriterLease pattern notes). */
-        this.writerLease_ = null;
-        /** When the current lease request was queued (anchors staleness checks). */
-        this.writerLeaseRequestedAt_ = 0;
-        /** One timer, role by state: held → heartbeat, requested → steal check. */
+        /** One writer lease per TRACKED root (see the WriterLease notes). */
+        this.writerLeases_ = new Map();
+        /** One timer for all leases: held → heartbeat, requested → steal check. */
         this.leaseTimer_ = null;
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
@@ -4977,25 +4975,24 @@ class PersistenceManager {
      */
     track(pathString) {
         this.trackedRoots_.add(pathString);
-        this.ensureWriterLease_();
+        this.ensureWriterLease_(pathString);
     }
     /**
-     * True when this manager may write: it holds the manager-wide writer
-     * lease, or leases are unenforceable here (no Web Locks — the manifest
-     * CAS remains the correctness backstop).
+     * True when this manager may write the root: it holds the root's writer
+     * lease, or leases are unenforceable here (no Web Locks, or the root has
+     * no lease entry — the manifest CAS remains the correctness backstop).
      */
-    holdsWriterLease_() {
-        return this.writerLease_ === null
-            ? true
-            : this.writerLease_.state === 'held';
+    holdsWriterLease_(pathString) {
+        const lease = this.writerLeases_.get(pathString);
+        return lease === undefined ? true : lease.state === 'held';
     }
-    /** The shared heartbeat key for this manager's database prefix. */
-    heartbeatKey_() {
-        return 'firebase-database-persistence-writer|' + this.prefix_;
+    /** The root's shared heartbeat key. */
+    heartbeatKey_(pathString) {
+        return 'firebase-database-persistence-writer|' + this.key_(pathString);
     }
-    writeHeartbeat_() {
+    writeHeartbeat_(pathString) {
         try {
-            this.heartbeatStore_?.setItem(this.heartbeatKey_(), String(Date.now()));
+            this.heartbeatStore_?.setItem(this.heartbeatKey_(pathString), String(Date.now()));
         }
         catch (e) {
             // Storage that exists but THROWS (storage-disabled documents, quota)
@@ -5007,9 +5004,9 @@ class PersistenceManager {
             this.heartbeatStore_ = null;
         }
     }
-    readHeartbeat_() {
+    readHeartbeat_(pathString) {
         try {
-            const raw = this.heartbeatStore_?.getItem(this.heartbeatKey_());
+            const raw = this.heartbeatStore_?.getItem(this.heartbeatKey_(pathString));
             const value = raw === null || raw === undefined ? NaN : Number(raw);
             return isNaN(value) ? 0 : value;
         }
@@ -5038,37 +5035,38 @@ class PersistenceManager {
      * stealing within the staleness budget of first joining the queue.
      */
     onLeaseTick_() {
-        const lease = this.writerLease_;
-        if (lease === null || this.disposed_) {
+        if (this.disposed_) {
             return;
         }
-        if (lease.state === 'held') {
-            this.writeHeartbeat_();
-            return;
-        }
-        if (this.heartbeatStore_ === null) {
-            return;
-        }
-        const heartbeat = this.readHeartbeat_();
-        if (heartbeat <= 0) {
-            return;
-        }
-        const freshest = Math.max(heartbeat, this.writerLeaseRequestedAt_);
-        if (Date.now() - freshest > this.leaseStaleMs_) {
-            this.requestWriterLease_(true);
+        for (const [pathString, lease] of this.writerLeases_) {
+            if (lease.state === 'held') {
+                this.writeHeartbeat_(pathString);
+                continue;
+            }
+            if (this.heartbeatStore_ === null) {
+                return;
+            }
+            const heartbeat = this.readHeartbeat_(pathString);
+            if (heartbeat <= 0) {
+                continue;
+            }
+            const freshest = Math.max(heartbeat, lease.requestedAt);
+            if (Date.now() - freshest > this.leaseStaleMs_) {
+                this.requestWriterLease_(pathString, true);
+            }
         }
     }
-    /** Requests the manager-wide writer lease once (idempotent). */
-    ensureWriterLease_() {
-        if (this.writerLease_ !== null || this.disposed_) {
+    /** Requests the root's writer lease once (idempotent per root). */
+    ensureWriterLease_(pathString) {
+        if (this.writerLeases_.has(pathString) || this.disposed_) {
             return;
         }
         const locks = webLocks();
         if (locks === null) {
             return;
         }
-        this.requestWriterLease_(false);
-        if (this.leaseTimer_ === null) {
+        this.requestWriterLease_(pathString, false);
+        if (this.leaseTimer_ === null && this.writerLeases_.size > 0) {
             this.leaseTimer_ = setInterval(() => {
                 this.onLeaseTick_();
             }, this.leaseHeartbeatMs_);
@@ -5076,15 +5074,15 @@ class PersistenceManager {
         }
     }
     /**
-     * Puts a lease request in the browser's queue, superseding any current
-     * one (`steal` preempts a stale holder; see onLeaseTick_).
+     * Puts a lease request for the root in the browser's queue, superseding
+     * any current one (`steal` preempts a stale holder; see onLeaseTick_).
      */
-    requestWriterLease_(steal) {
+    requestWriterLease_(pathString, steal) {
         const locks = webLocks();
         if (locks === null) {
             return;
         }
-        const previous = this.writerLease_;
+        const previous = this.writerLeases_.get(pathString);
         const lease = {
             state: 'requested',
             release: null,
@@ -5092,17 +5090,17 @@ class PersistenceManager {
             // (NotSupportedError — verified in Chrome: the request rejects
             // immediately and no steal happens). A steal needs no abort path
             // anyway: it is granted almost at once, and a steal that lands after
-            // this manager was superseded/disposed is handed straight back by
-            // the grant callback's identity check.
+            // this lease was superseded/disposed is handed straight back by the
+            // grant callback's identity check.
             controller: !steal && typeof AbortController !== 'undefined'
                 ? new AbortController()
-                : null
+                : null,
+            requestedAt: Date.now()
         };
-        this.writerLease_ = lease;
-        this.writerLeaseRequestedAt_ = Date.now();
+        this.writerLeases_.set(pathString, lease);
         // Replace-then-abort: the superseded request's rejection sees a
         // different current lease and is a no-op.
-        if (previous !== null && previous.state === 'requested') {
+        if (previous !== undefined && previous.state === 'requested') {
             previous.controller?.abort();
         }
         const options = { mode: 'exclusive' };
@@ -5113,8 +5111,8 @@ class PersistenceManager {
             options.steal = true;
         }
         const onSettled = (failed) => {
-            if (this.writerLease_ !== lease) {
-                return; // superseded or disposed: nothing to do
+            if (this.writerLeases_.get(pathString) !== lease) {
+                return; // superseded or released: nothing to do
             }
             if (lease.state === 'held') {
                 // A held lock's request promise only settles early when another
@@ -5122,36 +5120,34 @@ class PersistenceManager {
                 // suspended, or a lock-manager failure treated the same way). Stop
                 // writing at once and re-queue politely — never steal back
                 // unprompted; any stale baseline reconciles through the flush CAS.
-                this.requestWriterLease_(false);
+                this.requestWriterLease_(pathString, false);
                 return;
             }
             if (failed) {
                 // Queued-request failure (not a supersede — those hit the identity
                 // guard above): fail open rather than never persisting, and re-arm
-                // the write windows a skipped flush may have consumed.
-                this.writerLease_ = null;
-                for (const pathString of this.trackedRoots_) {
-                    this.armWriteWindowIfPending_(pathString);
-                }
+                // the write window a skipped flush may have consumed.
+                this.writerLeases_.delete(pathString);
+                this.stopLeaseTimerIfIdle_();
+                this.armWriteWindowIfPending_(pathString);
             }
         };
         try {
             void locks
-                .request(this.writerLeaseName_(), options, () => {
-                if (this.writerLease_ !== lease || this.disposed_) {
-                    // Superseded/disposed while queued: hand the lock straight
-                    // back so the next tab's request is granted.
+                .request(this.writerLeaseName_(pathString), options, () => {
+                if (this.writerLeases_.get(pathString) !== lease || this.disposed_) {
+                    // Superseded/released/disposed while queued: hand the lock
+                    // straight back so the next tab's request is granted.
                     return Promise.resolve();
                 }
                 lease.state = 'held';
-                this.writeHeartbeat_();
-                // Writes were skipped while another tab held the lease; whatever
-                // is pending in memory enters the ordinary write window now. A
-                // stale baseline (the old holder committed) resolves through the
-                // flush CAS + adoptCommittedBaseline_, exactly once.
-                for (const pathString of this.trackedRoots_) {
-                    this.armWriteWindowIfPending_(pathString);
-                }
+                this.writeHeartbeat_(pathString);
+                // Writes for this root were skipped while another tab held its
+                // lease; whatever is pending in memory enters the ordinary write
+                // window now. A stale baseline (the old holder committed)
+                // resolves through the flush CAS + adoptCommittedBaseline_,
+                // exactly once.
+                this.armWriteWindowIfPending_(pathString);
                 return new Promise(resolve => {
                     lease.release = resolve;
                 });
@@ -5164,25 +5160,48 @@ class PersistenceManager {
             onSettled(true);
         }
     }
-    writerLeaseName_() {
-        return 'firebase-database-persistence-write|' + this.prefix_;
+    writerLeaseName_(pathString) {
+        return 'firebase-database-persistence-write|' + this.key_(pathString);
     }
-    /** Returns the writer lease to the browser (dispose only). */
-    releaseWriterLease_() {
-        if (this.leaseTimer_ !== null) {
-            clearInterval(this.leaseTimer_);
-            this.leaseTimer_ = null;
-        }
-        const lease = this.writerLease_;
-        if (lease === null) {
+    /** Returns the root's writer lease to the browser (idempotent). */
+    releaseWriterLease_(pathString) {
+        const lease = this.writerLeases_.get(pathString);
+        if (lease === undefined) {
             return;
         }
-        this.writerLease_ = null;
+        this.writerLeases_.delete(pathString);
+        this.stopLeaseTimerIfIdle_();
         if (lease.state === 'held') {
             lease.release?.();
         }
         else {
             lease.controller?.abort();
+        }
+    }
+    /**
+     * Cleanup-completion rule shared by untrack paths: return the root's
+     * lease unless the root was re-tracked meanwhile — the new listen owns
+     * it now.
+     */
+    releaseWriterLeaseIfUntracked_(pathString) {
+        if (!this.trackedRoots_.has(pathString)) {
+            this.releaseWriterLease_(pathString);
+        }
+    }
+    /** Returns every lease (dispose). */
+    releaseAllWriterLeases_() {
+        for (const pathString of [...this.writerLeases_.keys()]) {
+            this.releaseWriterLease_(pathString);
+        }
+    }
+    /**
+     * A tab tracking nothing must neither heartbeat nor evaluate steals: the
+     * tick stops with the last lease and restarts with the next track().
+     */
+    stopLeaseTimerIfIdle_() {
+        if (this.writerLeases_.size === 0 && this.leaseTimer_ !== null) {
+            clearInterval(this.leaseTimer_);
+            this.leaseTimer_ = null;
         }
     }
     /**
@@ -5223,6 +5242,9 @@ class PersistenceManager {
             if (ownedRevision !== null) {
                 void this.enqueue_(pathString, () => this.deleteRecordIfRevision_(pathString, ownedRevision));
             }
+            // The delete authorizes itself (revision-named), so the lease can
+            // return right away; the re-track guard keeps a fresh listen's lease.
+            this.releaseWriterLeaseIfUntracked_(pathString);
             return;
         }
         // Release the tree only after the final flush settles (flush_ reads
@@ -5235,6 +5257,9 @@ class PersistenceManager {
                 this.lastFlush_.delete(pathString);
                 this.changedSinceFlush_.delete(pathString);
             }
+            // AFTER the final flush so the last tree still writes under this
+            // tab's lease; a re-tracked root keeps it (the new listen owns it).
+            this.releaseWriterLeaseIfUntracked_(pathString);
         };
         void this.flushNow(pathString).then(release, release);
     }
@@ -5834,11 +5859,15 @@ class PersistenceManager {
                     // be a follower queued behind another tab's lease) must survive.
                     // Auth/missing misses must not delete another identity's
                     // otherwise valid cache record. A manifest too malformed to carry
-                    // a revision cannot be named — delete unconditionally; no CAS
-                    // writer can have produced it, so nothing current is at risk.
+                    // a revision cannot be named — its cleanup re-reaches the verdict
+                    // INSIDE the delete transaction instead (deleteRecordIfInvalid_):
+                    // "no CAS writer produced this" was established by a readonly
+                    // read and does not hold across the transaction boundary — a
+                    // concurrent writer may have replaced the garbage with a valid
+                    // generation by the time the delete runs.
                     void (cleanupRevision !== null
                         ? this.deleteRecordIfRevision_(pathString, cleanupRevision)
-                        : this.deleteRecord_(pathString));
+                        : this.deleteRecordIfInvalid_(pathString));
                 }
             }
             return result;
@@ -5873,10 +5902,25 @@ class PersistenceManager {
         }
         return assembled;
     }
-    deleteRecord_(pathString) {
+    /**
+     * Cleanup for a manifest judged structurally invalid: the verdict is
+     * re-reached INSIDE the readwrite transaction, so a valid generation a
+     * concurrent writer committed after the (readonly) judgement is never
+     * touched. Still-invalid garbage — whatever garbage it is by now — goes.
+     */
+    deleteRecordIfInvalid_(pathString) {
         const key = this.key_(pathString);
-        return this.withStore_('readwrite', undefined, store => {
-            this.deleteRecordInStore_(store, key);
+        return this.withStore_('readwrite', undefined, (store, done) => {
+            const req = store.get(key);
+            req.onsuccess = () => {
+                const manifest = req.result;
+                if (manifest === undefined || structurallyValidManifest(manifest)) {
+                    done(undefined);
+                    return;
+                }
+                this.deleteRecordInStore_(store, key);
+                done(undefined);
+            };
         });
     }
     /**
@@ -6317,6 +6361,10 @@ class PersistenceManager {
         }
         persistenceStats.evictions++;
         recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
+        // The root left tracking: return its lease so a tab that still tracks
+        // it can write. Order relative to the queued purge is free — the purge
+        // authorizes itself inside its own transaction, never via the lease.
+        this.releaseWriterLease_(pathString);
         // The purge is IMMEDIATE and atomic — it must never wait for the
         // writer lease. The lease is held for the holder tab's lifetime, and a
         // holder that does not listen to this root never receives the
@@ -6340,9 +6388,13 @@ class PersistenceManager {
     }
     /**
      * Eviction's delete: manifest + sidecars in one transaction, gated on the
-     * stored manifest belonging to THIS manager's auth scope (see evict). A
-     * manifest too malformed to carry a scope is removed — no live writer
-     * produced it, and eviction is exactly the moment to drop it.
+     * stored manifest belonging to THIS manager's auth scope (see evict).
+     * `null` is a REAL scope — the anonymous identity — not malformation:
+     * an anonymous user's valid record must survive a signed-in tab's
+     * eviction exactly like any other identity's. The unconditional purge is
+     * reserved for records whose scope field is actually malformed (neither
+     * string nor null) or whose manifest is structurally invalid — no live
+     * writer produced those, and eviction is exactly the moment to drop them.
      */
     purgeEvictedRecord_(pathString) {
         const key = this.key_(pathString);
@@ -6355,7 +6407,10 @@ class PersistenceManager {
                     return;
                 }
                 const scope = manifest.authScope;
-                if (typeof scope === 'string' && scope !== this.authScope_) {
+                const scopeWellFormed = typeof scope === 'string' || scope === null;
+                if (structurallyValidManifest(manifest) &&
+                    scopeWellFormed &&
+                    scope !== this.authScope_) {
                     done(undefined);
                     return;
                 }
@@ -6366,7 +6421,7 @@ class PersistenceManager {
     }
     dispose() {
         this.disposed_ = true;
-        this.releaseWriterLease_();
+        this.releaseAllWriterLeases_();
         for (const timer of this.writeTimers_.values()) {
             clearTimeout(timer);
         }
@@ -6511,10 +6566,10 @@ class PersistenceManager {
         if (!entry || this.disposed_ || !this.authScopeConfigured_) {
             return Promise.resolve();
         }
-        if (!this.holdsWriterLease_()) {
-            // Another tab is the writer. latest_ keeps the newest tree in memory;
-            // if the lease ever transfers here, the grant callback re-enters the
-            // ordinary write window for every tracked root.
+        if (!this.holdsWriterLease_(pathString)) {
+            // Another tab is this root's writer. latest_ keeps the newest tree in
+            // memory; if the lease ever transfers here, the grant callback
+            // re-enters the ordinary write window for this root.
             return Promise.resolve();
         }
         const { node, revision, authScope } = entry;
