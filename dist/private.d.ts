@@ -688,6 +688,8 @@ export declare function goOnline(db: Database): void;
 declare interface HeartbeatStore {
     getItem(key: string): string | null;
     setItem(key: string, value: string): void;
+    /** Optional: stores without it simply skip release-time stamp cleanup. */
+    removeItem?(key: string): void;
 }
 
 /**
@@ -2092,6 +2094,16 @@ declare class PersistenceManager {
     /** One timer for all leases: held → heartbeat, requested → steal check. */
     private leaseTimer_;
     private heartbeatStore_;
+    /**
+     * Identifies THIS manager's heartbeat stamps (`<ms>|<token>`), so a
+     * clean release can remove its own stamp without ever deleting a
+     * successor's. Without cleanup, a departed holder's stamp lingers: a
+     * later holder whose storage cannot WRITE never overwrites it, and a
+     * follower that can READ sees a PRESENT-but-stale heartbeat — and
+     * steals from a perfectly healthy writer, contradicting the documented
+     * page-death fallback for storage-denied holders.
+     */
+    private heartbeatToken_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
@@ -2166,6 +2178,16 @@ declare class PersistenceManager {
      */
     private requestWriterLease_;
     private writerLeaseName_;
+    /**
+     * Removes THIS manager's own heartbeat stamp (token-checked, so a
+     * successor's stamp is never deleted). The get→remove pair is not
+     * atomic; the benign worst case is deleting a successor stamp written
+     * in between — absence never justifies a steal, and the successor
+     * re-stamps on its next tick. A crashed holder never runs this, so its
+     * stamp can linger: a follower may then steal once from a write-denied
+     * successor — accepted residual; the stealer stamps and it stabilizes.
+     */
+    private clearOwnHeartbeat_;
     /** Returns the root's writer lease to the browser (idempotent). */
     private releaseWriterLease_;
     /**

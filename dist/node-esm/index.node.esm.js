@@ -4925,6 +4925,16 @@ class PersistenceManager {
         this.networkSuspended_ = false;
         /** One timer for all leases: held → heartbeat, requested → steal check. */
         this.leaseTimer_ = null;
+        /**
+         * Identifies THIS manager's heartbeat stamps (`<ms>|<token>`), so a
+         * clean release can remove its own stamp without ever deleting a
+         * successor's. Without cleanup, a departed holder's stamp lingers: a
+         * later holder whose storage cannot WRITE never overwrites it, and a
+         * follower that can READ sees a PRESENT-but-stale heartbeat — and
+         * steals from a perfectly healthy writer, contradicting the documented
+         * page-death fallback for storage-denied holders.
+         */
+        this.heartbeatToken_ = Date.now().toString(36) + Math.random().toString(36).slice(2);
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
         this.writesDeferredUntilRestores_ = new Set();
@@ -5033,7 +5043,7 @@ class PersistenceManager {
     }
     writeHeartbeat_(pathString) {
         try {
-            this.heartbeatStore_?.setItem(this.heartbeatKey_(pathString), String(Date.now()));
+            this.heartbeatStore_?.setItem(this.heartbeatKey_(pathString), Date.now() + '|' + this.heartbeatToken_);
         }
         catch (e) {
             // Storage that exists but THROWS (storage-disabled documents, quota)
@@ -5048,7 +5058,10 @@ class PersistenceManager {
     readHeartbeat_(pathString) {
         try {
             const raw = this.heartbeatStore_?.getItem(this.heartbeatKey_(pathString));
-            const value = raw === null || raw === undefined ? NaN : Number(raw);
+            // `<ms>|<token>` (and bare `<ms>` from older stamps) both parse.
+            const value = raw === null || raw === undefined
+                ? NaN
+                : Number(String(raw).split('|')[0]);
             return isNaN(value) ? 0 : value;
         }
         catch (e) {
@@ -5163,6 +5176,15 @@ class PersistenceManager {
                 // suspended, or a lock-manager failure treated the same way). Stop
                 // writing at once and re-queue politely — never steal back
                 // unprompted; any stale baseline reconciles through the flush CAS.
+                //
+                // Settle the STOLEN callback first: the UA keeps the holder
+                // callback pending until the promise it returned settles, and
+                // re-queueing replaces the map entry, so no later release or
+                // dispose could ever reach this resolver again. Left unsettled,
+                // every steal leaks one pending callback — whose closure retains
+                // this manager (and, once disposed, its baselines) indefinitely.
+                lease.release?.();
+                lease.release = null;
                 this.requestWriterLease_(pathString, false);
                 return;
             }
@@ -5206,6 +5228,31 @@ class PersistenceManager {
     writerLeaseName_(pathString) {
         return 'firebase-database-persistence-write|' + this.key_(pathString);
     }
+    /**
+     * Removes THIS manager's own heartbeat stamp (token-checked, so a
+     * successor's stamp is never deleted). The get→remove pair is not
+     * atomic; the benign worst case is deleting a successor stamp written
+     * in between — absence never justifies a steal, and the successor
+     * re-stamps on its next tick. A crashed holder never runs this, so its
+     * stamp can linger: a follower may then steal once from a write-denied
+     * successor — accepted residual; the stealer stamps and it stabilizes.
+     */
+    clearOwnHeartbeat_(pathString) {
+        const store = this.heartbeatStore_;
+        if (store === null || typeof store.removeItem !== 'function') {
+            return;
+        }
+        try {
+            const key = this.heartbeatKey_(pathString);
+            const raw = store.getItem(key);
+            if (typeof raw === 'string' && raw.endsWith('|' + this.heartbeatToken_)) {
+                store.removeItem(key);
+            }
+        }
+        catch (e) {
+            this.heartbeatStore_ = null;
+        }
+    }
     /** Returns the root's writer lease to the browser (idempotent). */
     releaseWriterLease_(pathString) {
         const lease = this.writerLeases_.get(pathString);
@@ -5215,6 +5262,10 @@ class PersistenceManager {
         this.writerLeases_.delete(pathString);
         this.stopLeaseTimerIfIdle_();
         if (lease.state === 'held') {
+            // Clean handoff: take the stamp with us, so a successor that cannot
+            // write storage is judged by ABSENCE (page-death handoff), not by
+            // our lingering, eventually-stale stamp (see heartbeatToken_).
+            this.clearOwnHeartbeat_(pathString);
             lease.release?.();
         }
         else {
