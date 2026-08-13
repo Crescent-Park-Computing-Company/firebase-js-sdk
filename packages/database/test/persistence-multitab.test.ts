@@ -337,7 +337,7 @@ function makeWorkspace(): Record<string, unknown> {
 const ROOT_PATH = new Path('tabs/file-system');
 const ROOT = ROOT_PATH.toString();
 const MANIFEST_KEY = 'test-repo|' + ROOT;
-const LOCK = 'firebase-database-persistence-write|test-repo';
+const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
 const CHURN_REL = 'app-0/data/entries/entry-0/body';
 
 function mkManager(
@@ -350,7 +350,7 @@ function mkManager(
       getItem(k: string): string | null;
       setItem(k: string, v: string): void;
     } | null;
-    scope?: string;
+    scope?: string | null;
   } = {}
 ): PersistenceManager {
   const manager = new PersistenceManager(
@@ -367,7 +367,7 @@ function mkManager(
     options.staleMs ?? 600_000,
     options.store ?? null
   );
-  manager.setAuthScope(options.scope ?? 'u1');
+  manager.setAuthScope(options.scope === undefined ? 'u1' : options.scope);
   return manager;
 }
 
@@ -861,6 +861,211 @@ describe('PersistenceManager multi-tab write economics', () => {
     manager.dispose();
   });
 
+  it('disjoint roots in different tabs each get their own writer — no starvation', async () => {
+    // THE round-7 shape: tab A tracks only /foo, tab B tracks only /bar.
+    // A lock that covers more than the resource it gates (a manager-wide
+    // lock) would elect A the writer for EVERYTHING and leave /bar
+    // unpersisted for A's whole lifetime — there is no cross-tab relay of
+    // B's tree to A, and A never tracks /bar. Per-root locks make the two
+    // tabs independent by construction.
+    const FOO_PATH = new Path('tabs/foo');
+    const BAR_PATH = new Path('tabs/bar');
+    const FOO = FOO_PATH.toString();
+    const BAR = BAR_PATH.toString();
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(FOO);
+    tabA.serverCacheUpdated(FOO_PATH, nodeFromJSON({ a: 1 }), undefined);
+    await tabA.flushNow(FOO);
+    await flushAsync();
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(BAR);
+    tabB.serverCacheUpdated(BAR_PATH, nodeFromJSON({ b: 2 }), undefined);
+    await tabB.flushNow(BAR);
+    await flushAsync();
+
+    expect(shared.data.get('test-repo|' + FOO)).to.not.equal(
+      undefined,
+      "A's root must persist"
+    );
+    expect(shared.data.get('test-repo|' + BAR)).to.not.equal(
+      undefined,
+      "B's root must persist even though A booted first"
+    );
+    expect(
+      fakeLocks.isHeld('firebase-database-persistence-write|test-repo|' + FOO)
+    ).to.equal(true);
+    expect(
+      fakeLocks.isHeld('firebase-database-persistence-write|test-repo|' + BAR)
+    ).to.equal(true);
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it("untrack flushes the final tree under the lease, then hands the root's lock to the next tab", async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+
+    // A's LAST update, then untrack: the final flush must land (it runs
+    // under A's still-held lease), and only then does the lock transfer.
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-final'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    tabA.untrack(ROOT);
+    await flushAsync(10);
+    const afterFinal = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(afterFinal.revision.split('-')[0]).to.be.a('string');
+
+    // B is granted and becomes the writer without A's tab dying. The
+    // release → grant → write-window chain crosses several async hops, so
+    // wait for the OUTCOME (a new committed revision), bounded — if the
+    // handoff regresses, the loop times out and the assertion fails.
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-next'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    const handedBy = Date.now() + 2000;
+    while (Date.now() < handedBy) {
+      await tabB.flushNow(ROOT);
+      await flushAsync(2);
+      const current = shared.data.get(MANIFEST_KEY) as { revision: string };
+      if (current.revision !== afterFinal.revision) {
+        break;
+      }
+    }
+    const afterB = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(afterB.revision).to.not.equal(
+      afterFinal.revision,
+      "B must become ROOT's writer once A untracks — no tab-lifetime squat"
+    );
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('unnamable-manifest cleanup re-reaches its verdict in the delete transaction', async () => {
+    // A manifest too malformed to carry a revision cannot be CAS-named.
+    // "No CAS writer produced it" was established by a READONLY read; by
+    // the time the cleanup transaction runs, a concurrent writer may have
+    // replaced the garbage with a valid generation — the delete must
+    // re-read and only remove what is STILL invalid.
+    let commitSuccessor: (() => void) | null = null;
+    let manifestReads = 0;
+    const shared = makeFakeIndexedDB({
+      onGet: key => {
+        if (key === MANIFEST_KEY && ++manifestReads >= 2) {
+          // Fires synchronously before the CLEANUP transaction's re-read
+          // returns: the successor is committed between the restore's
+          // verdict and the delete — the exact race.
+          commitSuccessor?.();
+          commitSuccessor = null;
+        }
+      }
+    });
+    shared.data.set(MANIFEST_KEY, { formatVersion: 999, garbage: true });
+
+    const writer = mkManager(shared.factory);
+    writer.track(ROOT);
+    const tree = nodeFromJSON(makeWorkspace());
+    commitSuccessor = () => {
+      shared.data.set(MANIFEST_KEY, successor);
+    };
+    // Pre-build a valid successor via a throwaway manager on a private
+    // store, then transplant it at the hook.
+    const staging = makeFakeIndexedDB();
+    const stager = mkManager(staging.factory);
+    stager.track(ROOT);
+    stager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await stager.flushNow(ROOT);
+    await flushAsync();
+    const successor = staging.data.get(MANIFEST_KEY);
+    expect(successor).to.not.equal(undefined);
+    for (const [key, value] of staging.data) {
+      if (key.startsWith(MANIFEST_KEY + '#')) {
+        shared.data.set(key, value);
+      }
+    }
+    stager.dispose();
+
+    const reader = mkManager(shared.factory);
+    reader.track(ROOT);
+    const restored = (await reader.restoreForListen(ROOT)).record;
+    expect(restored).to.equal(null); // the garbage was rightly unusable
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      successor,
+      'the valid successor committed mid-race must survive the cleanup'
+    );
+    reader.dispose();
+    writer.dispose();
+
+    // And genuinely-still-invalid garbage does get removed.
+    const shared2 = makeFakeIndexedDB();
+    shared2.data.set(MANIFEST_KEY, { formatVersion: 999, garbage: true });
+    const reader2 = mkManager(shared2.factory);
+    reader2.track(ROOT);
+    expect((await reader2.restoreForListen(ROOT)).record).to.equal(null);
+    await flushAsync(10);
+    expect(shared2.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'still-invalid garbage is cleaned up'
+    );
+    reader2.dispose();
+  });
+
+  it('eviction preserves a valid anonymous-scope record — null is an identity, not malformation', async () => {
+    const shared = makeFakeIndexedDB();
+
+    const anon = mkManager(shared.factory, { scope: null });
+    anon.track(ROOT);
+    anon.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await anon.flushNow(ROOT);
+    await flushAsync();
+    anon.dispose();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+
+    const signedIn = mkManager(shared.factory, { scope: 'u1' });
+    signedIn.track(ROOT);
+    signedIn.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
+      undefined,
+      "the anonymous identity's record must survive a signed-in eviction"
+    );
+    signedIn.dispose();
+
+    // A record whose scope field is ACTUALLY malformed is still purged.
+    shared.data.set(MANIFEST_KEY, {
+      ...(shared.data.get(MANIFEST_KEY) as object),
+      authScope: 42
+    });
+    const again = mkManager(shared.factory, { scope: 'u1' });
+    again.track(ROOT);
+    again.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'a malformed-scope record is dropped at eviction'
+    );
+    again.dispose();
+  });
+
   it('an absent heartbeat never justifies a steal', async () => {
     const fakeLocks = makeFakeWebLocks();
     _setWebLocksForTesting(fakeLocks.locks);
@@ -907,8 +1112,11 @@ describe('PersistenceManager multi-tab write economics', () => {
     await flushAsync();
     expect(fakeLocks.isHeld(LOCK)).to.equal(true);
     expect(
-      (holder as unknown as { writerLease_: { state: string } }).writerLease_
-        .state
+      (
+        holder as unknown as {
+          writerLeases_: Map<string, { state: string }>;
+        }
+      ).writerLeases_.get(ROOT)?.state
     ).to.equal('held', 'the healthy holder must keep the lease');
     // The holder's first failed stamp disabled its dead channel.
     expect(
@@ -949,8 +1157,11 @@ describe('PersistenceManager multi-tab write economics', () => {
     await flushAsync();
     expect(fakeLocks.isHeld(LOCK)).to.equal(true);
     expect(
-      (holder as unknown as { writerLease_: { state: string } }).writerLease_
-        .state
+      (
+        holder as unknown as {
+          writerLeases_: Map<string, { state: string }>;
+        }
+      ).writerLeases_.get(ROOT)?.state
     ).to.equal('held');
     expect(
       (follower as unknown as { heartbeatStore_: unknown }).heartbeatStore_
