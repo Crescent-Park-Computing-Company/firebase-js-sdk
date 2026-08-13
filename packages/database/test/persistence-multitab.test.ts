@@ -110,34 +110,56 @@ function makeFakeWebLocks(events: string[] = []): {
 }
 
 // ── minimal document/window event-target stub for page-lifecycle tests ─────
-function makeFakeLifecycleTarget(): {
+function makeFakeLifecycleTarget(options: { freezeCapable?: boolean } = {}): {
   target: {
     addEventListener: (type: string, handler: (event: unknown) => void) => void;
     removeEventListener: (
       type: string,
       handler: (event: unknown) => void
     ) => void;
+    visibilityState: string;
+    onfreeze?: null;
   };
   dispatch: (type: string, event?: unknown) => void;
+  setVisibility: (state: 'visible' | 'hidden') => void;
   listenerCount: () => number;
 } {
   const listeners = new Map<string, Set<(event: unknown) => void>>();
-  return {
-    target: {
-      addEventListener: (type, handler) => {
-        if (!listeners.has(type)) {
-          listeners.set(type, new Set());
-        }
-        listeners.get(type)!.add(handler);
-      },
-      removeEventListener: (type, handler) => {
-        listeners.get(type)?.delete(handler);
+  const target: {
+    addEventListener: (type: string, handler: (event: unknown) => void) => void;
+    removeEventListener: (
+      type: string,
+      handler: (event: unknown) => void
+    ) => void;
+    visibilityState: string;
+    onfreeze?: null;
+  } = {
+    addEventListener: (type, handler) => {
+      if (!listeners.has(type)) {
+        listeners.set(type, new Set());
       }
+      listeners.get(type)!.add(handler);
     },
-    dispatch: (type, event = {}) => {
-      for (const handler of [...(listeners.get(type) ?? [])]) {
-        handler(event);
-      }
+    removeEventListener: (type, handler) => {
+      listeners.get(type)?.delete(handler);
+    },
+    visibilityState: 'visible'
+  };
+  if (options.freezeCapable) {
+    // freezeLifecycleSupported_ feature-detects via `'onfreeze' in document`.
+    target.onfreeze = null;
+  }
+  const dispatch = (type: string, event: unknown = {}) => {
+    for (const handler of [...(listeners.get(type) ?? [])]) {
+      handler(event);
+    }
+  };
+  return {
+    target,
+    dispatch,
+    setVisibility: state => {
+      target.visibilityState = state;
+      dispatch('visibilitychange');
     },
     listenerCount: () =>
       [...listeners.values()].reduce((sum, set) => sum + set.size, 0)
@@ -925,6 +947,150 @@ describe('PersistenceManager multi-tab write economics', () => {
     await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
     tabA.dispose();
     tabB.dispose();
+  });
+
+  it('on freeze-less browsers the lease follows visibility; a hidden tab never writes', async () => {
+    // Safari/Firefox: Web Locks without the freeze lifecycle. A hidden tab
+    // can be suspended with NO event at all, so it must neither hold nor
+    // queue while hidden — and, because a hidden page is still RUNNING,
+    // its write gate must stay CLOSED (parked), never fail open.
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
+
+    const lifecycleA = makeFakeLifecycleTarget();
+    stubGlobal('document', lifecycleA.target);
+    stubGlobal('window', lifecycleA.target);
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const gen1 = shared.data.get('test-repo|' + ROOT) as { revision: string };
+    const instanceA = gen1.revision.split('-')[0];
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+
+    const lifecycleB = makeFakeLifecycleTarget();
+    stubGlobal('document', lifecycleB.target);
+    stubGlobal('window', lifecycleB.target);
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-pending'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+
+    // A goes hidden: its held lock hands over; B commits.
+    lifecycleA.setVisibility('hidden');
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    const afterHandoff = shared.data.get('test-repo|' + ROOT) as {
+      revision: string;
+    };
+    expect(afterHandoff.revision.split('-')[0]).to.not.equal(
+      instanceA,
+      'a visible tab must take over from a hidden holder on freeze-less browsers'
+    );
+
+    // The hidden tab keeps RUNNING and churning — but its parked gate must
+    // hold: no writes, no re-queued request, while hidden.
+    const writeThroughs0 = persistenceStats.writeThroughs;
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-hidden'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(persistenceStats.writeThroughs).to.equal(
+      writeThroughs0,
+      'a hidden tab must never write on freeze-less browsers'
+    );
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(0);
+
+    // Visible again: re-queues behind the current holder (never seizes),
+    // and takes over when the holder exits.
+    lifecycleA.setVisibility('visible');
+    await flushAsync(4);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+    tabB.dispose();
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    expect(
+      (
+        shared.data.get('test-repo|' + ROOT) as { revision: string }
+      ).revision.split('-')[0]
+    ).to.equal(instanceA);
+    tabA.dispose();
+  });
+
+  it('a tab that starts hidden parks without queueing until first visible', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
+
+    const lifecycle = makeFakeLifecycleTarget();
+    lifecycle.target.visibilityState = 'hidden'; // opened in the background
+    stubGlobal('document', lifecycle.target);
+    stubGlobal('window', lifecycle.target);
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(
+      0,
+      'a hidden tab must not queue a lease request at startup'
+    );
+    expect(fakeLocks.isHeld(LOCK)).to.equal(false);
+
+    const tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT); // parked: gate closed
+    await flushAsync();
+    expect(shared.data.get('test-repo|' + ROOT)).to.equal(undefined);
+
+    lifecycle.setVisibility('visible');
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
+    manager.dispose();
+  });
+
+  it('freeze-capable browsers keep the lease and keep writing while hidden', async () => {
+    // Chrome/Edge: a lock-holding page is exempt from freezing — a hidden
+    // tab keeps running and SHOULD keep persisting (background agents keep
+    // the cache fresh for the next boot). The visibility handoff must not
+    // engage there.
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
+
+    const lifecycle = makeFakeLifecycleTarget({ freezeCapable: true });
+    stubGlobal('document', lifecycle.target);
+    stubGlobal('window', lifecycle.target);
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    let tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+
+    lifecycle.setVisibility('hidden');
+    await flushAsync(4);
+    expect(fakeLocks.isHeld(LOCK)).to.equal(
+      true,
+      'a freeze-capable browser keeps the lease while hidden'
+    );
+    const writeThroughs0 = persistenceStats.writeThroughs;
+    tree = tree.updateChild(new Path(CHURN_REL), nodeFromJSON('bg-write'));
+    manager.serverCacheUpdated(ROOT_PATH, tree, [CHURN_REL.split('/')]);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    expect(persistenceStats.writeThroughs).to.equal(writeThroughs0 + 1);
+    manager.dispose();
   });
 
   it('re-arms the write window when lock acquisition fails open', async () => {
