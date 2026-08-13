@@ -1239,6 +1239,157 @@ describe('PersistenceManager multi-tab write economics', () => {
     manager.dispose();
   });
 
+  it('a flush already staging when the tab goes offline cannot commit its manifest', async () => {
+    // The eligibility gate at flush entry runs BEFORE async staging.
+    // goOffline() (synchronous user code) can land mid-staging; the commit
+    // transaction must re-check eligibility, or the now-offline tab
+    // publishes its pre-offline snapshot over a revision the new holder is
+    // still debouncing — and if every tab then closes, storage keeps the
+    // stale tree. Suspension is triggered FROM the first staged range
+    // write (the onPut hook fires synchronously mid-staging, after the
+    // entry gate passed).
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    let suspendOnStage: (() => void) | null = null;
+    const shared = makeFakeIndexedDB({
+      onPut: key => {
+        if (key.includes('#range:') && suspendOnStage !== null) {
+          const suspend = suspendOnStage;
+          suspendOnStage = null;
+          suspend();
+        }
+      }
+    });
+
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    let tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    const gen1 = shared.data.get(MANIFEST_KEY) as { revision: string };
+    const staged0 = [...shared.data.keys()].filter(key =>
+      key.includes('#range:')
+    );
+
+    tree = tree.updateChild(new Path(CHURN_REL), nodeFromJSON('pre-offline'));
+    manager.serverCacheUpdated(ROOT_PATH, tree, [CHURN_REL.split('/')]);
+    suspendOnStage = () => manager.setNetworkSuspended(true);
+    await manager.flushNow(ROOT);
+    await flushAsync(6);
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
+    ).to.equal(
+      gen1.revision,
+      'an in-flight flush must not commit after suspension'
+    );
+    // The abandoned staging records are reclaimed by the loser path.
+    expect(
+      [...shared.data.keys()].filter(key => key.includes('#range:')).sort()
+    ).to.deep.equal(
+      staged0.sort(),
+      'staged ids from the blocked commit are reclaimed'
+    );
+
+    // Resume: eligible again (re-granted, alone) — the pending tree
+    // commits through the ordinary window retry.
+    manager.setNetworkSuspended(false);
+    const flushedBy = Date.now() + 2000;
+    while (Date.now() < flushedBy) {
+      await flushAsync(2);
+      const current = shared.data.get(MANIFEST_KEY) as { revision: string };
+      if (current.revision !== gen1.revision) {
+        break;
+      }
+    }
+    await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
+    manager.dispose();
+  });
+
+  it('an empty-tree flush already in flight when the tab goes offline cannot delete', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    manager.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+
+    // Call flush_ DIRECTLY: flushNow queues, so a synchronous suspend
+    // would land before the entry gate ever ran (blocked there — proving
+    // nothing about this fix). flush_ runs its entry gate synchronously
+    // (it passes: still eligible), and the suspension then lands in the
+    // gate → readwrite-transaction gap the in-transaction re-check closes.
+    manager.serverCacheUpdated(ROOT_PATH, nodeFromJSON(null), undefined);
+    const inFlight = (
+      manager as unknown as { flush_(p: string): Promise<void> }
+    ).flush_(ROOT);
+    manager.setNetworkSuspended(true);
+    await inFlight;
+    await flushAsync(6);
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
+      undefined,
+      'an in-flight empty flush must not delete after suspension'
+    );
+    manager.dispose();
+  });
+
+  it('an in-flight manifest refresh after suspension neither refreshes nor adopts', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    const tree: Node = nodeFromJSON(makeWorkspace());
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await manager.flushNow(ROOT);
+    await flushAsync();
+    const before = shared.data.get(MANIFEST_KEY) as { updatedAt: number };
+
+    // Same node again -> the refresh path — REACHED only once the stored
+    // manifest has aged past the refresh threshold, so backdate the
+    // baseline (a fresh one early-returns before any transaction and the
+    // test would pass vacuously). Suspension lands in the async gap; an
+    // ineligible tab must not extend the record's perceived freshness
+    // (refresh) NOR discard its decoded baseline (adopt).
+    const aged = (
+      manager as unknown as {
+        lastFlush_: Map<string, { storedUpdatedAt: number }>;
+      }
+    ).lastFlush_.get(ROOT)!;
+    aged.storedUpdatedAt = Date.now() - 9_000_000_000;
+    // flush_ directly, for the same reason as the empty-path test: the
+    // suspension must land AFTER the entry gate passed.
+    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    const inFlight = (
+      manager as unknown as { flush_(p: string): Promise<void> }
+    ).flush_(ROOT);
+    manager.setNetworkSuspended(true);
+    await inFlight;
+    await flushAsync(4);
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { updatedAt: number }).updatedAt
+    ).to.equal(before.updatedAt, 'no freshness extension while ineligible');
+    const baseline = (
+      manager as unknown as {
+        lastFlush_: Map<string, { rootNode: unknown }>;
+      }
+    ).lastFlush_.get(ROOT);
+    expect(baseline?.rootNode).to.not.equal(
+      null,
+      'the decoded baseline survives — ineligibility is not a CAS conflict'
+    );
+    manager.dispose();
+  });
+
   it('an absent heartbeat never justifies a steal', async () => {
     const fakeLocks = makeFakeWebLocks();
     _setWebLocksForTesting(fakeLocks.locks);

@@ -2736,6 +2736,18 @@ export class PersistenceManager {
         'readwrite',
         false,
         (store, done, progress) => {
+          // Eligibility is re-checked INSIDE the commit transaction: the
+          // gate at flush entry ran before async staging, and the lease can
+          // be released (goOffline) or lost (steal) while this flush was
+          // suspended in between. Losing it reads as a CAS conflict — the
+          // adopt + write-window retry re-runs the entry gate. Re-running
+          // the LIVE gate (not a captured token) deliberately still allows
+          // a suspend→resume→re-granted holder to commit: it is the
+          // eligible writer again, and nothing newer can exist locally.
+          if (!this.holdsWriterLease_(pathString)) {
+            done(false);
+            return;
+          }
           const req = store.get(key);
           req.onsuccess = () => {
             progress();
@@ -2774,10 +2786,19 @@ export class PersistenceManager {
     if (prev && prev.rootNode === node) {
       // Content-identical: refresh only the manifest timestamp. The revision
       // guard prevents a stale tab from refreshing a superseded generation.
-      return this.withStore_<boolean>(
+      // 'ineligible' (the lease was released or lost between the entry gate
+      // and this transaction — see the empty-path comment) is a plain
+      // no-op, NOT a conflict: the stored generation may be perfectly
+      // current, and an ineligible tab must neither extend its perceived
+      // freshness nor discard its own decoded baseline over it.
+      return this.withStore_<'refreshed' | 'conflict' | 'ineligible'>(
         'readwrite',
-        false,
+        'conflict',
         (store, done, progress) => {
+          if (!this.holdsWriterLease_(pathString)) {
+            done('ineligible');
+            return;
+          }
           const req = store.get(key);
           req.onsuccess = () => {
             progress();
@@ -2785,17 +2806,17 @@ export class PersistenceManager {
             if (current && current.revision === prev.revision) {
               const put = store.put({ ...current, updatedAt: now }, key);
               put.onsuccess = progress;
-              done(true);
+              done('refreshed');
             } else {
-              done(false);
+              done('conflict');
             }
           };
         }
-      ).then(ok => {
-        if (this.disposed_) {
+      ).then(outcome => {
+        if (this.disposed_ || outcome === 'ineligible') {
           return;
         }
-        if (ok) {
+        if (outcome === 'refreshed') {
           this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
           return;
         }
@@ -3022,6 +3043,16 @@ export class PersistenceManager {
           'readwrite',
           false,
           (store, done, progress) => {
+            // Same in-transaction eligibility re-check as the empty path:
+            // the entry gate ran before staging, and the lease can be
+            // released (goOffline) or lost (steal) while the staging work
+            // was in flight. Failing reads as a CAS conflict — staged ids
+            // are reclaimed and the write window (which re-runs the entry
+            // gate) owns any retry.
+            if (!this.holdsWriterLease_(pathString)) {
+              done(false);
+              return;
+            }
             const currentReq = store.get(key);
             currentReq.onsuccess = () => {
               progress();
