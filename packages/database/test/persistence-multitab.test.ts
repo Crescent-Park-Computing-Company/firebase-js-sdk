@@ -38,21 +38,28 @@ import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
 
-// ── minimal fake Web Locks manager (exclusive mode, FIFO grants) ────────────
+// ── minimal fake Web Locks manager (exclusive mode, FIFO grants, abortable
+//    pending requests — mirrors the platform contract the manager relies on) ─
 function makeFakeWebLocks(): {
   locks: {
     request: (
       name: string,
-      options: { mode: 'exclusive' },
+      options: { mode: 'exclusive'; signal?: AbortSignal },
       callback: (lock: unknown) => Promise<void>
     ) => Promise<void>;
   };
   holders: Map<string, number>;
+  /** Requests waiting in the queue (excludes the current holder). */
+  queuedCount: (name: string) => number;
+  /** A callback is currently holding the lock. */
+  isHeld: (name: string) => boolean;
 } {
-  const queues = new Map<
-    string,
-    Array<{ callback: (lock: unknown) => Promise<void>; settle: () => void }>
-  >();
+  interface PendingRequest {
+    callback: (lock: unknown) => Promise<void>;
+    settle: () => void;
+    reject: (error: Error) => void;
+  }
+  const queues = new Map<string, PendingRequest[]>();
   const busy = new Set<string>();
   const holders = new Map<string, number>();
   const pump = (name: string) => {
@@ -76,16 +83,66 @@ function makeFakeWebLocks(): {
   };
   return {
     locks: {
-      request: (name, _options, callback) =>
-        new Promise<void>(settle => {
+      request: (name, options, callback) =>
+        new Promise<void>((settle, reject) => {
           if (!queues.has(name)) {
             queues.set(name, []);
           }
-          queues.get(name)!.push({ callback, settle });
+          const pending: PendingRequest = { callback, settle, reject };
+          queues.get(name)!.push(pending);
+          // Web Locks contract: aborting the signal drops a request that has
+          // not been granted yet and rejects with an AbortError.
+          options.signal?.addEventListener('abort', () => {
+            const queue = queues.get(name);
+            const index = queue ? queue.indexOf(pending) : -1;
+            if (queue && index !== -1) {
+              queue.splice(index, 1);
+              const abortError = new Error('The request was aborted.');
+              abortError.name = 'AbortError';
+              reject(abortError);
+            }
+          });
           pump(name);
         })
     },
-    holders
+    holders,
+    queuedCount: name => queues.get(name)?.length ?? 0,
+    isHeld: name => busy.has(name)
+  };
+}
+
+// ── minimal document/window event-target stub for page-lifecycle tests ─────
+function makeFakeLifecycleTarget(): {
+  target: {
+    addEventListener: (type: string, handler: (event: unknown) => void) => void;
+    removeEventListener: (
+      type: string,
+      handler: (event: unknown) => void
+    ) => void;
+  };
+  dispatch: (type: string, event?: unknown) => void;
+  listenerCount: () => number;
+} {
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  return {
+    target: {
+      addEventListener: (type, handler) => {
+        if (!listeners.has(type)) {
+          listeners.set(type, new Set());
+        }
+        listeners.get(type)!.add(handler);
+      },
+      removeEventListener: (type, handler) => {
+        listeners.get(type)?.delete(handler);
+      }
+    },
+    dispatch: (type, event = {}) => {
+      for (const handler of [...(listeners.get(type) ?? [])]) {
+        handler(event);
+      }
+    },
+    listenerCount: () =>
+      [...listeners.values()].reduce((sum, set) => sum + set.size, 0)
   };
 }
 
@@ -312,24 +369,38 @@ describe('PersistenceManager multi-tab write economics', () => {
   // property descriptors rather than assignment.
   let savedNavigator: PropertyDescriptor | undefined;
 
-  const stubNavigator = (value: unknown) => {
-    Object.defineProperty(globalThis, 'navigator', {
+  let savedDocument: PropertyDescriptor | undefined;
+  let savedWindow: PropertyDescriptor | undefined;
+
+  const stubGlobal = (name: 'navigator' | 'document' | 'window', value: unknown) => {
+    Object.defineProperty(globalThis, name, {
       value,
       configurable: true,
       writable: true
     });
   };
+  const stubNavigator = (value: unknown) => stubGlobal('navigator', value);
+  const restoreGlobal = (
+    name: 'navigator' | 'document' | 'window',
+    descriptor: PropertyDescriptor | undefined
+  ) => {
+    if (descriptor) {
+      Object.defineProperty(globalThis, name, descriptor);
+    } else {
+      delete (globalThis as Record<string, unknown>)[name];
+    }
+  };
 
   beforeEach(() => {
     savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    savedDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    savedWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   });
 
   afterEach(() => {
-    if (savedNavigator) {
-      Object.defineProperty(globalThis, 'navigator', savedNavigator);
-    } else {
-      delete (globalThis as { navigator?: unknown }).navigator;
-    }
+    restoreGlobal('navigator', savedNavigator);
+    restoreGlobal('document', savedDocument);
+    restoreGlobal('window', savedWindow);
   });
 
   it('with Web Locks, only the lease holder writes under cross-tab churn', async () => {
@@ -514,5 +585,128 @@ describe('PersistenceManager multi-tab write economics', () => {
     expect(record === null || record.node.isEmpty() === false).to.equal(true);
     tabA.dispose();
     tabB.dispose();
+  });
+
+  it('cancels queued lock requests when a non-holder root untracks', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    const treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+
+    // Listener re-homes untrack and later re-track the same root routinely.
+    // Every released-before-grant request must leave the browser's queue —
+    // without cancellation each cycle would strand one more queued request
+    // (retaining the manager) until the holding tab exits.
+    const tabB = mkManager(shared.factory);
+    for (let cycle = 0; cycle < 5; cycle++) {
+      tabB.track(ROOT);
+      expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+      tabB.untrack(ROOT);
+      await flushAsync(4); // untrack releases after its final flush settles
+      expect(fakeLocks.queuedCount(LOCK)).to.equal(
+        0,
+        'released-before-grant requests must leave the lock queue'
+      );
+    }
+
+    // Cancellation must not fail the lease open: a re-tracked root still
+    // defers to the current holder.
+    tabB.track(ROOT);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    const writeThroughs0 = persistenceStats.writeThroughs;
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-waits'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    await tabB.flushNow(ROOT);
+    await flushAsync();
+    expect(persistenceStats.writeThroughs).to.equal(writeThroughs0);
+
+    // The holder exits: the surviving (re-tracked) request is granted and
+    // the survivor becomes the writer.
+    tabA.dispose();
+    await flushAsync();
+    await tabB.flushNow(ROOT);
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    expect(persistenceStats.writeThroughs).to.be.greaterThan(writeThroughs0);
+    tabB.dispose();
+  });
+
+  it('a frozen holder releases the lease; a live tab takes over; resume re-queues', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
+
+    // Each "tab" gets its own document/window lifecycle target; the manager
+    // captures the globals when it installs its handlers (first lease).
+    const lifecycleA = makeFakeLifecycleTarget();
+    stubGlobal('document', lifecycleA.target);
+    stubGlobal('window', lifecycleA.target);
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const gen1 = shared.data.get('test-repo|' + ROOT) as { revision: string };
+    const instanceA = gen1.revision.split('-')[0];
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+
+    const lifecycleB = makeFakeLifecycleTarget();
+    stubGlobal('document', lifecycleB.target);
+    stubGlobal('window', lifecycleB.target);
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+
+    // Tab A freezes without untrack()/dispose() ever running. Its held lock
+    // must be released so live tabs are not starved of writes indefinitely.
+    lifecycleA.dispatch('freeze');
+    await flushAsync(4);
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-takes-over'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    await tabB.flushNow(ROOT);
+    await flushAsync(30);
+    const manifest = shared.data.get('test-repo|' + ROOT) as {
+      revision: string;
+    };
+    expect(manifest.revision.split('-')[0]).to.not.equal(
+      instanceA,
+      'a live tab must take the lease over from a frozen holder'
+    );
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
+
+    // The frozen page resumes: it re-queues behind the current holder
+    // (never seizes the lock back), and takes over again when B exits.
+    lifecycleA.dispatch('resume');
+    await flushAsync(4);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+    tabB.dispose();
+    await flushAsync(4);
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-again'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await flushAsync(30);
+    const finalManifest = shared.data.get('test-repo|' + ROOT) as {
+      revision: string;
+    };
+    expect(finalManifest.revision.split('-')[0]).to.equal(instanceA);
+
+    // dispose removes the lifecycle handlers it installed.
+    tabA.dispose();
+    expect(lifecycleA.listenerCount()).to.equal(0);
   });
 });
