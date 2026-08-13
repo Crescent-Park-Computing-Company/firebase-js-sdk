@@ -2110,6 +2110,8 @@ declare class PersistenceManager {
      * holdsWriteLease_ fails open.
      */
     private acquireWriteLease_;
+    /** Puts a fresh lease request in the browser's queue for the root. */
+    private requestWriteLease_;
     /**
      * A page can be FROZEN or moved into the back/forward cache without
      * untrack()/dispose() ever running; a held lock would then keep excluding
@@ -2125,6 +2127,29 @@ declare class PersistenceManager {
      * Installed once, with the first lease; removed on dispose.
      */
     private installLeaseLifecycleHandlers_;
+    /**
+     * Chrome/Edge implement the freeze/resume lifecycle events — and a page
+     * there that holds a Web Lock is deliberately never frozen, so a hidden
+     * tab keeps writing and its lease correctly stays put. Safari and Firefox
+     * expose Web Locks WITHOUT those events: a hidden tab can be suspended at
+     * any time with no signal at all, and a suspended holder would starve
+     * every visible tab's writes indefinitely. There — and only there — the
+     * lease follows VISIBILITY instead (see parkWriteLeases_).
+     */
+    private freezeLifecycleSupported_;
+    /**
+     * Freeze-less visibility handoff, hidden side: every lease returns its
+     * browser resource (a held lock is released, a queued request aborted)
+     * but the entry stays, PARKED — the hidden page is still running, and an
+     * absent entry would fail the write gate OPEN, putting two writers on
+     * the root. Parked leases re-request on the next visible transition.
+     */
+    private parkWriteLeases_;
+    /**
+     * Freeze-less visibility handoff, visible side: parked leases re-queue
+     * (behind whichever tab currently holds — a returning tab never seizes).
+     */
+    private unparkWriteLeases_;
     /** Returns every lease (held or queued) ahead of page suspension. */
     private suspendWriteLeases_;
     /** Re-requests leases for the still-tracked roots after the page resumes. */

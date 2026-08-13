@@ -4966,7 +4966,7 @@ class PersistenceManager {
      */
     holdsWriteLease_(pathString) {
         const lease = this.writeLeases_.get(pathString);
-        return lease === undefined ? true : lease.held;
+        return lease === undefined ? true : lease.state === 'held';
     }
     /**
      * Requests the root's cross-tab write lease (never blocks; flushes stay
@@ -4983,20 +4983,39 @@ class PersistenceManager {
             return;
         }
         this.installLeaseLifecycleHandlers_();
+        if (!this.freezeLifecycleSupported_() &&
+            typeof document !== 'undefined' &&
+            document.visibilityState === 'hidden') {
+            // Freeze-less browsers: hidden tabs never hold OR queue (see
+            // WriteLease.state). Selected while hidden — a background-opened
+            // tab — parks until the first visibilitychange to visible.
+            this.writeLeases_.set(pathString, {
+                state: 'parked',
+                release: null,
+                controller: null
+            });
+            return;
+        }
+        this.requestWriteLease_(pathString, locks);
+    }
+    /** Puts a fresh lease request in the browser's queue for the root. */
+    requestWriteLease_(pathString, locks) {
         const lease = {
-            held: false,
+            state: 'requested',
             release: null,
             controller: typeof AbortController !== 'undefined' ? new AbortController() : null
         };
         this.writeLeases_.set(pathString, lease);
         const name = 'firebase-database-persistence-write|' + this.key_(pathString);
         const failOpen = () => {
-            // An intentional cancellation (releaseWriteLease_ aborted a queued
-            // request) already removed the entry — the guard makes it a no-op,
-            // which also keeps a freeze-suspend from re-arming windows on a page
-            // being frozen. Anything else is a lock API failure: fail open
-            // rather than never persisting.
-            if (this.writeLeases_.get(pathString) !== lease) {
+            // Intentional rejections are no-ops: a cancellation
+            // (releaseWriteLease_ removed the entry before aborting) fails the
+            // identity check, and a park (visibility handoff aborted the queued
+            // request but keeps the entry to hold the gate closed) is excluded
+            // by state. Anything else is a lock API failure: fail open rather
+            // than never persisting.
+            if (this.writeLeases_.get(pathString) !== lease ||
+                lease.state === 'parked') {
                 return;
             }
             this.writeLeases_.delete(pathString);
@@ -5011,14 +5030,17 @@ class PersistenceManager {
                 .request(name, lease.controller !== null
                 ? { mode: 'exclusive', signal: lease.controller.signal }
                 : { mode: 'exclusive' }, () => {
-                if (this.writeLeases_.get(pathString) !== lease) {
+                if (this.writeLeases_.get(pathString) !== lease ||
+                    lease.state !== 'requested') {
                     // Released (untrack/evict/suspend/dispose all remove the map
-                    // entry) while queued: hand the lock straight back so the
-                    // next tab's request is granted. Map identity is the one
-                    // liveness test — the same one failOpen uses.
+                    // entry) or parked while queued: hand the lock straight back
+                    // so the next tab's request is granted. Map identity plus
+                    // state is the one liveness test — the same one failOpen
+                    // uses. The state check matters where AbortController is
+                    // unavailable and a parked lease's request stayed queued.
                     return Promise.resolve();
                 }
-                lease.held = true;
+                lease.state = 'held';
                 // Writes were skipped while another tab held the lease;
                 // whatever is pending in memory enters the ordinary write
                 // window now. A stale baseline (the old holder committed)
@@ -5085,6 +5107,75 @@ class PersistenceManager {
             () => win.removeEventListener('pagehide', onPageHide),
             () => win.removeEventListener('pageshow', onPageShow)
         ];
+        if (!this.freezeLifecycleSupported_()) {
+            // No freeze lifecycle (Safari, Firefox): the lease follows visibility
+            // instead — see freezeLifecycleSupported_ / parkWriteLeases_. Bound
+            // only there: on Chrome a hidden lock-holding tab keeps running and
+            // flushing (it is exempt from freezing), which a blanket
+            // visibility handoff would needlessly give up.
+            const onVisibility = () => {
+                if (doc.visibilityState === 'hidden') {
+                    this.parkWriteLeases_();
+                }
+                else {
+                    this.unparkWriteLeases_();
+                }
+            };
+            doc.addEventListener('visibilitychange', onVisibility);
+            this.leaseLifecycleCleanup_.push(() => doc.removeEventListener('visibilitychange', onVisibility));
+        }
+    }
+    /**
+     * Chrome/Edge implement the freeze/resume lifecycle events — and a page
+     * there that holds a Web Lock is deliberately never frozen, so a hidden
+     * tab keeps writing and its lease correctly stays put. Safari and Firefox
+     * expose Web Locks WITHOUT those events: a hidden tab can be suspended at
+     * any time with no signal at all, and a suspended holder would starve
+     * every visible tab's writes indefinitely. There — and only there — the
+     * lease follows VISIBILITY instead (see parkWriteLeases_).
+     */
+    freezeLifecycleSupported_() {
+        return typeof document !== 'undefined' && 'onfreeze' in document;
+    }
+    /**
+     * Freeze-less visibility handoff, hidden side: every lease returns its
+     * browser resource (a held lock is released, a queued request aborted)
+     * but the entry stays, PARKED — the hidden page is still running, and an
+     * absent entry would fail the write gate OPEN, putting two writers on
+     * the root. Parked leases re-request on the next visible transition.
+     */
+    parkWriteLeases_() {
+        for (const lease of this.writeLeases_.values()) {
+            if (lease.state === 'held') {
+                lease.state = 'parked';
+                lease.release?.();
+                lease.release = null;
+            }
+            else if (lease.state === 'requested') {
+                lease.state = 'parked';
+                lease.controller?.abort();
+                lease.controller = null;
+            }
+        }
+    }
+    /**
+     * Freeze-less visibility handoff, visible side: parked leases re-queue
+     * (behind whichever tab currently holds — a returning tab never seizes).
+     */
+    unparkWriteLeases_() {
+        if (this.disposed_) {
+            return;
+        }
+        const locks = webLocks();
+        if (locks === null) {
+            return;
+        }
+        for (const [pathString, lease] of [...this.writeLeases_]) {
+            if (lease.state === 'parked') {
+                this.writeLeases_.delete(pathString);
+                this.requestWriteLease_(pathString, locks);
+            }
+        }
     }
     /** Returns every lease (held or queued) ahead of page suspension. */
     suspendWriteLeases_() {
@@ -5120,19 +5211,21 @@ class PersistenceManager {
             return;
         }
         this.writeLeases_.delete(pathString);
-        if (lease.held) {
+        if (lease.state === 'held') {
             // Held: hand the lock back by resolving the callback's promise.
-            lease.held = false;
+            lease.state = 'parked';
             lease.release?.();
         }
-        else {
+        else if (lease.state === 'requested') {
             // Still queued: remove the request from the browser's lock queue so
             // repeated untrack/retrack cycles cannot accumulate orphaned queued
             // requests (each retaining this manager until some other tab exits).
             // Abort only PRE-grant — a held lock is returned via release above,
             // keeping behavior identical across Web Locks spec revisions.
+            lease.state = 'parked';
             lease.controller?.abort();
         }
+        // 'parked' holds no browser resource: nothing to return.
     }
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
