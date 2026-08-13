@@ -55,6 +55,7 @@ function makeFakeWebLocks(events: string[] = []): {
   holders: Map<string, number>;
   queuedCount: (name: string) => number;
   isHeld: (name: string) => boolean;
+  settledCallbacks: (name: string) => number;
 } {
   interface PendingRequest {
     callback: (lock: unknown) => Promise<void>;
@@ -64,6 +65,10 @@ function makeFakeWebLocks(events: string[] = []): {
   const queues = new Map<string, PendingRequest[]>();
   const busy = new Map<string, PendingRequest>();
   const holders = new Map<string, number>();
+  // How many holder CALLBACK promises have settled per name — the UA-side
+  // bookkeeping a stolen holder must still complete (by resolving its
+  // release) even though its request promise already rejected.
+  const callbackSettled = new Map<string, number>();
   const abortError = () => {
     const error = new Error('The request was aborted.');
     error.name = 'AbortError';
@@ -84,6 +89,7 @@ function makeFakeWebLocks(events: string[] = []): {
       .then(() => next.callback({ name, mode: 'exclusive' }))
       .catch(() => {})
       .then(() => {
+        callbackSettled.set(name, (callbackSettled.get(name) ?? 0) + 1);
         // Settle only the holder that still owns the lock (a stolen
         // holder was already rejected and replaced).
         if (busy.get(name) === next) {
@@ -138,7 +144,8 @@ function makeFakeWebLocks(events: string[] = []): {
     },
     holders,
     queuedCount: name => queues.get(name)?.length ?? 0,
-    isHeld: name => busy.has(name)
+    isHeld: name => busy.has(name),
+    settledCallbacks: name => callbackSettled.get(name) ?? 0
   };
 }
 
@@ -146,6 +153,7 @@ function makeFakeWebLocks(events: string[] = []): {
 function makeFakeHeartbeatStore(): {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
   data: Map<string, string>;
 } {
   const data = new Map<string, string>();
@@ -154,6 +162,9 @@ function makeFakeHeartbeatStore(): {
     getItem: key => data.get(key) ?? null,
     setItem: (key, value) => {
       data.set(key, value);
+    },
+    removeItem: key => {
+      data.delete(key);
     }
   };
 }
@@ -1613,6 +1624,142 @@ describe('PersistenceManager multi-tab write economics', () => {
     expect(shared.data.has(MANIFEST_KEY + '#range:zzz')).to.equal(false);
     expect(persistenceStats.storageFailures).to.equal(failures0);
     manager.dispose();
+  });
+
+  it("a stolen holder's callback settles — no dangling lock bookkeeping", async () => {
+    // On a steal, the request promise rejects but the UA keeps the holder
+    // CALLBACK pending until the promise it returned settles. Re-queueing
+    // replaces the map entry, so nothing later can reach the old resolver
+    // — one leaked pending callback (retaining the manager) per steal.
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+    const store = makeFakeHeartbeatStore();
+
+    // A heartbeats only at grant (huge interval) — the suspended holder.
+    const tabA = mkManager(shared.factory, {
+      store,
+      heartbeatMs: 100_000,
+      staleMs: 100_000
+    });
+    tabA.track(ROOT);
+    await flushAsync();
+    expect(fakeLocks.settledCallbacks(LOCK)).to.equal(0); // A holds, pending
+
+    // B treats A's grant-time stamp as stale and steals.
+    const tabB = mkManager(shared.factory, {
+      store,
+      heartbeatMs: 20,
+      staleMs: 60
+    });
+    tabB.track(ROOT);
+    const stolenBy = Date.now() + 2000;
+    while (Date.now() < stolenBy && fakeLocks.settledCallbacks(LOCK) === 0) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      await flushAsync(2);
+    }
+    expect(fakeLocks.settledCallbacks(LOCK)).to.equal(
+      1,
+      "the stolen holder's callback must settle when it re-queues"
+    );
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('a clean release removes only the holder’s own heartbeat stamp', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const HB_KEY = 'firebase-database-persistence-writer|test-repo|' + ROOT;
+
+    // Own stamp: removed on clean release.
+    const sharedA = makeFakeIndexedDB();
+    const storeA = makeFakeHeartbeatStore();
+    const tabA = mkManager(sharedA.factory, { store: storeA });
+    tabA.track(ROOT);
+    await flushAsync();
+    expect(storeA.data.get(HB_KEY)).to.be.a('string'); // stamped at grant
+    tabA.dispose();
+    expect(storeA.data.has(HB_KEY)).to.equal(
+      false,
+      'a departing holder takes its own stamp with it'
+    );
+
+    // A successor's stamp: never deleted (token-checked).
+    const sharedB = makeFakeIndexedDB();
+    const storeB = makeFakeHeartbeatStore();
+    const tabB = mkManager(sharedB.factory, { store: storeB });
+    tabB.track(ROOT);
+    await flushAsync();
+    const successorStamp = Date.now() + '|someone-elses-token';
+    storeB.data.set(HB_KEY, successorStamp);
+    tabB.dispose();
+    expect(storeB.data.get(HB_KEY)).to.equal(
+      successorStamp,
+      "another holder's stamp must survive this manager's release"
+    );
+  });
+
+  it('a departed holder’s stamp cannot make a follower steal from a write-denied successor', async () => {
+    // The Lens round-11 shape: A stamps and releases CLEANLY; B is granted
+    // but cannot WRITE storage (its channel dies at the grant stamp); C
+    // can READ. Without release-time cleanup, C sees A's PRESENT-but-stale
+    // stamp and steals from the healthy B — the storage-denied fallback is
+    // supposed to be page-death handoff, judged by ABSENCE.
+    const fakeLocks = makeFakeWebLocks();
+    _setWebLocksForTesting(fakeLocks.locks);
+    const shared = makeFakeIndexedDB();
+    const data = new Map<string, string>();
+    const readableWritable = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        data.set(k, v);
+      },
+      removeItem: (k: string) => {
+        data.delete(k);
+      }
+    };
+    const writeDenied = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: () => {
+        throw new Error('storage denied');
+      },
+      removeItem: (k: string) => {
+        data.delete(k);
+      }
+    };
+
+    const tabA = mkManager(shared.factory, { store: readableWritable });
+    tabA.track(ROOT);
+    await flushAsync();
+    tabA.dispose(); // clean release: stamp cleared
+
+    const tabB = mkManager(shared.factory, {
+      store: writeDenied,
+      heartbeatMs: 100_000,
+      staleMs: 100_000
+    });
+    tabB.track(ROOT);
+    await flushAsync(); // granted; grant stamp throws → channel dies
+
+    const tabC = mkManager(shared.factory, {
+      store: readableWritable,
+      heartbeatMs: 15,
+      staleMs: 40
+    });
+    tabC.track(ROOT);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await flushAsync();
+    expect(
+      (
+        tabB as unknown as { writerLeases_: Map<string, { state: string }> }
+      ).writerLeases_.get(ROOT)?.state
+    ).to.equal(
+      'held',
+      'absence (not a predecessor’s stale stamp) must govern: no steal'
+    );
+    tabA.dispose();
+    tabB.dispose();
+    tabC.dispose();
   });
 
   it('an absent heartbeat never justifies a steal', async () => {
