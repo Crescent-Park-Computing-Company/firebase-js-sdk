@@ -2221,6 +2221,22 @@ declare class PersistenceManager {
      */
     private decodeFragmentsSliced_;
     private deleteRecord_;
+    /**
+     * Housekeeping variant of deleteRecord_: deletes the root's record only
+     * while the committed manifest still carries `expectedRevision` — the one
+     * generation this manager itself verified or wrote. An unconditional
+     * housekeeping delete could erase a FRESH generation another tab
+     * committed for this root after this manager last looked (that tab keeps
+     * flushing under its own lease and would skip identical rewrites against
+     * a lastFlush_ that no longer describes storage). Check and delete run in
+     * ONE readwrite transaction, so a concurrent commit cannot interleave
+     * between them. Skipping is always safe: a record left behind is at
+     * worst a slightly stale shadow, and every restored record is
+     * revalidated against the server by the hash protocol anyway.
+     */
+    private deleteRecordIfRevision_;
+    /** Deletes a root's manifest and every '#'-suffixed sidecar in `store`. */
+    private deleteRecordInStore_;
     private withRestoreSlot_;
     /**
      * Projects an exact-path peek from a covering root that is already restored

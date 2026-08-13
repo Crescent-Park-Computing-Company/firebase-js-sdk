@@ -4996,37 +4996,57 @@ class PersistenceManager {
         };
         this.writeLeases_.set(pathString, lease);
         const name = 'firebase-database-persistence-write|' + this.key_(pathString);
-        void locks
-            .request(name, lease.controller !== null
-            ? { mode: 'exclusive', signal: lease.controller.signal }
-            : { mode: 'exclusive' }, () => {
-            if (!lease.wanted || this.disposed_) {
-                // Released (or the manager died) while queued: hand the lock
-                // straight back so the next tab's request is granted.
-                return Promise.resolve();
+        const failOpen = () => {
+            // An intentional cancellation (releaseWriteLease_ aborted a queued
+            // request) already removed the entry — the guard makes it a no-op,
+            // which also keeps a freeze-suspend from re-arming windows on a page
+            // being frozen. Anything else is a lock API failure: fail open
+            // rather than never persisting.
+            if (this.writeLeases_.get(pathString) !== lease) {
+                return;
             }
-            lease.held = true;
-            // Writes were skipped while another tab held the lease; whatever
-            // is pending in memory enters the ordinary write window now. A
-            // stale baseline (the old holder committed) resolves through the
-            // flush CAS + adoptCommittedBaseline_, exactly once.
-            if (this.trackedRoots_.has(pathString) &&
+            this.writeLeases_.delete(pathString);
+            // A write window may already have fired and been skipped while this
+            // request was pending; with the gate now failing open nothing else
+            // would restore it until the next server update. Re-arm for pending
+            // data so the latest tree still persists this session.
+            if (!this.disposed_ &&
+                this.trackedRoots_.has(pathString) &&
                 this.latest_.has(pathString)) {
                 this.armWriteWindow_(pathString);
             }
-            return new Promise(resolve => {
-                lease.release = resolve;
-            });
-        })
-            .catch(() => {
-            // An intentional cancellation (releaseWriteLease_ aborted a queued
-            // request) already removed the entry — the guard below makes it a
-            // no-op. Anything else is a lock API failure: fail open rather
-            // than never persisting.
-            if (this.writeLeases_.get(pathString) === lease) {
-                this.writeLeases_.delete(pathString);
-            }
-        });
+        };
+        try {
+            void locks
+                .request(name, lease.controller !== null
+                ? { mode: 'exclusive', signal: lease.controller.signal }
+                : { mode: 'exclusive' }, () => {
+                if (!lease.wanted || this.disposed_) {
+                    // Released (or the manager died) while queued: hand the lock
+                    // straight back so the next tab's request is granted.
+                    return Promise.resolve();
+                }
+                lease.held = true;
+                // Writes were skipped while another tab held the lease;
+                // whatever is pending in memory enters the ordinary write
+                // window now. A stale baseline (the old holder committed)
+                // resolves through the flush CAS + adoptCommittedBaseline_,
+                // exactly once.
+                if (this.trackedRoots_.has(pathString) &&
+                    this.latest_.has(pathString)) {
+                    this.armWriteWindow_(pathString);
+                }
+                return new Promise(resolve => {
+                    lease.release = resolve;
+                });
+            })
+                .catch(failOpen);
+        }
+        catch (e) {
+            // A synchronously-throwing request() must not break the listen path
+            // that called track().
+            failOpen();
+        }
     }
     /**
      * A page can be FROZEN or moved into the back/forward cache without
@@ -5135,11 +5155,29 @@ class PersistenceManager {
         }
         this.flushPending_.delete(pathString);
         if (this.trackedRootFor(pathString) !== null) {
+            // Housekeeping delete (the covering ancestor's record is the one
+            // future sessions should restore): guarded to the one generation
+            // this manager itself verified or wrote. An ADOPTED baseline
+            // (rootNode null) carries another writer's revision for content this
+            // manager never saw — it authorizes nothing. The lease is released
+            // only from the queued operation's completion: releasing first would
+            // let a waiting tab commit a fresh generation in the window before
+            // the queued delete runs, only for the delete to erase it (and the
+            // revision guard closes the same interleave when this tab was never
+            // the holder at all). Skip the release if the root was re-tracked
+            // meanwhile — the new listen owns the lease now.
+            const prev = this.lastFlush_.get(pathString);
+            const ownedRevision = prev !== undefined && prev.rootNode !== null ? prev.revision : null;
             this.latest_.delete(pathString);
             this.lastFlush_.delete(pathString);
             this.changedSinceFlush_.delete(pathString);
-            this.releaseWriteLease_(pathString);
-            void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+            void this.enqueue_(pathString, () => (ownedRevision !== null
+                ? this.deleteRecordIfRevision_(pathString, ownedRevision)
+                : Promise.resolve()).then(() => {
+                if (!this.trackedRoots_.has(pathString)) {
+                    this.releaseWriteLease_(pathString);
+                }
+            }));
             return;
         }
         // Release the tree only after the final flush settles (flush_ reads
@@ -5775,37 +5813,67 @@ class PersistenceManager {
     deleteRecord_(pathString) {
         const key = this.key_(pathString);
         return this.withStore_('readwrite', undefined, store => {
-            store.delete(key);
-            // Immutable ranges and legacy chunk/hash/tree sidecars share '#'.
-            // suffix namespace. Range-delete where the platform has IDBKeyRange;
-            // cursor-walk otherwise (Node, test fakes) — key-only, no values.
-            if (typeof IDBKeyRange !== 'undefined') {
-                try {
-                    store.delete(IDBKeyRange.bound(key + '#', key + '#' + String.fromCharCode(0xffff)));
+            this.deleteRecordInStore_(store, key);
+        });
+    }
+    /**
+     * Housekeeping variant of deleteRecord_: deletes the root's record only
+     * while the committed manifest still carries `expectedRevision` — the one
+     * generation this manager itself verified or wrote. An unconditional
+     * housekeeping delete could erase a FRESH generation another tab
+     * committed for this root after this manager last looked (that tab keeps
+     * flushing under its own lease and would skip identical rewrites against
+     * a lastFlush_ that no longer describes storage). Check and delete run in
+     * ONE readwrite transaction, so a concurrent commit cannot interleave
+     * between them. Skipping is always safe: a record left behind is at
+     * worst a slightly stale shadow, and every restored record is
+     * revalidated against the server by the hash protocol anyway.
+     */
+    deleteRecordIfRevision_(pathString, expectedRevision) {
+        const key = this.key_(pathString);
+        return this.withStore_('readwrite', undefined, store => {
+            const req = store.get(key);
+            req.onsuccess = () => {
+                const manifest = req.result;
+                if (!manifest || manifest.revision !== expectedRevision) {
                     return;
                 }
-                catch (e) {
-                    // Fall through to the cursor walk.
-                }
-            }
+                this.deleteRecordInStore_(store, key);
+            };
+        });
+    }
+    /** Deletes a root's manifest and every '#'-suffixed sidecar in `store`. */
+    deleteRecordInStore_(store, key) {
+        store.delete(key);
+        // Immutable ranges and legacy chunk/hash/tree sidecars share '#'.
+        // suffix namespace. Range-delete where the platform has IDBKeyRange;
+        // cursor-walk otherwise (Node, test fakes) — key-only, no values.
+        if (typeof IDBKeyRange !== 'undefined') {
             try {
-                const req = store.openCursor();
-                req.onsuccess = () => {
-                    const cursor = req.result;
-                    if (!cursor) {
-                        return;
-                    }
-                    if (typeof cursor.key === 'string' &&
-                        cursor.key.startsWith(key + '#')) {
-                        cursor.delete();
-                    }
-                    cursor.continue();
-                };
+                store.delete(IDBKeyRange.bound(key + '#', key + '#' + String.fromCharCode(0xffff)));
+                return;
             }
             catch (e) {
-                // Sidecar cleanup is best-effort; the sweep reclaims leftovers.
+                // Fall through to the cursor walk.
             }
-        });
+        }
+        try {
+            const req = store.openCursor();
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) {
+                    return;
+                }
+                if (typeof cursor.key === 'string' &&
+                    cursor.key.startsWith(key + '#')) {
+                    cursor.delete();
+                }
+                cursor.continue();
+            };
+        }
+        catch (e) {
+            // Sidecar cleanup is best-effort; the sweep reclaims leftovers.
+        }
     }
     withRestoreSlot_(work) {
         const run = () => {
@@ -6160,12 +6228,23 @@ class PersistenceManager {
             clearTimeout(timer);
             this.writeTimers_.delete(pathString);
         }
-        this.releaseWriteLease_(pathString);
         persistenceStats.evictions++;
         recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
         // Through the queue: a flush already running for this root finishes its
-        // writes first, then the delete removes them — never the reverse.
-        void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+        // writes first, then the delete removes them — never the reverse. The
+        // delete itself stays UNCONDITIONAL (revoked access means the cached
+        // copy must go, even a generation another tab wrote — its own access
+        // is revoked too and its own evict follows), but the lease is held
+        // THROUGH it: releasing first would let a waiting tab commit a fresh
+        // generation into the window before this queued delete runs, only for
+        // the delete to erase it while that tab's lastFlush_ still claims the
+        // generation is stored. Skip the release if the root was re-tracked
+        // meanwhile — the new listen owns the lease now.
+        void this.enqueue_(pathString, () => this.deleteRecord_(pathString).then(() => {
+            if (!this.trackedRoots_.has(pathString)) {
+                this.releaseWriteLease_(pathString);
+            }
+        }));
     }
     dispose() {
         this.disposed_ = true;
