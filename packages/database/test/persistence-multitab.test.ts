@@ -171,6 +171,36 @@ function makeFakeIndexedDB(
   const async = (fn: () => void) => {
     void Promise.resolve().then(fn);
   };
+  // Spec-faithful exception semantics: an exception thrown from a request
+  // event handler ABORTS the transaction (onabort fires, oncomplete never
+  // does, later request callbacks in that transaction are suppressed).
+  // Without this, a throwing callback becomes a swallowed rejection while
+  // the transaction "completes" — masking exactly the bug class where a
+  // stored garbage value (e.g. literal null) throws mid-transaction in a
+  // real browser.
+  interface FakeTx {
+    aborted: boolean;
+    objectStore: () => unknown;
+    oncomplete: null | (() => void);
+    onabort: null | (() => void);
+    onerror: null | (() => void);
+  }
+  let activeTx: FakeTx | null = null;
+  const guarded = (owner: FakeTx | null, fire: () => void) => {
+    async(() => {
+      if (owner !== null && owner.aborted) {
+        return;
+      }
+      try {
+        fire();
+      } catch (e) {
+        if (owner !== null && !owner.aborted) {
+          owner.aborted = true;
+          owner.onabort?.();
+        }
+      }
+    });
+  };
   const makeRequest = (result: unknown) => {
     let doneFlag = false;
     const req: {
@@ -187,7 +217,7 @@ function makeFakeIndexedDB(
       onsuccess: null,
       onerror: null
     };
-    async(() => {
+    guarded(activeTx, () => {
       doneFlag = true;
       if (req.onsuccess) {
         req.onsuccess();
@@ -226,6 +256,7 @@ function makeFakeIndexedDB(
       return makeRequest(undefined);
     },
     openCursor: () => {
+      const owner = activeTx;
       const entries = [...data.entries()];
       const req: {
         result: unknown;
@@ -244,7 +275,7 @@ function makeFakeIndexedDB(
               options.onDelete?.(key);
               return makeRequest(undefined);
             },
-            continue: () => async(step)
+            continue: () => guarded(owner, step)
           };
         } else {
           req.result = null;
@@ -253,15 +284,12 @@ function makeFakeIndexedDB(
           req.onsuccess();
         }
       };
-      async(step);
+      guarded(owner, step);
       return req;
     }
   };
-  const tx = {
-    objectStore: () => store,
-    oncomplete: null as null | (() => void),
-    onabort: null,
-    onerror: null
+  const txProto = {
+    objectStore: () => store
   };
   const makeDb = () => ({
     version: state.version,
@@ -272,8 +300,19 @@ function makeFakeIndexedDB(
       return store;
     },
     transaction: () => {
-      const t = { ...tx };
-      setTimeout(() => t.oncomplete && t.oncomplete(), 0);
+      const t: FakeTx = {
+        ...txProto,
+        aborted: false,
+        oncomplete: null,
+        onabort: null,
+        onerror: null
+      };
+      activeTx = t;
+      setTimeout(() => {
+        if (!t.aborted && t.oncomplete) {
+          t.oncomplete();
+        }
+      }, 0);
       return t;
     }
   });
@@ -1387,6 +1426,192 @@ describe('PersistenceManager multi-tab write economics', () => {
       null,
       'the decoded baseline survives — ineligibility is not a CAS conflict'
     );
+    manager.dispose();
+  });
+
+  it('eviction purges stored null and primitive manifest values with their sidecars', async () => {
+    // IndexedDB happily stores a literal null. It passes an
+    // undefined-check, then THROWS on the scope property read inside the
+    // async onsuccess callback — aborting the transaction, so the revoked
+    // record and its sidecars (which may still carry revoked bytes) stay
+    // cached forever. Garbage no CAS writer produced must be purged, with
+    // sidecars, in the same transaction.
+    const shared = makeFakeIndexedDB();
+    shared.data.set(MANIFEST_KEY, null);
+    shared.data.set(MANIFEST_KEY + '#range:zzz', { tree: 'revoked-bytes' });
+
+    const failures0 = persistenceStats.storageFailures;
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    manager.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.has(MANIFEST_KEY)).to.equal(
+      false,
+      'a stored null manifest must be purged'
+    );
+    expect(shared.data.has(MANIFEST_KEY + '#range:zzz')).to.equal(
+      false,
+      'its sidecars must go with it'
+    );
+    expect(persistenceStats.storageFailures).to.equal(
+      failures0,
+      'no aborted transaction'
+    );
+    manager.dispose();
+
+    // Primitive garbage behaves the same.
+    const shared2 = makeFakeIndexedDB();
+    shared2.data.set(MANIFEST_KEY, 42);
+    shared2.data.set(MANIFEST_KEY + '#range:zzz', { tree: 'revoked-bytes' });
+    const manager2 = mkManager(shared2.factory);
+    manager2.track(ROOT);
+    manager2.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared2.data.has(MANIFEST_KEY)).to.equal(false);
+    expect(shared2.data.has(MANIFEST_KEY + '#range:zzz')).to.equal(false);
+    manager2.dispose();
+  });
+
+  it('the purge compares against the scope captured at revocation, not the live scope', async () => {
+    // An account switch can land between evict() and the queued purge
+    // transaction. Against the LIVE scope, both directions go wrong.
+
+    // Direction 1 — the revoked record must still be REMOVED: stored u1,
+    // revoked under u1, switch to u2 before the purge runs. A live-scope
+    // compare reads u1 as "another identity" and retains revoked data.
+    const shared = makeFakeIndexedDB();
+    const writer = mkManager(shared.factory, { scope: 'u1' });
+    writer.track(ROOT);
+    writer.serverCacheUpdated(
+      ROOT_PATH,
+      nodeFromJSON(makeWorkspace()),
+      undefined
+    );
+    await writer.flushNow(ROOT);
+    await flushAsync();
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
+    writer.evict(ROOT_PATH); // revoked under u1
+    writer.setAuthScope('u2'); // account switch in the gap
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      "u1's revoked record must be purged even after the switch to u2"
+    );
+    writer.dispose();
+
+    // Direction 2 — the NEW identity's fresh record must be PRESERVED:
+    // the purge's in-transaction read is intercepted (the fake-IDB onGet
+    // hook fires synchronously before the value returns) to transplant a
+    // valid u2 manifest — the successor the newly-current identity
+    // committed in the gap. A live-scope compare (u2 === u2) deletes it.
+    let transplant: (() => void) | null = null;
+    const shared2 = makeFakeIndexedDB({
+      onGet: key => {
+        if (key === MANIFEST_KEY && transplant !== null) {
+          const run = transplant;
+          transplant = null;
+          run();
+        }
+      }
+    });
+    const u1 = mkManager(shared2.factory, { scope: 'u1' });
+    u1.track(ROOT);
+    u1.serverCacheUpdated(ROOT_PATH, nodeFromJSON(makeWorkspace()), undefined);
+    await u1.flushNow(ROOT);
+    await flushAsync();
+
+    // Pre-build the u2 successor on a private store.
+    const staging = makeFakeIndexedDB();
+    const u2 = mkManager(staging.factory, { scope: 'u2' });
+    u2.track(ROOT);
+    u2.serverCacheUpdated(ROOT_PATH, nodeFromJSON(makeWorkspace()), undefined);
+    await u2.flushNow(ROOT);
+    await flushAsync();
+    const successor = staging.data.get(MANIFEST_KEY);
+    expect(successor).to.not.equal(undefined);
+    u2.dispose();
+
+    transplant = () => shared2.data.set(MANIFEST_KEY, successor);
+    u1.evict(ROOT_PATH); // revoked under u1
+    u1.setAuthScope('u2'); // switch lands before the purge transaction
+    await flushAsync(10);
+    expect(shared2.data.get(MANIFEST_KEY)).to.equal(
+      successor,
+      "the new identity's fresh record must survive u1's revocation purge"
+    );
+    u1.dispose();
+  });
+
+  it('a stored null manifest never poisons the flush paths', async () => {
+    // Without normalization, the CAS field reads throw on null inside the
+    // async callback: the transaction aborts, the loser path adopts, the
+    // window retries, and the SAME throw repeats — the root can never
+    // persist again while the garbage sits at its key.
+    const sharedA = makeFakeIndexedDB();
+    sharedA.data.set(MANIFEST_KEY, null);
+    const failures0 = persistenceStats.storageFailures;
+
+    const managerA = mkManager(sharedA.factory);
+    managerA.track(ROOT);
+    const tree: Node = nodeFromJSON(makeWorkspace());
+    managerA.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await managerA.flushNow(ROOT);
+    await flushAsync(6);
+    await expectSelfContainedAndEqual(sharedA.factory, sharedA.data, tree);
+    expect(persistenceStats.storageFailures).to.equal(
+      failures0,
+      'the staged commit replaces the garbage without an aborted transaction'
+    );
+    managerA.dispose();
+
+    // Empty-tree path over stored null: the empty flush completes (null
+    // reads as absent), and the root keeps working — a later non-empty
+    // flush commits a valid generation. Without normalization the CAS
+    // callback throws, the transaction stalls to its idle timeout, and no
+    // commit ever lands. (storageFailures is NOT the signal here: the
+    // fake IDB surfaces the stall, not a clean abort.)
+    const sharedB = makeFakeIndexedDB();
+    sharedB.data.set(MANIFEST_KEY, null);
+    const managerB = mkManager(sharedB.factory);
+    managerB.track(ROOT);
+    managerB.serverCacheUpdated(ROOT_PATH, nodeFromJSON(null), undefined);
+    await managerB.flushNow(ROOT);
+    await flushAsync(4);
+    expect(persistenceStats.storageFailures).to.equal(
+      failures0,
+      'the empty flush must not abort its transaction on stored null'
+    );
+    managerB.serverCacheUpdated(ROOT_PATH, tree, undefined);
+    await managerB.flushNow(ROOT);
+    await flushAsync(6);
+    const committed = sharedB.data.get(MANIFEST_KEY) as
+      | { revision?: unknown }
+      | null
+      | undefined;
+    expect(typeof committed?.revision).to.equal(
+      'string',
+      'the root must keep committing after an empty flush over stored null'
+    );
+    managerB.dispose();
+  });
+
+  it('restoring a stored null manifest is a clean corrupt miss whose cleanup reclaims the record', async () => {
+    const shared = makeFakeIndexedDB();
+    shared.data.set(MANIFEST_KEY, null);
+    shared.data.set(MANIFEST_KEY + '#range:zzz', { tree: 'orphan' });
+    const failures0 = persistenceStats.storageFailures;
+
+    const manager = mkManager(shared.factory);
+    manager.track(ROOT);
+    const restored = (await manager.restoreForListen(ROOT)).record;
+    expect(restored).to.equal(null);
+    await flushAsync(10);
+    expect(shared.data.has(MANIFEST_KEY)).to.equal(
+      false,
+      'null is corrupt garbage, not a silent absent-miss: cleanup reclaims it'
+    );
+    expect(shared.data.has(MANIFEST_KEY + '#range:zzz')).to.equal(false);
+    expect(persistenceStats.storageFailures).to.equal(failures0);
     manager.dispose();
   });
 
