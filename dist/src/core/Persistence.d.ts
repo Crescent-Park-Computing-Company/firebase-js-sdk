@@ -106,6 +106,19 @@ export declare const persistenceStats: {
         detail?: string;
     }>;
 };
+/** Heartbeat cadence while holding the writer lease. @internal */
+export declare const LEASE_HEARTBEAT_MS = 20000;
+/**
+ * A holder whose heartbeat is older than this is considered suspended and
+ * may be stolen from. Must comfortably exceed the worst legitimate
+ * heartbeat gap (Chrome background timer clamping is 60s). @internal
+ */
+export declare const LEASE_STALE_MS = 120000;
+/** The subset of Storage the heartbeat needs (injectable for tests). */
+interface HeartbeatStore {
+    getItem(key: string): string | null;
+    setItem(key: string, value: string): void;
+}
 export declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
@@ -116,6 +129,8 @@ export declare class PersistenceManager {
     private rangeTargetBytes_;
     private peekHandoffMs_;
     private peekPreAuthHandoffMs_;
+    private leaseHeartbeatMs_;
+    private leaseStaleMs_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -172,14 +187,24 @@ export declare class PersistenceManager {
      */
     private activeReads_;
     private restoreReasons_;
-    /** Cross-tab write leases per tracked root (see WriteLease). */
-    private writeLeases_;
+    /** The manager-wide writer lease (see the WriterLease pattern notes). */
+    private writerLease_;
+    /** When the current lease request was queued (anchors staleness checks). */
+    private writerLeaseRequestedAt_;
+    /** One timer, role by state: held → heartbeat, requested → steal check. */
+    private leaseTimer_;
+    private heartbeatStore_;
     /**
-     * Page-lifecycle stewardship of the leases (see
-     * installLeaseLifecycleHandlers_): unsubscribe callbacks, installed with
-     * the first lease and removed on dispose.
+     * Eviction purges recorded while NOT the writer: an unconditional
+     * security purge from a follower could erase a generation the current
+     * holder just committed (leaving its lastFlush_ claiming the generation
+     * is stored, so identical rewrites short-circuit). Purges are writes, and
+     * writes belong to the writer: a follower records the intent and the
+     * grant callback executes it — the holder's own eviction usually purges
+     * long before. Re-tracking a root cancels its pending purge (access was
+     * restored; the record may be fresh again).
      */
-    private leaseLifecycleCleanup_;
+    private pendingEvictPurges_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
@@ -199,7 +224,7 @@ export declare class PersistenceManager {
     private authGeneration_;
     isAuthScopeConfigured(): boolean;
     setAuthScope(scope: string | null, confirmedByApp?: boolean): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number);
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number, leaseHeartbeatMs_?: number, leaseStaleMs_?: number, heartbeatStore?: HeartbeatStore | null);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -209,72 +234,37 @@ export declare class PersistenceManager {
      */
     track(pathString: string): void;
     /**
-     * True when this manager may write the root: it holds the root's
-     * cross-tab lease, or leases are unenforceable here (no Web Locks — the
-     * manifest CAS remains the correctness backstop).
+     * True when this manager may write: it holds the manager-wide writer
+     * lease, or leases are unenforceable here (no Web Locks — the manifest
+     * CAS remains the correctness backstop).
      */
-    private holdsWriteLease_;
+    private holdsWriterLease_;
+    /** The shared heartbeat key for this manager's database prefix. */
+    private heartbeatKey_;
+    private writeHeartbeat_;
+    private readHeartbeat_;
     /**
-     * Requests the root's cross-tab write lease (never blocks; flushes stay
-     * gated on holdsWriteLease_ until the browser grants it). Idempotent per
-     * root. Where Web Locks are unavailable no lease entry is created and
-     * holdsWriteLease_ fails open.
+     * One tick, role by lease state: a holder proves liveness (heartbeat); a
+     * queued follower checks the holder's liveness and STEALS the lock when
+     * the heartbeat has gone stale — the holder is frozen, cached, suspended,
+     * or wedged, and would otherwise starve every live tab's writes for as
+     * long as it existed. The request-time anchor prevents stealing within
+     * the staleness budget of first joining the queue (covers holders that
+     * cannot write heartbeats at all).
      */
-    private acquireWriteLease_;
-    /** Puts a fresh lease request in the browser's queue for the root. */
-    private requestWriteLease_;
+    private onLeaseTick_;
+    /** Requests the manager-wide writer lease once (idempotent). */
+    private ensureWriterLease_;
     /**
-     * A page can be FROZEN or moved into the back/forward cache without
-     * untrack()/dispose() ever running; a held lock would then keep excluding
-     * every live tab's writes for as long as the suspended page exists —
-     * persistence goes silently stale across the whole origin. The Page
-     * Lifecycle contract is to release held Web Locks before suspension: on
-     * `freeze` / persisted `pagehide`, every lease (held or queued) is
-     * returned; on `resume` / persisted `pageshow`, leases are re-requested
-     * for every still-tracked root and ownership settles through the normal
-     * grant path (a stale baseline reconciles via the flush CAS +
-     * adoptCommittedBaseline_, exactly once). Releasing here also keeps a
-     * page that holds no other locks eligible for the back/forward cache.
-     * Installed once, with the first lease; removed on dispose.
+     * Puts a lease request in the browser's queue, superseding any current
+     * one (`steal` preempts a stale holder; see onLeaseTick_).
      */
-    private installLeaseLifecycleHandlers_;
-    /**
-     * Chrome/Edge implement the freeze/resume lifecycle events — and a page
-     * there that holds a Web Lock is deliberately never frozen, so a hidden
-     * tab keeps writing and its lease correctly stays put. Safari and Firefox
-     * expose Web Locks WITHOUT those events: a hidden tab can be suspended at
-     * any time with no signal at all, and a suspended holder would starve
-     * every visible tab's writes indefinitely. There — and only there — the
-     * lease follows VISIBILITY instead (see parkWriteLeases_).
-     */
-    private freezeLifecycleSupported_;
-    /**
-     * Freeze-less visibility handoff, hidden side: every lease returns its
-     * browser resource (a held lock is released, a queued request aborted)
-     * but the entry stays, PARKED — the hidden page is still running, and an
-     * absent entry would fail the write gate OPEN, putting two writers on
-     * the root. Parked leases re-request on the next visible transition.
-     */
-    private parkWriteLeases_;
-    /**
-     * Freeze-less visibility handoff, visible side: parked leases re-queue
-     * (behind whichever tab currently holds — a returning tab never seizes).
-     */
-    private unparkWriteLeases_;
-    /** Returns every lease (held or queued) ahead of page suspension. */
-    private suspendWriteLeases_;
-    /** Re-requests leases for the still-tracked roots after the page resumes. */
-    private resumeWriteLeases_;
-    /**
-     * Completion step for untrack/evict cleanup: returns the lease unless the
-     * root was re-tracked meanwhile — the new listen owns it now. Destructive
-     * cleanup calls this AFTER its queued operation settles, so a waiting tab
-     * can never be granted (and commit) into the window before the cleanup
-     * runs, only for that cleanup to erase its generation.
-     */
-    private releaseWriteLeaseIfUntracked_;
-    /** Returns the root's write lease to the browser (idempotent). */
-    private releaseWriteLease_;
+    private requestWriterLease_;
+    private writerLeaseName_;
+    /** Executes eviction purges recorded while this manager was a follower. */
+    private runPendingEvictPurges_;
+    /** Returns the writer lease to the browser (dispose only). */
+    private releaseWriterLease_;
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
      * root, its record — which contains this subtree and keeps flushing — is
@@ -485,3 +475,4 @@ export declare class PersistenceManager {
     private flush_;
     private gcRangeRecords_;
 }
+export {};
