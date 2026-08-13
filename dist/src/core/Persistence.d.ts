@@ -119,6 +119,15 @@ interface HeartbeatStore {
     getItem(key: string): string | null;
     setItem(key: string, value: string): void;
 }
+export interface WebLocksLike {
+    request: (name: string, options: {
+        mode: 'exclusive';
+        signal?: AbortSignal;
+        steal?: boolean;
+    }, callback: (lock: unknown) => Promise<void>) => Promise<void>;
+}
+/** @internal */
+export declare function _setWebLocksForTesting(locks: WebLocksLike | null | undefined): void;
 export declare class PersistenceManager {
     private prefix_;
     private idbFactory_;
