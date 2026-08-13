@@ -4396,12 +4396,7 @@ class PersistenceManager {
      * holdsWriteLease_ fails open.
      */
     acquireWriteLease_(pathString) {
-        const existing = this.writeLeases_.get(pathString);
-        if (existing !== undefined) {
-            existing.wanted = true;
-            return;
-        }
-        if (this.disposed_) {
+        if (this.writeLeases_.has(pathString) || this.disposed_) {
             return;
         }
         const locks = webLocks();
@@ -4411,7 +4406,6 @@ class PersistenceManager {
         this.installLeaseLifecycleHandlers_();
         const lease = {
             held: false,
-            wanted: true,
             release: null,
             controller: typeof AbortController !== 'undefined' ? new AbortController() : null
         };
@@ -4431,20 +4425,18 @@ class PersistenceManager {
             // request was pending; with the gate now failing open nothing else
             // would restore it until the next server update. Re-arm for pending
             // data so the latest tree still persists this session.
-            if (!this.disposed_ &&
-                this.trackedRoots_.has(pathString) &&
-                this.latest_.has(pathString)) {
-                this.armWriteWindow_(pathString);
-            }
+            this.armWriteWindowIfPending_(pathString);
         };
         try {
             void locks
                 .request(name, lease.controller !== null
                 ? { mode: 'exclusive', signal: lease.controller.signal }
                 : { mode: 'exclusive' }, () => {
-                if (!lease.wanted || this.disposed_) {
-                    // Released (or the manager died) while queued: hand the lock
-                    // straight back so the next tab's request is granted.
+                if (this.writeLeases_.get(pathString) !== lease) {
+                    // Released (untrack/evict/suspend/dispose all remove the map
+                    // entry) while queued: hand the lock straight back so the
+                    // next tab's request is granted. Map identity is the one
+                    // liveness test — the same one failOpen uses.
                     return Promise.resolve();
                 }
                 lease.held = true;
@@ -4453,10 +4445,7 @@ class PersistenceManager {
                 // window now. A stale baseline (the old holder committed)
                 // resolves through the flush CAS + adoptCommittedBaseline_,
                 // exactly once.
-                if (this.trackedRoots_.has(pathString) &&
-                    this.latest_.has(pathString)) {
-                    this.armWriteWindow_(pathString);
-                }
+                this.armWriteWindowIfPending_(pathString);
                 return new Promise(resolve => {
                     lease.release = resolve;
                 });
@@ -4533,6 +4522,18 @@ class PersistenceManager {
             this.acquireWriteLease_(pathString);
         }
     }
+    /**
+     * Completion step for untrack/evict cleanup: returns the lease unless the
+     * root was re-tracked meanwhile — the new listen owns it now. Destructive
+     * cleanup calls this AFTER its queued operation settles, so a waiting tab
+     * can never be granted (and commit) into the window before the cleanup
+     * runs, only for that cleanup to erase its generation.
+     */
+    releaseWriteLeaseIfUntracked_(pathString) {
+        if (!this.trackedRoots_.has(pathString)) {
+            this.releaseWriteLease_(pathString);
+        }
+    }
     /** Returns the root's write lease to the browser (idempotent). */
     releaseWriteLease_(pathString) {
         const lease = this.writeLeases_.get(pathString);
@@ -4540,7 +4541,6 @@ class PersistenceManager {
             return;
         }
         this.writeLeases_.delete(pathString);
-        lease.wanted = false;
         if (lease.held) {
             // Held: hand the lock back by resolving the callback's promise.
             lease.held = false;
@@ -4594,11 +4594,7 @@ class PersistenceManager {
             this.changedSinceFlush_.delete(pathString);
             void this.enqueue_(pathString, () => (ownedRevision !== null
                 ? this.deleteRecordIfRevision_(pathString, ownedRevision)
-                : Promise.resolve()).then(() => {
-                if (!this.trackedRoots_.has(pathString)) {
-                    this.releaseWriteLease_(pathString);
-                }
-            }));
+                : Promise.resolve()).then(() => this.releaseWriteLeaseIfUntracked_(pathString)));
             return;
         }
         // Release the tree only after the final flush settles (flush_ reads
@@ -4610,10 +4606,10 @@ class PersistenceManager {
                 this.latest_.delete(pathString);
                 this.lastFlush_.delete(pathString);
                 this.changedSinceFlush_.delete(pathString);
-                // After the final flush so a lease-holding tab still writes the
-                // last tree before the lease transfers.
-                this.releaseWriteLease_(pathString);
             }
+            // After the final flush so a lease-holding tab still writes the
+            // last tree before the lease transfers.
+            this.releaseWriteLeaseIfUntracked_(pathString);
         };
         void this.flushNow(pathString).then(release, release);
     }
@@ -5535,6 +5531,20 @@ class PersistenceManager {
             this.armWriteWindow_(pathString);
         }
     }
+    /**
+     * Re-enters the ordinary write window when the root still has work: it is
+     * tracked and holds a pending tree in latest_ (flush_ reads latest_ when
+     * it runs, so whatever landed meanwhile is covered). The one definition
+     * used by every deferred-retry path — a lease grant after skipped writes,
+     * a failed-open lock acquisition, and the stale-baseline adoption.
+     */
+    armWriteWindowIfPending_(pathString) {
+        if (!this.disposed_ &&
+            this.trackedRoots_.has(pathString) &&
+            this.latest_.has(pathString)) {
+            this.armWriteWindow_(pathString);
+        }
+    }
     /** Arms the non-restarting single-flight write window for a root. */
     armWriteWindow_(pathString) {
         if (!this.writeTimers_.has(pathString)) {
@@ -5661,11 +5671,7 @@ class PersistenceManager {
         // the delete to erase it while that tab's lastFlush_ still claims the
         // generation is stored. Skip the release if the root was re-tracked
         // meanwhile — the new listen owns the lease now.
-        void this.enqueue_(pathString, () => this.deleteRecord_(pathString).then(() => {
-            if (!this.trackedRoots_.has(pathString)) {
-                this.releaseWriteLease_(pathString);
-            }
-        }));
+        void this.enqueue_(pathString, () => this.deleteRecord_(pathString).then(() => this.releaseWriteLeaseIfUntracked_(pathString)));
     }
     dispose() {
         this.disposed_ = true;
@@ -5787,9 +5793,21 @@ class PersistenceManager {
                 // under the absent / replaceable-foreign CAS arm instead.
                 this.lastFlush_.delete(pathString);
             }
-            if (this.trackedRoots_.has(pathString)) {
-                this.armWriteWindow_(pathString);
-            }
+            // The write window is the ONLY retry path. A window that elapsed
+            // while the losing flush was in flight marked flushPending_, and the
+            // queue drain would re-flush IMMEDIATELY on settle — full-tree
+            // staging back-to-back under sustained lease-less churn, bypassing
+            // the debounce this adoption exists to provide. The armed window
+            // supersedes it: flush_ reads latest_ when it runs, so the update
+            // that marked the queue pending is still fully covered, just
+            // deferred. For an untracked root (the final flush from untrack lost
+            // the CAS) there is deliberately no retry at all: the winner's
+            // generation is a coherent snapshot seconds-fresh at most, and the
+            // hash protocol revalidates it on the next boot — not worth keeping
+            // the tree and lease alive past untrack (this matches the pre-lease
+            // behavior, whose drain retry always found latest_ already released).
+            this.flushPending_.delete(pathString);
+            this.armWriteWindowIfPending_(pathString);
         });
     }
     /**

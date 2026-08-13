@@ -240,6 +240,14 @@ export declare class PersistenceManager {
     private suspendWriteLeases_;
     /** Re-requests leases for the still-tracked roots after the page resumes. */
     private resumeWriteLeases_;
+    /**
+     * Completion step for untrack/evict cleanup: returns the lease unless the
+     * root was re-tracked meanwhile — the new listen owns it now. Destructive
+     * cleanup calls this AFTER its queued operation settles, so a waiting tab
+     * can never be granted (and commit) into the window before the cleanup
+     * runs, only for that cleanup to erase its generation.
+     */
+    private releaseWriteLeaseIfUntracked_;
     /** Returns the root's write lease to the browser (idempotent). */
     private releaseWriteLease_;
     /**
@@ -365,6 +373,14 @@ export declare class PersistenceManager {
      * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     private flushWritesDeferredUntilRestores_;
+    /**
+     * Re-enters the ordinary write window when the root still has work: it is
+     * tracked and holds a pending tree in latest_ (flush_ reads latest_ when
+     * it runs, so whatever landed meanwhile is covered). The one definition
+     * used by every deferred-retry path — a lease grant after skipped writes,
+     * a failed-open lock acquisition, and the stale-baseline adoption.
+     */
+    private armWriteWindowIfPending_;
     /** Arms the non-restarting single-flight write window for a root. */
     private armWriteWindow_;
     private accumulateChangedPaths_;
