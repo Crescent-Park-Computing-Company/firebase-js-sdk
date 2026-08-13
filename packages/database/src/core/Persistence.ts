@@ -445,51 +445,86 @@ function structurallyValidManifest(
 }
 
 /**
- * Cross-tab write lease for one root (see acquireWriteLease_). Persisted
- * generations are already SAFE under concurrent writers — immutable range
- * records plus the manifest revision CAS — but they are not CHEAP under
- * them: two live tabs flushing the same root leapfrog each other's
- * revisions, and every CAS loser abandons its staged generation and
- * re-stages the whole root. Under steady churn (a busy workspace) that is
- * full-tree serialization and IndexedDB writes in EVERY tab EVERY window,
- * indefinitely — the observed multi-tab boot crash/thrash. A Web Locks
- * lease makes one tab the writer per root; the others keep tracking in
- * memory and take over, through the ordinary stale-baseline CAS path, when
- * the holder goes away. Environments without Web Locks (Node, older WebKit)
- * fail open to the CAS-only behavior.
+ * Cross-tab single-writer coordination — the "primary client" pattern
+ * (leader lease + heartbeat liveness + steal-on-stale takeover).
+ *
+ * Persisted generations are already SAFE under concurrent writers —
+ * immutable range records plus the manifest revision CAS — but they are not
+ * CHEAP under them: two live tabs flushing the same root leapfrog each
+ * other's revisions, and every CAS loser abandons its staged generation and
+ * re-stages the whole root. Under steady churn that is full-tree
+ * serialization and IndexedDB writes in EVERY tab EVERY window,
+ * indefinitely — the observed multi-tab boot crash/thrash.
+ *
+ * ONE Web Lock per manager (per database prefix) elects the writer; its
+ * lifetime is the MANAGER's, never a root's, so listener churn
+ * (track/untrack), eviction, and cleanup ordering cannot interact with lock
+ * ownership at all. Followers keep tracking in memory and take over through
+ * the ordinary stale-baseline CAS path when the lease transfers.
+ *
+ * LIVENESS is proven by heartbeat, not inferred from lifecycle events: the
+ * holder stamps a shared storage key every LEASE_HEARTBEAT_MS; a queued
+ * follower that observes the stamp stale by LEASE_STALE_MS steals the lock
+ * (Web Locks `steal`). This one mechanism uniformly covers every way a
+ * holder can go silent — frozen tabs, back/forward-cached pages, Safari and
+ * Firefox background suspension (which fire no freeze event), and even a
+ * wedged-but-visible page — where enumerating lifecycle signals cannot. A
+ * hidden-but-RUNNING tab keeps heartbeating and keeps persisting, which is
+ * strictly better than proxying suspension through visibility. The stolen
+ * holder's request promise rejects; when its JavaScript resumes it re-queues
+ * politely (never steals back unprompted), reconciling any stale baseline
+ * through the flush CAS + manifest-only adoption, exactly once.
+ *
+ * Environments without Web Locks fail open to CAS-only behavior; without
+ * shared storage (no localStorage) heartbeats are disabled and takeover
+ * happens only on page death — the CAS remains the correctness backstop in
+ * every configuration. Clock skew is a non-issue: all tabs share one
+ * machine clock, and the staleness threshold generously exceeds background
+ * timer throttling (Chrome clamps background timers to one minute, and a
+ * page holding a Web Lock is exempt from intensive throttling).
  */
-interface WriteLease {
-  /**
-   * requested — a locks.request() is queued; the gate stays closed until
-   *             the browser grants it.
-   * held      — this manager owns writes for the root.
-   * parked    — the root is selected but deliberately holds NO browser
-   *             request: on browsers without the freeze lifecycle a HIDDEN
-   *             tab must neither hold nor queue (it can be suspended at any
-   *             time with no event at all, and a suspended holder starves
-   *             every visible tab). A parked lease keeps the gate CLOSED —
-   *             the hidden page is still running, and failing open would
-   *             put two writers on the root — and re-requests on the next
-   *             visibilitychange to visible.
-   */
-  state: 'requested' | 'held' | 'parked';
+interface WriterLease {
+  state: 'requested' | 'held';
   /** Resolving this hands the held lock back to the browser. */
   release: (() => void) | null;
   /**
    * Aborting this removes a still-QUEUED request from the browser's lock
-   * queue. Without it a released-before-grant lease would sit in the queue
-   * (retaining this manager) until the current holder exits — and every
-   * untrack/retrack cycle of a non-holder root (listener re-homes do this
-   * routinely) would queue one more. Never aborted once held: the held
-   * lock is returned by resolving `release` instead.
+   * queue (dispose before grant, or superseding it with a steal request).
+   * Never aborted once held: a held lock is returned via `release`.
    */
   controller: AbortController | null;
+}
+
+/** Heartbeat cadence while holding the writer lease. @internal */
+export const LEASE_HEARTBEAT_MS = 20_000;
+/**
+ * A holder whose heartbeat is older than this is considered suspended and
+ * may be stolen from. Must comfortably exceed the worst legitimate
+ * heartbeat gap (Chrome background timer clamping is 60s). @internal
+ */
+export const LEASE_STALE_MS = 120_000;
+
+/** The subset of Storage the heartbeat needs (injectable for tests). */
+interface HeartbeatStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+function defaultHeartbeatStore(): HeartbeatStore | null {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage !== null) {
+      return localStorage;
+    }
+  } catch (e) {
+    // Access itself can throw (storage-disabled documents).
+  }
+  return null;
 }
 
 interface WebLocksLike {
   request: (
     name: string,
-    options: { mode: 'exclusive'; signal?: AbortSignal },
+    options: { mode: 'exclusive'; signal?: AbortSignal; steal?: boolean },
     callback: (lock: unknown) => Promise<void>
   ) => Promise<void>;
 }
@@ -573,14 +608,24 @@ export class PersistenceManager {
     }
   >();
   private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
-  /** Cross-tab write leases per tracked root (see WriteLease). */
-  private writeLeases_ = new Map<string, WriteLease>();
+  /** The manager-wide writer lease (see the WriterLease pattern notes). */
+  private writerLease_: WriterLease | null = null;
+  /** When the current lease request was queued (anchors staleness checks). */
+  private writerLeaseRequestedAt_ = 0;
+  /** One timer, role by state: held → heartbeat, requested → steal check. */
+  private leaseTimer_: ReturnType<typeof setInterval> | null = null;
+  private heartbeatStore_: HeartbeatStore | null;
   /**
-   * Page-lifecycle stewardship of the leases (see
-   * installLeaseLifecycleHandlers_): unsubscribe callbacks, installed with
-   * the first lease and removed on dispose.
+   * Eviction purges recorded while NOT the writer: an unconditional
+   * security purge from a follower could erase a generation the current
+   * holder just committed (leaving its lastFlush_ claiming the generation
+   * is stored, so identical rewrites short-circuit). Purges are writes, and
+   * writes belong to the writer: a follower records the intent and the
+   * grant callback executes it — the holder's own eviction usually purges
+   * long before. Re-tracking a root cancels its pending purge (access was
+   * restored; the record may be fresh again).
    */
-  private leaseLifecycleCleanup_: Array<() => void> | null = null;
+  private pendingEvictPurges_ = new Set<string>();
   private activeRestoreCount_ = 0;
   private restoreQueue_: Array<() => void> = [];
   private writesDeferredUntilRestores_ = new Set<string>();
@@ -665,8 +710,12 @@ export class PersistenceManager {
     private writeDelayMs_: number = PERSISTENCE_WRITE_DEBOUNCE_MS,
     private rangeTargetBytes_: number = PERSISTENCE_RANGE_TARGET_BYTES,
     private peekHandoffMs_: number = PERSISTENCE_PEEK_HANDOFF_MS,
-    private peekPreAuthHandoffMs_: number = PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS
+    private peekPreAuthHandoffMs_: number = PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS,
+    private leaseHeartbeatMs_: number = LEASE_HEARTBEAT_MS,
+    private leaseStaleMs_: number = LEASE_STALE_MS,
+    heartbeatStore: HeartbeatStore | null = defaultHeartbeatStore()
   ) {
+    this.heartbeatStore_ = heartbeatStore;
     if (!this.schemaKnownCurrent_) {
       // Do not put the cold server listen behind a potentially slow Safari
       // version-change transaction. Migration runs in the background; restore
@@ -688,7 +737,10 @@ export class PersistenceManager {
       this.writeDelayMs_,
       this.rangeTargetBytes_,
       this.peekHandoffMs_,
-      this.peekPreAuthHandoffMs_
+      this.peekPreAuthHandoffMs_,
+      this.leaseHeartbeatMs_,
+      this.leaseStaleMs_,
+      this.heartbeatStore_
     );
     if (this.authScopeConfigured_) {
       rebound.setAuthScope(scope, this.authScopeConfirmed_);
@@ -721,297 +773,223 @@ export class PersistenceManager {
    */
   track(pathString: string): void {
     this.trackedRoots_.add(pathString);
-    this.acquireWriteLease_(pathString);
+    // Access restored (or a fresh listen): a purge recorded while this root
+    // was evicted no longer applies.
+    this.pendingEvictPurges_.delete(pathString);
+    this.ensureWriterLease_();
   }
 
   /**
-   * True when this manager may write the root: it holds the root's
-   * cross-tab lease, or leases are unenforceable here (no Web Locks — the
-   * manifest CAS remains the correctness backstop).
+   * True when this manager may write: it holds the manager-wide writer
+   * lease, or leases are unenforceable here (no Web Locks — the manifest
+   * CAS remains the correctness backstop).
    */
-  private holdsWriteLease_(pathString: string): boolean {
-    const lease = this.writeLeases_.get(pathString);
-    return lease === undefined ? true : lease.state === 'held';
+  private holdsWriterLease_(): boolean {
+    return this.writerLease_ === null
+      ? true
+      : this.writerLease_.state === 'held';
+  }
+
+  /** The shared heartbeat key for this manager's database prefix. */
+  private heartbeatKey_(): string {
+    return 'firebase-database-persistence-writer|' + this.prefix_;
+  }
+
+  private writeHeartbeat_(): void {
+    try {
+      this.heartbeatStore_?.setItem(this.heartbeatKey_(), String(Date.now()));
+    } catch (e) {
+      // Best-effort: without heartbeats, takeover waits for page death.
+    }
+  }
+
+  private readHeartbeat_(): number {
+    try {
+      const raw = this.heartbeatStore_?.getItem(this.heartbeatKey_());
+      const value = raw === null || raw === undefined ? NaN : Number(raw);
+      return isNaN(value) ? 0 : value;
+    } catch (e) {
+      return 0;
+    }
   }
 
   /**
-   * Requests the root's cross-tab write lease (never blocks; flushes stay
-   * gated on holdsWriteLease_ until the browser grants it). Idempotent per
-   * root. Where Web Locks are unavailable no lease entry is created and
-   * holdsWriteLease_ fails open.
+   * One tick, role by lease state: a holder proves liveness (heartbeat); a
+   * queued follower checks the holder's liveness and STEALS the lock when
+   * the heartbeat has gone stale — the holder is frozen, cached, suspended,
+   * or wedged, and would otherwise starve every live tab's writes for as
+   * long as it existed. The request-time anchor prevents stealing within
+   * the staleness budget of first joining the queue (covers holders that
+   * cannot write heartbeats at all).
    */
-  private acquireWriteLease_(pathString: string): void {
-    if (this.writeLeases_.has(pathString) || this.disposed_) {
+  private onLeaseTick_(): void {
+    const lease = this.writerLease_;
+    if (lease === null || this.disposed_) {
+      return;
+    }
+    if (lease.state === 'held') {
+      this.writeHeartbeat_();
+      return;
+    }
+    if (this.heartbeatStore_ === null) {
+      return;
+    }
+    const freshest = Math.max(
+      this.readHeartbeat_(),
+      this.writerLeaseRequestedAt_
+    );
+    if (Date.now() - freshest > this.leaseStaleMs_) {
+      this.requestWriterLease_(true);
+    }
+  }
+
+  /** Requests the manager-wide writer lease once (idempotent). */
+  private ensureWriterLease_(): void {
+    if (this.writerLease_ !== null || this.disposed_) {
       return;
     }
     const locks = webLocks();
     if (locks === null) {
       return;
     }
-    this.installLeaseLifecycleHandlers_();
-    if (
-      !this.freezeLifecycleSupported_() &&
-      typeof document !== 'undefined' &&
-      document.visibilityState === 'hidden'
-    ) {
-      // Freeze-less browsers: hidden tabs never hold OR queue (see
-      // WriteLease.state). Selected while hidden — a background-opened
-      // tab — parks until the first visibilitychange to visible.
-      this.writeLeases_.set(pathString, {
-        state: 'parked',
-        release: null,
-        controller: null
-      });
-      return;
+    this.requestWriterLease_(false);
+    if (this.leaseTimer_ === null) {
+      this.leaseTimer_ = setInterval(() => {
+        this.onLeaseTick_();
+      }, this.leaseHeartbeatMs_);
+      (this.leaseTimer_ as { unref?: () => void }).unref?.();
     }
-    this.requestWriteLease_(pathString, locks);
   }
 
-  /** Puts a fresh lease request in the browser's queue for the root. */
-  private requestWriteLease_(pathString: string, locks: WebLocksLike): void {
-    const lease: WriteLease = {
+  /**
+   * Puts a lease request in the browser's queue, superseding any current
+   * one (`steal` preempts a stale holder; see onLeaseTick_).
+   */
+  private requestWriterLease_(steal: boolean): void {
+    const locks = webLocks();
+    if (locks === null) {
+      return;
+    }
+    const previous = this.writerLease_;
+    const lease: WriterLease = {
       state: 'requested',
       release: null,
+      // The Web Locks spec FORBIDS combining `signal` with `steal`
+      // (NotSupportedError — verified in Chrome: the request rejects
+      // immediately and no steal happens). A steal needs no abort path
+      // anyway: it is granted almost at once, and a steal that lands after
+      // this manager was superseded/disposed is handed straight back by
+      // the grant callback's identity check.
       controller:
-        typeof AbortController !== 'undefined' ? new AbortController() : null
+        !steal && typeof AbortController !== 'undefined'
+          ? new AbortController()
+          : null
     };
-    this.writeLeases_.set(pathString, lease);
-    const name = 'firebase-database-persistence-write|' + this.key_(pathString);
-    const failOpen = () => {
-      // Intentional rejections are no-ops: a cancellation
-      // (releaseWriteLease_ removed the entry before aborting) fails the
-      // identity check, and a park (visibility handoff aborted the queued
-      // request but keeps the entry to hold the gate closed) is excluded
-      // by state. Anything else is a lock API failure: fail open rather
-      // than never persisting.
-      if (
-        this.writeLeases_.get(pathString) !== lease ||
-        lease.state === 'parked'
-      ) {
+    this.writerLease_ = lease;
+    this.writerLeaseRequestedAt_ = Date.now();
+    // Replace-then-abort: the superseded request's rejection sees a
+    // different current lease and is a no-op.
+    if (previous !== null && previous.state === 'requested') {
+      previous.controller?.abort();
+    }
+    const options: {
+      mode: 'exclusive';
+      signal?: AbortSignal;
+      steal?: boolean;
+    } = { mode: 'exclusive' };
+    if (lease.controller !== null) {
+      options.signal = lease.controller.signal;
+    }
+    if (steal) {
+      options.steal = true;
+    }
+    const onSettled = (failed: boolean) => {
+      if (this.writerLease_ !== lease) {
+        return; // superseded or disposed: nothing to do
+      }
+      if (lease.state === 'held') {
+        // A held lock's request promise only settles early when another
+        // tab STOLE it (a stale-heartbeat takeover while this page was
+        // suspended, or a lock-manager failure treated the same way). Stop
+        // writing at once and re-queue politely — never steal back
+        // unprompted; any stale baseline reconciles through the flush CAS.
+        this.requestWriterLease_(false);
         return;
       }
-      this.writeLeases_.delete(pathString);
-      // A write window may already have fired and been skipped while this
-      // request was pending; with the gate now failing open nothing else
-      // would restore it until the next server update. Re-arm for pending
-      // data so the latest tree still persists this session.
-      this.armWriteWindowIfPending_(pathString);
+      if (failed) {
+        // Queued-request failure (not a supersede — those hit the identity
+        // guard above): fail open rather than never persisting, and re-arm
+        // the write windows a skipped flush may have consumed.
+        this.writerLease_ = null;
+        for (const pathString of this.trackedRoots_) {
+          this.armWriteWindowIfPending_(pathString);
+        }
+      }
     };
     try {
       void locks
-        .request(
-          name,
-          lease.controller !== null
-            ? { mode: 'exclusive', signal: lease.controller.signal }
-            : { mode: 'exclusive' },
-          () => {
-            if (
-              this.writeLeases_.get(pathString) !== lease ||
-              lease.state !== 'requested'
-            ) {
-              // Released (untrack/evict/suspend/dispose all remove the map
-              // entry) or parked while queued: hand the lock straight back
-              // so the next tab's request is granted. Map identity plus
-              // state is the one liveness test — the same one failOpen
-              // uses. The state check matters where AbortController is
-              // unavailable and a parked lease's request stayed queued.
-              return Promise.resolve();
-            }
-            lease.state = 'held';
-            // Writes were skipped while another tab held the lease;
-            // whatever is pending in memory enters the ordinary write
-            // window now. A stale baseline (the old holder committed)
-            // resolves through the flush CAS + adoptCommittedBaseline_,
-            // exactly once.
-            this.armWriteWindowIfPending_(pathString);
-            return new Promise<void>(resolve => {
-              lease.release = resolve;
-            });
+        .request(this.writerLeaseName_(), options, () => {
+          if (this.writerLease_ !== lease || this.disposed_) {
+            // Superseded/disposed while queued: hand the lock straight
+            // back so the next tab's request is granted.
+            return Promise.resolve();
           }
-        )
-        .catch(failOpen);
+          lease.state = 'held';
+          this.writeHeartbeat_();
+          // Writes were skipped while another tab held the lease; whatever
+          // is pending in memory enters the ordinary write window now. A
+          // stale baseline (the old holder committed) resolves through the
+          // flush CAS + adoptCommittedBaseline_, exactly once.
+          for (const pathString of this.trackedRoots_) {
+            this.armWriteWindowIfPending_(pathString);
+          }
+          this.runPendingEvictPurges_();
+          return new Promise<void>(resolve => {
+            lease.release = resolve;
+          });
+        })
+        .then(
+          () => onSettled(false),
+          () => onSettled(true)
+        );
     } catch (e) {
       // A synchronously-throwing request() must not break the listen path
       // that called track().
-      failOpen();
+      onSettled(true);
     }
   }
 
-  /**
-   * A page can be FROZEN or moved into the back/forward cache without
-   * untrack()/dispose() ever running; a held lock would then keep excluding
-   * every live tab's writes for as long as the suspended page exists —
-   * persistence goes silently stale across the whole origin. The Page
-   * Lifecycle contract is to release held Web Locks before suspension: on
-   * `freeze` / persisted `pagehide`, every lease (held or queued) is
-   * returned; on `resume` / persisted `pageshow`, leases are re-requested
-   * for every still-tracked root and ownership settles through the normal
-   * grant path (a stale baseline reconciles via the flush CAS +
-   * adoptCommittedBaseline_, exactly once). Releasing here also keeps a
-   * page that holds no other locks eligible for the back/forward cache.
-   * Installed once, with the first lease; removed on dispose.
-   */
-  private installLeaseLifecycleHandlers_(): void {
-    if (
-      this.leaseLifecycleCleanup_ !== null ||
-      typeof document === 'undefined' ||
-      typeof document.addEventListener !== 'function' ||
-      typeof window === 'undefined' ||
-      typeof window.addEventListener !== 'function'
-    ) {
-      return;
-    }
-    const suspend = () => this.suspendWriteLeases_();
-    const resume = () => this.resumeWriteLeases_();
-    const onPageHide = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        suspend();
-      }
-    };
-    const onPageShow = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        resume();
-      }
-    };
-    // Capture the targets: cleanup must unregister from the exact objects
-    // the handlers were installed on.
-    const doc = document;
-    const win = window;
-    doc.addEventListener('freeze', suspend);
-    doc.addEventListener('resume', resume);
-    win.addEventListener('pagehide', onPageHide);
-    win.addEventListener('pageshow', onPageShow);
-    this.leaseLifecycleCleanup_ = [
-      () => doc.removeEventListener('freeze', suspend),
-      () => doc.removeEventListener('resume', resume),
-      () => win.removeEventListener('pagehide', onPageHide),
-      () => win.removeEventListener('pageshow', onPageShow)
-    ];
-    if (!this.freezeLifecycleSupported_()) {
-      // No freeze lifecycle (Safari, Firefox): the lease follows visibility
-      // instead — see freezeLifecycleSupported_ / parkWriteLeases_. Bound
-      // only there: on Chrome a hidden lock-holding tab keeps running and
-      // flushing (it is exempt from freezing), which a blanket
-      // visibility handoff would needlessly give up.
-      const onVisibility = () => {
-        if (doc.visibilityState === 'hidden') {
-          this.parkWriteLeases_();
-        } else {
-          this.unparkWriteLeases_();
-        }
-      };
-      doc.addEventListener('visibilitychange', onVisibility);
-      this.leaseLifecycleCleanup_.push(() =>
-        doc.removeEventListener('visibilitychange', onVisibility)
-      );
-    }
+  private writerLeaseName_(): string {
+    return 'firebase-database-persistence-write|' + this.prefix_;
   }
 
-  /**
-   * Chrome/Edge implement the freeze/resume lifecycle events — and a page
-   * there that holds a Web Lock is deliberately never frozen, so a hidden
-   * tab keeps writing and its lease correctly stays put. Safari and Firefox
-   * expose Web Locks WITHOUT those events: a hidden tab can be suspended at
-   * any time with no signal at all, and a suspended holder would starve
-   * every visible tab's writes indefinitely. There — and only there — the
-   * lease follows VISIBILITY instead (see parkWriteLeases_).
-   */
-  private freezeLifecycleSupported_(): boolean {
-    return typeof document !== 'undefined' && 'onfreeze' in document;
-  }
-
-  /**
-   * Freeze-less visibility handoff, hidden side: every lease returns its
-   * browser resource (a held lock is released, a queued request aborted)
-   * but the entry stays, PARKED — the hidden page is still running, and an
-   * absent entry would fail the write gate OPEN, putting two writers on
-   * the root. Parked leases re-request on the next visible transition.
-   */
-  private parkWriteLeases_(): void {
-    for (const lease of this.writeLeases_.values()) {
-      if (lease.state === 'held') {
-        lease.state = 'parked';
-        lease.release?.();
-        lease.release = null;
-      } else if (lease.state === 'requested') {
-        lease.state = 'parked';
-        lease.controller?.abort();
-        lease.controller = null;
+  /** Executes eviction purges recorded while this manager was a follower. */
+  private runPendingEvictPurges_(): void {
+    const paths = [...this.pendingEvictPurges_];
+    this.pendingEvictPurges_.clear();
+    for (const pathString of paths) {
+      if (!this.trackedRoots_.has(pathString)) {
+        void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
       }
     }
   }
 
-  /**
-   * Freeze-less visibility handoff, visible side: parked leases re-queue
-   * (behind whichever tab currently holds — a returning tab never seizes).
-   */
-  private unparkWriteLeases_(): void {
-    if (this.disposed_) {
+  /** Returns the writer lease to the browser (dispose only). */
+  private releaseWriterLease_(): void {
+    if (this.leaseTimer_ !== null) {
+      clearInterval(this.leaseTimer_);
+      this.leaseTimer_ = null;
+    }
+    const lease = this.writerLease_;
+    if (lease === null) {
       return;
     }
-    const locks = webLocks();
-    if (locks === null) {
-      return;
-    }
-    for (const [pathString, lease] of [...this.writeLeases_]) {
-      if (lease.state === 'parked') {
-        this.writeLeases_.delete(pathString);
-        this.requestWriteLease_(pathString, locks);
-      }
-    }
-  }
-
-  /** Returns every lease (held or queued) ahead of page suspension. */
-  private suspendWriteLeases_(): void {
-    for (const pathString of [...this.writeLeases_.keys()]) {
-      this.releaseWriteLease_(pathString);
-    }
-  }
-
-  /** Re-requests leases for the still-tracked roots after the page resumes. */
-  private resumeWriteLeases_(): void {
-    if (this.disposed_) {
-      return;
-    }
-    for (const pathString of this.trackedRoots_) {
-      this.acquireWriteLease_(pathString);
-    }
-  }
-
-  /**
-   * Completion step for untrack/evict cleanup: returns the lease unless the
-   * root was re-tracked meanwhile — the new listen owns it now. Destructive
-   * cleanup calls this AFTER its queued operation settles, so a waiting tab
-   * can never be granted (and commit) into the window before the cleanup
-   * runs, only for that cleanup to erase its generation.
-   */
-  private releaseWriteLeaseIfUntracked_(pathString: string): void {
-    if (!this.trackedRoots_.has(pathString)) {
-      this.releaseWriteLease_(pathString);
-    }
-  }
-
-  /** Returns the root's write lease to the browser (idempotent). */
-  private releaseWriteLease_(pathString: string): void {
-    const lease = this.writeLeases_.get(pathString);
-    if (lease === undefined) {
-      return;
-    }
-    this.writeLeases_.delete(pathString);
+    this.writerLease_ = null;
     if (lease.state === 'held') {
-      // Held: hand the lock back by resolving the callback's promise.
-      lease.state = 'parked';
       lease.release?.();
-    } else if (lease.state === 'requested') {
-      // Still queued: remove the request from the browser's lock queue so
-      // repeated untrack/retrack cycles cannot accumulate orphaned queued
-      // requests (each retaining this manager until some other tab exits).
-      // Abort only PRE-grant — a held lock is returned via release above,
-      // keeping behavior identical across Web Locks spec revisions.
-      lease.state = 'parked';
+    } else {
       lease.controller?.abort();
     }
-    // 'parked' holds no browser resource: nothing to return.
   }
 
   /**
@@ -1037,27 +1015,24 @@ export class PersistenceManager {
     if (this.trackedRootFor(pathString) !== null) {
       // Housekeeping delete (the covering ancestor's record is the one
       // future sessions should restore): guarded to the one generation
-      // this manager itself verified or wrote. An ADOPTED baseline
-      // (rootNode null) carries another writer's revision for content this
-      // manager never saw — it authorizes nothing. The lease is released
-      // only from the queued operation's completion: releasing first would
-      // let a waiting tab commit a fresh generation in the window before
-      // the queued delete runs, only for the delete to erase it (and the
-      // revision guard closes the same interleave when this tab was never
-      // the holder at all). Skip the release if the root was re-tracked
-      // meanwhile — the new listen owns the lease now.
+      // this manager itself verified or wrote — a revision-NAMED delete is
+      // safe without lock ownership by construction, because it can never
+      // remove a successor generation some other writer committed. An
+      // ADOPTED baseline (rootNode null) carries another writer's revision
+      // for content this manager never saw — it authorizes nothing, and
+      // skipping is safe (a leftover record is at worst a slightly stale
+      // shadow the hash protocol revalidates).
       const prev = this.lastFlush_.get(pathString);
       const ownedRevision =
         prev !== undefined && prev.rootNode !== null ? prev.revision : null;
       this.latest_.delete(pathString);
       this.lastFlush_.delete(pathString);
       this.changedSinceFlush_.delete(pathString);
-      void this.enqueue_(pathString, () =>
-        (ownedRevision !== null
-          ? this.deleteRecordIfRevision_(pathString, ownedRevision)
-          : Promise.resolve()
-        ).then(() => this.releaseWriteLeaseIfUntracked_(pathString))
-      );
+      if (ownedRevision !== null) {
+        void this.enqueue_(pathString, () =>
+          this.deleteRecordIfRevision_(pathString, ownedRevision)
+        );
+      }
       return;
     }
     // Release the tree only after the final flush settles (flush_ reads
@@ -1070,9 +1045,6 @@ export class PersistenceManager {
         this.lastFlush_.delete(pathString);
         this.changedSinceFlush_.delete(pathString);
       }
-      // After the final flush so a lease-holding tab still writes the
-      // last tree before the lease transfers.
-      this.releaseWriteLeaseIfUntracked_(pathString);
     };
     void this.flushNow(pathString).then(release, release);
   }
@@ -1641,6 +1613,13 @@ export class PersistenceManager {
     onManifest: (hashes: PersistedSeedHashes) => void = () => {}
   ): Promise<ReadResult | null> {
     const key = this.key_(pathString);
+    // The revision of the generation a corrupt/expired verdict was reached
+    // ON — the cleanup below deletes only THAT generation (a revision-named
+    // delete cannot remove a successor another writer commits between this
+    // read and the cleanup transaction). Null when the stored manifest is
+    // too malformed to even carry a string revision (nothing current can be
+    // named; see the cleanup site).
+    let cleanupRevision: string | null = null;
     // One readonly transaction is the consistency boundary for manifest +
     // immutable range records. The manifest callback fires after every range
     // request has been synchronously queued, but before those payloads finish
@@ -1664,6 +1643,10 @@ export class PersistenceManager {
             return;
           }
           if (!structurallyValidManifest(manifest)) {
+            const rawRevision = (manifest as { revision?: unknown }).revision;
+            if (typeof rawRevision === 'string') {
+              cleanupRevision = rawRevision;
+            }
             this.restoreReasons_.set(pathString, 'corrupt');
             done(null);
             return;
@@ -1674,6 +1657,7 @@ export class PersistenceManager {
             return;
           }
           if (manifest.updatedAt < Date.now() - PERSISTENCE_MAX_AGE_MS) {
+            cleanupRevision = manifest.revision;
             this.restoreReasons_.set(pathString, 'expired');
             done(null);
             return;
@@ -1711,6 +1695,7 @@ export class PersistenceManager {
                   record.tree === undefined
                 ) {
                   failed = true;
+                  cleanupRevision = manifest.revision;
                   this.restoreReasons_.set(pathString, 'corrupt');
                 } else {
                   rawTrees[index] = record.tree;
@@ -1745,6 +1730,7 @@ export class PersistenceManager {
           return null;
         }
         if (assembled === null || assembled.isEmpty()) {
+          cleanupRevision = collected.manifest.revision;
           this.restoreReasons_.set(pathString, 'corrupt');
         } else {
           result = {
@@ -1764,9 +1750,16 @@ export class PersistenceManager {
       if (result === null) {
         const reason = this.restoreReasons_.get(pathString);
         if (reason === 'corrupt' || reason === 'expired') {
-          // Best-effort cleanup. Auth/missing misses must not delete another
-          // identity's otherwise valid cache record.
-          void this.deleteRecord_(pathString);
+          // Best-effort cleanup, NAMED to the generation the verdict was
+          // reached on: a successor committed meanwhile (this manager may
+          // be a follower queued behind another tab's lease) must survive.
+          // Auth/missing misses must not delete another identity's
+          // otherwise valid cache record. A manifest too malformed to carry
+          // a revision cannot be named — delete unconditionally; no CAS
+          // writer can have produced it, so nothing current is at risk.
+          void (cleanupRevision !== null
+            ? this.deleteRecordIfRevision_(pathString, cleanupRevision)
+            : this.deleteRecord_(pathString));
         }
       }
       return result;
@@ -2315,11 +2308,24 @@ export class PersistenceManager {
   /** Drop an unusable persisted record but keep the live root tracked. */
   invalidate(path: Path): void {
     const pathString = path.toString();
+    // The record being invalidated is the one this manager just RESTORED —
+    // its revision sits in lastFlush_ (set by restoreForListen). Name the
+    // delete to it so a successor generation another writer committed
+    // meanwhile survives. Unnamable (no verified baseline): skip — the next
+    // restore of a genuinely bad record fails again and readRecordOnce_'s
+    // own named cleanup removes it.
+    const prev = this.lastFlush_.get(pathString);
+    const restoredRevision =
+      prev !== undefined && prev.rootNode !== null ? prev.revision : null;
     this.latest_.delete(pathString);
     this.lastFlush_.delete(pathString);
     this.changedSinceFlush_.delete(pathString);
     recordPersistenceEvent(pathString, 'invalidate', 'corrupt-or-incompatible');
-    void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+    if (restoredRevision !== null) {
+      void this.enqueue_(pathString, () =>
+        this.deleteRecordIfRevision_(pathString, restoredRevision)
+      );
+    }
   }
 
   /**
@@ -2342,34 +2348,28 @@ export class PersistenceManager {
     }
     persistenceStats.evictions++;
     recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
-    // Through the queue: a flush already running for this root finishes its
-    // writes first, then the delete removes them — never the reverse. The
-    // delete itself stays UNCONDITIONAL (revoked access means the cached
-    // copy must go, even a generation another tab wrote — its own access
-    // is revoked too and its own evict follows), but the lease is held
-    // THROUGH it: releasing first would let a waiting tab commit a fresh
-    // generation into the window before this queued delete runs, only for
-    // the delete to erase it while that tab's lastFlush_ still claims the
-    // generation is stored. Skip the release if the root was re-tracked
-    // meanwhile — the new listen owns the lease now.
-    void this.enqueue_(pathString, () =>
-      this.deleteRecord_(pathString).then(() =>
-        this.releaseWriteLeaseIfUntracked_(pathString)
-      )
-    );
+    // The purge is unconditional by INTENT (revoked access must purge the
+    // cached copy), but purges are writes and writes belong to the writer:
+    // a follower's immediate delete could erase a generation the current
+    // holder just committed, leaving that holder's lastFlush_ claiming the
+    // generation is stored (identical rewrites then short-circuit). The
+    // holder purges now — through the root's queue, so a flush already in
+    // flight finishes first, and the lease (manager-scoped, untouched by
+    // eviction) is held throughout. A follower records the intent; the
+    // grant callback executes it, and the holder tab's own eviction (same
+    // revocation, same user) usually purges long before. Re-tracking
+    // cancels the pending purge (see track()).
+    if (this.holdsWriterLease_()) {
+      void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
+    } else {
+      this.pendingEvictPurges_.add(pathString);
+    }
   }
 
   dispose(): void {
     this.disposed_ = true;
-    for (const pathString of [...this.writeLeases_.keys()]) {
-      this.releaseWriteLease_(pathString);
-    }
-    if (this.leaseLifecycleCleanup_ !== null) {
-      for (const cleanup of this.leaseLifecycleCleanup_) {
-        cleanup();
-      }
-      this.leaseLifecycleCleanup_ = null;
-    }
+    this.releaseWriterLease_();
+    this.pendingEvictPurges_.clear();
     for (const timer of this.writeTimers_.values()) {
       clearTimeout(timer);
     }
@@ -2522,10 +2522,10 @@ export class PersistenceManager {
     if (!entry || this.disposed_ || !this.authScopeConfigured_) {
       return Promise.resolve();
     }
-    if (!this.holdsWriteLease_(pathString)) {
-      // Another tab is this root's writer. latest_ keeps the newest tree in
-      // memory; if the lease ever transfers here, the grant callback
-      // re-enters the ordinary write window.
+    if (!this.holdsWriterLease_()) {
+      // Another tab is the writer. latest_ keeps the newest tree in memory;
+      // if the lease ever transfers here, the grant callback re-enters the
+      // ordinary write window for every tracked root.
       return Promise.resolve();
     }
     const { node, revision, authScope } = entry;

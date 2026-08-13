@@ -16,17 +16,20 @@
  */
 
 /**
- * Multi-tab flush economics: cross-tab write leases (Web Locks) and the
+ * Multi-tab write economics: the manager-wide writer lease (Web Locks
+ * leader election), heartbeat liveness + steal-on-stale takeover, and the
  * manifest-only stale-baseline adoption.
  *
  * The regression these lock in: two live tabs flushing the same churning
  * root used to leapfrog each other's manifest revisions, and every CAS
- * loser re-read + decoded the ENTIRE stored root, adopted it as an
- * identity-diff baseline that shares no identity with the live tree (so
- * every range marked dirty), re-staged the full root, and retried
- * IMMEDIATELY — unbounded full-tree work in every tab for as long as both
- * lived, which crashed large workspaces and monopolized IndexedDB against
- * boot restores.
+ * loser re-read + decoded the ENTIRE stored root, re-staged it in full, and
+ * retried immediately — unbounded full-tree work in every tab, which
+ * crashed large workspaces and monopolized IndexedDB against boot restores.
+ *
+ * These tests stub ONLY `navigator` (configurable in every browser). They
+ * never redefine `window`/`document` — those are non-configurable own
+ * properties in Chrome and Firefox, and the design needs no lifecycle
+ * listeners: holder liveness is proven by heartbeat, not lifecycle events.
  */
 import { expect } from 'chai';
 
@@ -35,20 +38,17 @@ import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
 
-// ── minimal fake Web Locks manager (exclusive mode, FIFO grants, abortable
-//    pending requests — mirrors the platform contract the manager relies on) ─
+// ── fake Web Locks manager (exclusive, FIFO, abortable, steal-capable) ──────
 function makeFakeWebLocks(events: string[] = []): {
   locks: {
     request: (
       name: string,
-      options: { mode: 'exclusive'; signal?: AbortSignal },
+      options: { mode: 'exclusive'; signal?: AbortSignal; steal?: boolean },
       callback: (lock: unknown) => Promise<void>
     ) => Promise<void>;
   };
   holders: Map<string, number>;
-  /** Requests waiting in the queue (excludes the current holder). */
   queuedCount: (name: string) => number;
-  /** A callback is currently holding the lock. */
   isHeld: (name: string) => boolean;
 } {
   interface PendingRequest {
@@ -57,8 +57,13 @@ function makeFakeWebLocks(events: string[] = []): {
     reject: (error: Error) => void;
   }
   const queues = new Map<string, PendingRequest[]>();
-  const busy = new Set<string>();
+  const busy = new Map<string, PendingRequest>();
   const holders = new Map<string, number>();
+  const abortError = () => {
+    const error = new Error('The request was aborted.');
+    error.name = 'AbortError';
+    return error;
+  };
   const pump = (name: string) => {
     if (busy.has(name)) {
       return;
@@ -67,37 +72,60 @@ function makeFakeWebLocks(events: string[] = []): {
     if (next === undefined) {
       return;
     }
-    busy.add(name);
+    busy.set(name, next);
     holders.set(name, (holders.get(name) ?? 0) + 1);
     events.push('grant:' + holders.get(name));
     void Promise.resolve()
       .then(() => next.callback({ name, mode: 'exclusive' }))
       .catch(() => {})
       .then(() => {
-        busy.delete(name);
-        next.settle();
-        pump(name);
+        // Settle only the holder that still owns the lock (a stolen
+        // holder was already rejected and replaced).
+        if (busy.get(name) === next) {
+          busy.delete(name);
+          next.settle();
+          pump(name);
+        }
       });
   };
   return {
     locks: {
       request: (name, options, callback) =>
         new Promise<void>((settle, reject) => {
+          if (options.steal && options.signal) {
+            // Platform contract (verified in Chrome): signal+steal is
+            // rejected outright — a steal that carried a signal would
+            // silently never steal.
+            const error = new Error(
+              "The 'signal' and 'steal' options cannot be used together."
+            );
+            error.name = 'NotSupportedError';
+            reject(error);
+            return;
+          }
           if (!queues.has(name)) {
             queues.set(name, []);
           }
           const pending: PendingRequest = { callback, settle, reject };
-          queues.get(name)!.push(pending);
-          // Web Locks contract: aborting the signal drops a request that has
-          // not been granted yet and rejects with an AbortError.
+          if (options.steal) {
+            // Web Locks steal: the held lock is released immediately, the
+            // old holder's request promise rejects with AbortError, and the
+            // stealing request is granted first.
+            const holder = busy.get(name);
+            if (holder !== undefined) {
+              busy.delete(name);
+              holder.reject(abortError());
+            }
+            queues.get(name)!.unshift(pending);
+          } else {
+            queues.get(name)!.push(pending);
+          }
           options.signal?.addEventListener('abort', () => {
             const queue = queues.get(name);
             const index = queue ? queue.indexOf(pending) : -1;
             if (queue && index !== -1) {
               queue.splice(index, 1);
-              const abortError = new Error('The request was aborted.');
-              abortError.name = 'AbortError';
-              reject(abortError);
+              reject(abortError());
             }
           });
           pump(name);
@@ -109,60 +137,19 @@ function makeFakeWebLocks(events: string[] = []): {
   };
 }
 
-// ── minimal document/window event-target stub for page-lifecycle tests ─────
-function makeFakeLifecycleTarget(options: { freezeCapable?: boolean } = {}): {
-  target: {
-    addEventListener: (type: string, handler: (event: unknown) => void) => void;
-    removeEventListener: (
-      type: string,
-      handler: (event: unknown) => void
-    ) => void;
-    visibilityState: string;
-    onfreeze?: null;
-  };
-  dispatch: (type: string, event?: unknown) => void;
-  setVisibility: (state: 'visible' | 'hidden') => void;
-  listenerCount: () => number;
+// ── shared heartbeat store (the localStorage seam) ──────────────────────────
+function makeFakeHeartbeatStore(): {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  data: Map<string, string>;
 } {
-  const listeners = new Map<string, Set<(event: unknown) => void>>();
-  const target: {
-    addEventListener: (type: string, handler: (event: unknown) => void) => void;
-    removeEventListener: (
-      type: string,
-      handler: (event: unknown) => void
-    ) => void;
-    visibilityState: string;
-    onfreeze?: null;
-  } = {
-    addEventListener: (type, handler) => {
-      if (!listeners.has(type)) {
-        listeners.set(type, new Set());
-      }
-      listeners.get(type)!.add(handler);
-    },
-    removeEventListener: (type, handler) => {
-      listeners.get(type)?.delete(handler);
-    },
-    visibilityState: 'visible'
-  };
-  if (options.freezeCapable) {
-    // freezeLifecycleSupported_ feature-detects via `'onfreeze' in document`.
-    target.onfreeze = null;
-  }
-  const dispatch = (type: string, event: unknown = {}) => {
-    for (const handler of [...(listeners.get(type) ?? [])]) {
-      handler(event);
-    }
-  };
+  const data = new Map<string, string>();
   return {
-    target,
-    dispatch,
-    setVisibility: state => {
-      target.visibilityState = state;
-      dispatch('visibilitychange');
-    },
-    listenerCount: () =>
-      [...listeners.values()].reduce((sum, set) => sum + set.size, 0)
+    data,
+    getItem: key => data.get(key) ?? null,
+    setItem: (key, value) => {
+      data.set(key, value);
+    }
   };
 }
 
@@ -249,6 +236,7 @@ function makeFakeIndexedDB(
             value,
             delete: () => {
               data.delete(key);
+              options.onDelete?.(key);
               return makeRequest(undefined);
             },
             continue: () => async(step)
@@ -344,12 +332,21 @@ function makeWorkspace(): Record<string, unknown> {
 
 const ROOT_PATH = new Path('tabs/file-system');
 const ROOT = ROOT_PATH.toString();
+const MANIFEST_KEY = 'test-repo|' + ROOT;
+const LOCK = 'firebase-database-persistence-write|test-repo';
 const CHURN_REL = 'app-0/data/entries/entry-0/body';
 
 function mkManager(
   factory: IDBFactory,
-  writeDelay = 0,
-  rangeTarget = 4 * 1024
+  options: {
+    writeDelay?: number;
+    heartbeatMs?: number;
+    staleMs?: number;
+    store?: {
+      getItem(k: string): string | null;
+      setItem(k: string, v: string): void;
+    } | null;
+  } = {}
 ): PersistenceManager {
   const manager = new PersistenceManager(
     'test-repo',
@@ -357,27 +354,30 @@ function mkManager(
     true,
     8000,
     100 * 1024 * 1024,
-    writeDelay,
-    rangeTarget
+    options.writeDelay ?? 0,
+    4 * 1024,
+    undefined,
+    undefined,
+    options.heartbeatMs ?? 60_000,
+    options.staleMs ?? 600_000,
+    options.store ?? null
   );
   manager.setAuthScope('u1');
   return manager;
 }
 
-/** Manifest + every referenced range record present, all content readable. */
+/** Manifest + every referenced range record present, content readable. */
 async function expectSelfContainedAndEqual(
   factory: IDBFactory,
   data: Map<string, unknown>,
   expected: Node
 ): Promise<void> {
-  const manifest = data.get('test-repo|' + ROOT) as {
+  const manifest = data.get(MANIFEST_KEY) as {
     ranges: Array<{ recordId: string }>;
   };
   expect(manifest).to.not.equal(undefined);
   for (const range of manifest.ranges) {
-    expect(data.has('test-repo|' + ROOT + '#range:' + range.recordId)).to.equal(
-      true
-    );
+    expect(data.has(MANIFEST_KEY + '#range:' + range.recordId)).to.equal(true);
   }
   const reader = mkManager(factory);
   reader.track(ROOT);
@@ -389,44 +389,28 @@ async function expectSelfContainedAndEqual(
 
 describe('PersistenceManager multi-tab write economics', () => {
   // Node 21+ defines globalThis.navigator as a getter; stub/restore via
-  // property descriptors rather than assignment.
+  // property descriptors. ONLY navigator is ever stubbed — it is a
+  // configurable/replaceable property in every engine, unlike
+  // window/document.
   let savedNavigator: PropertyDescriptor | undefined;
-
-  let savedDocument: PropertyDescriptor | undefined;
-  let savedWindow: PropertyDescriptor | undefined;
-
-  const stubGlobal = (
-    name: 'navigator' | 'document' | 'window',
-    value: unknown
-  ) => {
-    Object.defineProperty(globalThis, name, {
+  const stubNavigator = (value: unknown) => {
+    Object.defineProperty(globalThis, 'navigator', {
       value,
       configurable: true,
       writable: true
     });
   };
-  const stubNavigator = (value: unknown) => stubGlobal('navigator', value);
-  const restoreGlobal = (
-    name: 'navigator' | 'document' | 'window',
-    descriptor: PropertyDescriptor | undefined
-  ) => {
-    if (descriptor) {
-      Object.defineProperty(globalThis, name, descriptor);
-    } else {
-      delete (globalThis as Record<string, unknown>)[name];
-    }
-  };
 
   beforeEach(() => {
     savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-    savedDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
-    savedWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   });
 
   afterEach(() => {
-    restoreGlobal('navigator', savedNavigator);
-    restoreGlobal('document', savedDocument);
-    restoreGlobal('window', savedWindow);
+    if (savedNavigator) {
+      Object.defineProperty(globalThis, 'navigator', savedNavigator);
+    } else {
+      delete (globalThis as { navigator?: unknown }).navigator;
+    }
   });
 
   it('with Web Locks, only the lease holder writes under cross-tab churn', async () => {
@@ -440,7 +424,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
     await tabA.flushNow(ROOT);
     await flushAsync();
-    const gen1 = shared.data.get('test-repo|' + ROOT) as { revision: string };
+    const gen1 = shared.data.get(MANIFEST_KEY) as { revision: string };
     expect(gen1).to.not.equal(undefined);
 
     const tabB = mkManager(shared.factory);
@@ -449,7 +433,6 @@ describe('PersistenceManager multi-tab write economics', () => {
     expect(restored).to.not.equal(null);
     let treeB: Node = restored!.node;
 
-    // Steady churn observed by both tabs.
     const writeThroughs0 = persistenceStats.writeThroughs;
     const hashed0 = persistenceStats.rangesHashed;
     for (let i = 0; i < 5; i++) {
@@ -463,13 +446,9 @@ describe('PersistenceManager multi-tab write economics', () => {
       await flushAsync();
     }
 
-    // The holder's generations stayed incremental: one dirty range per churn
-    // event, never a full re-stage; the non-holder wrote nothing.
-    const manifest = shared.data.get('test-repo|' + ROOT) as {
-      revision: string;
-    };
-    expect(manifest.revision.startsWith(gen1.revision.split('-')[0])).to.equal(
-      true,
+    const manifest = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(manifest.revision.split('-')[0]).to.equal(
+      gen1.revision.split('-')[0],
       'every committed generation must come from the lease holder (tab A)'
     );
     expect(persistenceStats.writeThroughs - writeThroughs0).to.equal(5);
@@ -496,7 +475,6 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabB.track(ROOT);
     let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
 
-    // A commits one more generation; B (non-holder) accumulates in memory.
     treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-newer'));
     tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
     await tabA.flushNow(ROOT);
@@ -506,18 +484,17 @@ describe('PersistenceManager multi-tab write economics', () => {
     await tabB.flushNow(ROOT); // skipped: not the holder
     await flushAsync();
 
-    // Holder goes away; the lease transfers to B, whose baseline (its boot
-    // restore) is now stale — the takeover resolves through the CAS +
-    // manifest-only adoption, never a range read. The read log is cleared
-    // BEFORE the dispose: the grant callback arms B's (zero-delay) write
-    // window immediately, so the takeover flush itself runs inside the
-    // observation window of the assertion below.
+    // The read log is cleared BEFORE the dispose: the grant callback arms
+    // B's (zero-delay) write window immediately, so the takeover flush
+    // itself runs inside the assertion's observation window.
     gets.length = 0;
     tabA.dispose();
     await flushAsync();
     treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-owns'));
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
     await tabB.flushNow(ROOT);
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 20));
     await flushAsync(30);
 
     const rangeGets = gets.filter(key => key.includes('#range:'));
@@ -529,8 +506,279 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabB.dispose();
   });
 
+  it('a silent holder is stolen from; the stolen holder stops writing and re-queues politely', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+    const store = makeFakeHeartbeatStore();
+
+    // A heartbeats only at grant (huge interval) — the "suspended holder":
+    // its JavaScript may be paused at any time with no lifecycle event at
+    // all (Safari/Firefox background suspension, frozen tabs, wedged pages).
+    const tabA = mkManager(shared.factory, {
+      heartbeatMs: 100_000,
+      staleMs: 100_000,
+      store
+    });
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const instanceA = (
+      shared.data.get(MANIFEST_KEY) as { revision: string }
+    ).revision.split('-')[0];
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+
+    // B ticks fast and treats a 60ms-stale heartbeat as a dead holder.
+    const tabB = mkManager(shared.factory, {
+      heartbeatMs: 20,
+      staleMs: 60,
+      store
+    });
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-steals'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+
+    // Wait past staleness: B's tick steals, the grant arms B's window, and
+    // B commits through the ordinary CAS + adoption path.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await flushAsync(30);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    await flushAsync(30);
+    const manifest = shared.data.get(MANIFEST_KEY) as { revision: string };
+    expect(manifest.revision.split('-')[0]).to.not.equal(
+      instanceA,
+      'a live tab must steal the lease from a silent holder'
+    );
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
+
+    // The stolen holder's write gate closed and it re-queued POLITELY (one
+    // queued request, no counter-steal).
+    const writeThroughs0 = persistenceStats.writeThroughs;
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-stale'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(persistenceStats.writeThroughs).to.equal(
+      writeThroughs0,
+      'a stolen holder must stop writing until the lease is granted again'
+    );
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true); // B still holds
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it("a follower's eviction purge waits for the lease; the holder's generation survives until then", async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    expect((await tabB.restoreForListen(ROOT)).record).to.not.equal(null);
+
+    // B (a follower) is evicted. Its purge must NOT run while A holds the
+    // lease and has a live generation — A's lastFlush_ still describes
+    // storage and identical rewrites would silently short-circuit.
+    tabB.evict(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
+      undefined,
+      "a follower's eviction must not delete the holder's live generation"
+    );
+    // A (the holder) keeps committing normally meanwhile.
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-still-on'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
+    ).to.be.a('string');
+
+    // The lease transfers to B: the recorded purge executes on grant.
+    tabA.dispose();
+    await flushAsync(20);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'the pending eviction purge must execute once the lease is granted'
+    );
+    tabB.dispose();
+  });
+
+  it('re-tracking a root cancels its pending eviction purge', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    const treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    expect((await tabB.restoreForListen(ROOT)).record).to.not.equal(null);
+    tabB.evict(ROOT_PATH); // pending purge (B is a follower)
+    tabB.track(ROOT); // access restored: the stale intent must be DROPPED,
+    tabB.untrack(ROOT); // even if the root is later untracked again
+    await flushAsync(8);
+    tabA.dispose(); // lease transfers to B
+    await flushAsync(20);
+    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(
+      undefined,
+      'a re-tracked root must not be purged by a stale eviction intent'
+    );
+    tabB.dispose();
+  });
+
+  it('corrupt-record cleanup deletes only the generation the verdict was reached on', async () => {
+    // No Web Locks: the revision-NAMED delete alone must protect a
+    // successor generation — no ownership involved. The successor is
+    // committed via the onGet hook, which runs synchronously BEFORE the
+    // store returns a value: the restore's read (1st manifest get) sees the
+    // corrupt R1, and by the time ANY later read or delete touches the
+    // manifest, the healthy successor is already committed — exactly the
+    // real interleaving (verdict on R1, writer commits R2, cleanup runs).
+    let manifestReads = 0;
+    let manifestDeleted = false;
+    let commitSuccessor: (() => void) | null = null;
+    const shared = makeFakeIndexedDB({
+      onGet: key => {
+        if (key === MANIFEST_KEY && ++manifestReads >= 2) {
+          commitSuccessor?.();
+        }
+      },
+      onDelete: key => {
+        if (key === MANIFEST_KEY) {
+          manifestDeleted = true;
+        }
+      }
+    });
+
+    const writer = mkManager(shared.factory);
+    writer.track(ROOT);
+    const treeW: Node = nodeFromJSON(makeWorkspace());
+    writer.serverCacheUpdated(ROOT_PATH, treeW, undefined);
+    await writer.flushNow(ROOT);
+    await flushAsync();
+    const good = shared.data.get(MANIFEST_KEY) as {
+      revision: string;
+      ranges: Array<{ recordId: string }>;
+    };
+
+    // Corrupt the stored generation R1: drop one range record.
+    const droppedKey = MANIFEST_KEY + '#range:' + good.ranges[0].recordId;
+    const droppedRecord = shared.data.get(droppedKey);
+    shared.data.delete(droppedKey);
+    commitSuccessor = () => {
+      commitSuccessor = null;
+      shared.data.set(droppedKey, droppedRecord);
+      shared.data.set(MANIFEST_KEY, {
+        ...(shared.data.get(MANIFEST_KEY) as object),
+        revision: 'successor-1'
+      });
+    };
+
+    const reader = mkManager(shared.factory);
+    reader.track(ROOT);
+    manifestReads = 0; // count only the reader's reads from here on:
+    // read #1 = the restore (sees corrupt R1); read #2 = the cleanup's
+    // revision guard — the successor commits synchronously before it.
+    const result = await reader.restoreForListen(ROOT);
+    expect(result.record).to.equal(null);
+    expect(result.reason).to.equal('corrupt');
+    await flushAsync(20);
+    expect(manifestDeleted).to.equal(
+      false,
+      'the revision-named cleanup must leave the successor manifest in place'
+    );
+    const survivorManifest = shared.data.get(MANIFEST_KEY) as {
+      revision: string;
+    };
+    expect(survivorManifest).to.not.equal(
+      undefined,
+      'a successor generation must survive corrupt-record cleanup'
+    );
+    expect(survivorManifest.revision).to.equal('successor-1');
+    writer.dispose();
+    reader.dispose();
+  });
+
+  it('invalidate deletes only the restored generation; unnamable baselines delete nothing', async () => {
+    const shared = makeFakeIndexedDB();
+    const writer = mkManager(shared.factory);
+    writer.track(ROOT);
+    let treeW: Node = nodeFromJSON(makeWorkspace());
+    writer.serverCacheUpdated(ROOT_PATH, treeW, undefined);
+    await writer.flushNow(ROOT);
+    await flushAsync();
+    const r1 = (shared.data.get(MANIFEST_KEY) as { revision: string }).revision;
+
+    // Reader restores R1, then the writer commits R2; the reader's
+    // invalidate (named to R1) must not remove R2.
+    const reader = mkManager(shared.factory);
+    reader.track(ROOT);
+    expect((await reader.restoreForListen(ROOT)).record).to.not.equal(null);
+    treeW = treeW.updateChild(new Path(CHURN_REL), nodeFromJSON('w2'));
+    writer.serverCacheUpdated(ROOT_PATH, treeW, [CHURN_REL.split('/')]);
+    await writer.flushNow(ROOT);
+    await flushAsync();
+    const r2 = (shared.data.get(MANIFEST_KEY) as { revision: string }).revision;
+    expect(r2).to.not.equal(r1);
+    reader.invalidate(ROOT_PATH);
+    await flushAsync(10);
+    expect(
+      (shared.data.get(MANIFEST_KEY) as { revision: string }).revision
+    ).to.equal(r2, 'invalidate must not remove a successor generation');
+
+    // Named to the CURRENT generation, invalidate does clean up.
+    const reader2 = mkManager(shared.factory);
+    reader2.track(ROOT);
+    expect((await reader2.restoreForListen(ROOT)).record).to.not.equal(null);
+    reader2.invalidate(ROOT_PATH);
+    await flushAsync(10);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(
+      undefined,
+      'invalidate still removes the generation it restored'
+    );
+    writer.dispose();
+    reader.dispose();
+    reader2.dispose();
+  });
+
+  it('dispose aborts a still-queued lease request', async () => {
+    const fakeLocks = makeFakeWebLocks();
+    stubNavigator({ locks: fakeLocks.locks });
+    const shared = makeFakeIndexedDB();
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    await flushAsync();
+    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
+    const tabB = mkManager(shared.factory);
+    tabB.track(ROOT);
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
+    tabB.dispose();
+    expect(fakeLocks.queuedCount(LOCK)).to.equal(
+      0,
+      'a disposed manager must leave the lock queue'
+    );
+    tabA.dispose();
+  });
+
   it('without Web Locks, a CAS conflict adopts manifest-only and defers the retry to the write window', async () => {
-    // Node default: no navigator -> leases fail open, CAS is the backstop.
     const gets: string[] = [];
     const puts: string[] = [];
     const shared = makeFakeIndexedDB({
@@ -546,11 +794,10 @@ describe('PersistenceManager multi-tab write economics', () => {
     await tabA.flushNow(ROOT);
     await flushAsync();
 
-    const tabB = mkManager(shared.factory, WRITE_DELAY);
+    const tabB = mkManager(shared.factory, { writeDelay: WRITE_DELAY });
     tabB.track(ROOT);
     let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
 
-    // A commits a newer generation; B's baseline is now stale.
     treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('newer-a'));
     tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
     await tabA.flushNow(ROOT);
@@ -562,13 +809,8 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
     await tabB.flushNow(ROOT); // conflict -> manifest-only adopt
     puts.length = 0;
-    // Plenty of macrotask turns for an immediate (undeferred) retry to have
-    // begun STAGING — while staying far under the write window.
     await flushAsync(30);
 
-    // No range payload was read during adoption, and the retry has not even
-    // STARTED staging — it waits out the ordinary write window instead of
-    // re-flushing back-to-back.
     expect(gets.filter(key => key.includes('#range:'))).to.deep.equal([]);
     expect(puts.filter(key => key.includes('#range:'))).to.deep.equal(
       [],
@@ -579,6 +821,47 @@ describe('PersistenceManager multi-tab write economics', () => {
     await new Promise(resolve => setTimeout(resolve, WRITE_DELAY + 20));
     await flushAsync(20);
     expect(persistenceStats.writeThroughs).to.equal(writeThroughs0 + 1);
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('a window that elapsed mid-conflict defers to the adoption write window', async () => {
+    const puts: string[] = [];
+    const shared = makeFakeIndexedDB({ onPut: key => puts.push(key) });
+    const WRITE_DELAY = 250;
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const tabB = mkManager(shared.factory, { writeDelay: WRITE_DELAY });
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-newer'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b1'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    const inFlight = tabB.flushNow(ROOT); // CAS conflict -> adopt
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b2'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    (tabB as unknown as { scheduleFlush_: (p: string) => void }).scheduleFlush_(
+      ROOT
+    );
+    await inFlight;
+    puts.length = 0;
+    await flushAsync(10);
+    expect(puts.filter(key => key.includes('#range:'))).to.deep.equal(
+      [],
+      'the queue-drain retry must not begin staging before the write window'
+    );
+    await new Promise(resolve => setTimeout(resolve, WRITE_DELAY + 20));
+    await flushAsync(30);
     await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
     tabA.dispose();
     tabB.dispose();
@@ -607,15 +890,8 @@ describe('PersistenceManager multi-tab write economics', () => {
     await tabB.flushNow(ROOT); // conflict -> adopts manifest-only baseline
     await flushAsync(4);
 
-    // A covering peek off the adopted baseline would need rootNode, which
-    // is deliberately absent (serving from an undecoded baseline is exactly
-    // the decode this path removed). The peek must fall through to the
-    // exact-root read — which MISSES, because no record exists at the
-    // subtree's own key — without crashing on the null baseline.
     const record = await tabB.peek(ROOT + '/app-1', 'u1');
     expect(record).to.equal(null);
-    // Positive control: a DECODABLE baseline (tab A committed its own
-    // generation, rootNode real) must keep serving covering peeks.
     const control = await tabA.peek(ROOT + '/app-1', 'u1');
     expect(control).to.not.equal(null);
     expect(control!.node.val(true)).to.deep.equal(
@@ -625,199 +901,13 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabB.dispose();
   });
 
-  it('cancels queued lock requests when a non-holder root untracks', async () => {
-    const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB();
-    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
-
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    const treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
-
-    // Listener re-homes untrack and later re-track the same root routinely.
-    // Every released-before-grant request must leave the browser's queue —
-    // without cancellation each cycle would strand one more queued request
-    // (retaining the manager) until the holding tab exits.
-    const tabB = mkManager(shared.factory);
-    for (let cycle = 0; cycle < 5; cycle++) {
-      tabB.track(ROOT);
-      expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-      tabB.untrack(ROOT);
-      await flushAsync(4); // untrack releases after its final flush settles
-      expect(fakeLocks.queuedCount(LOCK)).to.equal(
-        0,
-        'released-before-grant requests must leave the lock queue'
-      );
-    }
-
-    // Cancellation must not fail the lease open: a re-tracked root still
-    // defers to the current holder.
-    tabB.track(ROOT);
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
-    const writeThroughs0 = persistenceStats.writeThroughs;
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-waits'));
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    await tabB.flushNow(ROOT);
-    await flushAsync();
-    expect(persistenceStats.writeThroughs).to.equal(writeThroughs0);
-
-    // The holder exits: the surviving (re-tracked) request is granted and
-    // the survivor becomes the writer.
-    tabA.dispose();
-    await flushAsync();
-    await tabB.flushNow(ROOT);
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-    expect(persistenceStats.writeThroughs).to.be.greaterThan(writeThroughs0);
-    tabB.dispose();
-  });
-
-  it('a frozen holder releases the lease; a live tab takes over; resume re-queues', async () => {
-    const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB();
-    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
-
-    // Each "tab" gets its own document/window lifecycle target; the manager
-    // captures the globals when it installs its handlers (first lease).
-    const lifecycleA = makeFakeLifecycleTarget();
-    stubGlobal('document', lifecycleA.target);
-    stubGlobal('window', lifecycleA.target);
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    let treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    const gen1 = shared.data.get('test-repo|' + ROOT) as { revision: string };
-    const instanceA = gen1.revision.split('-')[0];
-    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
-
-    const lifecycleB = makeFakeLifecycleTarget();
-    stubGlobal('document', lifecycleB.target);
-    stubGlobal('window', lifecycleB.target);
-    const tabB = mkManager(shared.factory);
-    tabB.track(ROOT);
-    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-
-    // Tab A freezes without untrack()/dispose() ever running. Its held lock
-    // must be released so live tabs are not starved of writes indefinitely.
-    lifecycleA.dispatch('freeze');
-    await flushAsync(4);
-    treeB = treeB.updateChild(
-      new Path(CHURN_REL),
-      nodeFromJSON('b-takes-over')
-    );
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    await tabB.flushNow(ROOT);
-    await flushAsync(30);
-    const manifest = shared.data.get('test-repo|' + ROOT) as {
-      revision: string;
-    };
-    expect(manifest.revision.split('-')[0]).to.not.equal(
-      instanceA,
-      'a live tab must take the lease over from a frozen holder'
-    );
-    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
-
-    // The frozen page resumes: it re-queues behind the current holder
-    // (never seizes the lock back), and takes over again when B exits.
-    lifecycleA.dispatch('resume');
-    await flushAsync(4);
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-    tabB.dispose();
-    await flushAsync(4);
-    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-again'));
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
-    await tabA.flushNow(ROOT);
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-    const finalManifest = shared.data.get('test-repo|' + ROOT) as {
-      revision: string;
-    };
-    expect(finalManifest.revision.split('-')[0]).to.equal(instanceA);
-
-    // dispose removes the lifecycle handlers it installed.
-    tabA.dispose();
-    expect(lifecycleA.listenerCount()).to.equal(0);
-  });
-
-  it('evict holds the lease through its queued delete; a successor commits only after it', async () => {
-    const events: string[] = [];
-    const fakeLocks = makeFakeWebLocks(events);
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB({
-      onDelete: key => events.push('del:' + key)
-    });
-    const MANIFEST_KEY = 'test-repo|' + ROOT;
-
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    const treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    expect(shared.data.get(MANIFEST_KEY)).to.not.equal(undefined);
-
-    // Tab B queues behind A and already has pending data to write.
-    const tabB = mkManager(shared.factory);
-    tabB.track(ROOT);
-    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-pending'));
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-
-    // A's access is revoked WHILE a slow flush of A's is still in flight —
-    // the queued delete lands behind it, holding the hazard window open.
-    // (A fresh-identity tree forces a full restage: many macrotasks.)
-    tabA.serverCacheUpdated(
-      ROOT_PATH,
-      nodeFromJSON(makeWorkspace()),
-      undefined
-    );
-    void tabA.flushNow(ROOT); // deliberately not awaited: in flight at evict
-    // The purge is unconditional, but the lease must be held THROUGH the
-    // queued delete: B may only be granted (and commit) after the delete
-    // has run, so the delete can never erase B's fresh generation.
-    events.length = 0;
-    tabA.evict(ROOT_PATH);
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-
-    const deleteIndex = events.indexOf('del:' + MANIFEST_KEY);
-    const grantIndex = events.findIndex(e => e.startsWith('grant:'));
-    expect(deleteIndex).to.not.equal(-1, 'the evict purge must run');
-    expect(grantIndex).to.not.equal(-1, 'the successor must be granted');
-    expect(deleteIndex).to.be.lessThan(
-      grantIndex,
-      'the lease must not transfer until the queued delete settled'
-    );
-    // B then committed a fresh, self-contained generation that survived.
-    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
-    tabB.dispose();
-    tabA.dispose();
-  });
-
   it('the ancestor-covered untrack delete only removes generations this manager verified or wrote', async () => {
-    // No Web Locks (Node default): the revision guard alone must protect a
-    // follower's housekeeping delete from erasing another writer's fresh
-    // generation — no lease ordering involved.
     const shared = makeFakeIndexedDB();
     const CHILD_PATH = new Path('tabs/file-system/sub-app');
     const CHILD = CHILD_PATH.toString();
     const CHILD_KEY = 'test-repo|' + CHILD;
     const childRel = ['data', 'entries', 'entry-0', 'body'];
 
-    // Writer W owns the child root and commits generation W1.
     const writer = mkManager(shared.factory);
     writer.track(CHILD);
     let treeW: Node = nodeFromJSON(makeWorkspace());
@@ -825,21 +915,17 @@ describe('PersistenceManager multi-tab write economics', () => {
     await writer.flushNow(CHILD);
     await flushAsync();
 
-    // Tab A tracks the ancestor AND the child, and restored W1.
     const tabA = mkManager(shared.factory);
     tabA.track(ROOT);
     tabA.track(CHILD);
     expect((await tabA.restoreForListen(CHILD)).record).to.not.equal(null);
 
-    // W commits a NEWER generation W2; A's knowledge (W1) is now stale.
     treeW = treeW.updateChild(new Path(childRel.join('/')), nodeFromJSON('w2'));
     writer.serverCacheUpdated(CHILD_PATH, treeW, [childRel]);
     await writer.flushNow(CHILD);
     await flushAsync();
     const w2 = shared.data.get(CHILD_KEY) as { revision: string };
 
-    // A untracks the child (covered by the tracked ancestor). Its
-    // housekeeping delete must NOT erase W2 — a generation it never saw.
     tabA.untrack(CHILD);
     await flushAsync(8);
     const survivor = shared.data.get(CHILD_KEY) as { revision: string };
@@ -849,8 +935,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     );
     expect(survivor.revision).to.equal(w2.revision);
 
-    // An ADOPTED (undecoded) baseline carries W's revision for content A
-    // never saw — it must not authorize the delete either.
+    // An ADOPTED (undecoded) baseline authorizes nothing.
     tabA.track(CHILD);
     let treeB: Node = (await tabA.restoreForListen(CHILD)).record!.node;
     treeW = treeW.updateChild(new Path(childRel.join('/')), nodeFromJSON('w3'));
@@ -859,20 +944,16 @@ describe('PersistenceManager multi-tab write economics', () => {
     await flushAsync();
     treeB = treeB.updateChild(new Path(childRel.join('/')), nodeFromJSON('w3'));
     tabA.serverCacheUpdated(CHILD_PATH, treeB, [childRel]);
-    await tabA.flushNow(CHILD); // CAS conflict -> adopts W's manifest (rootNode null)
-    // Untrack synchronously, BEFORE the deferred retry's timer fires: the
-    // baseline is still the adopted (undecoded) one, and the store still
-    // carries W's generation — exactly the state that must not be deleted.
-    tabA.untrack(CHILD);
+    await tabA.flushNow(CHILD); // CAS conflict -> adopts (rootNode null)
+    tabA.untrack(CHILD); // before the deferred retry's timer fires
     await flushAsync(8);
     expect(shared.data.get(CHILD_KEY)).to.not.equal(
       undefined,
       'an adopted baseline must not authorize the housekeeping delete'
     );
 
-    // The guard must not kill the cleanup either: a generation this manager
-    // itself wrote IS removed when it untracks under a covering ancestor.
-    writer.untrack(CHILD); // W leaves; A becomes the sole writer
+    // The guard must not kill the cleanup: our own generation IS removed.
+    writer.untrack(CHILD);
     await flushAsync(8);
     tabA.track(CHILD);
     let treeOwn: Node = (await tabA.restoreForListen(CHILD)).record!.node;
@@ -897,205 +978,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     tabA.dispose();
   });
 
-  it('a window that elapsed mid-conflict defers to the adoption write window', async () => {
-    // Node default (no Web Locks): the CAS + debounced adoption is the only
-    // protection. An update whose write window ELAPSES while the losing
-    // flush is still in flight marks the queue pending; the drain must NOT
-    // re-flush immediately — that is back-to-back full-tree staging under
-    // sustained lease-less churn, the exact thrash the debounce prevents.
-    const puts: string[] = [];
-    const shared = makeFakeIndexedDB({ onPut: key => puts.push(key) });
-    const WRITE_DELAY = 250;
-
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    let treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    const tabB = mkManager(shared.factory, WRITE_DELAY);
-    tabB.track(ROOT);
-    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
-    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-newer'));
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-
-    // B's conflicting flush is IN FLIGHT when a second update's window
-    // elapses (scheduleFlush_ is exactly what the timer runs; the queue is
-    // busy, so it marks flushPending_).
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b1'));
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    const inFlight = tabB.flushNow(ROOT); // CAS conflict -> adopt
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b2'));
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    (tabB as unknown as { scheduleFlush_: (p: string) => void }).scheduleFlush_(
-      ROOT
-    );
-    await inFlight;
-    puts.length = 0;
-    await flushAsync(10); // ample for an immediate (undeferred) retry to stage
-    expect(puts.filter(key => key.includes('#range:'))).to.deep.equal(
-      [],
-      'the queue-drain retry must not begin staging before the write window'
-    );
-
-    // After the window: exactly one deferred retry, carrying the LATEST
-    // tree — the update that marked the queue pending is not lost.
-    await new Promise(resolve => setTimeout(resolve, WRITE_DELAY + 20));
-    await flushAsync(30);
-    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
-    tabA.dispose();
-    tabB.dispose();
-  });
-
-  it('on freeze-less browsers the lease follows visibility; a hidden tab never writes', async () => {
-    // Safari/Firefox: Web Locks without the freeze lifecycle. A hidden tab
-    // can be suspended with NO event at all, so it must neither hold nor
-    // queue while hidden — and, because a hidden page is still RUNNING,
-    // its write gate must stay CLOSED (parked), never fail open.
-    const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB();
-    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
-
-    const lifecycleA = makeFakeLifecycleTarget();
-    stubGlobal('document', lifecycleA.target);
-    stubGlobal('window', lifecycleA.target);
-    const tabA = mkManager(shared.factory);
-    tabA.track(ROOT);
-    let treeA: Node = nodeFromJSON(makeWorkspace());
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    const gen1 = shared.data.get('test-repo|' + ROOT) as { revision: string };
-    const instanceA = gen1.revision.split('-')[0];
-    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
-
-    const lifecycleB = makeFakeLifecycleTarget();
-    stubGlobal('document', lifecycleB.target);
-    stubGlobal('window', lifecycleB.target);
-    const tabB = mkManager(shared.factory);
-    tabB.track(ROOT);
-    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
-    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-pending'));
-    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-
-    // A goes hidden: its held lock hands over; B commits.
-    lifecycleA.setVisibility('hidden');
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-    const afterHandoff = shared.data.get('test-repo|' + ROOT) as {
-      revision: string;
-    };
-    expect(afterHandoff.revision.split('-')[0]).to.not.equal(
-      instanceA,
-      'a visible tab must take over from a hidden holder on freeze-less browsers'
-    );
-
-    // The hidden tab keeps RUNNING and churning — but its parked gate must
-    // hold: no writes, no re-queued request, while hidden.
-    const writeThroughs0 = persistenceStats.writeThroughs;
-    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-hidden'));
-    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
-    await tabA.flushNow(ROOT);
-    await flushAsync();
-    expect(persistenceStats.writeThroughs).to.equal(
-      writeThroughs0,
-      'a hidden tab must never write on freeze-less browsers'
-    );
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(0);
-
-    // Visible again: re-queues behind the current holder (never seizes),
-    // and takes over when the holder exits.
-    lifecycleA.setVisibility('visible');
-    await flushAsync(4);
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(1);
-    tabB.dispose();
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-    expect(
-      (
-        shared.data.get('test-repo|' + ROOT) as { revision: string }
-      ).revision.split('-')[0]
-    ).to.equal(instanceA);
-    tabA.dispose();
-  });
-
-  it('a tab that starts hidden parks without queueing until first visible', async () => {
-    const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB();
-    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
-
-    const lifecycle = makeFakeLifecycleTarget();
-    lifecycle.target.visibilityState = 'hidden'; // opened in the background
-    stubGlobal('document', lifecycle.target);
-    stubGlobal('window', lifecycle.target);
-    const manager = mkManager(shared.factory);
-    manager.track(ROOT);
-    expect(fakeLocks.queuedCount(LOCK)).to.equal(
-      0,
-      'a hidden tab must not queue a lease request at startup'
-    );
-    expect(fakeLocks.isHeld(LOCK)).to.equal(false);
-
-    const tree: Node = nodeFromJSON(makeWorkspace());
-    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
-    await manager.flushNow(ROOT); // parked: gate closed
-    await flushAsync();
-    expect(shared.data.get('test-repo|' + ROOT)).to.equal(undefined);
-
-    lifecycle.setVisibility('visible');
-    await flushAsync(30);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await flushAsync(30);
-    await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
-    manager.dispose();
-  });
-
-  it('freeze-capable browsers keep the lease and keep writing while hidden', async () => {
-    // Chrome/Edge: a lock-holding page is exempt from freezing — a hidden
-    // tab keeps running and SHOULD keep persisting (background agents keep
-    // the cache fresh for the next boot). The visibility handoff must not
-    // engage there.
-    const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
-    const shared = makeFakeIndexedDB();
-    const LOCK = 'firebase-database-persistence-write|test-repo|' + ROOT;
-
-    const lifecycle = makeFakeLifecycleTarget({ freezeCapable: true });
-    stubGlobal('document', lifecycle.target);
-    stubGlobal('window', lifecycle.target);
-    const manager = mkManager(shared.factory);
-    manager.track(ROOT);
-    let tree: Node = nodeFromJSON(makeWorkspace());
-    manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
-    await manager.flushNow(ROOT);
-    await flushAsync();
-    expect(fakeLocks.isHeld(LOCK)).to.equal(true);
-
-    lifecycle.setVisibility('hidden');
-    await flushAsync(4);
-    expect(fakeLocks.isHeld(LOCK)).to.equal(
-      true,
-      'a freeze-capable browser keeps the lease while hidden'
-    );
-    const writeThroughs0 = persistenceStats.writeThroughs;
-    tree = tree.updateChild(new Path(CHURN_REL), nodeFromJSON('bg-write'));
-    manager.serverCacheUpdated(ROOT_PATH, tree, [CHURN_REL.split('/')]);
-    await manager.flushNow(ROOT);
-    await flushAsync();
-    expect(persistenceStats.writeThroughs).to.equal(writeThroughs0 + 1);
-    manager.dispose();
-  });
-
-  it('re-arms the write window when lock acquisition fails open', async () => {
-    // A lock manager that rejects (non-abort) AFTER the write window has
-    // already fired and been skipped.
+  it('re-arms the write windows when lock acquisition fails open', async () => {
     let rejectRequest: ((error: Error) => void) | null = null;
     stubNavigator({
       locks: {
@@ -1112,10 +995,8 @@ describe('PersistenceManager multi-tab write economics', () => {
     manager.serverCacheUpdated(ROOT_PATH, tree, undefined);
     await manager.flushNow(ROOT); // skipped: request still pending
     await flushAsync();
-    expect(shared.data.get('test-repo|' + ROOT)).to.equal(undefined);
+    expect(shared.data.get(MANIFEST_KEY)).to.equal(undefined);
 
-    // The request now fails for a non-cancellation reason. Failing open
-    // must restore the consumed write window, not just drop the gate.
     rejectRequest!(new Error('lock manager failure'));
     await flushAsync(4);
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -1123,8 +1004,7 @@ describe('PersistenceManager multi-tab write economics', () => {
     await expectSelfContainedAndEqual(shared.factory, shared.data, tree);
     manager.dispose();
 
-    // A synchronously-throwing request() must not break track(), and the
-    // root still persists through the fail-open gate.
+    // A synchronously-throwing request() must not break track().
     stubNavigator({
       locks: {
         request: () => {
