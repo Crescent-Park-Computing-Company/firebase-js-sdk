@@ -4342,17 +4342,6 @@ class PersistenceManager {
         this.writerLeaseRequestedAt_ = 0;
         /** One timer, role by state: held → heartbeat, requested → steal check. */
         this.leaseTimer_ = null;
-        /**
-         * Eviction purges recorded while NOT the writer: an unconditional
-         * security purge from a follower could erase a generation the current
-         * holder just committed (leaving its lastFlush_ claiming the generation
-         * is stored, so identical rewrites short-circuit). Purges are writes, and
-         * writes belong to the writer: a follower records the intent and the
-         * grant callback executes it — the holder's own eviction usually purges
-         * long before. Re-tracking a root cancels its pending purge (access was
-         * restored; the record may be fresh again).
-         */
-        this.pendingEvictPurges_ = new Set();
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
         this.writesDeferredUntilRestores_ = new Set();
@@ -4413,9 +4402,6 @@ class PersistenceManager {
      */
     track(pathString) {
         this.trackedRoots_.add(pathString);
-        // Access restored (or a fresh listen): a purge recorded while this root
-        // was evicted no longer applies.
-        this.pendingEvictPurges_.delete(pathString);
         this.ensureWriterLease_();
     }
     /**
@@ -4437,7 +4423,13 @@ class PersistenceManager {
             this.heartbeatStore_?.setItem(this.heartbeatKey_(), String(Date.now()));
         }
         catch (e) {
-            // Best-effort: without heartbeats, takeover waits for page death.
+            // Storage that exists but THROWS (storage-disabled documents, quota)
+            // means this manager cannot participate in the heartbeat protocol at
+            // all: keep trying and every holder stamp fails silently while
+            // followers keep reading whatever is there. Disable the channel for
+            // this manager's lifetime — takeover degrades to page death, which is
+            // the documented no-shared-storage mode.
+            this.heartbeatStore_ = null;
         }
     }
     readHeartbeat_() {
@@ -4447,17 +4439,28 @@ class PersistenceManager {
             return isNaN(value) ? 0 : value;
         }
         catch (e) {
+            // See writeHeartbeat_: a throwing store is a dead channel, and a
+            // reader that cannot see heartbeats must never steal (the tick's
+            // null-store guard makes this permanent, not just this tick).
+            this.heartbeatStore_ = null;
             return 0;
         }
     }
     /**
      * One tick, role by lease state: a holder proves liveness (heartbeat); a
      * queued follower checks the holder's liveness and STEALS the lock when
-     * the heartbeat has gone stale — the holder is frozen, cached, suspended,
-     * or wedged, and would otherwise starve every live tab's writes for as
-     * long as it existed. The request-time anchor prevents stealing within
-     * the staleness budget of first joining the queue (covers holders that
-     * cannot write heartbeats at all).
+     * the heartbeat is PRESENT but stale — the holder stamped once (every
+     * holder stamps at grant) and then went silent: frozen, cached,
+     * suspended, or wedged, and would otherwise starve every live tab's
+     * writes for as long as it existed. An ABSENT heartbeat never justifies a
+     * steal: it means the liveness protocol is not operating for this lock —
+     * the holder's storage throws, the stamp was cleared, or nothing was
+     * ever granted — and stealing on silence alone would take the lock from
+     * a perfectly healthy writer over and over (each stolen holder re-queues
+     * and, reading the same absence, steals right back). Without a readable
+     * heartbeat, takeover degrades to page death — the documented
+     * no-shared-storage mode. The request-time anchor additionally prevents
+     * stealing within the staleness budget of first joining the queue.
      */
     onLeaseTick_() {
         const lease = this.writerLease_;
@@ -4471,7 +4474,11 @@ class PersistenceManager {
         if (this.heartbeatStore_ === null) {
             return;
         }
-        const freshest = Math.max(this.readHeartbeat_(), this.writerLeaseRequestedAt_);
+        const heartbeat = this.readHeartbeat_();
+        if (heartbeat <= 0) {
+            return;
+        }
+        const freshest = Math.max(heartbeat, this.writerLeaseRequestedAt_);
         if (Date.now() - freshest > this.leaseStaleMs_) {
             this.requestWriterLease_(true);
         }
@@ -4570,7 +4577,6 @@ class PersistenceManager {
                 for (const pathString of this.trackedRoots_) {
                     this.armWriteWindowIfPending_(pathString);
                 }
-                this.runPendingEvictPurges_();
                 return new Promise(resolve => {
                     lease.release = resolve;
                 });
@@ -4585,16 +4591,6 @@ class PersistenceManager {
     }
     writerLeaseName_() {
         return 'firebase-database-persistence-write|' + this.prefix_;
-    }
-    /** Executes eviction purges recorded while this manager was a follower. */
-    runPendingEvictPurges_() {
-        const paths = [...this.pendingEvictPurges_];
-        this.pendingEvictPurges_.clear();
-        for (const pathString of paths) {
-            if (!this.trackedRoots_.has(pathString)) {
-                void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
-            }
-        }
     }
     /** Returns the writer lease to the browser (dispose only). */
     releaseWriterLease_() {
@@ -5746,28 +5742,56 @@ class PersistenceManager {
         }
         persistenceStats.evictions++;
         recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
-        // The purge is unconditional by INTENT (revoked access must purge the
-        // cached copy), but purges are writes and writes belong to the writer:
-        // a follower's immediate delete could erase a generation the current
-        // holder just committed, leaving that holder's lastFlush_ claiming the
-        // generation is stored (identical rewrites then short-circuit). The
-        // holder purges now — through the root's queue, so a flush already in
-        // flight finishes first, and the lease (manager-scoped, untouched by
-        // eviction) is held throughout. A follower records the intent; the
-        // grant callback executes it, and the holder tab's own eviction (same
-        // revocation, same user) usually purges long before. Re-tracking
-        // cancels the pending purge (see track()).
-        if (this.holdsWriterLease_()) {
-            void this.enqueue_(pathString, () => this.deleteRecord_(pathString));
-        }
-        else {
-            this.pendingEvictPurges_.add(pathString);
-        }
+        // The purge is IMMEDIATE and atomic — it must never wait for the
+        // writer lease. The lease is held for the holder tab's lifetime, and a
+        // holder that does not listen to this root never receives the
+        // revocation itself: a purge deferred to lease grant would leave the
+        // revoked bytes cached for as long as that tab lives, violating the
+        // invariant above. Deleting without the lease is made safe by SCOPE,
+        // checked in the same readwrite transaction: only the writer can have
+        // committed a newer generation here, and a same-scope writer tracking
+        // this root receives the same revocation and evicts too (clearing its
+        // own lastFlush_, so no stale identical-rewrite short-circuit
+        // survives); a writer NOT tracking this root never writes it at all. A
+        // manifest under ANOTHER identity's scope is left alone — this user's
+        // revoked bytes are not in it, and the other identity's access is its
+        // own. (Residual, accepted: a same-scope writer that legitimately
+        // RETAINS access through different query-level rules can have a fresh
+        // generation purged and skip identical rewrites against its stale
+        // lastFlush_ until the manifest-refresh path self-heals it — bounded
+        // cache staleness, never corruption.) Through the root's queue, so a
+        // flush of this manager already in flight finishes first.
+        void this.enqueue_(pathString, () => this.purgeEvictedRecord_(pathString));
+    }
+    /**
+     * Eviction's delete: manifest + sidecars in one transaction, gated on the
+     * stored manifest belonging to THIS manager's auth scope (see evict). A
+     * manifest too malformed to carry a scope is removed — no live writer
+     * produced it, and eviction is exactly the moment to drop it.
+     */
+    purgeEvictedRecord_(pathString) {
+        const key = this.key_(pathString);
+        return this.withStore_('readwrite', undefined, (store, done) => {
+            const req = store.get(key);
+            req.onsuccess = () => {
+                const manifest = req.result;
+                if (manifest === undefined) {
+                    done(undefined);
+                    return;
+                }
+                const scope = manifest.authScope;
+                if (typeof scope === 'string' && scope !== this.authScope_) {
+                    done(undefined);
+                    return;
+                }
+                this.deleteRecordInStore_(store, key);
+                done(undefined);
+            };
+        });
     }
     dispose() {
         this.disposed_ = true;
         this.releaseWriterLease_();
-        this.pendingEvictPurges_.clear();
         for (const timer of this.writeTimers_.values()) {
             clearTimeout(timer);
         }
@@ -5928,8 +5952,49 @@ class PersistenceManager {
         }
         const key = this.key_(pathString);
         if (node.isEmpty()) {
-            return this.deleteRecord_(pathString).then(() => {
-                this.lastFlush_.delete(pathString);
+            // An empty tree is a GENERATION, and deleting the record is its
+            // commit — so it obeys the exact CAS arms a manifest commit does,
+            // inside one readwrite transaction. The lease check above ran before
+            // async work: Web Locks `steal` can revoke it while this flush is
+            // suspended, and an unconditional delete on resume would erase the
+            // manifest and ranges the NEW holder committed meanwhile. With a
+            // baseline, delete only the baseline's revision (adopted counts —
+            // this is commit CAS, not an ownership guard); with none, only an
+            // absent record or a replaceable-foreign manifest (same live scope
+            // staging over another identity/format — see the commit arms) may be
+            // removed. Anything else is a CAS conflict: adopt the winner
+            // manifest-only and let the write window retry — where the lease
+            // gate runs again, so a stolen holder never retries as a writer.
+            return this.withStore_('readwrite', false, (store, done, progress) => {
+                const req = store.get(key);
+                req.onsuccess = () => {
+                    progress();
+                    const current = req.result;
+                    if (current === undefined) {
+                        done(true);
+                        return;
+                    }
+                    const replaceableForeign = !prev &&
+                        authScope === this.authScope_ &&
+                        (current.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
+                            current.authScope !== authScope);
+                    if ((prev && current.revision === prev.revision) ||
+                        replaceableForeign) {
+                        this.deleteRecordInStore_(store, key);
+                        done(true);
+                        return;
+                    }
+                    done(false);
+                };
+            }).then(ok => {
+                if (this.disposed_) {
+                    return;
+                }
+                if (ok) {
+                    this.lastFlush_.delete(pathString);
+                    return;
+                }
+                return this.adoptCommittedBaseline_(pathString);
             });
         }
         if (prev && prev.rootNode === node) {
@@ -6013,9 +6078,20 @@ class PersistenceManager {
         catch (e) {
             persistenceStats.storageFailures++;
             recordPersistenceEvent(pathString, 'flush-plan-error');
-            return this.deleteRecord_(pathString).then(() => {
-                this.lastFlush_.delete(pathString);
-            });
+            // Protective cleanup of THIS manager's own possibly-implicated
+            // generation — housekeeping, so it follows the ownership rule (see
+            // deleteRecordIfRevision_ / the covered-untrack delete): only a
+            // revision this manager itself verified or wrote. An ADOPTED baseline
+            // (rootNode null) is another writer's generation — a local planning
+            // failure says nothing about it — and with no baseline at all there
+            // is nothing of ours to protect against. A lease lost to a steal
+            // while this flush was suspended is covered the same way: the
+            // revision-named delete cannot touch the new holder's generation.
+            const owned = prev !== undefined && prev.rootNode !== null ? prev.revision : null;
+            this.lastFlush_.delete(pathString);
+            return owned !== null
+                ? this.deleteRecordIfRevision_(pathString, owned)
+                : Promise.resolve();
         }
         const dirtyPlans = [];
         let previousPost = null;

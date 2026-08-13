@@ -2076,17 +2076,6 @@ declare class PersistenceManager {
     /** One timer, role by state: held → heartbeat, requested → steal check. */
     private leaseTimer_;
     private heartbeatStore_;
-    /**
-     * Eviction purges recorded while NOT the writer: an unconditional
-     * security purge from a follower could erase a generation the current
-     * holder just committed (leaving its lastFlush_ claiming the generation
-     * is stored, so identical rewrites short-circuit). Purges are writes, and
-     * writes belong to the writer: a follower records the intent and the
-     * grant callback executes it — the holder's own eviction usually purges
-     * long before. Re-tracking a root cancels its pending purge (access was
-     * restored; the record may be fresh again).
-     */
-    private pendingEvictPurges_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
@@ -2128,11 +2117,18 @@ declare class PersistenceManager {
     /**
      * One tick, role by lease state: a holder proves liveness (heartbeat); a
      * queued follower checks the holder's liveness and STEALS the lock when
-     * the heartbeat has gone stale — the holder is frozen, cached, suspended,
-     * or wedged, and would otherwise starve every live tab's writes for as
-     * long as it existed. The request-time anchor prevents stealing within
-     * the staleness budget of first joining the queue (covers holders that
-     * cannot write heartbeats at all).
+     * the heartbeat is PRESENT but stale — the holder stamped once (every
+     * holder stamps at grant) and then went silent: frozen, cached,
+     * suspended, or wedged, and would otherwise starve every live tab's
+     * writes for as long as it existed. An ABSENT heartbeat never justifies a
+     * steal: it means the liveness protocol is not operating for this lock —
+     * the holder's storage throws, the stamp was cleared, or nothing was
+     * ever granted — and stealing on silence alone would take the lock from
+     * a perfectly healthy writer over and over (each stolen holder re-queues
+     * and, reading the same absence, steals right back). Without a readable
+     * heartbeat, takeover degrades to page death — the documented
+     * no-shared-storage mode. The request-time anchor additionally prevents
+     * stealing within the staleness budget of first joining the queue.
      */
     private onLeaseTick_;
     /** Requests the manager-wide writer lease once (idempotent). */
@@ -2143,8 +2139,6 @@ declare class PersistenceManager {
      */
     private requestWriterLease_;
     private writerLeaseName_;
-    /** Executes eviction purges recorded while this manager was a follower. */
-    private runPendingEvictPurges_;
     /** Returns the writer lease to the browser (dispose only). */
     private releaseWriterLease_;
     /**
@@ -2305,6 +2299,13 @@ declare class PersistenceManager {
      * listens, so nothing else would ever untrack it.
      */
     evict(path: Path): void;
+    /**
+     * Eviction's delete: manifest + sidecars in one transaction, gated on the
+     * stored manifest belonging to THIS manager's auth scope (see evict). A
+     * manifest too malformed to carry a scope is removed — no live writer
+     * produced it, and eviction is exactly the moment to drop it.
+     */
+    private purgeEvictedRecord_;
     dispose(): void;
     /**
      * Test seam: forces a pending flush window to fire now.
