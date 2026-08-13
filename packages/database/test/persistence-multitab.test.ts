@@ -486,13 +486,16 @@ describe('PersistenceManager multi-tab write economics', () => {
 
     // Holder goes away; the lease transfers to B, whose baseline (its boot
     // restore) is now stale — the takeover resolves through the CAS +
-    // manifest-only adoption, never a range read.
+    // manifest-only adoption, never a range read. The read log is cleared
+    // BEFORE the dispose: the grant callback arms B's (zero-delay) write
+    // window immediately, so the takeover flush itself runs inside the
+    // observation window of the assertion below.
+    gets.length = 0;
     tabA.dispose();
     await flushAsync();
-    gets.length = 0;
     treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b-owns'));
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
-    await tabB.flushNow(ROOT); // CAS conflict -> adopt -> deferred retry
+    await tabB.flushNow(ROOT);
     await flushAsync(30);
 
     const rangeGets = gets.filter(key => key.includes('#range:'));
@@ -582,11 +585,20 @@ describe('PersistenceManager multi-tab write economics', () => {
     await tabB.flushNow(ROOT); // conflict -> adopts manifest-only baseline
     await flushAsync(4);
 
-    // A covering peek off the adopted baseline would need rootNode, which is
-    // deliberately absent; the peek must fall through to a real read (which
-    // resolves the exact subtree) instead of crashing or resolving nothing.
+    // A covering peek off the adopted baseline would need rootNode, which
+    // is deliberately absent (serving from an undecoded baseline is exactly
+    // the decode this path removed). The peek must fall through to the
+    // exact-root read — which MISSES, because no record exists at the
+    // subtree's own key — without crashing on the null baseline.
     const record = await tabB.peek(ROOT + '/app-1', 'u1');
-    expect(record === null || record.node.isEmpty() === false).to.equal(true);
+    expect(record).to.equal(null);
+    // Positive control: a DECODABLE baseline (tab A committed its own
+    // generation, rootNode real) must keep serving covering peeks.
+    const control = await tabA.peek(ROOT + '/app-1', 'u1');
+    expect(control).to.not.equal(null);
+    expect(control!.node.val(true)).to.deep.equal(
+      treeA.getChild(new Path('app-1')).val(true)
+    );
     tabA.dispose();
     tabB.dispose();
   });
@@ -851,6 +863,58 @@ describe('PersistenceManager multi-tab write economics', () => {
     );
     writer.dispose();
     tabA.dispose();
+  });
+
+  it('a window that elapsed mid-conflict defers to the adoption write window', async () => {
+    // Node default (no Web Locks): the CAS + debounced adoption is the only
+    // protection. An update whose write window ELAPSES while the losing
+    // flush is still in flight marks the queue pending; the drain must NOT
+    // re-flush immediately — that is back-to-back full-tree staging under
+    // sustained lease-less churn, the exact thrash the debounce prevents.
+    const puts: string[] = [];
+    const shared = makeFakeIndexedDB({ onPut: key => puts.push(key) });
+    const WRITE_DELAY = 250;
+
+    const tabA = mkManager(shared.factory);
+    tabA.track(ROOT);
+    let treeA: Node = nodeFromJSON(makeWorkspace());
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, undefined);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+    const tabB = mkManager(shared.factory, WRITE_DELAY);
+    tabB.track(ROOT);
+    let treeB: Node = (await tabB.restoreForListen(ROOT)).record!.node;
+    treeA = treeA.updateChild(new Path(CHURN_REL), nodeFromJSON('a-newer'));
+    tabA.serverCacheUpdated(ROOT_PATH, treeA, [CHURN_REL.split('/')]);
+    await tabA.flushNow(ROOT);
+    await flushAsync();
+
+    // B's conflicting flush is IN FLIGHT when a second update's window
+    // elapses (scheduleFlush_ is exactly what the timer runs; the queue is
+    // busy, so it marks flushPending_).
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b1'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    const inFlight = tabB.flushNow(ROOT); // CAS conflict -> adopt
+    treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('b2'));
+    tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
+    (
+      tabB as unknown as { scheduleFlush_: (p: string) => void }
+    ).scheduleFlush_(ROOT);
+    await inFlight;
+    puts.length = 0;
+    await flushAsync(10); // ample for an immediate (undeferred) retry to stage
+    expect(puts.filter(key => key.includes('#range:'))).to.deep.equal(
+      [],
+      'the queue-drain retry must not begin staging before the write window'
+    );
+
+    // After the window: exactly one deferred retry, carrying the LATEST
+    // tree — the update that marked the queue pending is not lost.
+    await new Promise(resolve => setTimeout(resolve, WRITE_DELAY + 20));
+    await flushAsync(30);
+    await expectSelfContainedAndEqual(shared.factory, shared.data, treeB);
+    tabA.dispose();
+    tabB.dispose();
   });
 
   it('re-arms the write window when lock acquisition fails open', async () => {
