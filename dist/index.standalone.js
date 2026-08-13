@@ -4889,6 +4889,12 @@ class PersistenceManager {
         this.restoreReasons_ = new Map();
         /** Cross-tab write leases per tracked root (see WriteLease). */
         this.writeLeases_ = new Map();
+        /**
+         * Page-lifecycle stewardship of the leases (see
+         * installLeaseLifecycleHandlers_): unsubscribe callbacks, installed with
+         * the first lease and removed on dispose.
+         */
+        this.leaseLifecycleCleanup_ = null;
         this.activeRestoreCount_ = 0;
         this.restoreQueue_ = [];
         this.writesDeferredUntilRestores_ = new Set();
@@ -4978,22 +4984,31 @@ class PersistenceManager {
         if (locks === null) {
             return;
         }
-        const lease = { held: false, wanted: true, release: null };
+        this.installLeaseLifecycleHandlers_();
+        const lease = {
+            held: false,
+            wanted: true,
+            release: null,
+            controller: typeof AbortController !== 'undefined' ? new AbortController() : null
+        };
         this.writeLeases_.set(pathString, lease);
         const name = 'firebase-database-persistence-write|' + this.key_(pathString);
         void locks
-            .request(name, { mode: 'exclusive' }, () => {
+            .request(name, lease.controller !== null
+            ? { mode: 'exclusive', signal: lease.controller.signal }
+            : { mode: 'exclusive' }, () => {
             if (!lease.wanted || this.disposed_) {
                 // Released (or the manager died) while queued: hand the lock
                 // straight back so the next tab's request is granted.
                 return Promise.resolve();
             }
             lease.held = true;
-            // Writes were skipped while another tab held the lease; whatever is
-            // pending in memory enters the ordinary write window now. A stale
-            // baseline (the old holder committed) resolves through the flush
-            // CAS + adoptCommittedBaseline_, exactly once.
-            if (this.trackedRoots_.has(pathString) && this.latest_.has(pathString)) {
+            // Writes were skipped while another tab held the lease; whatever
+            // is pending in memory enters the ordinary write window now. A
+            // stale baseline (the old holder committed) resolves through the
+            // flush CAS + adoptCommittedBaseline_, exactly once.
+            if (this.trackedRoots_.has(pathString) &&
+                this.latest_.has(pathString)) {
                 this.armWriteWindow_(pathString);
             }
             return new Promise(resolve => {
@@ -5001,11 +5016,78 @@ class PersistenceManager {
             });
         })
             .catch(() => {
-            // Lock API failure — fail open rather than never persisting.
+            // An intentional cancellation (releaseWriteLease_ aborted a queued
+            // request) already removed the entry — the guard below makes it a
+            // no-op. Anything else is a lock API failure: fail open rather
+            // than never persisting.
             if (this.writeLeases_.get(pathString) === lease) {
                 this.writeLeases_.delete(pathString);
             }
         });
+    }
+    /**
+     * A page can be FROZEN or moved into the back/forward cache without
+     * untrack()/dispose() ever running; a held lock would then keep excluding
+     * every live tab's writes for as long as the suspended page exists —
+     * persistence goes silently stale across the whole origin. The Page
+     * Lifecycle contract is to release held Web Locks before suspension: on
+     * `freeze` / persisted `pagehide`, every lease (held or queued) is
+     * returned; on `resume` / persisted `pageshow`, leases are re-requested
+     * for every still-tracked root and ownership settles through the normal
+     * grant path (a stale baseline reconciles via the flush CAS +
+     * adoptCommittedBaseline_, exactly once). Releasing here also keeps a
+     * page that holds no other locks eligible for the back/forward cache.
+     * Installed once, with the first lease; removed on dispose.
+     */
+    installLeaseLifecycleHandlers_() {
+        if (this.leaseLifecycleCleanup_ !== null ||
+            typeof document === 'undefined' ||
+            typeof document.addEventListener !== 'function' ||
+            typeof window === 'undefined' ||
+            typeof window.addEventListener !== 'function') {
+            return;
+        }
+        const suspend = () => this.suspendWriteLeases_();
+        const resume = () => this.resumeWriteLeases_();
+        const onPageHide = (event) => {
+            if (event.persisted) {
+                suspend();
+            }
+        };
+        const onPageShow = (event) => {
+            if (event.persisted) {
+                resume();
+            }
+        };
+        // Capture the targets: cleanup must unregister from the exact objects
+        // the handlers were installed on.
+        const doc = document;
+        const win = window;
+        doc.addEventListener('freeze', suspend);
+        doc.addEventListener('resume', resume);
+        win.addEventListener('pagehide', onPageHide);
+        win.addEventListener('pageshow', onPageShow);
+        this.leaseLifecycleCleanup_ = [
+            () => doc.removeEventListener('freeze', suspend),
+            () => doc.removeEventListener('resume', resume),
+            () => win.removeEventListener('pagehide', onPageHide),
+            () => win.removeEventListener('pageshow', onPageShow)
+        ];
+    }
+    /** Returns every lease (held or queued) ahead of page suspension. */
+    suspendWriteLeases_() {
+        for (const pathString of [...this.writeLeases_.keys()]) {
+            this.releaseWriteLease_(pathString);
+        }
+    }
+    /** Re-requests leases for the still-tracked roots after the page resumes. */
+    resumeWriteLeases_() {
+        if (this.disposed_) {
+            return;
+        }
+        for (const pathString of this.trackedRoots_) {
+            this.acquireWriteLease_(pathString);
+        }
     }
     /** Returns the root's write lease to the browser (idempotent). */
     releaseWriteLease_(pathString) {
@@ -5015,8 +5097,19 @@ class PersistenceManager {
         }
         this.writeLeases_.delete(pathString);
         lease.wanted = false;
-        lease.held = false;
-        lease.release?.();
+        if (lease.held) {
+            // Held: hand the lock back by resolving the callback's promise.
+            lease.held = false;
+            lease.release?.();
+        }
+        else {
+            // Still queued: remove the request from the browser's lock queue so
+            // repeated untrack/retrack cycles cannot accumulate orphaned queued
+            // requests (each retaining this manager until some other tab exits).
+            // Abort only PRE-grant — a held lock is returned via release above,
+            // keeping behavior identical across Web Locks spec revisions.
+            lease.controller?.abort();
+        }
     }
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
@@ -6075,6 +6168,12 @@ class PersistenceManager {
         this.disposed_ = true;
         for (const pathString of [...this.writeLeases_.keys()]) {
             this.releaseWriteLease_(pathString);
+        }
+        if (this.leaseLifecycleCleanup_ !== null) {
+            for (const cleanup of this.leaseLifecycleCleanup_) {
+                cleanup();
+            }
+            this.leaseLifecycleCleanup_ = null;
         }
         for (const timer of this.writeTimers_.values()) {
             clearTimeout(timer);

@@ -2063,6 +2063,12 @@ declare class PersistenceManager {
     private restoreReasons_;
     /** Cross-tab write leases per tracked root (see WriteLease). */
     private writeLeases_;
+    /**
+     * Page-lifecycle stewardship of the leases (see
+     * installLeaseLifecycleHandlers_): unsubscribe callbacks, installed with
+     * the first lease and removed on dispose.
+     */
+    private leaseLifecycleCleanup_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
@@ -2104,6 +2110,25 @@ declare class PersistenceManager {
      * holdsWriteLease_ fails open.
      */
     private acquireWriteLease_;
+    /**
+     * A page can be FROZEN or moved into the back/forward cache without
+     * untrack()/dispose() ever running; a held lock would then keep excluding
+     * every live tab's writes for as long as the suspended page exists —
+     * persistence goes silently stale across the whole origin. The Page
+     * Lifecycle contract is to release held Web Locks before suspension: on
+     * `freeze` / persisted `pagehide`, every lease (held or queued) is
+     * returned; on `resume` / persisted `pageshow`, leases are re-requested
+     * for every still-tracked root and ownership settles through the normal
+     * grant path (a stale baseline reconciles via the flush CAS +
+     * adoptCommittedBaseline_, exactly once). Releasing here also keeps a
+     * page that holds no other locks eligible for the back/forward cache.
+     * Installed once, with the first lease; removed on dispose.
+     */
+    private installLeaseLifecycleHandlers_;
+    /** Returns every lease (held or queued) ahead of page suspension. */
+    private suspendWriteLeases_;
+    /** Re-requests leases for the still-tracked roots after the page resumes. */
+    private resumeWriteLeases_;
     /** Returns the root's write lease to the browser (idempotent). */
     private releaseWriteLease_;
     /**
