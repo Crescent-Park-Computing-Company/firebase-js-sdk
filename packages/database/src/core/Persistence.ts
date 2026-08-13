@@ -521,7 +521,7 @@ function defaultHeartbeatStore(): HeartbeatStore | null {
   return null;
 }
 
-interface WebLocksLike {
+export interface WebLocksLike {
   request: (
     name: string,
     options: { mode: 'exclusive'; signal?: AbortSignal; steal?: boolean },
@@ -529,7 +529,29 @@ interface WebLocksLike {
   ) => Promise<void>;
 }
 
+/**
+ * Test seam for the Web Locks API. `undefined` = discover the ambient
+ * `navigator.locks` (production). Tests MUST pin this (a fake, or `null`
+ * for the lock-less/CAS-only environment): the ambient value differs across
+ * runtimes — Node has no navigator, real browsers have real Web Locks — and
+ * a unit test that inherits it exercises different code paths per runtime
+ * (a REAL lock manager would also let one test's undisposed manager block
+ * every later test's writes). Injection mirrors the HeartbeatStore seam and
+ * keeps the suites free of global stubbing.
+ */
+let webLocksOverride: WebLocksLike | null | undefined = undefined;
+
+/** @internal */
+export function _setWebLocksForTesting(
+  locks: WebLocksLike | null | undefined
+): void {
+  webLocksOverride = locks;
+}
+
 function webLocks(): WebLocksLike | null {
+  if (webLocksOverride !== undefined) {
+    return webLocksOverride;
+  }
   if (typeof navigator === 'undefined') {
     return null;
   }

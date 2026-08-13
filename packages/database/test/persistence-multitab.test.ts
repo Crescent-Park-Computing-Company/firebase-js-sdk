@@ -33,7 +33,11 @@
  */
 import { expect } from 'chai';
 
-import { PersistenceManager, persistenceStats } from '../src/core/Persistence';
+import {
+  PersistenceManager,
+  persistenceStats,
+  _setWebLocksForTesting
+} from '../src/core/Persistence';
 import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
@@ -388,34 +392,28 @@ async function expectSelfContainedAndEqual(
 }
 
 describe('PersistenceManager multi-tab write economics', () => {
-  // Node 21+ defines globalThis.navigator as a getter; stub/restore via
-  // property descriptors. ONLY navigator is ever stubbed — it is a
-  // configurable/replaceable property in every engine, unlike
-  // window/document.
-  let savedNavigator: PropertyDescriptor | undefined;
-  const stubNavigator = (value: unknown) => {
-    Object.defineProperty(globalThis, 'navigator', {
-      value,
-      configurable: true,
-      writable: true
-    });
-  };
-
+  // Every test PINS its lock environment through the injection seam — no
+  // global is ever stubbed. The default is lock-less (the CAS-only
+  // environment); lease tests opt in with
+  // `_setWebLocksForTesting(fakeLocks.locks)`. Pinning matters because the
+  // ambient environment differs across runtimes (Node has no navigator,
+  // real browsers have REAL Web Locks): the "without Web Locks" family
+  // genuinely diverges under real locks (a single writer would be elected,
+  // suppressing the CAS conflicts under test), and a REAL lock manager
+  // would let one test's manager block a later test's writes. afterEach
+  // restores lock-less — never ambient — so the files that run after this
+  // suite in the same bundle stay deterministic too.
   beforeEach(() => {
-    savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    _setWebLocksForTesting(null);
   });
 
   afterEach(() => {
-    if (savedNavigator) {
-      Object.defineProperty(globalThis, 'navigator', savedNavigator);
-    } else {
-      delete (globalThis as { navigator?: unknown }).navigator;
-    }
+    _setWebLocksForTesting(null);
   });
 
   it('with Web Locks, only the lease holder writes under cross-tab churn', async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
 
     const tabA = mkManager(shared.factory);
@@ -460,7 +458,7 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it('lease takeover: survivor adopts the manifest without reading ranges and re-stages once', async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const gets: string[] = [];
     const shared = makeFakeIndexedDB({ onGet: key => gets.push(key) });
 
@@ -508,7 +506,7 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it('a silent holder is stolen from; the stolen holder stops writing and re-queues politely', async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
     const store = makeFakeHeartbeatStore();
 
@@ -573,7 +571,7 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it("a follower's eviction purge waits for the lease; the holder's generation survives until then", async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
 
     const tabA = mkManager(shared.factory);
@@ -617,7 +615,7 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it('re-tracking a root cancels its pending eviction purge', async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
 
     const tabA = mkManager(shared.factory);
@@ -760,7 +758,7 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it('dispose aborts a still-queued lease request', async () => {
     const fakeLocks = makeFakeWebLocks();
-    stubNavigator({ locks: fakeLocks.locks });
+    _setWebLocksForTesting(fakeLocks.locks);
     const shared = makeFakeIndexedDB();
 
     const tabA = mkManager(shared.factory);
@@ -888,7 +886,20 @@ describe('PersistenceManager multi-tab write economics', () => {
     treeB = treeB.updateChild(new Path(CHURN_REL), nodeFromJSON('newer'));
     tabB.serverCacheUpdated(ROOT_PATH, treeB, [CHURN_REL.split('/')]);
     await tabB.flushNow(ROOT); // conflict -> adopts manifest-only baseline
-    await flushAsync(4);
+    // Wait for the ADOPTION itself (bounded), not a fixed number of
+    // scheduler turns: the CAS-losing flush settles through IDB callbacks
+    // whose macrotask count differs across engines (Firefox needs more
+    // rounds than Chrome/Node). If adoption regresses the loop times out
+    // and the assertions below fail on the un-adopted state.
+    const adoptedBy = Date.now() + 2000;
+    const baselines = (
+      tabB as unknown as {
+        lastFlush_: Map<string, { rootNode: unknown }>;
+      }
+    ).lastFlush_;
+    while (Date.now() < adoptedBy && baselines.get(ROOT)?.rootNode !== null) {
+      await flushAsync(1);
+    }
 
     const record = await tabB.peek(ROOT + '/app-1', 'u1');
     expect(record).to.equal(null);
@@ -980,13 +991,11 @@ describe('PersistenceManager multi-tab write economics', () => {
 
   it('re-arms the write windows when lock acquisition fails open', async () => {
     let rejectRequest: ((error: Error) => void) | null = null;
-    stubNavigator({
-      locks: {
-        request: () =>
-          new Promise<void>((_resolve, reject) => {
-            rejectRequest = reject;
-          })
-      }
+    _setWebLocksForTesting({
+      request: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRequest = reject;
+        })
     });
     const shared = makeFakeIndexedDB();
     const manager = mkManager(shared.factory);
@@ -1005,11 +1014,9 @@ describe('PersistenceManager multi-tab write economics', () => {
     manager.dispose();
 
     // A synchronously-throwing request() must not break track().
-    stubNavigator({
-      locks: {
-        request: () => {
-          throw new Error('synchronous lock failure');
-        }
+    _setWebLocksForTesting({
+      request: () => {
+        throw new Error('synchronous lock failure');
       }
     });
     const manager2 = mkManager(shared.factory);

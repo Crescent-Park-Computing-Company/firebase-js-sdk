@@ -43,7 +43,8 @@ import {
   PersistedRecord,
   PersistedSeedHashes,
   PersistenceRestoreResult,
-  persistenceStats
+  persistenceStats,
+  _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
   repoCancelPendingSeedRestores,
@@ -78,6 +79,16 @@ import {
   QueryParams,
   queryParamsLimitToFirst
 } from '../src/core/view/QueryParams';
+
+// This suite tests SINGLE-manager write economics: pin the lock-less
+// (CAS-only) environment so every test runs the same code path in every
+// runtime. Without the pin, Node (no navigator) fails open while real
+// browsers discover REAL Web Locks — the write gate then waits on an async
+// lock grant these tests never await, and one test's manager can block a
+// later test's writes through the shared browser lock manager. The
+// multi-tab lease behavior has its own suite (persistence-multitab.test.ts)
+// which injects a fake lock manager per test.
+_setWebLocksForTesting(null);
 
 function computeCanonicalHash(json: unknown): string {
   return nodeFromJSON(json).hash();
