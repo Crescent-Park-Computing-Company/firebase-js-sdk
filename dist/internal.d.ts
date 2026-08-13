@@ -2374,13 +2374,19 @@ declare class PersistenceManager {
     evict(path: Path): void;
     /**
      * Eviction's delete: manifest + sidecars in one transaction, gated on the
-     * stored manifest belonging to THIS manager's auth scope (see evict).
-     * `null` is a REAL scope — the anonymous identity — not malformation:
-     * an anonymous user's valid record must survive a signed-in tab's
-     * eviction exactly like any other identity's. The unconditional purge is
-     * reserved for records whose scope field is actually malformed (neither
-     * string nor null) or whose manifest is structurally invalid — no live
-     * writer produced those, and eviction is exactly the moment to drop them.
+     * stored manifest belonging to the REVOKED scope (captured at evict();
+     * see the comment there). `null` is a REAL scope — the anonymous
+     * identity — not malformation: an anonymous user's valid record must
+     * survive a signed-in tab's eviction exactly like any other identity's.
+     * The unconditional purge is reserved for values no live writer produced
+     * — a structurally invalid manifest, a malformed scope field (neither
+     * string nor null), or a stored value that is not an object at all
+     * (null, primitives): eviction is exactly the moment to drop those WITH
+     * their sidecars, which may still carry revoked bytes. Only a truly
+     * ABSENT record (undefined) is a no-op. Field reads happen only after
+     * structural validation — a stored literal `null` passes an
+     * undefined-check and then throws on property access, aborting the
+     * transaction and silently RETAINING the revoked record.
      */
     private purgeEvictedRecord_;
     dispose(): void;

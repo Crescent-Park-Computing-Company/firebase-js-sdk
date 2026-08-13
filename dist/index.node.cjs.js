@@ -5803,13 +5803,19 @@ class PersistenceManager {
             const manifestReq = store.get(key);
             manifestReq.onsuccess = () => {
                 progress();
-                const manifest = manifestReq.result ?? null;
-                if (manifest === null) {
+                // ABSENT (undefined) is a plain miss; a stored literal `null` is
+                // NOT — it is garbage that must flow to the corrupt branch so the
+                // in-transaction cleanup reclaims it and its sidecars (folding it
+                // into the miss would leave it cached forever).
+                if (manifestReq.result === undefined) {
                     done(null);
                     return;
                 }
+                const manifest = manifestReq.result;
                 if (!structurallyValidManifest(manifest)) {
-                    const rawRevision = manifest.revision;
+                    const rawRevision = manifest === null
+                        ? undefined
+                        : manifest.revision;
                     if (typeof rawRevision === 'string') {
                         cleanupRevision = rawRevision;
                     }
@@ -6435,35 +6441,52 @@ class PersistenceManager {
         // lastFlush_ until the manifest-refresh path self-heals it — bounded
         // cache staleness, never corruption.) Through the root's queue, so a
         // flush of this manager already in flight finishes first.
-        void this.enqueue_(pathString, () => this.purgeEvictedRecord_(pathString));
+        // The scope whose access was revoked is CAPTURED NOW, not read later:
+        // the purge runs behind any in-flight per-root work, and an account
+        // switch (setAuthScope) can land in that gap. Compared against the
+        // manager's LIVE scope, the old identity's revoked record would read
+        // as "another identity's" and be preserved, while a fresh record the
+        // NEW identity just committed would match and be deleted — exactly
+        // backwards. The reference value for in-transaction validation must be
+        // immutable, like deleteRecordIfRevision_'s expectedRevision.
+        const revokedScope = this.authScope_;
+        void this.enqueue_(pathString, () => this.purgeEvictedRecord_(pathString, revokedScope));
     }
     /**
      * Eviction's delete: manifest + sidecars in one transaction, gated on the
-     * stored manifest belonging to THIS manager's auth scope (see evict).
-     * `null` is a REAL scope — the anonymous identity — not malformation:
-     * an anonymous user's valid record must survive a signed-in tab's
-     * eviction exactly like any other identity's. The unconditional purge is
-     * reserved for records whose scope field is actually malformed (neither
-     * string nor null) or whose manifest is structurally invalid — no live
-     * writer produced those, and eviction is exactly the moment to drop them.
+     * stored manifest belonging to the REVOKED scope (captured at evict();
+     * see the comment there). `null` is a REAL scope — the anonymous
+     * identity — not malformation: an anonymous user's valid record must
+     * survive a signed-in tab's eviction exactly like any other identity's.
+     * The unconditional purge is reserved for values no live writer produced
+     * — a structurally invalid manifest, a malformed scope field (neither
+     * string nor null), or a stored value that is not an object at all
+     * (null, primitives): eviction is exactly the moment to drop those WITH
+     * their sidecars, which may still carry revoked bytes. Only a truly
+     * ABSENT record (undefined) is a no-op. Field reads happen only after
+     * structural validation — a stored literal `null` passes an
+     * undefined-check and then throws on property access, aborting the
+     * transaction and silently RETAINING the revoked record.
      */
-    purgeEvictedRecord_(pathString) {
+    purgeEvictedRecord_(pathString, revokedScope) {
         const key = this.key_(pathString);
         return this.withStore_('readwrite', undefined, (store, done) => {
             const req = store.get(key);
             req.onsuccess = () => {
-                const manifest = req.result;
-                if (manifest === undefined) {
+                const stored = req.result;
+                if (stored === undefined) {
                     done(undefined);
                     return;
                 }
-                const scope = manifest.authScope;
-                const scopeWellFormed = typeof scope === 'string' || scope === null;
-                if (structurallyValidManifest(manifest) &&
-                    scopeWellFormed &&
-                    scope !== this.authScope_) {
-                    done(undefined);
-                    return;
+                if (structurallyValidManifest(stored)) {
+                    const scope = stored.authScope;
+                    if ((typeof scope === 'string' || scope === null) &&
+                        scope !== revokedScope) {
+                        // Another identity's valid record: the revoked bytes are not
+                        // in it, and the other identity's access is its own.
+                        done(undefined);
+                        return;
+                    }
                 }
                 this.deleteRecordInStore_(store, key);
                 done(undefined);
@@ -6662,7 +6685,14 @@ class PersistenceManager {
                 const req = store.get(key);
                 req.onsuccess = () => {
                     progress();
-                    const current = req.result;
+                    // A stored literal `null` is garbage no CAS writer produced;
+                    // normalized to ABSENT so the empty commit succeeds instead of
+                    // throwing on the field reads below (an exception here aborts
+                    // the transaction, and every window retry would abort the same
+                    // way — the root could never flush again). Restore-side
+                    // cleanup (deleteRecordIfInvalid_) reclaims the value and its
+                    // sidecars.
+                    const current = (req.result ?? undefined);
                     if (current === undefined) {
                         done(true);
                         return;
@@ -6924,7 +6954,11 @@ class PersistenceManager {
                 const currentReq = store.get(key);
                 currentReq.onsuccess = () => {
                     progress();
-                    const current = currentReq.result;
+                    // Stored `null` normalizes to ABSENT (see the empty-path
+                    // comment): the first-generation commit then OVERWRITES the
+                    // garbage instead of throwing on the replaceableForeign
+                    // field reads and aborting every commit of this root forever.
+                    const current = (currentReq.result ?? undefined);
                     // A first generation may REPLACE a manifest this manager can
                     // never restore (another identity's scope, or an unknown
                     // format): treating those as CAS winners would strand the
