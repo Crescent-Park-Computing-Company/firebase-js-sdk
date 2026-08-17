@@ -21,7 +21,8 @@ import { expect } from 'chai';
 import {
   getPersistedValue,
   setPersistenceAuthScope,
-  setPersistenceEnabled
+  setPersistenceEnabled,
+  _PEEK_MATERIALIZE_SLICE_LEAVES
 } from '../src/api/Database';
 import {
   consumePersistedMaterialization,
@@ -3801,5 +3802,70 @@ describe('getPersistedValue', () => {
     expect(() => getPersistedValue(db as never, 'bad#path')).to.throw(
       /invalid path/i
     );
+  });
+
+  it('sliced materialization matches node.val() exactly, including array coercion', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('shape/root');
+    manager.track(root.toString());
+    // Every val() shape the sliced walk must reproduce: dense integer keys
+    // (array coercion), sparse-but-coercible keys (holes), integer keys too
+    // sparse to coerce (object), nested mixes, and named-key objects.
+    const raw = {
+      dense: { '0': 'a', '1': 'b', '2': 'c' },
+      holes: { '0': 'x', '2': 'z' }, // maxKey 2 < 2*2 → array with a hole
+      tooSparse: { '0': 'x', '9': 'y' }, // maxKey 9 >= 2*2 → stays an object
+      nested: { list: { '0': { name: 'n0' }, '1': { name: 'n1' } } },
+      named: { alpha: 1, beta: true, gamma: 'g' }
+    };
+    const node = nodeFromJSON(raw);
+    manager.serverCacheUpdated(root, node);
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    const sliced = await getPersistedValue(db as never, '/shape/root');
+    // The reference is the SDK's own val() over the same restored node — the
+    // authoritative definition the sliced walk replicates.
+    const record = await manager.peek(root.toString());
+    expect(stringify(sliced)).to.equal(stringify(record!.node.val()));
+    // Spot-check the coercions directly.
+    const value = sliced as Record<string, unknown>;
+    expect(value.dense).to.be.an('array').with.lengthOf(3);
+    expect(value.holes).to.be.an('array').with.lengthOf(3);
+    expect((value.holes as unknown[])[1]).to.equal(undefined);
+    expect(value.tooSparse).to.be.an('object').and.not.an('array');
+    expect((value.nested as { list: unknown[] }).list).to.be.an('array');
+  });
+
+  it('yields to the event loop while materializing a large tree', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('big/root');
+    manager.track(root.toString());
+    // More leaves than one slice budget, so the walk must yield at least once.
+    const wide: Record<string, Record<string, number>> = {};
+    const perParent = 100;
+    const parents = Math.ceil((_PEEK_MATERIALIZE_SLICE_LEAVES * 2) / perParent);
+    for (let i = 0; i < parents; i++) {
+      const children: Record<string, number> = {};
+      for (let j = 0; j < perParent; j++) {
+        children['c' + j] = i * perParent + j;
+      }
+      wide['p' + i] = children;
+    }
+    manager.serverCacheUpdated(root, nodeFromJSON(wide));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // A macrotask scheduled AFTER the peek starts must run BEFORE the peek
+    // resolves — the monolithic val() walk could never allow that.
+    let macrotaskRan = false;
+    const peek = getPersistedValue(db as never, '/big/root');
+    setTimeout(() => {
+      macrotaskRan = true;
+    }, 0);
+    const value = (await peek) as Record<string, unknown>;
+    expect(macrotaskRan).to.equal(true);
+    expect(Object.keys(value).length).to.equal(parents);
+    expect((value.p0 as Record<string, number>).c0).to.equal(0);
   });
 });

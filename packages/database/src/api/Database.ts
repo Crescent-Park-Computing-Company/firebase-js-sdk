@@ -55,6 +55,7 @@ import {
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { stampMaterializedValue } from '../core/ServerCacheSeed';
 import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
+import { Node } from '../core/snap/Node';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
@@ -451,6 +452,102 @@ export function goOffline(db: Database): void {
 }
 
 /**
+ * Leaves materialized per main-thread slice of the peek walk. Sized so one
+ * slice stays well inside a frame budget on mobile hardware while keeping the
+ * total slice count (and its scheduling overhead) low on large workspaces.
+ * @internal
+ */
+export const _PEEK_MATERIALIZE_SLICE_LEAVES = 4000;
+
+/**
+ * Yields one macrotask. MessageChannel where available: unlike setTimeout(0),
+ * ports are exempt from the nested-timer clamp (~4ms after a few levels),
+ * which would otherwise stretch a many-slice materialization by whole
+ * seconds exactly on the slow boots it is meant to help.
+ */
+let peekYieldChannel: MessageChannel | null = null;
+const peekYieldResolvers: Array<() => void> = [];
+function yieldMacrotask(): Promise<void> {
+  if (typeof MessageChannel === 'undefined') {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+  if (peekYieldChannel === null) {
+    peekYieldChannel = new MessageChannel();
+    peekYieldChannel.port1.onmessage = () => peekYieldResolvers.shift()?.();
+  }
+  return new Promise(resolve => {
+    peekYieldResolvers.push(resolve);
+    peekYieldChannel!.port2.postMessage(null);
+  });
+}
+
+// ChildrenNode.val()'s integer-key grammar (private there; replicated for the
+// sliced walk's array coercion, which must match val() exactly).
+const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
+
+/**
+ * Materializes `node` to the exact JS value `node.val()` returns — same child
+ * ordering (PRIORITY_INDEX), same array coercion, same leaf semantics — but in
+ * yielded slices: after every _PEEK_MATERIALIZE_SLICE_LEAVES leaves the walk
+ * gives the main thread a macrotask to paint and GC.
+ *
+ * Why not node.val(): the pre-auth peek materializes the ENTIRE persisted
+ * workspace at boot, and one synchronous walk over a large root is a
+ * multi-second main-thread block plus an allocation spike at exactly the
+ * moment mobile WebKit is quickest to kill the page. The IndexedDB decode
+ * before this point is already sliced (decodeFragmentsSliced_); this closes
+ * the one remaining monolithic walk on the boot path.
+ */
+async function materializeNodeSliced(node: Node): Promise<unknown> {
+  let leavesSinceYield = 0;
+  const walk = async (current: Node): Promise<unknown> => {
+    if (current.isLeafNode()) {
+      if (++leavesSinceYield >= _PEEK_MATERIALIZE_SLICE_LEAVES) {
+        leavesSinceYield = 0;
+        await yieldMacrotask();
+      }
+      return current.val();
+    }
+    if (current.isEmpty()) {
+      return null;
+    }
+    const pairs: Array<[string, Node]> = [];
+    current.forEachChild(PRIORITY_INDEX, (key: string, child: Node) => {
+      pairs.push([key, child]);
+    });
+    const obj: Record<string, unknown> = {};
+    let numKeys = 0;
+    let maxKey = 0;
+    let allIntegerKeys = true;
+    for (const [key, child] of pairs) {
+      obj[key] = await walk(child);
+      numKeys++;
+      // charCode fast-reject mirrors ChildrenNode.val().
+      if (
+        allIntegerKeys &&
+        key.charCodeAt(0) >= 48 /* '0' */ &&
+        key.charCodeAt(0) <= 57 /* '9' */ &&
+        PEEK_INTEGER_REGEXP.test(key)
+      ) {
+        maxKey = Math.max(maxKey, Number(key));
+      } else {
+        allIntegerKeys = false;
+      }
+    }
+    if (allIntegerKeys && maxKey < 2 * numKeys) {
+      const array: unknown[] = [];
+      // eslint-disable-next-line guard-for-in
+      for (const key in obj) {
+        array[key as unknown as number] = obj[key];
+      }
+      return array;
+    }
+    return obj;
+  };
+  return walk(node);
+}
+
+/**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
  * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
@@ -493,11 +590,13 @@ export function getPersistedValue(
   // exact listener's initial replay.
   return persistence
     .peek(new Path(pathString).toString(), expectedAuthScope)
-    .then(record => {
+    .then(async record => {
       if (record === null) {
         return null;
       }
-      const value = record.node.val();
+      // Sliced val(): identical result, but the walk yields macrotasks so a
+      // large workspace cannot block boot in one multi-second task.
+      const value = await materializeNodeSliced(record.node);
       if (value !== null && typeof value === 'object') {
         // One-boot materialization handoff (see ServerCacheSeed): the
         // authenticated listener that adopts this same immutable Node replays
