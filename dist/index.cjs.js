@@ -15215,17 +15215,84 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         repo.server_.unlisten(query, tag);
         sendListen('fallback', reason);
     };
+    /**
+     * Certified complete server caches strictly below the root (shallowest
+     * first), or null when any descendant view holds PARTIAL server data — a
+     * filtered query's window, a half-filled cache — which cannot be grafted
+     * and would be replaced by applying a stale stored tree over it.
+     *
+     * Complete descendant caches are server truth the SDK already certified
+     * (a deeper listen's initial answer landing while the root's restore is
+     * still decoding). The restored base is applied WITH them grafted over
+     * it, so an early component read never forfeits the whole root's cache to
+     * a cold reload. The set is captured when the seeded listen is sent and
+     * cannot grow mid-window: a descendant registration joining the existing
+     * root view sends no wire listen of its own, and every server operation
+     * for the root is boot-buffered until the base applies.
+     */
+    let grafts = null;
+    const collectGraftableDescendants = () => {
+        const states = syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path);
+        const collected = [];
+        for (const state of states) {
+            if (state.complete === null) {
+                return null;
+            }
+            collected.push({ path: state.path, complete: state.complete });
+        }
+        return collected;
+    };
+    /**
+     * Stored range hashes describe exactly the STORED tree; grafting makes
+     * that claim false for every range a graft's leaves intersect — and a
+     * stale stored hash could falsely match a server range that REVERTED to
+     * the stored bytes, silently certifying grafted data the server no longer
+     * holds (the one corruption the range handshake cannot self-heal). Blank
+     * the intersecting ranges' hashes: an empty hash never matches, so the
+     * server always resends those ranges' current data — converging to server
+     * truth in every interleaving. Untouched ranges hold exactly the stored
+     * bytes (markDirtyRanges marks every intersecting range), so their stored
+     * hashes remain truthful. The virtual tail past the last post is already
+     * the empty hash on the wire.
+     */
+    const blankGraftedRangeHashes = (compoundHash, graftPaths) => {
+        const ranges = compoundHash.posts.map((post, index) => ({
+            post,
+            hash: compoundHash.hashes[index],
+            size: 0
+        }));
+        const marked = markDirtyRanges(ranges, graftPaths);
+        const hashes = compoundHash.hashes.slice();
+        for (let index = 0; index < ranges.length; index++) {
+            if (marked.dirty[index]) {
+                hashes[index] = '';
+            }
+        }
+        return { posts: compoundHash.posts, hashes };
+    };
     const onManifest = () => {
         if (!isCurrent() || sentFromManifest) {
             return;
         }
-        if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
-            null ||
-            syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path)
-                .length > 0) {
-            // Existing server-cache state changes the exact tree the persisted
-            // hashes describe; let the restore resolution pick the cold path.
+        if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
+            // The root itself is already server-certified — nothing a restore
+            // could add; let the restore resolution pick the cold path.
             return;
+        }
+        grafts = collectGraftableDescendants();
+        if (grafts === null) {
+            // Partial descendant data cannot be grafted; let the restore
+            // resolution pick the cold path.
+            return;
+        }
+        if (grafts.length > 0) {
+            const pending = repo.pendingListenHashes_.get(pathString);
+            if (pending !== undefined) {
+                // The listen must claim the tree we will actually hold: the merged
+                // base-plus-grafts. Blank the graft-intersecting range hashes and
+                // the whole-tree hash (see blankGraftedRangeHashes).
+                repo.pendingListenHashes_.set(pathString, '', blankGraftedRangeHashes(pending.compoundHash, grafts.map(graft => pathSlice(graft.path))));
+            }
         }
         sentFromManifest = true;
         repo.bootBuffers_.set(pathString, []);
@@ -15279,15 +15346,43 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         if (!sentFromManifest) {
             // Manifest callback never fired usable (pre-existing server cache,
             // or a race); apply-then-listen, the pre-manifest-first sequence.
-            if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null ||
-                syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path).length > 0) {
+            if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
+                repo.pendingListenHashes_.clear(pathString);
+                finish('cold');
+                return;
+            }
+            grafts = collectGraftableDescendants();
+            if (grafts === null) {
+                // Partial descendant server data cannot be grafted (see
+                // collectGraftableDescendants); applying the stored tree over it
+                // would replace live server data with stale bytes.
                 repo.pendingListenHashes_.clear(pathString);
                 finish('cold');
                 return;
             }
         }
         try {
-            const restored = stampSeedHashes(record.node, record.hash, record.compoundHash);
+            // Graft certified descendant caches over the restored base: the
+            // deeper listens' server truth wins where they nest, and the range
+            // hashes covering them were blanked so the server resends exactly
+            // those intervals' current data (see blankGraftedRangeHashes). The
+            // set captured at listen-send time still holds: descendant wire
+            // listens are shadow-stopped by this root registration, pushes are
+            // boot-buffered, and mid-window get() responses skip the SyncTree.
+            const graftList = grafts ?? [];
+            let base = record.node;
+            for (const graft of graftList) {
+                base = base.updateChild(graft.path, graft.complete);
+            }
+            const restored = graftList.length === 0
+                ? stampSeedHashes(base, record.hash, record.compoundHash)
+                : stampSeedHashes(base, 
+                // A merged tree matches no stored whole-tree hash; claim
+                // none. The blanked compound hash still lets every clean
+                // range validate instead of re-downloading.
+                '', record.compoundHash !== undefined
+                    ? blankGraftedRangeHashes(record.compoundHash, graftList.map(graft => pathSlice(graft.path)))
+                    : undefined);
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isCurrent()) {
@@ -15557,6 +15652,18 @@ function repoGetValue(repo, query, eventRegistration) {
     }
     return repo.server_.get(query).then(payload => {
         const node = nodeFromJSON(payload).withIndex(query._queryParams.getIndex());
+        // Boot window: an ancestor's manifest-first listen is out and its
+        // cached base has not applied yet. Server PUSHES for that root are
+        // held in the boot buffer, but a get() is request-response and lands
+        // here directly. Installing its (fresh) answer into the SyncTree now
+        // would be clobbered moments later by the stale base applying at the
+        // root — listeners at this path would visibly flip fresh→stale→fresh.
+        // Resolve the caller with the fresh value but skip the SyncTree side
+        // effect; the base + buffered deltas populate the tree consistently,
+        // and the listen's certification corrects any residue.
+        if (repoBootBufferRootFor(repo, query._path.toString()) !== null) {
+            return node;
+        }
         /**
          * Below we simulate the actions of an `onlyOnce` `onValue()` event where:
          * Add an event registration,
