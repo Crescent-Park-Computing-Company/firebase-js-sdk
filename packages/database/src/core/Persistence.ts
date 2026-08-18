@@ -647,6 +647,12 @@ export class PersistenceManager {
       cleanupTimer: ReturnType<typeof setTimeout> | null;
       manifestHashes: PersistedSeedHashes | null;
       manifestCallbacks: Set<(hashes: PersistedSeedHashes) => void>;
+      /**
+       * The decoded root this entry resolved with (set by release; null
+       * until then / on miss). Identity key for hasRetainedPeek: stamps may
+       * only ride the EXACT retained decode a future listener will join.
+       */
+      resolvedNode: Node | null;
     }
   >();
   private restoreReasons_ = new Map<string, PersistenceRestoreReason>();
@@ -704,6 +710,33 @@ export class PersistenceManager {
 
   isAuthScopeConfigured(): boolean {
     return this.authScopeConfigured_;
+  }
+
+  /**
+   * The current identity-scope generation — bumped by every setAuthScope
+   * that changes the scope. Callers whose continuation spans an await after
+   * peek() resolves capture this before the wait and compare after, so a
+   * scope switch mid-continuation invalidates the result exactly like
+   * peek()'s own resolution-time check. @internal
+   */
+  authGeneration(): number {
+    return this.authGeneration_;
+  }
+
+  /**
+   * True while THE read that decoded `node` is still RETAINED at this root
+   * for a future listener join (see readRecord_'s retainAfterResolve) — the
+   * only window in which materialization stamps have a consumer. Identity-
+   * bound on purpose: a path-only check would also pass for a REPLACEMENT
+   * read (the original consumed by a listener mid-walk, a second peek
+   * retained since), and stamps would then ride the consumed read's live
+   * nodes with no replay ever taking them — a session-long pinned copy of
+   * each subtree. False once the read was consumed, expired, superseded,
+   * or the manager disposed. @internal
+   */
+  hasRetainedPeek(pathString: string, node: Node): boolean {
+    const entry = this.activeReads_.get(pathString);
+    return entry?.retainAfterResolve === true && entry.resolvedNode === node;
   }
 
   setAuthScope(scope: string | null, confirmedByApp = true): boolean {
@@ -1707,13 +1740,15 @@ export class PersistenceManager {
       cleanupTimer: ReturnType<typeof setTimeout> | null;
       manifestHashes: PersistedSeedHashes | null;
       manifestCallbacks: Set<(hashes: PersistedSeedHashes) => void>;
+      resolvedNode: Node | null;
     } = {
       promise: Promise.resolve(null),
       progress,
       retainAfterResolve,
       cleanupTimer: null,
       manifestHashes: null,
-      manifestCallbacks: new Set([onManifest])
+      manifestCallbacks: new Set([onManifest]),
+      resolvedNode: null
     };
     const promise = this.readRecordOnce_(
       pathString,
@@ -1732,6 +1767,7 @@ export class PersistenceManager {
     const release = (result: ReadResult | null) => {
       entry.progress.clear();
       entry.manifestCallbacks.clear();
+      entry.resolvedNode = result === null ? null : result.record.node;
       if (this.activeReads_.get(pathString) !== entry) {
         return;
       }

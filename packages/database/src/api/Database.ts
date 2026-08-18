@@ -54,7 +54,9 @@ import {
 } from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
 import { stampMaterializedValue } from '../core/ServerCacheSeed';
+import { ChildrenNode } from '../core/snap/ChildrenNode';
 import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
+import { Node } from '../core/snap/Node';
 import { parseRepoInfo } from '../core/util/libs/parser';
 import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
@@ -451,6 +453,155 @@ export function goOffline(db: Database): void {
 }
 
 /**
+ * Per-child work units charged per main-thread slice of the peek walk (one
+ * charge per child pulled from a node's iterator and per array-coercion
+ * copy). Sized so one slice stays well inside a frame budget on mobile
+ * hardware while keeping the total slice count (and its scheduling overhead)
+ * low on large workspaces.
+ * @internal
+ */
+export const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
+
+/**
+ * Yields one macrotask. MessageChannel where available: unlike setTimeout(0),
+ * ports are exempt from the nested-timer clamp (~4ms after a few levels),
+ * which would otherwise stretch a many-slice materialization by whole
+ * seconds exactly on the slow boots it is meant to help.
+ *
+ * Node port lifecycle: a referenced MessagePort keeps the Node event loop
+ * alive, so the ports are referenced only while yields are pending and
+ * unref'd once the queue drains — an idle channel must not block a Node
+ * consumer's otherwise-clean shutdown. The direction matters both ways: a
+ * PERMANENTLY unref'd port is wrong too, because Node drops delivery when
+ * no other handle holds the loop and the yield would never resolve.
+ * Browsers have no ref/unref on ports; the optional calls are no-ops there.
+ */
+interface UnrefablePort {
+  ref?: () => void;
+  unref?: () => void;
+}
+let peekYieldChannel: MessageChannel | null = null;
+const peekYieldResolvers: Array<() => void> = [];
+function setPeekPortsReferenced(referenced: boolean): void {
+  for (const port of [peekYieldChannel!.port1, peekYieldChannel!.port2]) {
+    const p = port as unknown as UnrefablePort;
+    if (referenced) {
+      p.ref?.();
+    } else {
+      p.unref?.();
+    }
+  }
+}
+function yieldMacrotask(): Promise<void> {
+  if (typeof MessageChannel === 'undefined') {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+  if (peekYieldChannel === null) {
+    peekYieldChannel = new MessageChannel();
+    // Installing onmessage references the port in Node; start idle-unref'd.
+    peekYieldChannel.port1.onmessage = () => {
+      peekYieldResolvers.shift()?.();
+      if (peekYieldResolvers.length === 0) {
+        setPeekPortsReferenced(false);
+      }
+    };
+    setPeekPortsReferenced(false);
+  }
+  return new Promise(resolve => {
+    peekYieldResolvers.push(resolve);
+    setPeekPortsReferenced(true);
+    peekYieldChannel!.port2.postMessage(null);
+  });
+}
+
+// ChildrenNode.val()'s integer-key grammar (private there; replicated for the
+// sliced walk's array coercion, which must match val() exactly).
+const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
+
+/**
+ * Materializes `node` to the exact JS value `node.val()` returns — same child
+ * ordering (PRIORITY_INDEX), same array coercion, same leaf semantics — in
+ * yielded slices under one budget invariant: EVERY per-child unit of work
+ * (a child pulled from a node's lazy iterator, an array-coercion copy)
+ * charges the shared slice budget, and no uncharged loop is unbounded. After
+ * _PEEK_MATERIALIZE_SLICE_VISITS charges the walk yields a macrotask so the
+ * main thread can paint and GC.
+ *
+ * Children are pulled from ChildrenNode.getIterator(PRIORITY_INDEX) — the
+ * identical resolveIndex_ order forEachChild/val() traverse — one at a time,
+ * so a wide flat node never enumerates (or buffers) its whole child set
+ * between two yields. An eager per-node child copy would itself be the
+ * unbounded synchronous walk this function exists to prevent.
+ *
+ * Why not node.val(): the pre-auth peek materializes the ENTIRE persisted
+ * workspace at boot, and one synchronous walk over a large root is a
+ * multi-second main-thread block plus an allocation spike at exactly the
+ * moment mobile WebKit is quickest to kill the page. The IndexedDB decode
+ * before this point is already sliced (decodeFragmentsSliced_); this closes
+ * the remaining monolithic walk on the boot path.
+ */
+async function materializeNodeSliced(node: Node): Promise<unknown> {
+  let visitsSinceYield = 0;
+  const walk = async (current: Node): Promise<unknown> => {
+    if (current.isLeafNode()) {
+      return current.val();
+    }
+    if (current.isEmpty()) {
+      return null;
+    }
+    // Lazy child iteration: same PRIORITY_INDEX order as forEachChild (both
+    // resolve the identical index), pulled one child per budget charge.
+    const iterator = (current as ChildrenNode).getIterator(PRIORITY_INDEX);
+    const obj: Record<string, unknown> = {};
+    let numKeys = 0;
+    let maxKey = 0;
+    let allIntegerKeys = true;
+    let child = iterator.getNext();
+    while (child !== null) {
+      if (++visitsSinceYield >= _PEEK_MATERIALIZE_SLICE_VISITS) {
+        visitsSinceYield = 0;
+        await yieldMacrotask();
+      }
+      const key = child.name;
+      // Inline leaves: a promise per leaf (via recursion) would dominate
+      // allocation on exactly the wide flat collections this bounds.
+      obj[key] = child.node.isLeafNode()
+        ? child.node.val()
+        : await walk(child.node);
+      numKeys++;
+      // charCode fast-reject mirrors ChildrenNode.val().
+      if (
+        allIntegerKeys &&
+        key.charCodeAt(0) >= 48 /* '0' */ &&
+        key.charCodeAt(0) <= 57 /* '9' */ &&
+        PEEK_INTEGER_REGEXP.test(key)
+      ) {
+        maxKey = Math.max(maxKey, Number(key));
+      } else {
+        allIntegerKeys = false;
+      }
+      child = iterator.getNext();
+    }
+    if (allIntegerKeys && maxKey < 2 * numKeys) {
+      const array: unknown[] = [];
+      // eslint-disable-next-line guard-for-in
+      for (const key in obj) {
+        // Charged like any other per-child unit: a huge dense array must not
+        // replay its whole length in one uncharged task after the last yield.
+        if (++visitsSinceYield >= _PEEK_MATERIALIZE_SLICE_VISITS) {
+          visitsSinceYield = 0;
+          await yieldMacrotask();
+        }
+        array[key as unknown as number] = obj[key];
+      }
+      return array;
+    }
+    return obj;
+  };
+  return walk(node);
+}
+
+/**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
  * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
@@ -491,21 +642,47 @@ export function getPersistedValue(
   // listen to. This lets the authenticated listener consume the same decoded
   // Node and prevents a fresher ancestor record from being mistaken for the
   // exact listener's initial replay.
-  return persistence
-    .peek(new Path(pathString).toString(), expectedAuthScope)
-    .then(record => {
+  const normalizedPath = new Path(pathString).toString();
+  // peek() revalidates the identity scope when its record promise resolves,
+  // but the sliced walk below opens a multi-macrotask window AFTER that
+  // check. Capture the generation here and re-check once the walk is done,
+  // so a scope switch or sign-out mid-walk invalidates this peek exactly
+  // like one that lands before resolution — a public-API caller must never
+  // receive the previous account's cached tree.
+  const authGeneration = persistence.authGeneration();
+  return persistence.peek(normalizedPath, expectedAuthScope).then(
+    async (record): Promise<unknown | null> => {
       if (record === null) {
         return null;
       }
-      const value = record.node.val();
-      if (value !== null && typeof value === 'object') {
-        // One-boot materialization handoff (see ServerCacheSeed): the
-        // authenticated listener that adopts this same immutable Node replays
-        // it as a child_added burst, and a caller that opts in via
-        // consumePersistedMaterialization() adopts each top-level child's
-        // slice of this single materialization instead of walking the tree a
-        // second time. snapshot.val() itself never returns these objects.
-        // Index access covers both object and array-coerced shapes.
+      // Sliced val(): identical result, but the walk yields macrotasks so a
+      // large workspace cannot block boot in one multi-second task.
+      const value = await materializeNodeSliced(record.node);
+      if (persistence.authGeneration() !== authGeneration) {
+        return null;
+      }
+      // One-boot materialization handoff (see ServerCacheSeed), installed
+      // ATOMICALLY after the walk and only while THE read that decoded this
+      // exact node is still retained for a future listener join — the only
+      // window with a consumer. Identity-bound (record.node, not just the
+      // path): a listener consuming the read mid-walk, or a replacement
+      // peek retained since, must leave zero stamps behind — a stamp
+      // without a taker pins a full JS copy of its subtree for the session.
+      // When the check fails, the joined/next listener simply
+      // re-materializes via val(), the ordinary cold path.
+      //
+      // This pass is deliberately synchronous (not budget-charged): it
+      // allocates nothing — the values already live in `value` — and its
+      // per-child cost is a WeakMap set for object children only
+      // (stampMaterializedValue ignores primitives itself), strictly
+      // cheaper than the listener replay burst over the same children.
+      // Charging it would reopen the mid-pass interleaving the atomicity
+      // exists to prevent.
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        persistence.hasRetainedPeek(normalizedPath, record.node)
+      ) {
         const byKey = value as Record<string, unknown>;
         record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
           stampMaterializedValue(childNode, byKey[key]);
@@ -513,7 +690,8 @@ export function getPersistedValue(
         stampMaterializedValue(record.node, value);
       }
       return value;
-    });
+    }
+  );
 }
 
 /**

@@ -21,7 +21,8 @@ import { expect } from 'chai';
 import {
   getPersistedValue,
   setPersistenceAuthScope,
-  setPersistenceEnabled
+  setPersistenceEnabled,
+  _PEEK_MATERIALIZE_SLICE_VISITS
 } from '../src/api/Database';
 import {
   consumePersistedMaterialization,
@@ -59,6 +60,7 @@ import {
 } from '../src/core/Repo';
 import { ListenWireResult } from '../src/core/ServerActions';
 import {
+  consumeMaterializedValue,
   ListenHashFn,
   PendingListenHashStore
 } from '../src/core/ServerCacheSeed';
@@ -3801,5 +3803,225 @@ describe('getPersistedValue', () => {
     expect(() => getPersistedValue(db as never, 'bad#path')).to.throw(
       /invalid path/i
     );
+  });
+
+  it('sliced materialization matches node.val() exactly, including array coercion', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('shape/root');
+    manager.track(root.toString());
+    // Every val() shape the sliced walk must reproduce: dense integer keys
+    // (array coercion), sparse-but-coercible keys (holes), integer keys too
+    // sparse to coerce (object), nested mixes, and named-key objects.
+    const raw = {
+      dense: { '0': 'a', '1': 'b', '2': 'c' },
+      holes: { '0': 'x', '2': 'z' }, // maxKey 2 < 2*2 → array with a hole
+      tooSparse: { '0': 'x', '9': 'y' }, // maxKey 9 >= 2*2 → stays an object
+      nested: { list: { '0': { name: 'n0' }, '1': { name: 'n1' } } },
+      named: { alpha: 1, beta: true, gamma: 'g' }
+    };
+    const node = nodeFromJSON(raw);
+    manager.serverCacheUpdated(root, node);
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    const sliced = await getPersistedValue(db as never, '/shape/root');
+    // The reference is the SDK's own val() over the same restored node — the
+    // authoritative definition the sliced walk replicates.
+    const record = await manager.peek(root.toString());
+    expect(stringify(sliced)).to.equal(stringify(record!.node.val()));
+    // Spot-check the coercions directly.
+    const value = sliced as Record<string, unknown>;
+    expect(value.dense).to.be.an('array').with.lengthOf(3);
+    expect(value.holes).to.be.an('array').with.lengthOf(3);
+    expect((value.holes as unknown[])[1]).to.equal(undefined);
+    expect(value.tooSparse).to.be.an('object').and.not.an('array');
+    expect((value.nested as { list: unknown[] }).list).to.be.an('array');
+  });
+
+  it('yields to the event loop while materializing a large tree', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('big/root');
+    manager.track(root.toString());
+    // More leaves than one slice budget, so the walk must yield at least once.
+    const wide: Record<string, Record<string, number>> = {};
+    const perParent = 100;
+    const parents = Math.ceil((_PEEK_MATERIALIZE_SLICE_VISITS * 2) / perParent);
+    for (let i = 0; i < parents; i++) {
+      const children: Record<string, number> = {};
+      for (let j = 0; j < perParent; j++) {
+        children['c' + j] = i * perParent + j;
+      }
+      wide['p' + i] = children;
+    }
+    manager.serverCacheUpdated(root, nodeFromJSON(wide));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // A macrotask scheduled AFTER the peek starts must run BEFORE the peek
+    // resolves — the monolithic val() walk could never allow that.
+    let macrotaskRan = false;
+    const peek = getPersistedValue(db as never, '/big/root');
+    setTimeout(() => {
+      macrotaskRan = true;
+    }, 0);
+    const value = (await peek) as Record<string, unknown>;
+    expect(macrotaskRan).to.equal(true);
+    expect(Object.keys(value).length).to.equal(parents);
+    expect((value.p0 as Record<string, number>).c0).to.equal(0);
+  });
+
+  it('yields inside one FLAT wide node — children are pulled lazily, never enumerated up front', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('flat/root');
+    manager.track(root.toString());
+    // One node whose DIRECT children exceed several slice budgets. An eager
+    // per-node child copy (forEachChild into an array) would enumerate all of
+    // them synchronously before the first yield — the exact wide-collection
+    // long task the lazy iterator exists to prevent.
+    const flat: Record<string, string> = {};
+    const count = _PEEK_MATERIALIZE_SLICE_VISITS * 3;
+    for (let i = 0; i < count; i++) {
+      flat['k' + i] = 'v' + i;
+    }
+    manager.serverCacheUpdated(root, nodeFromJSON(flat));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    let macrotaskRan = false;
+    const peek = getPersistedValue(db as never, '/flat/root');
+    setTimeout(() => {
+      macrotaskRan = true;
+    }, 0);
+    const value = (await peek) as Record<string, string>;
+    // The walk must have yielded mid-node: this macrotask ran before resolve.
+    expect(macrotaskRan).to.equal(true);
+    expect(Object.keys(value).length).to.equal(count);
+    expect(value.k0).to.equal('v0');
+    expect(value['k' + (count - 1)]).to.equal('v' + (count - 1));
+  });
+
+  /** A tree wide enough that the sliced walk must yield at least once. */
+  function wideTree(): Record<string, string> {
+    const flat: Record<string, string> = {};
+    for (let i = 0; i < _PEEK_MATERIALIZE_SLICE_VISITS * 2; i++) {
+      flat['k' + i] = 'v' + i;
+    }
+    return flat;
+  }
+
+  it('an auth-scope switch during the sliced walk invalidates the peek', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('acct/root');
+    manager.setAuthScope('user-a');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // peek() itself revalidates the scope at record resolution; the sliced
+    // walk then opens a multi-macrotask window. Switch accounts at the first
+    // yield: the continuation must return null, never the old identity's tree.
+    const peek = getPersistedValue(db as never, '/acct/root', 'user-a');
+    setTimeout(() => manager.setAuthScope('user-b'), 0);
+    expect(await peek).to.equal(null);
+  });
+
+  it('a listener consuming the retained read mid-walk leaves no orphaned stamps', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('race/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // The authenticated listener may join the peek's retained read while the
+    // walk is parked on a yield; its child_added burst applies synchronously
+    // and consumes stamps THEN. Stamps installed by the walk afterwards would
+    // ride live Nodes with no replay ever taking them — a session-long pinned
+    // JS copy of each subtree. The atomic handoff must skip stamping entirely
+    // once the retention is gone.
+    const peek = getPersistedValue(db as never, '/race/root');
+    const joined = new Promise<PersistedRecord | null>(resolve => {
+      setTimeout(() => {
+        // restoreForListen's join shape: consume (not retain) the read.
+        void manager
+          .restoreForListen(root.toString())
+          .then(result => resolve(result.record));
+      }, 0);
+    });
+    const [value, record] = await Promise.all([peek, joined]);
+    expect(value).to.not.equal(null);
+    expect(record).to.not.equal(null);
+    // The value itself is still delivered…
+    expect((value as Record<string, string>).k0).to.equal('v0');
+    // …but no stamp was left behind on any node of the consumed read.
+    expect(consumeMaterializedValue(record!.node)).to.equal(undefined);
+    record!.node.forEachChild(PRIORITY_INDEX, (_key, child) => {
+      expect(consumeMaterializedValue(child)).to.equal(undefined);
+    });
+  });
+
+  it('a replacement peek retained mid-walk cannot authorize stamps on the consumed read', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('replace/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // While peek1's walk is parked on a yield: a listener CONSUMES the
+    // retained read (removing its entry), then a second getPersistedValue
+    // installs a fresh retained entry at the SAME path. A path-only
+    // retention check would now pass and stamp peek1's record — whose nodes
+    // are live in SyncTree with no replay ever coming. The identity-bound
+    // check must refuse: the retained entry did not resolve peek1's node.
+    const peek1 = getPersistedValue(db as never, '/replace/root');
+    const raced = new Promise<PersistedRecord | null>(resolve => {
+      setTimeout(() => {
+        void manager
+          .restoreForListen(root.toString()) // consumes the retained read
+          .then(result => {
+            void getPersistedValue(db as never, '/replace/root'); // replacement retention
+            resolve(result.record);
+          });
+      }, 0);
+    });
+    const [value, consumedRecord] = await Promise.all([peek1, raced]);
+    expect(value).to.not.equal(null);
+    expect(consumedRecord).to.not.equal(null);
+    // The consumed read's nodes must carry ZERO stamps from peek1.
+    expect(consumeMaterializedValue(consumedRecord!.node)).to.equal(undefined);
+    consumedRecord!.node.forEachChild(PRIORITY_INDEX, (_key, child) => {
+      expect(consumeMaterializedValue(child)).to.equal(undefined);
+    });
+  });
+
+  it('leaves no referenced MessagePort behind after the sliced walk drains', async function () {
+    // Node-only observability: a REFERENCED MessagePort keeps the Node event
+    // loop alive, so an idle yield channel would hang a Node consumer's
+    // otherwise-clean shutdown (mocha's exit:true masks the hang itself —
+    // assert the handle state instead). Browsers have no ref/unref.
+    const getActiveResourcesInfo = (
+      process as unknown as { getActiveResourcesInfo?: () => string[] }
+    ).getActiveResourcesInfo;
+    if (typeof getActiveResourcesInfo !== 'function') {
+      this.skip();
+      return;
+    }
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('handles/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // The wide tree forces at least one MessageChannel yield.
+    expect(await getPersistedValue(db as never, '/handles/root')).to.not.equal(
+      null
+    );
+    const referencedPorts = getActiveResourcesInfo().filter(resource =>
+      resource.includes('MessagePort')
+    );
+    expect(referencedPorts).to.deep.equal([]);
   });
 });
