@@ -3995,4 +3995,33 @@ describe('getPersistedValue', () => {
       expect(consumeMaterializedValue(child)).to.equal(undefined);
     });
   });
+
+  it('leaves no referenced MessagePort behind after the sliced walk drains', async function () {
+    // Node-only observability: a REFERENCED MessagePort keeps the Node event
+    // loop alive, so an idle yield channel would hang a Node consumer's
+    // otherwise-clean shutdown (mocha's exit:true masks the hang itself —
+    // assert the handle state instead). Browsers have no ref/unref.
+    const getActiveResourcesInfo = (
+      process as unknown as { getActiveResourcesInfo?: () => string[] }
+    ).getActiveResourcesInfo;
+    if (typeof getActiveResourcesInfo !== 'function') {
+      this.skip();
+      return;
+    }
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('handles/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // The wide tree forces at least one MessageChannel yield.
+    expect(await getPersistedValue(db as never, '/handles/root')).to.not.equal(
+      null
+    );
+    const referencedPorts = getActiveResourcesInfo().filter(resource =>
+      resource.includes('MessagePort')
+    );
+    expect(referencedPorts).to.deep.equal([]);
+  });
 });
