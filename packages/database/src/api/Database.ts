@@ -625,30 +625,53 @@ export function getPersistedValue(
   // listen to. This lets the authenticated listener consume the same decoded
   // Node and prevents a fresher ancestor record from being mistaken for the
   // exact listener's initial replay.
-  return persistence
-    .peek(new Path(pathString).toString(), expectedAuthScope)
-    .then(async record => {
+  const normalizedPath = new Path(pathString).toString();
+  // peek() revalidates the identity scope when its record promise resolves,
+  // but the sliced walk below opens a multi-macrotask window AFTER that
+  // check. Capture the generation here and re-check once the walk is done,
+  // so a scope switch or sign-out mid-walk invalidates this peek exactly
+  // like one that lands before resolution — a public-API caller must never
+  // receive the previous account's cached tree.
+  const authGeneration = persistence.authGeneration();
+  return persistence.peek(normalizedPath, expectedAuthScope).then(
+    async (record): Promise<unknown | null> => {
       if (record === null) {
         return null;
       }
       // Sliced val(): identical result, but the walk yields macrotasks so a
       // large workspace cannot block boot in one multi-second task. The
-      // one-boot materialization handoff (see ServerCacheSeed) rides the
-      // walk's own root-level loop: each top-level child is stamped with its
-      // exact materialized value as it is built — no second pass over the
-      // children — so the authenticated listener that adopts this same
-      // immutable Node via consumePersistedMaterialization() reuses this
-      // single materialization. snapshot.val() itself never returns these
-      // objects; stampMaterializedValue ignores primitives on its own.
-      const value = await materializeNodeSliced(
-        record.node,
-        stampMaterializedValue
+      // one-boot materialization handoff (see ServerCacheSeed) is BUFFERED
+      // during the walk and installed all-at-once below: a listener joining
+      // the retained read mid-walk applies its child_added burst
+      // synchronously, and stamps trickled in during yields would be
+      // half-consumable — early children adopted, late ones landing on
+      // nodes already live in SyncTree with no replay ever taking them
+      // (a session-long pinned copy of each such subtree).
+      const stamps: Array<[Node, unknown]> = [];
+      const value = await materializeNodeSliced(record.node, (child, v) =>
+        stamps.push([child, v])
       );
-      if (value !== null && typeof value === 'object') {
+      if (persistence.authGeneration() !== authGeneration) {
+        return null;
+      }
+      // Atomic handoff: stamp only while the completed read is still
+      // retained for a future listener join — the only window with a
+      // consumer. A listener that already consumed the read (or an expired
+      // retention) simply re-materializes via val(), the ordinary cold
+      // path; no stamp is ever left without a taker.
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        persistence.hasRetainedPeek(normalizedPath)
+      ) {
+        for (const [child, childValue] of stamps) {
+          stampMaterializedValue(child, childValue);
+        }
         stampMaterializedValue(record.node, value);
       }
       return value;
-    });
+    }
+  );
 }
 
 /**

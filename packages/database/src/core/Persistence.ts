@@ -706,6 +706,30 @@ export class PersistenceManager {
     return this.authScopeConfigured_;
   }
 
+  /**
+   * The current identity-scope generation — bumped by every setAuthScope
+   * that changes the scope. Callers whose continuation spans an await after
+   * peek() resolves capture this before the wait and compare after, so a
+   * scope switch mid-continuation invalidates the result exactly like
+   * peek()'s own resolution-time check. @internal
+   */
+  authGeneration(): number {
+    return this.authGeneration_;
+  }
+
+  /**
+   * True while this root's completed peek read is still RETAINED for a
+   * future listener join (see readRecord_'s retainAfterResolve) — the only
+   * window in which materialization stamps have a consumer. False once a
+   * listener consumed the read, the retention expired, the scope changed,
+   * or the manager was disposed: a stamp installed then would ride a live
+   * Node with no replay ever taking it — a session-long pinned copy of the
+   * subtree. @internal
+   */
+  hasRetainedPeek(pathString: string): boolean {
+    return this.activeReads_.get(pathString)?.retainAfterResolve === true;
+  }
+
   setAuthScope(scope: string | null, confirmedByApp = true): boolean {
     const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
     this.authScopeConfigured_ = true;

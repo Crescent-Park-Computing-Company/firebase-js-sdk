@@ -60,6 +60,7 @@ import {
 } from '../src/core/Repo';
 import { ListenWireResult } from '../src/core/ServerActions';
 import {
+  consumeMaterializedValue,
   ListenHashFn,
   PendingListenHashStore
 } from '../src/core/ServerCacheSeed';
@@ -3897,5 +3898,66 @@ describe('getPersistedValue', () => {
     expect(Object.keys(value).length).to.equal(count);
     expect(value.k0).to.equal('v0');
     expect(value['k' + (count - 1)]).to.equal('v' + (count - 1));
+  });
+
+  /** A tree wide enough that the sliced walk must yield at least once. */
+  function wideTree(): Record<string, string> {
+    const flat: Record<string, string> = {};
+    for (let i = 0; i < _PEEK_MATERIALIZE_SLICE_VISITS * 2; i++) {
+      flat['k' + i] = 'v' + i;
+    }
+    return flat;
+  }
+
+  it('an auth-scope switch during the sliced walk invalidates the peek', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('acct/root');
+    manager.setAuthScope('user-a');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // peek() itself revalidates the scope at record resolution; the sliced
+    // walk then opens a multi-macrotask window. Switch accounts at the first
+    // yield: the continuation must return null, never the old identity's tree.
+    const peek = getPersistedValue(db as never, '/acct/root', 'user-a');
+    setTimeout(() => manager.setAuthScope('user-b'), 0);
+    expect(await peek).to.equal(null);
+  });
+
+  it('a listener consuming the retained read mid-walk leaves no orphaned stamps', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('race/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // The authenticated listener may join the peek's retained read while the
+    // walk is parked on a yield; its child_added burst applies synchronously
+    // and consumes stamps THEN. Stamps installed by the walk afterwards would
+    // ride live Nodes with no replay ever taking them — a session-long pinned
+    // JS copy of each subtree. The atomic handoff must skip stamping entirely
+    // once the retention is gone.
+    const peek = getPersistedValue(db as never, '/race/root');
+    const joined = new Promise<PersistedRecord | null>(resolve => {
+      setTimeout(() => {
+        // restoreForListen's join shape: consume (not retain) the read.
+        void manager
+          .restoreForListen(root.toString())
+          .then(result => resolve(result.record));
+      }, 0);
+    });
+    const [value, record] = await Promise.all([peek, joined]);
+    expect(value).to.not.equal(null);
+    expect(record).to.not.equal(null);
+    // The value itself is still delivered…
+    expect((value as Record<string, string>).k0).to.equal('v0');
+    // …but no stamp was left behind on any node of the consumed read.
+    expect(consumeMaterializedValue(record!.node)).to.equal(undefined);
+    record!.node.forEachChild(PRIORITY_INDEX, (_key, child) => {
+      expect(consumeMaterializedValue(child)).to.equal(undefined);
+    });
   });
 });
