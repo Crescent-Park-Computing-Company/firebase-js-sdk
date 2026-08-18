@@ -22,7 +22,7 @@ import {
   getPersistedValue,
   setPersistenceAuthScope,
   setPersistenceEnabled,
-  _PEEK_MATERIALIZE_SLICE_LEAVES
+  _PEEK_MATERIALIZE_SLICE_VISITS
 } from '../src/api/Database';
 import {
   consumePersistedMaterialization,
@@ -3844,7 +3844,7 @@ describe('getPersistedValue', () => {
     // More leaves than one slice budget, so the walk must yield at least once.
     const wide: Record<string, Record<string, number>> = {};
     const perParent = 100;
-    const parents = Math.ceil((_PEEK_MATERIALIZE_SLICE_LEAVES * 2) / perParent);
+    const parents = Math.ceil((_PEEK_MATERIALIZE_SLICE_VISITS * 2) / perParent);
     for (let i = 0; i < parents; i++) {
       const children: Record<string, number> = {};
       for (let j = 0; j < perParent; j++) {
@@ -3867,5 +3867,35 @@ describe('getPersistedValue', () => {
     expect(macrotaskRan).to.equal(true);
     expect(Object.keys(value).length).to.equal(parents);
     expect((value.p0 as Record<string, number>).c0).to.equal(0);
+  });
+
+  it('yields inside one FLAT wide node — children are pulled lazily, never enumerated up front', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('flat/root');
+    manager.track(root.toString());
+    // One node whose DIRECT children exceed several slice budgets. An eager
+    // per-node child copy (forEachChild into an array) would enumerate all of
+    // them synchronously before the first yield — the exact wide-collection
+    // long task the lazy iterator exists to prevent.
+    const flat: Record<string, string> = {};
+    const count = _PEEK_MATERIALIZE_SLICE_VISITS * 3;
+    for (let i = 0; i < count; i++) {
+      flat['k' + i] = 'v' + i;
+    }
+    manager.serverCacheUpdated(root, nodeFromJSON(flat));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    let macrotaskRan = false;
+    const peek = getPersistedValue(db as never, '/flat/root');
+    setTimeout(() => {
+      macrotaskRan = true;
+    }, 0);
+    const value = (await peek) as Record<string, string>;
+    // The walk must have yielded mid-node: this macrotask ran before resolve.
+    expect(macrotaskRan).to.equal(true);
+    expect(Object.keys(value).length).to.equal(count);
+    expect(value.k0).to.equal('v0');
+    expect(value['k' + (count - 1)]).to.equal('v' + (count - 1));
   });
 });
