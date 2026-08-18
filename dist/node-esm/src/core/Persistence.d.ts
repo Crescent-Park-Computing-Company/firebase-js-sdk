@@ -249,6 +249,26 @@ export declare class PersistenceManager {
     private authScopeConfirmed_;
     private authGeneration_;
     isAuthScopeConfigured(): boolean;
+    /**
+     * The current identity-scope generation — bumped by every setAuthScope
+     * that changes the scope. Callers whose continuation spans an await after
+     * peek() resolves capture this before the wait and compare after, so a
+     * scope switch mid-continuation invalidates the result exactly like
+     * peek()'s own resolution-time check. @internal
+     */
+    authGeneration(): number;
+    /**
+     * True while THE read that decoded `node` is still RETAINED at this root
+     * for a future listener join (see readRecord_'s retainAfterResolve) — the
+     * only window in which materialization stamps have a consumer. Identity-
+     * bound on purpose: a path-only check would also pass for a REPLACEMENT
+     * read (the original consumed by a listener mid-walk, a second peek
+     * retained since), and stamps would then ride the consumed read's live
+     * nodes with no replay ever taking them — a session-long pinned copy of
+     * each subtree. False once the read was consumed, expired, superseded,
+     * or the manager disposed. @internal
+     */
+    hasRetainedPeek(pathString: string, node: Node): boolean;
     setAuthScope(scope: string | null, confirmedByApp?: boolean): boolean;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number, leaseHeartbeatMs_?: number, leaseStaleMs_?: number, heartbeatStore?: HeartbeatStore | null);
     rebindTo(prefix: string): PersistenceManager;

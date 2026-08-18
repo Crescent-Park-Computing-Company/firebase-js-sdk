@@ -2122,6 +2122,8 @@ declare class PersistenceManager {
     private authScopeConfirmed_;
     private authGeneration_;
     isAuthScopeConfigured(): boolean;
+    /* Excluded from this release type: authGeneration */
+    /* Excluded from this release type: hasRetainedPeek */
     setAuthScope(scope: string | null, confirmedByApp?: boolean): boolean;
     constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number, leaseHeartbeatMs_?: number, leaseStaleMs_?: number, heartbeatStore?: HeartbeatStore | null);
     rebindTo(prefix: string): PersistenceManager;

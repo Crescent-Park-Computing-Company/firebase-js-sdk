@@ -110,6 +110,15 @@ export declare function connectDatabaseEmulator(db: Database, host: string, port
  */
 export declare function goOffline(db: Database): void;
 /**
+ * Per-child work units charged per main-thread slice of the peek walk (one
+ * charge per child pulled from a node's iterator and per array-coercion
+ * copy). Sized so one slice stays well inside a frame budget on mobile
+ * hardware while keeping the total slice count (and its scheduling overhead)
+ * low on large workspaces.
+ * @internal
+ */
+export declare const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
+/**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
  * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
