@@ -647,9 +647,11 @@ export class PersistenceManager {
       cleanupTimer: ReturnType<typeof setTimeout> | null;
       manifestHashes: PersistedSeedHashes | null;
       manifestCallbacks: Set<(hashes: PersistedSeedHashes) => void>;
-      /** The decoded root this entry resolved with (set by release; null
+      /**
+       * The decoded root this entry resolved with (set by release; null
        * until then / on miss). Identity key for hasRetainedPeek: stamps may
-       * only ride the EXACT retained decode a future listener will join. */
+       * only ride the EXACT retained decode a future listener will join.
+       */
       resolvedNode: Node | null;
     }
   >();
