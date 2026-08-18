@@ -3960,4 +3960,39 @@ describe('getPersistedValue', () => {
       expect(consumeMaterializedValue(child)).to.equal(undefined);
     });
   });
+
+  it('a replacement peek retained mid-walk cannot authorize stamps on the consumed read', async () => {
+    const { db, manager } = makeDatabaseWithPersistence();
+    const root = new Path('replace/root');
+    manager.track(root.toString());
+    manager.serverCacheUpdated(root, nodeFromJSON(wideTree()));
+    await manager.flushNow(root.toString());
+    await flushAsync();
+
+    // While peek1's walk is parked on a yield: a listener CONSUMES the
+    // retained read (removing its entry), then a second getPersistedValue
+    // installs a fresh retained entry at the SAME path. A path-only
+    // retention check would now pass and stamp peek1's record — whose nodes
+    // are live in SyncTree with no replay ever coming. The identity-bound
+    // check must refuse: the retained entry did not resolve peek1's node.
+    const peek1 = getPersistedValue(db as never, '/replace/root');
+    const raced = new Promise<PersistedRecord | null>(resolve => {
+      setTimeout(() => {
+        void manager
+          .restoreForListen(root.toString()) // consumes the retained read
+          .then(result => {
+            void getPersistedValue(db as never, '/replace/root'); // replacement retention
+            resolve(result.record);
+          });
+      }, 0);
+    });
+    const [value, consumedRecord] = await Promise.all([peek1, raced]);
+    expect(value).to.not.equal(null);
+    expect(consumedRecord).to.not.equal(null);
+    // The consumed read's nodes must carry ZERO stamps from peek1.
+    expect(consumeMaterializedValue(consumedRecord!.node)).to.equal(undefined);
+    consumedRecord!.node.forEachChild(PRIORITY_INDEX, (_key, child) => {
+      expect(consumeMaterializedValue(child)).to.equal(undefined);
+    });
+  });
 });

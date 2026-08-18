@@ -503,11 +503,6 @@ const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
  * between two yields. An eager per-node child copy would itself be the
  * unbounded synchronous walk this function exists to prevent.
  *
- * `onRootChild` fires once per DIRECT child of `node` with the child's node
- * and its exact materialized value (charged work — it rides the same loop).
- * getPersistedValue uses it to stamp the one-boot materialization handoff
- * without a second full pass over the children.
- *
  * Why not node.val(): the pre-auth peek materializes the ENTIRE persisted
  * workspace at boot, and one synchronous walk over a large root is a
  * multi-second main-thread block plus an allocation spike at exactly the
@@ -515,15 +510,9 @@ const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
  * before this point is already sliced (decodeFragmentsSliced_); this closes
  * the remaining monolithic walk on the boot path.
  */
-async function materializeNodeSliced(
-  node: Node,
-  onRootChild?: (child: Node, value: unknown) => void
-): Promise<unknown> {
+async function materializeNodeSliced(node: Node): Promise<unknown> {
   let visitsSinceYield = 0;
-  const walk = async (
-    current: Node,
-    onChild?: (child: Node, value: unknown) => void
-  ): Promise<unknown> => {
+  const walk = async (current: Node): Promise<unknown> => {
     if (current.isLeafNode()) {
       return current.val();
     }
@@ -546,11 +535,9 @@ async function materializeNodeSliced(
       const key = child.name;
       // Inline leaves: a promise per leaf (via recursion) would dominate
       // allocation on exactly the wide flat collections this bounds.
-      const value = child.node.isLeafNode()
+      obj[key] = child.node.isLeafNode()
         ? child.node.val()
         : await walk(child.node);
-      obj[key] = value;
-      onChild?.(child.node, value);
       numKeys++;
       // charCode fast-reject mirrors ChildrenNode.val().
       if (
@@ -581,7 +568,7 @@ async function materializeNodeSliced(
     }
     return obj;
   };
-  return walk(node, onRootChild);
+  return walk(node);
 }
 
 /**
@@ -639,34 +626,37 @@ export function getPersistedValue(
         return null;
       }
       // Sliced val(): identical result, but the walk yields macrotasks so a
-      // large workspace cannot block boot in one multi-second task. The
-      // one-boot materialization handoff (see ServerCacheSeed) is BUFFERED
-      // during the walk and installed all-at-once below: a listener joining
-      // the retained read mid-walk applies its child_added burst
-      // synchronously, and stamps trickled in during yields would be
-      // half-consumable — early children adopted, late ones landing on
-      // nodes already live in SyncTree with no replay ever taking them
-      // (a session-long pinned copy of each such subtree).
-      const stamps: Array<[Node, unknown]> = [];
-      const value = await materializeNodeSliced(record.node, (child, v) =>
-        stamps.push([child, v])
-      );
+      // large workspace cannot block boot in one multi-second task.
+      const value = await materializeNodeSliced(record.node);
       if (persistence.authGeneration() !== authGeneration) {
         return null;
       }
-      // Atomic handoff: stamp only while the completed read is still
-      // retained for a future listener join — the only window with a
-      // consumer. A listener that already consumed the read (or an expired
-      // retention) simply re-materializes via val(), the ordinary cold
-      // path; no stamp is ever left without a taker.
+      // One-boot materialization handoff (see ServerCacheSeed), installed
+      // ATOMICALLY after the walk and only while THE read that decoded this
+      // exact node is still retained for a future listener join — the only
+      // window with a consumer. Identity-bound (record.node, not just the
+      // path): a listener consuming the read mid-walk, or a replacement
+      // peek retained since, must leave zero stamps behind — a stamp
+      // without a taker pins a full JS copy of its subtree for the session.
+      // When the check fails, the joined/next listener simply
+      // re-materializes via val(), the ordinary cold path.
+      //
+      // This pass is deliberately synchronous (not budget-charged): it
+      // allocates nothing — the values already live in `value` — and its
+      // per-child cost is a WeakMap set for object children only
+      // (stampMaterializedValue ignores primitives itself), strictly
+      // cheaper than the listener replay burst over the same children.
+      // Charging it would reopen the mid-pass interleaving the atomicity
+      // exists to prevent.
       if (
         value !== null &&
         typeof value === 'object' &&
-        persistence.hasRetainedPeek(normalizedPath)
+        persistence.hasRetainedPeek(normalizedPath, record.node)
       ) {
-        for (const [child, childValue] of stamps) {
-          stampMaterializedValue(child, childValue);
-        }
+        const byKey = value as Record<string, unknown>;
+        record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+          stampMaterializedValue(childNode, byKey[key]);
+        });
         stampMaterializedValue(record.node, value);
       }
       return value;
