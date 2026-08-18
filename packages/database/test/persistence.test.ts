@@ -29,7 +29,8 @@ import {
   DataSnapshot,
   off,
   onValue,
-  QueryImpl
+  QueryImpl,
+  ValueEventRegistration
 } from '../src/api/Reference_impl';
 import {
   CompoundHashBuilder,
@@ -51,6 +52,7 @@ import {
   repoCancelPendingSeedRestores,
   repoClearListenOutcomes,
   repoDispose,
+  repoGetValue,
   repoOnDataUpdateForTest,
   repoOnListenOutcome,
   repoStartServerListen,
@@ -2316,6 +2318,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       (status: string, wire?: Partial<ListenWireResult>) => void
     > = [];
     const serverProgress: Array<(wire: ListenWireResult) => void> = [];
+    const getResponders: Array<(payload: unknown) => void> = [];
     const pendingHashes = new PendingListenHashStore();
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
@@ -2357,7 +2360,13 @@ describe('repoStartServerListen / repoStopServerListen', () => {
           );
           serverProgress.push(onProgress ?? (() => {}));
         },
-        unlisten: (...args: unknown[]) => calls.push('unlisten')
+        unlisten: (...args: unknown[]) => calls.push('unlisten'),
+        get: () => {
+          calls.push('get');
+          return new Promise(resolve => {
+            getResponders.push(resolve);
+          });
+        }
       }
     } as unknown as Repo;
     const path = new Path('users/alice');
@@ -2378,6 +2387,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       hashFns,
       serverCallbacks,
       serverProgress,
+      getResponders,
       data,
       factory
     };
@@ -2410,6 +2420,31 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       createCancelEvent: () => null as any,
       matches: () => matches,
+      hasAnyCallback: () => true
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+  }
+
+  /**
+   * A value registration that records every raised snapshot value — for
+   * asserting the exact event SEQUENCE a listener observes (a fresh→stale
+   * flip vs a single consistent value).
+   */
+  function recordingRegistration(values: unknown[]) {
+    return {
+      respondsTo: (eventType: string) => eventType === 'value',
+      createEvent: (
+        change: { snapshotNode: Node },
+        query: { _path: Path }
+      ) => ({
+        getPath: () => query._path,
+        getEventType: () => 'value',
+        getEventRunner: () => () => values.push(change.snapshotNode.val()),
+        toString: () => 'recording-event'
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
       hasAnyCallback: () => true
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
@@ -2585,7 +2620,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
 
-  it('a certified descendant makes the parent restore go cold', async () => {
+  it('a child certified while the restore is in flight is grafted, never clobbered', async () => {
     const { repo, query, path, hashFn, onComplete, calls, data } =
       makeListenHarness();
     await persistHarnessRoot(repo, path, {
@@ -2629,13 +2664,16 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
 
     expect(calls).to.deep.equal(['listen']);
-    // The persisted parent was not applied with hashes for a different tree.
-    // The independently certified child remains current.
+    // The certified child was grafted over the restored base: it remains
+    // current, and the parent still seeded from the cache around it.
     const childCache = syncTreeGetCompleteServerCache(
       repo.serverSyncTree_,
       childPath
     );
     expect(childCache?.val(true)).to.deep.equal({ msg: 'fresh' });
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ sibling: 'stale', inbox: { msg: 'fresh' } });
   });
 
   it('an empty filtered descendant still blocks a stale parent restore', async () => {
@@ -2704,6 +2742,208 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
+  });
+
+  it('grafts certified descendant caches over the restored base instead of going cold', async () => {
+    const { repo, query, path, hashFn, onComplete, calls } =
+      makeListenHarness();
+    // Big leaves either side of the graft path force the stored generation
+    // to split into MULTIPLE ranges, so the mid-window assertions below can
+    // distinguish a blanked graft-intersecting range from an intact clean
+    // one.
+    await persistHarnessRoot(repo, path, {
+      aaa: bigLeaf('a'),
+      inbox: { msg: 'stale' },
+      zzz: bigLeaf('z')
+    });
+    // Hold the restore open after the manifest fires so the boot window is
+    // inspectable while the seeded listen is on the wire.
+    const manager = repo.persistence_!;
+    const realRestore = manager.restoreForListen.bind(manager);
+    let releaseRecord: () => void = () => {};
+    const recordGate = new Promise<void>(resolve => {
+      releaseRecord = resolve;
+    });
+    manager.restoreForListen = (pathString, onManifest) =>
+      realRestore(pathString, onManifest).then(async result => {
+        await recordGate;
+        return result;
+      });
+
+    const parentQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      parentQuery,
+      stubRegistration()
+    );
+    // A deeper live listen certified BEFORE the parent's listen starts (a
+    // component's own onValue answered in one round-trip while the parent's
+    // IndexedDB decode is still ahead). Its complete cache is server truth
+    // for that subtree — graftable, never a reason to abandon the cache.
+    const childPath = new Path('users/alice/inbox');
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      childQuery,
+      stubRegistration()
+    );
+    syncTreeApplyServerOverwrite(
+      repo.serverSyncTree_,
+      childPath,
+      nodeFromJSON({ msg: 'fresh' })
+    );
+
+    const outcomes: ListenOutcome[] = [];
+    const unsubscribe = repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+
+    // Seeded, not cold — the listen went out manifest-first despite the
+    // certified descendant.
+    expect(calls).to.deep.equal(['listen']);
+    expect(outcomes[outcomes.length - 1].mode).to.equal('restored');
+    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+
+    // CONVERGENCE ON THE WIRE (what the SyncTree hashFn consults for this
+    // listen): the merged base-plus-graft tree matches no stored whole-tree
+    // hash, so the listen claims none, and every range the graft intersects
+    // has its hash BLANKED — an empty hash never matches, so the server
+    // always resends those intervals' current data. Clean ranges keep their
+    // stored hashes (they hold exactly the stored bytes) and can still
+    // validate without a re-download.
+    const pending = repo.pendingListenHashes_.get(path.toString());
+    expect(pending).to.not.equal(undefined);
+    expect(pending!.hash).to.equal('');
+    const wire = pending!.compoundHash;
+    expect(wire.hashes.length).to.equal(wire.posts.length + 1);
+    let sawBlankedGraftRange = false;
+    let sawIntactCleanRange = false;
+    for (let index = 0; index < wire.posts.length; index++) {
+      const rangeStart = index === 0 ? null : wire.posts[index - 1];
+      const rangeEnd = wire.posts[index];
+      // Range i covers (posts[i-1], posts[i]]; it intersects the graft's
+      // subtree iff it overlaps the marker interval of 'inbox'.
+      const intersectsGraft =
+        rangeEnd >= 'inbox' && (rangeStart === null || rangeStart < 'inboxz');
+      if (intersectsGraft) {
+        expect(wire.hashes[index]).to.equal('');
+        sawBlankedGraftRange = true;
+      } else if (wire.hashes[index] !== '') {
+        sawIntactCleanRange = true;
+      }
+    }
+    expect(sawBlankedGraftRange).to.equal(true);
+    // The stored generation splits this root into ranges untouched by the
+    // graft; their hashes must have survived intact.
+    expect(sawIntactCleanRange).to.equal(true);
+
+    releaseRecord();
+    await flushAsync();
+
+    // The restored base applied with the certified child grafted over it —
+    // the fresher subtree wins, the cache still serves everything else.
+    const merged = syncTreeGetCompleteServerCache(
+      repo.serverSyncTree_,
+      path
+    )?.val() as Record<string, unknown>;
+    expect(merged.inbox).to.deep.equal({ msg: 'fresh' });
+    expect(merged.aaa).to.equal(bigLeaf('a'));
+    expect(merged.zzz).to.equal(bigLeaf('z'));
+    // The grafted child kept its identity as the descendant view's truth.
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, childPath)?.val()
+    ).to.deep.equal({ msg: 'fresh' });
+    unsubscribe();
+  });
+  it('a get() answered during the boot window does not flip listeners fresh-then-stale', async () => {
+    const { repo, query, path, hashFn, onComplete, calls, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, {
+      sibling: 'stale',
+      inbox: { msg: 'stale' }
+    });
+    // Hold the restore open after the manifest fires, so the boot window is
+    // wide enough to interleave a get() response inside it.
+    const manager = repo.persistence_!;
+    const realRestore = manager.restoreForListen.bind(manager);
+    let releaseRecord: () => void = () => {};
+    const recordGate = new Promise<void>(resolve => {
+      releaseRecord = resolve;
+    });
+    manager.restoreForListen = (pathString, onManifest) =>
+      realRestore(pathString, onManifest).then(async result => {
+        await recordGate;
+        return result;
+      });
+
+    const realQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      realQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+
+    // Mid-window, a component subscribes to a child and issues a get() for
+    // it. The get is request-response — it bypasses the push buffer — and
+    // the server answers with FRESH data while the stale base is still
+    // decoding.
+    const childPath = new Path('users/alice/inbox');
+    const childValues: unknown[] = [];
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      childQuery,
+      recordingRegistration(childValues)
+    );
+    const getPromise = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    getResponders[0]({ msg: 'fresh' });
+    const got = await getPromise;
+    // The caller always receives the fresh server answer.
+    expect(got.val()).to.deep.equal({ msg: 'fresh' });
+
+    releaseRecord();
+    await flushAsync();
+
+    // The child listener must NOT have observed fresh data that then
+    // regressed to the stale base — the visible fresh→stale→fresh flip. It
+    // sees one consistent value: the boot-buffered progression (base, then
+    // buffered deltas), which the server then certifies or corrects.
+    expect(childValues).to.deep.equal([{ msg: 'stale' }]);
+    expect(repo.bootBuffers_.size).to.equal(0);
   });
 
   it('without a manifest callback the listen waits for the restore', async () => {
