@@ -43,8 +43,15 @@ import {
   SeedCompoundHash,
   stampSeedHashes
 } from './ServerCacheSeed';
+import {
+  assembleChildrenNode,
+  decodeChildrenSliced,
+  IngestCancelledError,
+  sliceableAsChildren
+} from './SlicedNodeDecode';
 import { ChildrenNode } from './snap/ChildrenNode';
-import { Node } from './snap/Node';
+import { KEY_INDEX } from './snap/indexes/KeyIndex';
+import { NamedNode, Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
@@ -116,6 +123,7 @@ import {
   warn
 } from './util/util';
 import { isValidPriority, validateFirebaseData } from './util/validation';
+import { yieldMacrotask } from './util/yieldMacrotask';
 import { Event } from './view/Event';
 import {
   EventQueue,
@@ -241,6 +249,8 @@ export type ListenOutcomeReason =
   | 'missing'
   | 'expired'
   | 'auth'
+  | 'auth-timeout'
+  | 'partial-descendants'
   | 'corrupt'
   | 'timeout';
 
@@ -548,6 +558,30 @@ function repoOnDataUpdate(
       return;
     }
   }
+  if (repoIngestEligible(repo, pathString, data, isMerge, tag)) {
+    // Full-root push at a persistent root: decode and apply in yielded
+    // slices instead of one monolithic task (see repoIngestFullRootPush).
+    // A boot buffer holds later wire operations in order while it runs.
+    // The cast restates repoIngestEligible's sliceableAsChildren guard.
+    void repoRunIngestPump(repo, pathString, data as Record<string, unknown>);
+    return;
+  }
+  repoApplyDataUpdate(repo, pathString, data, isMerge, tag);
+}
+
+/**
+ * The synchronous data-push application (the pre-ingest-pump body of
+ * repoOnDataUpdate): decode, apply to SyncTree, rerun transactions, raise
+ * events, write through to persistence. Bounded payloads only — full-root
+ * pushes at persistent roots divert to the sliced ingest pump above.
+ */
+function repoApplyDataUpdate(
+  repo: Repo,
+  pathString: string,
+  data: unknown,
+  isMerge: boolean,
+  tag: number | null
+): void {
   const path = new Path(pathString);
   data = repo.interceptServerDataCallback_
     ? repo.interceptServerDataCallback_(pathString, data)
@@ -602,6 +636,252 @@ function repoOnDataUpdate(
 }
 
 /**
+ * Whether a data push takes the sliced ingest pump: an untagged full
+ * overwrite, at EXACTLY a persistence-registered root (the only place a
+ * whole-workspace payload arrives), whose body is a plain children object
+ * (see sliceableAsChildren). Everything else — descendant pushes, merges,
+ * tagged query data, leaf/priority/array roots — is bounded or rare enough
+ * for the ordinary synchronous path.
+ */
+function repoIngestEligible(
+  repo: Repo,
+  pathString: string,
+  data: unknown,
+  isMerge: boolean,
+  tag: number | null
+): boolean {
+  return (
+    tag == null &&
+    !isMerge &&
+    repo.persistence_ !== null &&
+    repo.persistence_.isPersistentPath(pathString) &&
+    repo.interceptServerDataCallback_ === null &&
+    sliceableAsChildren(data)
+  );
+}
+
+/**
+ * Runs one sliced ingest under a boot-buffer window, then drains the window.
+ * The buffer serves double duty: ORDERING (later server operations for this
+ * root hold until the pumped base is in SyncTree, exactly like the
+ * manifest-first boot window) and LIVENESS (a stop/account-switch/dispose
+ * deletes the buffer, which the pump observes at its next yield and aborts).
+ */
+async function repoRunIngestPump(
+  repo: Repo,
+  pathString: string,
+  data: Record<string, unknown>
+): Promise<void> {
+  const buffer: BootBufferedOp[] = [];
+  repo.bootBuffers_.set(pathString, buffer);
+  const isCurrent = () =>
+    // Current exactly while OUR buffer array is still installed: stop
+    // listens, account switches, a successor window, and dispose all delete
+    // or replace the entry.
+    repo.bootBuffers_.get(pathString) === buffer;
+  try {
+    await repoIngestOnePush(repo, pathString, data, isCurrent);
+    await repoDrainIngestWindow(repo, pathString, buffer, isCurrent);
+  } catch (e) {
+    if (!(e instanceof IngestCancelledError)) {
+      throw e;
+    }
+    // Deliberate teardown: whoever tore the window down owns the listen's
+    // state; nothing further to run here.
+  }
+}
+
+/**
+ * Applies one full-root push through the sliced ingest, DEGRADING to the
+ * legacy monolithic apply on an unexpected mid-ingest error: the payload is
+ * still intact, and one synchronous overwrite converges SyncTree to exactly
+ * the tree the push named (partially-applied children are simply replaced).
+ * The long task this costs is the pre-pump status quo, paid only on a path
+ * that indicates an ingest bug. Cancellation is not degradation — it
+ * propagates.
+ */
+async function repoIngestOnePush(
+  repo: Repo,
+  pathString: string,
+  data: Record<string, unknown>,
+  isCurrent: () => boolean
+): Promise<void> {
+  try {
+    await repoIngestFullRootPush(repo, pathString, data, isCurrent);
+  } catch (e) {
+    if (e instanceof IngestCancelledError) {
+      throw e;
+    }
+    warn('sliced ingest failed for ' + pathString + '; applying whole', e);
+    repoApplyDataUpdate(repo, pathString, data, false, null);
+  }
+}
+
+/**
+ * Drains a boot-buffer window IN PLACE, the window still installed: ops are
+ * consumed from the front while new wire arrivals keep appending behind
+ * them — one live queue, so everything applies in exact arrival order by
+ * construction. (The pre-pump drain deleted the window first and re-entered
+ * the buffered entry points; anything the wire delivered mid-drain then
+ * landed in a NEW window and overtook the not-yet-replayed backlog.)
+ *
+ * A buffered full-root push replays through the sliced ingest against the
+ * just-applied base — the initialized per-child mode — never as one
+ * monolithic apply. Yields between ops; the window closes only when the
+ * queue is empty.
+ */
+async function repoDrainIngestWindow(
+  repo: Repo,
+  pathString: string,
+  buffer: BootBufferedOp[],
+  isCurrent: () => boolean
+): Promise<void> {
+  while (buffer.length > 0) {
+    const op = buffer.shift()!;
+    if (op.kind === 'data') {
+      if (repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)) {
+        await repoIngestOnePush(
+          repo,
+          op.pathString,
+          op.data as Record<string, unknown>,
+          isCurrent
+        );
+      } else {
+        // Direct application — the buffered entry point would just re-queue
+        // the op into the very window being drained.
+        repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+      }
+    } else if (op.kind === 'rm') {
+      repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+    } else {
+      op.apply();
+    }
+    if (buffer.length > 0) {
+      await yieldMacrotask();
+      if (!isCurrent()) {
+        throw new IngestCancelledError();
+      }
+    }
+  }
+  repo.bootBuffers_.delete(pathString);
+}
+
+/**
+ * Applies one full-root server push in yielded slices: each top-level child
+ * decodes under the shared slice budget and applies as ONE per-child server
+ * overwrite at root/key — semantically the same tree the monolithic
+ * overwrite produced, delivered as the bounded per-child operations the
+ * whole stack (SyncTree diffing, event fan-out, downstream frame coalescing)
+ * already handles. A final pass removes stale children the payload no
+ * longer contains, then records the root's write-through ONCE.
+ *
+ * Two application modes, chosen by the root's live server-cache state:
+ *  - INITIALIZED (fallback replay over a restored base): per-child
+ *    overwrites; unchanged children short-circuit in IndexedFilter's
+ *    child-level equals against bounded subtrees — the root-sized deep diff
+ *    of the monolithic path never happens.
+ *  - UNINITIALIZED (cold boot): per-child server operations would be
+ *    DROPPED by the view processor before the first full snapshot (its
+ *    uninitialized-cache guard), so children accumulate off-tree and apply
+ *    as one root overwrite — whose diff against the empty old tree is
+ *    trivial. The decode (the dominant cost) stays sliced either way.
+ */
+async function repoIngestFullRootPush(
+  repo: Repo,
+  pathString: string,
+  data: Record<string, unknown>,
+  isCurrent: () => boolean
+): Promise<void> {
+  const rootPath = new Path(pathString);
+  // Per-child overwrites can only REPLACE a plain children root: a leaf root
+  // needs the root itself replaced, and a root priority can only be cleared
+  // by a root-level operation (the payload carries none — eligibility
+  // rejected '.priority'). Those exotic shapes take the accumulate-and-
+  // overwrite branch, whose single root apply handles both, at the old
+  // diff cost — acceptable for shapes a persistent workspace root never has.
+  const cacheAtStart = syncTreeGetCompleteServerCache(
+    repo.serverSyncTree_,
+    rootPath
+  );
+  const initialized =
+    cacheAtStart !== null &&
+    !cacheAtStart.isLeafNode() &&
+    cacheAtStart.getPriority().isEmpty();
+  const seen = new Set<string>();
+  const coldChildren: NamedNode[] = [];
+  let coldChildrenHavePriority = false;
+
+  const applyOne = (childPath: Path, node: Node) => {
+    const events = syncTreeApplyServerOverwrite(
+      repo.serverSyncTree_,
+      childPath,
+      node
+    );
+    let affectedPath = childPath;
+    if (events.length > 0) {
+      affectedPath = repoRerunTransactions(repo, childPath);
+    }
+    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  };
+
+  await decodeChildrenSliced(data, isCurrent, (key, node) => {
+    seen.add(key);
+    if (initialized) {
+      applyOne(pathChild(rootPath, key), node);
+    } else {
+      coldChildren.push(new NamedNode(key, node));
+      coldChildrenHavePriority =
+        coldChildrenHavePriority || !node.getPriority().isEmpty();
+    }
+  });
+
+  if (!isCurrent()) {
+    throw new IngestCancelledError();
+  }
+
+  if (!initialized) {
+    // One overwrite of the assembled root: the view processor initializes
+    // from a full snapshot, and the diff against the empty old tree is
+    // trivial. '.priority' at the root of a plain-children payload was
+    // excluded by eligibility, so priority is null by construction.
+    applyOne(
+      rootPath,
+      assembleChildrenNode(coldChildren, coldChildrenHavePriority, null)
+    );
+  } else {
+    // Remove children the payload no longer contains — a full overwrite
+    // REPLACES the root, so absence is deletion. Keys enumerate from the
+    // live server cache, removals apply as bounded per-child overwrites.
+    const serverCache = syncTreeGetCompleteServerCache(
+      repo.serverSyncTree_,
+      rootPath
+    );
+    if (serverCache !== null && !serverCache.isLeafNode()) {
+      const stale: string[] = [];
+      serverCache.forEachChild(KEY_INDEX, key => {
+        if (!seen.has(key)) {
+          stale.push(key);
+        }
+      });
+      for (const key of stale) {
+        applyOne(pathChild(rootPath, key), ChildrenNode.EMPTY_NODE);
+        await yieldMacrotask();
+        if (!isCurrent()) {
+          throw new IngestCancelledError();
+        }
+      }
+    }
+  }
+
+  // ONE write-through naming the ROOT ('at-path' → changed path [] → every
+  // range dirty), exactly what the monolithic path recorded for a full
+  // overwrite. 'confirmed' (nothing further) would be a lie here — the push
+  // replaced the root, and a flush believing nothing changed would carry
+  // stale ranges over a new baseline tree.
+  repoPersistAfterServerUpdate(repo, rootPath, 'at-path');
+}
+
+/**
  * Sends a listen for the server sync tree, restoring the persisted server
  * cache first where applicable: a complete default listen on a persisted
  * root is held until the stored tree restores (bounded inside restore()),
@@ -634,7 +914,8 @@ export function repoStartServerListen(
   currentHashFn: ListenHashFn,
   onComplete: (status: string, data?: unknown) => Event[],
   skipPersistence = false,
-  authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS
+  authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS,
+  coldReason?: ListenOutcomeReason
 ): void {
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
@@ -735,7 +1016,9 @@ export function repoStartServerListen(
     !isDefaultComplete ||
     !persistence.isPersistentPath(pathString)
   ) {
-    sendListen('cold');
+    // coldReason names WHY a skipPersistence caller went cold (observability
+    // only — e.g. 'auth-timeout'); ordinary non-persistent listens carry none.
+    sendListen('cold', skipPersistence ? coldReason : undefined);
     return;
   }
 
@@ -803,7 +1086,8 @@ export function repoStartServerListen(
         currentHashFn,
         onComplete,
         true,
-        authScopeTimeoutMs
+        authScopeTimeoutMs,
+        'auth-timeout'
       );
     }, authScopeTimeoutMs);
     // Close the check-to-subscribe race if a pre-auth peek configured the
@@ -978,16 +1262,20 @@ export function repoStartServerListen(
     if (buffered === undefined) {
       return;
     }
-    repo.bootBuffers_.delete(pathString);
-    for (const op of buffered) {
-      if (op.kind === 'data') {
-        repoOnDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
-      } else if (op.kind === 'rm') {
-        repoOnRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
-      } else {
-        op.apply();
-      }
-    }
+    // Yielding in-place drain (window stays installed until the queue is
+    // empty): the legacy loop replayed the entire backlog — which can
+    // include a FULL-ROOT push (the fallback-while-restoring race) — in the
+    // same task that applied the base; now a full push replays through the
+    // sliced ingest and later arrivals append behind the backlog in order.
+    void repoDrainIngestWindow(
+      repo,
+      pathString,
+      buffered,
+      () => repo.bootBuffers_.get(pathString) === buffered
+    ).catch(() => {
+      // IngestCancelledError: the window was torn down (stop / account
+      // switch / dispose); its owner already put the listen state right.
+    });
   };
 
   void persistence
@@ -1039,7 +1327,7 @@ export function repoStartServerListen(
             // collectGraftableDescendants); applying the stored tree over it
             // would replace live server data with stale bytes.
             repo.pendingListenHashes_.clear(pathString);
-            finish('cold');
+            finish('cold', 'partial-descendants');
             return;
           }
         }
@@ -1246,6 +1534,9 @@ export function repoNotifyPersistenceAuthScope(repo: Repo): void {
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo, false);
+  // Buffer identity is every ingest pump's liveness signal: clearing here
+  // cancels any in-flight sliced ingest at its next yield.
+  repo.bootBuffers_.clear();
   repoClearListenOutcomes(repo);
   repo.persistenceAuthScopeListeners_.clear();
   repo.persistence_?.dispose();
@@ -1319,6 +1610,21 @@ function repoOnRangeMergeUpdate(
       return;
     }
   }
+  repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
+}
+
+/**
+ * The synchronous range-merge application (the post-buffer-check body of
+ * repoOnRangeMergeUpdate), called directly by the boot-window queue drain —
+ * whose window is still installed, so re-entering the buffered entry point
+ * would push the operation back into the very queue being drained.
+ */
+function repoApplyRangeMergeUpdate(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  tag: number | null
+): void {
   const path = new Path(pathString);
   const merges = ranges.map(
     range =>

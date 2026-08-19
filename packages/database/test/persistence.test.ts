@@ -77,6 +77,7 @@ import {
   syncTreeRemoveEventRegistration
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
+import { Tree } from '../src/core/util/Tree';
 import { sha1 } from '../src/core/util/util';
 import { EventQueue } from '../src/core/view/EventQueue';
 import {
@@ -2325,6 +2326,11 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       pendingListenHashes_: pendingHashes,
       bootBuffers_: new Map(),
       listenOutcomes_: new Map(),
+      // The boot-window drain reruns transactions after each replayed push;
+      // the real Repo always carries this tree. (The legacy synchronous
+      // drain crashed here too, but inside a void'd promise chain — the
+      // in-place drain surfaces what was silently swallowed.)
+      transactionQueueTree_: new Tree(),
       persistence_: manager,
       persistenceAuthScope_: null,
       persistenceAuthScopeListeners_: new Set<() => void>(),
@@ -2533,6 +2539,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     harness.repo.persistence_ = manager;
     harness.repo.persistenceAuthScope_ = undefined;
 
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(harness.repo, harness.path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     repoStartServerListen(
       harness.repo,
       harness.query,
@@ -2545,6 +2555,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(harness.calls).to.deep.equal(['listen']);
     expect(harness.repo.persistenceAuthScopeListeners_.size).to.equal(0);
+    // The cold outcome names WHY: identity hydration timed out (not a cache
+    // miss) — observability for attributing forced-cold boots.
+    expect(outcomes[0].mode).to.equal('cold');
+    expect(outcomes[0].reason).to.equal('auth-timeout');
   });
 
   it('a stop during the restore cancels the listen instead of orphaning it', async () => {
@@ -2733,6 +2747,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       nodeFromJSON({ a: 'live', b: 'live' })
     );
 
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
 
@@ -2742,6 +2760,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
+    // The cold outcome names the graft refusal — a filtered window below
+    // the root, not a cache miss.
+    expect(outcomes[0].mode).to.equal('cold');
+    expect(outcomes[0].reason).to.equal('partial-descendants');
   });
 
   it('grafts certified descendant caches over the restored base instead of going cold', async () => {
