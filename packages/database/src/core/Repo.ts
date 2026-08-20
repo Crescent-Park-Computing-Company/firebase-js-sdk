@@ -629,6 +629,16 @@ export function repoOnDataUpdateForTest(
   repoOnDataUpdate(repo, pathString, data, isMerge, tag);
 }
 
+/** Test seam: drives a server range merge exactly as the connection would. @internal */
+export function repoOnRangeMergeUpdateForTest(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  tag: number | null
+): void {
+  repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
+}
+
 function repoOnDataUpdate(
   repo: Repo,
   pathString: string,
@@ -638,6 +648,13 @@ function repoOnDataUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
+  // The wire delivers paths in server form ('users/alice', '' for root);
+  // every internal path-string key — persistence roots (setPersistentPath),
+  // ingest gates, queued ops, get()'s gate lookup — is Path.toString()
+  // canonical form ('/users/alice', '/'). Canonicalize once at the wire
+  // boundary so repoIngestEligible, gate coverage, and the drain's re-entry
+  // all compare within one form. Idempotent for already-canonical callers.
+  pathString = new Path(pathString).toString();
   if (repoDeferredStreamActive(repo)) {
     // A gate covers this path, or the ordered queue already holds earlier
     // wire operations: defer. The drain applies it after everything queued
@@ -1724,6 +1741,8 @@ function repoOnRangeMergeUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
+  // Wire-form path — canonicalize at the boundary (see repoOnDataUpdate).
+  pathString = new Path(pathString).toString();
   if (repoDeferredStreamActive(repo)) {
     repo.ingestQueue_.ops.push({
       kind: 'rm',
