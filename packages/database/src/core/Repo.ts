@@ -218,6 +218,17 @@ type BootBufferedOp =
   | {
       kind: 'complete';
       apply: () => void;
+    }
+  | {
+      /**
+       * A connection loss observed while an ingest window was open: the
+       * onDisconnect run must apply AFTER the pushes that preceded it on the
+       * wire (the sliced pump time-shifts those), so it queues like any
+       * other server-ordered operation. Deduplicated per window — the runs
+       * are cumulative state applications, and disconnect/reconnect cycles
+       * inside one window collapse to the run at the drain point.
+       */
+      kind: 'disconnect';
     };
 
 /**
@@ -524,6 +535,14 @@ export function repoGenerateServerValues(repo: Repo): Indexable {
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: drives a connection-status flip exactly as the connection would. @internal */
+export function repoOnConnectStatusForTest(
+  repo: Repo,
+  connectStatus: boolean
+): void {
+  repoOnConnectStatus(repo, connectStatus);
+}
+
 /** Test seam: drives a server data push exactly as the connection would. @internal */
 export function repoOnDataUpdateForTest(
   repo: Repo,
@@ -680,11 +699,23 @@ async function repoRunIngestPump(
 ): Promise<void> {
   const buffer: BootBufferedOp[] = [];
   repo.bootBuffers_.set(pathString, buffer);
+  // The window is evidence-scoped two ways (the PR #6 continuation class:
+  // revalidate after every yield):
+  //  - BUFFER IDENTITY: stop listens, a successor window, and dispose all
+  //    delete or replace the entry.
+  //  - AUTH GENERATION: an account switch cancels pending seed restores but
+  //    knows nothing of a standalone ingest window; the generation bump is
+  //    its signal. A pump outliving the switch would apply the PRIOR
+  //    account's payload and write it through into the NEW scope's cache
+  //    namespace — the SDK's precedent is cancellation (peeks null out,
+  //    restores cancel), and the old account's listens are being torn down
+  //    with the switch anyway. Persistence disabled mid-flight reads as a
+  //    mismatch too (undefined !== captured) — its dispose also clears the
+  //    window.
+  const authGeneration = repo.persistence_?.authGeneration();
   const isCurrent = () =>
-    // Current exactly while OUR buffer array is still installed: stop
-    // listens, account switches, a successor window, and dispose all delete
-    // or replace the entry.
-    repo.bootBuffers_.get(pathString) === buffer;
+    repo.bootBuffers_.get(pathString) === buffer &&
+    repo.persistence_?.authGeneration() === authGeneration;
   try {
     await repoIngestOnePush(repo, pathString, data, isCurrent);
     await repoDrainIngestWindow(repo, buffer, isCurrent);
@@ -698,8 +729,18 @@ async function repoRunIngestPump(
       warn('ingest window failed for ' + pathString, e);
     }
   } finally {
-    if (isCurrent()) {
-      repo.bootBuffers_.delete(pathString);
+    if (repo.bootBuffers_.get(pathString) === buffer) {
+      // Ownership by buffer identity alone: even when the auth generation
+      // moved (isCurrent false), this window is still OURS to take down —
+      // and a disconnect marker it holds must still run (repo-global state,
+      // not account data).
+      repoDropIngestWindow(repo, pathString);
+    } else if (buffer.some(op => op.kind === 'disconnect')) {
+      // The entry was removed or replaced externally while OUR array still
+      // holds a disconnect marker. The marker is repo-global state — flush
+      // it through the shared gate (which skips while any other window
+      // still holds one) instead of letting it die with the array.
+      repoRunBufferedDisconnect(repo);
     }
   }
 }
@@ -773,6 +814,8 @@ async function repoDrainIngestWindow(
         }
       } else if (op.kind === 'rm') {
         repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+      } else if (op.kind === 'disconnect') {
+        repoRunBufferedDisconnect(repo);
       } else {
         op.apply();
       }
@@ -788,6 +831,45 @@ async function repoDrainIngestWindow(
         throw new IngestCancelledError();
       }
     }
+  }
+}
+
+/**
+ * Runs a window-buffered onDisconnect marker with LAST-WINDOW semantics:
+ * every window open at disconnect time received a marker, and the run must
+ * happen only once every push those windows held has applied — an earlier
+ * window's run would be overwritten by a later window's still-pending push
+ * (the cross-window form of the same inversion). Skip while any OTHER open
+ * window still carries a marker; the final marker performs the run. A
+ * window opened AFTER the disconnect carries no marker and never blocks —
+ * its content post-dates the disconnect on the wire.
+ */
+function repoRunBufferedDisconnect(repo: Repo): void {
+  for (const ops of repo.bootBuffers_.values()) {
+    if (ops.some(op => op.kind === 'disconnect')) {
+      return;
+    }
+  }
+  repoRunOnDisconnectEvents(repo);
+}
+
+/**
+ * Tears down one ingest/boot window WITHOUT losing a buffered disconnect
+ * run: data/range/complete ops may be dropped (their listens are going away
+ * — the legacy cancel paths dropped exactly the same backlog), but the
+ * onDisconnect run is repo-global state the legacy path executed IMMEDIATELY
+ * at disconnect time; a teardown that dropped its only marker would skip it
+ * forever. Remove the window first, THEN run — the run must not see this
+ * window as still-blocking.
+ */
+function repoDropIngestWindow(repo: Repo, pathString: string): void {
+  const ops = repo.bootBuffers_.get(pathString);
+  if (ops === undefined) {
+    return;
+  }
+  repo.bootBuffers_.delete(pathString);
+  if (ops.some(op => op.kind === 'disconnect')) {
+    repoRunBufferedDisconnect(repo);
   }
 }
 
@@ -1065,7 +1147,7 @@ export function repoStartServerListen(
   token.reattachCold = () => {
     repo.pendingListenHashes_.clear(pathString);
     if (repo.bootBuffers_.has(pathString)) {
-      repo.bootBuffers_.delete(pathString);
+      repoDropIngestWindow(repo, pathString);
       repo.server_.unlisten(query, tag);
     }
     repoStartServerListen(
@@ -1106,7 +1188,7 @@ export function repoStartServerListen(
     restartedCold = true;
     repo.pendingSeedRestores_.delete(pathString);
     repo.pendingListenHashes_.clear(pathString);
-    repo.bootBuffers_.delete(pathString);
+    repoDropIngestWindow(repo, pathString);
     // The compound response may omit every matching range, so buffered data
     // cannot reconstruct a missing base. Tear down the seeded listen and send
     // exactly one ordinary full listen.
@@ -1238,9 +1320,10 @@ export function repoStartServerListen(
       })
       .finally(() => {
         // The window must never outlive its driver (ownership-checked: a
-        // successor window installed meanwhile is not ours to remove).
+        // successor window installed meanwhile is not ours to remove) — and
+        // a disconnect marker it still holds must run, not drop.
         if (isCurrent()) {
-          repo.bootBuffers_.delete(pathString);
+          repoDropIngestWindow(repo, pathString);
         }
       });
   };
@@ -1258,7 +1341,7 @@ export function repoStartServerListen(
       result => {
         if (!isCurrent()) {
           repo.pendingListenHashes_.clear(pathString);
-          repo.bootBuffers_.delete(pathString);
+          repoDropIngestWindow(repo, pathString);
           return;
         }
         const { record, reason } = result;
@@ -1339,7 +1422,7 @@ export function repoStartServerListen(
           );
           if (!isCurrent()) {
             repo.pendingListenHashes_.clear(pathString);
-            repo.bootBuffers_.delete(pathString);
+            repoDropIngestWindow(repo, pathString);
             return;
           }
           if (sentFromManifest) {
@@ -1403,7 +1486,7 @@ export function repoStopServerListen(
     }
     repo.server_.unlisten(query, tag);
   }
-  repo.bootBuffers_.delete(pathString);
+  repoDropIngestWindow(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
   repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
@@ -1501,9 +1584,20 @@ export function repoNotifyPersistenceAuthScope(repo: Repo): void {
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo, false);
+  // A disconnect observed while a window was open queued its onDisconnect
+  // run behind that window's pushes. Dropping the windows must not drop the
+  // run — the legacy path executed it immediately at disconnect time.
+  let pendingDisconnect = false;
+  for (const ops of repo.bootBuffers_.values()) {
+    pendingDisconnect =
+      pendingDisconnect || ops.some(op => op.kind === 'disconnect');
+  }
   // Buffer identity is every ingest pump's liveness signal: clearing here
   // cancels any in-flight sliced ingest at its next yield.
   repo.bootBuffers_.clear();
+  if (pendingDisconnect) {
+    repoRunOnDisconnectEvents(repo);
+  }
   repoClearListenOutcomes(repo);
   repo.persistenceAuthScopeListeners_.clear();
   repo.persistence_?.dispose();
@@ -1635,9 +1729,27 @@ export function repoInterceptServerData(
 }
 
 function repoOnConnectStatus(repo: Repo, connectStatus: boolean): void {
+  // The .info/connected flip rides infoSyncTree_ — independent of any data
+  // ingest — and must stay immediate either way.
   repoUpdateInfo(repo, 'connected', connectStatus);
   if (connectStatus === false) {
-    repoRunOnDisconnectEvents(repo);
+    // The onDisconnect run writes to serverSyncTree_, so it is ORDERED
+    // against server data: a run applied while an ingest window still holds
+    // an earlier full-root push would be overwritten when that push lands —
+    // wire order inverted. Queue it behind every open window (the sliced
+    // pump time-shifts the pushes; this time-shifts the run identically).
+    // One marker per window suffices: the run applies cumulative state, and
+    // repeated disconnects inside one window collapse to the drain-point run.
+    let buffered = false;
+    for (const ops of repo.bootBuffers_.values()) {
+      if (!ops.some(op => op.kind === 'disconnect')) {
+        ops.push({ kind: 'disconnect' });
+      }
+      buffered = true;
+    }
+    if (!buffered) {
+      repoRunOnDisconnectEvents(repo);
+    }
   }
 }
 

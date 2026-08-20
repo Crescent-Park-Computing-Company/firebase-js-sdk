@@ -22,7 +22,11 @@ import {
   PersistenceManager,
   _setWebLocksForTesting
 } from '../src/core/Persistence';
-import { repoOnDataUpdateForTest, Repo } from '../src/core/Repo';
+import {
+  repoOnConnectStatusForTest,
+  repoOnDataUpdateForTest,
+  Repo
+} from '../src/core/Repo';
 import {
   _INGEST_DECODE_SLICE_VISITS,
   decodeNodeSliced,
@@ -31,6 +35,11 @@ import {
   sliceableAsChildren
 } from '../src/core/SlicedNodeDecode';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
+import { SnapshotHolder } from '../src/core/SnapshotHolder';
+import {
+  newSparseSnapshotTree,
+  sparseSnapshotTreeRemember
+} from '../src/core/SparseSnapshotTree';
 import {
   SyncTree,
   syncTreeAddEventRegistration,
@@ -67,14 +76,23 @@ const DECODE_CORPUS: Array<[string, unknown]> = [
   ['leaf boolean', false],
   ['dot-value wrapper', { '.value': 7, '.priority': 3 }],
   ['leaf with priority', { '.value': 'v', '.priority': 'p' }],
-  ['children with child priorities', { a: { '.value': 1, '.priority': 2 }, b: 3 }],
+  [
+    'children with child priorities',
+    { a: { '.value': 1, '.priority': 2 }, b: 3 }
+  ],
   ['root priority on children', { '.priority': 9, a: 1, b: 2 }],
   ['array payload', ['x', 'y', 'z']],
   ['sparse array-like keys', { '0': 'a', '2': 'c', '5': 'f' }],
   ['metadata keys skipped', { a: 1, '.info': 'meta' }],
   ['empty children pruned', { a: { b: null }, c: 1 }],
   ['null', null],
-  ['deep mixed', { u1: { name: 'x', todos: { t1: { done: false, note: 'n' } } }, u2: { name: 'y' } }],
+  [
+    'deep mixed',
+    {
+      u1: { name: 'x', todos: { t1: { done: false, note: 'n' } } },
+      u2: { name: 'y' }
+    }
+  ],
   // Legal child names that shadow Object.prototype members: JSON.parse makes
   // them own string properties, so any direct obj.hasOwnProperty(...) call
   // in an enumeration loop would invoke user data and throw.
@@ -163,9 +181,9 @@ describe('SlicedNodeDecode', () => {
     expect(assembled.getImmediateChild('stable')).to.equal(
       base.getImmediateChild('stable')
     );
-    expect(assembled.getImmediateChild('changing').equals(
-      nodeFromJSON({ v: 2 })
-    )).to.equal(true);
+    expect(
+      assembled.getImmediateChild('changing').equals(nodeFromJSON({ v: 2 }))
+    ).to.equal(true);
   });
 
   it('does not graft when content differs or the key is absent from the base', async () => {
@@ -178,9 +196,9 @@ describe('SlicedNodeDecode', () => {
     expect(assembled.getImmediateChild('a')).to.not.equal(
       base.getImmediateChild('a')
     );
-    expect(assembled.equals(nodeFromJSON({ a: { v: 2 }, b: { fresh: true } }))).to.equal(
-      true
-    );
+    expect(
+      assembled.equals(nodeFromJSON({ a: { v: 2 }, b: { fresh: true } }))
+    ).to.equal(true);
   });
 
   it('decodes a payload with prototype-shadowing keys without invoking them', async () => {
@@ -219,6 +237,12 @@ describe('sliced full-root push ingestion', () => {
       pendingSeedRestores_: new Map(),
       bootBuffers_: new Map(),
       listenOutcomes_: new Map(),
+      onDisconnect_: newSparseSnapshotTree(),
+      infoData_: new SnapshotHolder(),
+      infoSyncTree_: new SyncTree({
+        startListening: () => [],
+        stopListening: () => {}
+      }),
       persistedUpdates_: [] as Array<{ path: string; precise: string }>,
       persistence_: {
         isPersistentPath: (p: string) => p === rootPath,
@@ -229,7 +253,8 @@ describe('sliced full-root push ingestion', () => {
         untrack: () => {},
         evict: () => {},
         invalidate: () => {},
-        isAuthScopeConfigured: () => true
+        isAuthScopeConfigured: () => true,
+        authGeneration: () => 1
       } as unknown as PersistenceManager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,
@@ -385,20 +410,12 @@ describe('sliced full-root push ingestion', () => {
     const payload = wideRoot(20);
     repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
     // While the pump is mid-flight, a descendant push arrives.
-    repoOnDataUpdateForTest(
-      repo,
-      rootPath + '/child3/value',
-      999,
-      false,
-      null
-    );
+    repoOnDataUpdateForTest(repo, rootPath + '/child3/value', 999, false, null);
     expect(repo.bootBuffers_.get(rootPath)!.length).to.equal(1);
     await flushAsync();
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     // The buffered delta applied AFTER the base: child3/value is 999.
-    expect(
-      cache!.getChild(new Path('child3/value')).val()
-    ).to.equal(999);
+    expect(cache!.getChild(new Path('child3/value')).val()).to.equal(999);
   });
 
   it('descendant pushes and merges keep the synchronous path', () => {
@@ -573,6 +590,102 @@ describe('sliced full-root push ingestion', () => {
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache).to.not.equal(null);
     expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('a disconnect mid-pump applies onDisconnect writes AFTER the buffered push (wire order)', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    // The onDisconnect contract: when the connection drops, child9 = 'gone'.
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
+      nodeFromJSON('gone')
+    );
+    const payload = wideRoot(12);
+    repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
+    // Connection drops while the decoder is mid-flight. Legacy applied the
+    // run immediately; the sliced pump must instead order it AFTER the push
+    // it time-shifted — otherwise the finished push overwrites the run's
+    // writes with the pre-disconnect snapshot (wire order inverted).
+    repoOnConnectStatusForTest(repo, false);
+    await flushAsync(64);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache).to.not.equal(null);
+    // The push landed AND the later-ordered onDisconnect write survives it.
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
+    expect(cache!.getChild(new Path('child3/value')).val()).to.equal(3);
+    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+  });
+
+  it('repeated disconnects inside one window collapse to a single buffered run', async () => {
+    const rootPath = '/users/alice';
+    const { repo } = makeIngestHarness(rootPath);
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(6), false, null);
+    repoOnConnectStatusForTest(repo, false);
+    repoOnConnectStatusForTest(repo, true);
+    repoOnConnectStatusForTest(repo, false);
+    const markers = repo.bootBuffers_
+      .get(rootPath)!
+      .filter(op => op.kind === 'disconnect');
+    expect(markers.length).to.equal(1);
+    await flushAsync(64);
+    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+  });
+
+  it('an auth-scope switch mid-pump cancels the ingest (no cross-account apply)', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    // A generation-bumping persistence stub: the pump captures the value at
+    // start and stands down when it moves (the account-switch signal).
+    let generation = 1;
+    (repo.persistence_ as unknown as Record<string, unknown>)[
+      'authGeneration'
+    ] = () => generation;
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
+    // The switch lands between decode slices.
+    generation = 2;
+    await flushAsync(64);
+    // The prior account's payload was never applied, and the window did not
+    // leak (the driver's teardown owns it even when superseded).
+    expect(
+      syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))
+    ).to.equal(null);
+    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+  });
+
+  it('a window torn down while holding a disconnect marker still runs it', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    // Initialize so the onDisconnect write has a tree to land in.
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ child9: { status: 'up' } })
+    );
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
+      nodeFromJSON('gone')
+    );
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
+    repoOnConnectStatusForTest(repo, false);
+    // Teardown mid-pump (the stop-listen shape): the buffered pushes are
+    // moot, but the repo-global onDisconnect run must not be lost with them.
+    repo.bootBuffers_.delete(rootPath);
+    // Directly dropping the entry (as SDK teardown paths now do via
+    // repoDropIngestWindow) is simulated by the driver's own finally here:
+    // the pump notices at its next yield and its teardown flushes the run.
+    await flushAsync(64);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
   });
 
   it('a second full push while pumping supersedes via the buffered path', async () => {

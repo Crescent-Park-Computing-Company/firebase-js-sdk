@@ -463,7 +463,6 @@ export function goOffline(db: Database): void {
  */
 export const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
 
-
 // ChildrenNode.val()'s integer-key grammar (private there; replicated for the
 // sliced walk's array coercion, which must match val() exactly).
 const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
@@ -600,8 +599,9 @@ export function getPersistedValue(
   // like one that lands before resolution — a public-API caller must never
   // receive the previous account's cached tree.
   const authGeneration = persistence.authGeneration();
-  return persistence.peek(normalizedPath, expectedAuthScope).then(
-    async (record): Promise<unknown | null> => {
+  return persistence
+    .peek(normalizedPath, expectedAuthScope)
+    .then(async (record): Promise<unknown | null> => {
       if (record === null) {
         return null;
       }
@@ -640,8 +640,7 @@ export function getPersistedValue(
         stampMaterializedValue(record.node, value);
       }
       return value;
-    }
-  );
+    });
 }
 
 /**

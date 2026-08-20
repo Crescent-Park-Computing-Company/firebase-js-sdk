@@ -125,7 +125,7 @@ export interface ListenOutcome {
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 
 // @public
-export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 
 // @public
 export function off(query: Query, eventType?: EventType, callback?: (snapshot: DataSnapshot, previousChildName?: string | null) => unknown): void;
