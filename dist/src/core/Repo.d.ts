@@ -74,13 +74,22 @@ interface PendingSeedRestore {
      */
     reattachCold?: () => void;
 }
-/** One server operation held during a manifest-first boot window. */
-type BootBufferedOp = {
+/**
+ * One wire-ordered operation deferred behind an ingest/boot gate. Data,
+ * range merges, and listen completions are the server stream itself; a
+ * disconnect carries its own registration tree, FROZEN at the moment the
+ * connection dropped (repoOnConnectStatus snapshots and resets the live
+ * repo.onDisconnect_ in one motion, so acks and registrations landing on
+ * the next connection can never rewrite an earlier disconnect's run).
+ */
+type DeferredWireOp = {
     kind: 'data';
     pathString: string;
     data: unknown;
     isMerge: boolean;
     tag: number | null;
+    /** The queue generation this account-bound op was received under. */
+    generation: number;
 } | {
     kind: 'rm';
     pathString: string;
@@ -90,10 +99,54 @@ type BootBufferedOp = {
         m: unknown;
     }>;
     tag: number | null;
+    generation: number;
 } | {
     kind: 'complete';
     apply: () => void;
+    generation: number;
+} | {
+    /** Repo-global (no generation): fires regardless of account changes. */
+    kind: 'disconnect';
+    tree: SparseSnapshotTree;
 };
+/**
+ * THE ordering primitive for asynchronous ingestion: one repo-level FIFO of
+ * wire-ordered operations, drained by a single driver, one operation at a
+ * time, yielding between them. The wire is one totally ordered stream;
+ * keeping the deferred portion in ONE queue makes global order STRUCTURAL —
+ * an operation runs after everything enqueued before it and nothing after
+ * it, across roots and across kinds (data, range merges, completions,
+ * disconnect runs), with no cross-queue coordination to get wrong. (The
+ * per-root form of this queue needed refcounted markers and barriers to
+ * approximate exactly this property, and grew a bug per review round —
+ * a queue per root reconstructs badly what one queue gives for free.)
+ *
+ * `gates` records which subtrees are ingest-gated (a manifest-first boot
+ * window or a sliced full-root ingest in flight) and is ROUTING METADATA
+ * ONLY — it decides whether a fresh wire callback defers or applies
+ * directly, never ordering. `generation` invalidates the in-flight sliced
+ * ingest continuation (NOT the queue) on account switch / persistence
+ * toggle / dispose: the superseded payload's decode stands down, while the
+ * queued stream — including disconnect runs, which are repo-global, not
+ * account data — still drains in order.
+ */
+interface IngestQueue {
+    ops: DeferredWireOp[];
+    /**
+     * Paths whose subtrees defer fresh wire ops into `ops`, each mapped to an
+     * identity token owned by the installer. The token makes lift/supersede
+     * observable to the in-flight ingest (its isCurrent compares identity):
+     * a stop-listen lifts the gate and the decode stands down; a successor
+     * ingest REPLACES the token and the predecessor stands down likewise.
+     */
+    gates: Map<string, object>;
+    /** True while the single drain driver is running. */
+    draining: boolean;
+    /** Bumped to cancel the in-flight sliced decode + its queued payloads. */
+    generation: number;
+}
+/** @internal */
+export declare function newIngestQueue(): IngestQueue;
 /** How a persistent default listen started. @public */
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 /** Why a restore fell back cold. @public */
@@ -155,13 +208,12 @@ export declare class Repo {
     /** Manifest-first hashes scoped to this Repo, never process-global. */
     pendingListenHashes_: PendingListenHashStore;
     /**
-     * Server operations buffered during a manifest-first boot window: the
-     * range listen is on the wire before the cached base has been applied to
-     * SyncTree, so anything the server sends for that root (range merges —
-     * deltas against the base — or full pushes) is held, in arrival order,
-     * until the base applies, then replayed. Keyed by the listened root path.
+     * The repo-level ordered ingest queue (see IngestQueue): wire operations
+     * deferred behind a manifest-first boot window or an in-flight sliced
+     * ingest, in exact arrival order across roots and kinds, plus the gate
+     * set and the continuation generation.
      */
-    bootBuffers_: Map<string, BootBufferedOp[]>;
+    ingestQueue_: IngestQueue;
     /**
      * Listen-complete state per default complete listen, keyed by path: whether
      * the current listen has received its initial server response, and waiters
@@ -186,6 +238,10 @@ export declare function repoGenerateServerValues(repo: Repo): Indexable;
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: lifts one ingest gate exactly as stop-listen does. @internal */
+export declare function repoLiftIngestGateForTest(repo: Repo, pathString: string): void;
+/** Test seam: drives a connection-status flip exactly as the connection would. @internal */
+export declare function repoOnConnectStatusForTest(repo: Repo, connectStatus: boolean): void;
 /** Test seam: drives a server data push exactly as the connection would. @internal */
 export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
 export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number, coldReason?: ListenOutcomeReason): void;

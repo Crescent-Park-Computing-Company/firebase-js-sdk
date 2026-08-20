@@ -17,10 +17,11 @@
 import { NamedNode, Node } from './snap/Node';
 /**
  * Per-key work units charged per main-thread slice of a sliced server-push
- * decode (one charge per JSON key visited, at every depth). Sized like the
- * peek walk's budget (_PEEK_MATERIALIZE_SLICE_VISITS): one slice stays well
- * inside a frame budget on mobile hardware while keeping total slice count
- * (and its scheduling overhead) low on large payloads.
+ * decode (one charge per JSON key visited, at every depth, and one per node
+ * compared by the graft's budgeted equality). Sized like the peek walk's
+ * budget (_PEEK_MATERIALIZE_SLICE_VISITS): one slice stays well inside a
+ * frame budget on mobile hardware while keeping total slice count (and its
+ * scheduling overhead) low on large payloads.
  * @internal
  */
 export declare const _INGEST_DECODE_SLICE_VISITS = 4000;
@@ -46,6 +47,11 @@ export interface DecodeSliceState {
  * and the walk yields a macrotask when the budget exhausts so a large
  * server push can never decode as one monolithic main-thread task.
  *
+ * Key enumeration is prototype-safe ({@link contains}) exactly like
+ * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
+ * a legal child key, and JSON.parse makes it an own string property — a
+ * direct method call through the object would invoke user data and throw.
+ *
  * Primitive children decode synchronously through nodeFromJSON itself (a
  * single bounded leaf) — a promise per leaf would dominate allocation on
  * exactly the wide flat collections this bounds (the peek walk's inline-leaf
@@ -57,23 +63,31 @@ export interface DecodeSliceState {
 export declare function decodeNodeSliced(json: unknown | null, state: DecodeSliceState, priority?: unknown): Promise<Node>;
 /**
  * The childSet-assembly tail of nodeFromJSON's object branch, shared by the
- * sliced decoder's interior nodes and by the ingest pump's cold-path root
- * assembly (per-top-level-child decode, then one node for a single
- * overwrite).
+ * sliced decoder's interior nodes and by the full-root assembly in
+ * decodeFullRootSliced.
  * @internal
  */
 export declare function assembleChildrenNode(children: NamedNode[], childrenHavePriority: boolean, priority: unknown): Node;
 /**
- * Streaming top level of a sliced full-root decode: hands each top-level
- * child of a plain-children push to `onChild` as (key, Node) without ever
- * assembling the root — the ingest pump applies changed children as
- * per-child server overwrites against the live base or collects them for a
- * cold single overwrite. Only called for payloads
- * {@link sliceableAsChildren} accepted, so priority/leaf/array roots never
- * reach it.
+ * Decodes one full-root plain-children push into a single Node, sliced, with
+ * IDENTITY GRAFTING against the live base: each decoded top-level child that
+ * is structurally equal to the base's same-named child is replaced by the
+ * base's OBJECT (graft by identity), so the eventual single SyncTree
+ * overwrite diffs the two roots with === short-circuits on every unchanged
+ * child — one atomic apply whose cost tracks the CHANGED portion, never the
+ * whole tree. The equality probe itself is budgeted (nodesEqualSliced), and
+ * unequal children cost one comparison walk only where they diverge.
+ *
+ * `base` null (uninitialized/leaf/prioritized cache) skips grafting — the
+ * apply then diffs against empty/being-replaced state, which is trivial or
+ * bounded by the view processor itself.
+ *
+ * Only called for payloads {@link sliceableAsChildren} accepted, so
+ * priority/leaf/array roots never reach it: the assembled root's priority is
+ * null by construction.
  * @internal
  */
-export declare function decodeChildrenSliced(json: Record<string, unknown>, isCurrent: () => boolean, onChild: (key: string, node: Node) => void): Promise<void>;
+export declare function decodeFullRootSliced(json: Record<string, unknown>, base: Node | null, isCurrent: () => boolean): Promise<Node>;
 /**
  * Whether a server push body is shaped for the sliced children ingest: a
  * plain JSON object of children — no leaf value, no '.value'/'.sv' wrapper,
