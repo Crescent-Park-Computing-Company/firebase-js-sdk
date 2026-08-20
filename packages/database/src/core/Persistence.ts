@@ -3019,7 +3019,6 @@ export class PersistenceManager {
     let previousRanges: PersistedRange[] = [];
     let dirty: boolean[] = [];
     let tailDirty = false;
-    let changed: string[][] | null = null;
     // An adopted baseline (rootNode null — another writer's committed
     // manifest) has UNKNOWN content: neither the identity diff nor paths
     // accumulated against our own chain describe differences from it, and
@@ -3027,19 +3026,17 @@ export class PersistenceManager {
     // snapshots into one stored tree. Stage a fresh full generation; its
     // revision still CASes against the adopted manifest.
     if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
-      changed =
+      const changed =
         accumulated !== null && accumulated !== undefined
           ? accumulated
           : collectChangedSubtreePaths(prev.rootNode, node);
-      if (changed !== null) {
-        previousRanges = prev.ranges;
-        if (changed.length === 0) {
-          dirty = new Array(prev.ranges.length).fill(false);
-        } else {
-          const marked = markDirtyRanges(prev.ranges, changed);
-          dirty = marked.dirty;
-          tailDirty = marked.tailDirty;
-        }
+      previousRanges = prev.ranges;
+      if (changed.length === 0) {
+        dirty = new Array(prev.ranges.length).fill(false);
+      } else {
+        const marked = markDirtyRanges(prev.ranges, changed);
+        dirty = marked.dirty;
+        tailDirty = marked.tailDirty;
       }
     }
 

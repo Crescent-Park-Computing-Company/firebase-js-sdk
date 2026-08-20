@@ -728,7 +728,8 @@ export function walkLeafInterval(
 
 /**
  * Node-pair visits the identity-diff may spend before concluding the trees
- * are too divorced to diff (null: everything changed). The diff's output was
+ * are too divorced to diff (collapse to the root path: everything dirty).
+ * The diff's output was
  * always budgeted (maxPaths); its WORK was not — two trees that share no
  * structure (a fallback boot's baseline vs a fully re-downloaded root) made
  * it walk both trees end to end only to conclude "all dirty". Visits accrue
@@ -744,10 +745,13 @@ export const DIFF_VISIT_BUDGET = 20000;
  * subtrees are recognized by object identity and never descended. A child
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves. Returns
- * null (everything changed) when the path budget or the visit budget
- * (`maxVisits` — see DIFF_VISIT_BUDGET) is exhausted, so the diff's cost is
- * bounded even against a baseline sharing no structure with the live tree.
+ * dirty mapping only needs interval bounds, not precise leaves. Exhausting
+ * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
+ * collapses the affected branches toward the root — in the limit to the
+ * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
+ * diff's cost is bounded even against a baseline sharing no structure with
+ * the live tree. The result is always a (possibly collapsed) path list; it
+ * over-approximates but never misses a change.
  */
 export function collectChangedSubtreePaths(
   before: Node,
@@ -755,7 +759,7 @@ export function collectChangedSubtreePaths(
   maxDepth = 8,
   maxPaths = 512,
   maxVisits = DIFF_VISIT_BUDGET
-): string[][] | null {
+): string[][] {
   const changed: string[][] = [];
   let visits = 0;
   /**
@@ -769,7 +773,7 @@ export function collectChangedSubtreePaths(
     }
     if (++visits > maxVisits) {
       // Work budget exhausted: the trees are too divorced for the diff to
-      // pay off. Signal total collapse (null) through the over-budget path.
+      // pay off. Collapse to the root path — everything dirty.
       changed.length = 0;
       changed.push([]);
       return true;

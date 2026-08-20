@@ -4470,8 +4470,7 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     after[marker] = { changed: 'z'.repeat(128) };
     const afterNode = nodeFromJSON(after);
     const changed = collectChangedSubtreePaths(beforeNode, afterNode);
-    expect(changed).to.not.equal(null);
-    const marked = markDirtyRanges(baseline, changed!);
+    const marked = markDirtyRanges(baseline, changed);
 
     const syncBuilder2 = new CompoundHashBuilder(
       fixedSizeSplitStrategy(2048),
@@ -4584,6 +4583,41 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
       expect(second!._idleTimeout).to.equal(PERSISTENCE_WRITE_DEBOUNCE_MS);
     }
     manager.dispose();
+  });
+
+  it('a dispose mid-staging abandons staged orphans without committing, and a fresh manager still restores the prior generation', async () => {
+    const shared = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', shared.factory);
+    const path = new Path('midstage/root');
+    manager.track(path.toString());
+    const before = wideRoot(4, 8);
+    manager.serverCacheUpdated(path, nodeFromJSON(before));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifestKey = 'test-repo|/midstage/root';
+    const committed = shared.data.get(manifestKey) as { revision: string };
+    expect(committed).to.not.equal(undefined);
+
+    // Second generation: dirty everything, then dispose while staging is in
+    // flight (after the flush has started, before its commit).
+    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(120, 60)));
+    const flushing = manager.flushNow(path.toString());
+    await new Promise<void>(resolve => setTimeout(resolve, 5));
+    manager.dispose();
+    await flushing;
+    await flushAsync();
+
+    // No commit: the manifest still names the FIRST generation. Any staged
+    // range records for the aborted generation are non-authoritative orphans
+    // owned by the GC/sweep — they must not affect a fresh manager.
+    const after = shared.data.get(manifestKey) as { revision: string };
+    expect(after.revision).to.equal(committed.revision);
+    const fresh = scopedManager('test-repo', shared.factory);
+    fresh.track(path.toString());
+    const restored = await fresh.restoreForListen(path.toString());
+    expect(restored.record).to.not.equal(null);
+    expect(restored.record!.node.equals(nodeFromJSON(before))).to.equal(true);
+    fresh.dispose();
   });
 
   it('a dispose during the sliced plan neither throws nor commits', async () => {
