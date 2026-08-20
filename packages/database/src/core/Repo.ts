@@ -44,14 +44,12 @@ import {
   stampSeedHashes
 } from './ServerCacheSeed';
 import {
-  assembleChildrenNode,
-  decodeChildrenSliced,
+  decodeFullRootSliced,
   IngestCancelledError,
   sliceableAsChildren
 } from './SlicedNodeDecode';
 import { ChildrenNode } from './snap/ChildrenNode';
-import { KEY_INDEX } from './snap/indexes/KeyIndex';
-import { NamedNode, Node } from './snap/Node';
+import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
@@ -663,9 +661,17 @@ function repoIngestEligible(
 /**
  * Runs one sliced ingest under a boot-buffer window, then drains the window.
  * The buffer serves double duty: ORDERING (later server operations for this
- * root hold until the pumped base is in SyncTree, exactly like the
+ * root hold until the pumped push is in SyncTree, exactly like the
  * manifest-first boot window) and LIVENESS (a stop/account-switch/dispose
  * deletes the buffer, which the pump observes at its next yield and aborts).
+ *
+ * Never rejects, and the window CANNOT outlive this driver: the finally
+ * deletes the entry whenever this run still owns it — deliberate teardown
+ * (cancellation: the new owner already replaced or removed it, the
+ * ownership check makes the delete a no-op), per-op degradation (contained
+ * inside repoIngestOnePush / the drain loop), and any unexpected error all
+ * end with no orphaned window that would silently swallow every future
+ * wire update for the root.
  */
 async function repoRunIngestPump(
   repo: Repo,
@@ -681,13 +687,20 @@ async function repoRunIngestPump(
     repo.bootBuffers_.get(pathString) === buffer;
   try {
     await repoIngestOnePush(repo, pathString, data, isCurrent);
-    await repoDrainIngestWindow(repo, pathString, buffer, isCurrent);
+    await repoDrainIngestWindow(repo, buffer, isCurrent);
   } catch (e) {
     if (!(e instanceof IngestCancelledError)) {
-      throw e;
+      // repoIngestOnePush and the drain contain ordinary op failures
+      // internally; anything else arriving here is unexpected — surface it
+      // (never rethrow: the callers void this promise, and an orphaned
+      // rejection would be silent anyway). The finally below still
+      // guarantees the window comes down.
+      warn('ingest window failed for ' + pathString, e);
     }
-    // Deliberate teardown: whoever tore the window down owns the listen's
-    // state; nothing further to run here.
+  } finally {
+    if (isCurrent()) {
+      repo.bootBuffers_.delete(pathString);
+    }
   }
 }
 
@@ -695,10 +708,12 @@ async function repoRunIngestPump(
  * Applies one full-root push through the sliced ingest, DEGRADING to the
  * legacy monolithic apply on an unexpected mid-ingest error: the payload is
  * still intact, and one synchronous overwrite converges SyncTree to exactly
- * the tree the push named (partially-applied children are simply replaced).
- * The long task this costs is the pre-pump status quo, paid only on a path
- * that indicates an ingest bug. Cancellation is not degradation — it
- * propagates.
+ * the tree the push named. The long task this costs is the pre-pump status
+ * quo, paid only on a path that indicates an ingest bug. Cancellation is
+ * not degradation — it propagates to the window driver. The degradation
+ * apply is itself guarded: if IT also throws (a payload both decoders
+ * reject), the error is contained here — op containment — so the window
+ * driver's drain and teardown still run.
  */
 async function repoIngestOnePush(
   repo: Repo,
@@ -713,7 +728,11 @@ async function repoIngestOnePush(
       throw e;
     }
     warn('sliced ingest failed for ' + pathString + '; applying whole', e);
-    repoApplyDataUpdate(repo, pathString, data, false, null);
+    try {
+      repoApplyDataUpdate(repo, pathString, data, false, null);
+    } catch (applyError) {
+      warn('monolithic apply also failed for ' + pathString, applyError);
+    }
   }
 }
 
@@ -721,40 +740,47 @@ async function repoIngestOnePush(
  * Drains a boot-buffer window IN PLACE, the window still installed: ops are
  * consumed from the front while new wire arrivals keep appending behind
  * them — one live queue, so everything applies in exact arrival order by
- * construction. (The pre-pump drain deleted the window first and re-entered
- * the buffered entry points; anything the wire delivered mid-drain then
- * landed in a NEW window and overtook the not-yet-replayed backlog.)
+ * construction. A buffered full-root push replays through the sliced
+ * ingest; other ops apply through the direct entry points (the buffered
+ * ones would re-queue into the very window being drained).
  *
- * A buffered full-root push replays through the sliced ingest against the
- * just-applied base — the initialized per-child mode — never as one
- * monolithic apply. Yields between ops; the window closes only when the
- * queue is empty.
+ * PER-OP FAULT CONTAINMENT: one throwing operation must not take down the
+ * drain — the remaining backlog still applies and the window still closes
+ * (a live socket's op stream has exactly this independence; the buffer only
+ * time-shifts it). Cancellation is the one exception: it propagates,
+ * because the new owner owns the listen's state and this backlog is moot.
  */
 async function repoDrainIngestWindow(
   repo: Repo,
-  pathString: string,
   buffer: BootBufferedOp[],
   isCurrent: () => boolean
 ): Promise<void> {
   while (buffer.length > 0) {
     const op = buffer.shift()!;
-    if (op.kind === 'data') {
-      if (repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)) {
-        await repoIngestOnePush(
-          repo,
-          op.pathString,
-          op.data as Record<string, unknown>,
-          isCurrent
-        );
+    try {
+      if (op.kind === 'data') {
+        if (
+          repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)
+        ) {
+          await repoIngestOnePush(
+            repo,
+            op.pathString,
+            op.data as Record<string, unknown>,
+            isCurrent
+          );
+        } else {
+          repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+        }
+      } else if (op.kind === 'rm') {
+        repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
       } else {
-        // Direct application — the buffered entry point would just re-queue
-        // the op into the very window being drained.
-        repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+        op.apply();
       }
-    } else if (op.kind === 'rm') {
-      repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
-    } else {
-      op.apply();
+    } catch (e) {
+      if (e instanceof IngestCancelledError) {
+        throw e;
+      }
+      warn('buffered op failed during ingest drain', e);
     }
     if (buffer.length > 0) {
       await yieldMacrotask();
@@ -763,28 +789,22 @@ async function repoDrainIngestWindow(
       }
     }
   }
-  repo.bootBuffers_.delete(pathString);
 }
 
 /**
- * Applies one full-root server push in yielded slices: each top-level child
- * decodes under the shared slice budget and applies as ONE per-child server
- * overwrite at root/key — semantically the same tree the monolithic
- * overwrite produced, delivered as the bounded per-child operations the
- * whole stack (SyncTree diffing, event fan-out, downstream frame coalescing)
- * already handles. A final pass removes stale children the payload no
- * longer contains, then records the root's write-through ONCE.
+ * Applies one full-root server push with a SLICED DECODE and a SINGLE
+ * atomic SyncTree overwrite. The wire contract is one server message = one
+ * coherent transition: listeners never observe a partially replaced root,
+ * transactions rerun once, and the event queue raises one batch — exactly
+ * the legacy apply's externally visible behavior. Only the decode (the
+ * dominant cost) is spread across macrotasks.
  *
- * Two application modes, chosen by the root's live server-cache state:
- *  - INITIALIZED (fallback replay over a restored base): per-child
- *    overwrites; unchanged children short-circuit in IndexedFilter's
- *    child-level equals against bounded subtrees — the root-sized deep diff
- *    of the monolithic path never happens.
- *  - UNINITIALIZED (cold boot): per-child server operations would be
- *    DROPPED by the view processor before the first full snapshot (its
- *    uninitialized-cache guard), so children accumulate off-tree and apply
- *    as one root overwrite — whose diff against the empty old tree is
- *    trivial. The decode (the dominant cost) stays sliced either way.
+ * The apply task itself stays bounded by IDENTITY GRAFTING (see
+ * decodeFullRootSliced): decoded children structurally equal to the live
+ * base's are replaced by the base's objects, so the overwrite's full-node
+ * diff short-circuits on === for every unchanged child and its cost tracks
+ * the changed portion. An uninitialized root (no complete server cache)
+ * skips grafting — its diff is against empty, trivial by construction.
  */
 async function repoIngestFullRootPush(
   repo: Repo,
@@ -793,86 +813,25 @@ async function repoIngestFullRootPush(
   isCurrent: () => boolean
 ): Promise<void> {
   const rootPath = new Path(pathString);
-  // Per-child overwrites can only REPLACE a plain children root: a leaf root
-  // needs the root itself replaced, and a root priority can only be cleared
-  // by a root-level operation (the payload carries none — eligibility
-  // rejected '.priority'). Those exotic shapes take the accumulate-and-
-  // overwrite branch, whose single root apply handles both, at the old
-  // diff cost — acceptable for shapes a persistent workspace root never has.
-  const cacheAtStart = syncTreeGetCompleteServerCache(
-    repo.serverSyncTree_,
-    rootPath
+  const base = syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath);
+  const assembled = await decodeFullRootSliced(
+    data,
+    base !== null && !base.isLeafNode() ? base : null,
+    isCurrent
   );
-  const initialized =
-    cacheAtStart !== null &&
-    !cacheAtStart.isLeafNode() &&
-    cacheAtStart.getPriority().isEmpty();
-  const seen = new Set<string>();
-  const coldChildren: NamedNode[] = [];
-  let coldChildrenHavePriority = false;
-
-  const applyOne = (childPath: Path, node: Node) => {
-    const events = syncTreeApplyServerOverwrite(
-      repo.serverSyncTree_,
-      childPath,
-      node
-    );
-    let affectedPath = childPath;
-    if (events.length > 0) {
-      affectedPath = repoRerunTransactions(repo, childPath);
-    }
-    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
-  };
-
-  await decodeChildrenSliced(data, isCurrent, (key, node) => {
-    seen.add(key);
-    if (initialized) {
-      applyOne(pathChild(rootPath, key), node);
-    } else {
-      coldChildren.push(new NamedNode(key, node));
-      coldChildrenHavePriority =
-        coldChildrenHavePriority || !node.getPriority().isEmpty();
-    }
-  });
-
   if (!isCurrent()) {
     throw new IngestCancelledError();
   }
-
-  if (!initialized) {
-    // One overwrite of the assembled root: the view processor initializes
-    // from a full snapshot, and the diff against the empty old tree is
-    // trivial. '.priority' at the root of a plain-children payload was
-    // excluded by eligibility, so priority is null by construction.
-    applyOne(
-      rootPath,
-      assembleChildrenNode(coldChildren, coldChildrenHavePriority, null)
-    );
-  } else {
-    // Remove children the payload no longer contains — a full overwrite
-    // REPLACES the root, so absence is deletion. Keys enumerate from the
-    // live server cache, removals apply as bounded per-child overwrites.
-    const serverCache = syncTreeGetCompleteServerCache(
-      repo.serverSyncTree_,
-      rootPath
-    );
-    if (serverCache !== null && !serverCache.isLeafNode()) {
-      const stale: string[] = [];
-      serverCache.forEachChild(KEY_INDEX, key => {
-        if (!seen.has(key)) {
-          stale.push(key);
-        }
-      });
-      for (const key of stale) {
-        applyOne(pathChild(rootPath, key), ChildrenNode.EMPTY_NODE);
-        await yieldMacrotask();
-        if (!isCurrent()) {
-          throw new IngestCancelledError();
-        }
-      }
-    }
+  const events = syncTreeApplyServerOverwrite(
+    repo.serverSyncTree_,
+    rootPath,
+    assembled
+  );
+  let affectedPath = rootPath;
+  if (events.length > 0) {
+    affectedPath = repoRerunTransactions(repo, rootPath);
   }
-
+  eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
   // ONE write-through naming the ROOT ('at-path' → changed path [] → every
   // range dirty), exactly what the monolithic path recorded for a full
   // overwrite. 'confirmed' (nothing further) would be a lie here — the push
@@ -1267,15 +1226,23 @@ export function repoStartServerListen(
     // include a FULL-ROOT push (the fallback-while-restoring race) — in the
     // same task that applied the base; now a full push replays through the
     // sliced ingest and later arrivals append behind the backlog in order.
-    void repoDrainIngestWindow(
-      repo,
-      pathString,
-      buffered,
-      () => repo.bootBuffers_.get(pathString) === buffered
-    ).catch(() => {
-      // IngestCancelledError: the window was torn down (stop / account
-      // switch / dispose); its owner already put the listen state right.
-    });
+    const isCurrent = () => repo.bootBuffers_.get(pathString) === buffered;
+    void repoDrainIngestWindow(repo, buffered, isCurrent)
+      .catch((e: unknown) => {
+        // Cancellation: the window was torn down (stop / account switch /
+        // dispose) and its new owner already put the listen state right.
+        // The drain contains every other failure internally.
+        if (!(e instanceof IngestCancelledError)) {
+          warn('boot-window drain failed for ' + pathString, e);
+        }
+      })
+      .finally(() => {
+        // The window must never outlive its driver (ownership-checked: a
+        // successor window installed meanwhile is not ours to remove).
+        if (isCurrent()) {
+          repo.bootBuffers_.delete(pathString);
+        }
+      });
   };
 
   void persistence

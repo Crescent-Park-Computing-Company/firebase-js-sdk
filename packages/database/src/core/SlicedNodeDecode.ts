@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { assert } from '@firebase/util';
+import { assert, contains } from '@firebase/util';
 
 import { ChildrenNode } from './snap/ChildrenNode';
 import { buildChildSet } from './snap/childSet';
@@ -31,10 +31,11 @@ import { yieldMacrotask } from './util/yieldMacrotask';
 
 /**
  * Per-key work units charged per main-thread slice of a sliced server-push
- * decode (one charge per JSON key visited, at every depth). Sized like the
- * peek walk's budget (_PEEK_MATERIALIZE_SLICE_VISITS): one slice stays well
- * inside a frame budget on mobile hardware while keeping total slice count
- * (and its scheduling overhead) low on large payloads.
+ * decode (one charge per JSON key visited, at every depth, and one per node
+ * compared by the graft's budgeted equality). Sized like the peek walk's
+ * budget (_PEEK_MATERIALIZE_SLICE_VISITS): one slice stays well inside a
+ * frame budget on mobile hardware while keeping total slice count (and its
+ * scheduling overhead) low on large payloads.
  * @internal
  */
 export const _INGEST_DECODE_SLICE_VISITS = 4000;
@@ -83,6 +84,11 @@ function charge(state: DecodeSliceState): Promise<void> | null {
  * but every JSON key visited charges one unit of the shared slice budget,
  * and the walk yields a macrotask when the budget exhausts so a large
  * server push can never decode as one monolithic main-thread task.
+ *
+ * Key enumeration is prototype-safe ({@link contains}) exactly like
+ * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
+ * a legal child key, and JSON.parse makes it an own string property — a
+ * direct method call through the object would invoke user data and throw.
  *
  * Primitive children decode synchronously through nodeFromJSON itself (a
  * single bounded leaf) — a promise per leaf would dominate allocation on
@@ -136,7 +142,7 @@ export async function decodeNodeSliced(
     let childrenHavePriority = false;
     const obj = json as Record<string, unknown>;
     for (const key in obj) {
-      if (obj.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+      if (contains(obj, key) && key.substring(0, 1) !== '.') {
         // Ignore metadata nodes
         const y = charge(state);
         if (y !== null) {
@@ -159,7 +165,7 @@ export async function decodeNodeSliced(
     let node: Node = ChildrenNode.EMPTY_NODE;
     const arr = json as unknown as Record<string, unknown>;
     for (const key in arr) {
-      if (arr.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+      if (contains(arr, key) && key.substring(0, 1) !== '.') {
         // ignore metadata nodes.
         const y = charge(state);
         if (y !== null) {
@@ -181,9 +187,8 @@ export async function decodeNodeSliced(
 
 /**
  * The childSet-assembly tail of nodeFromJSON's object branch, shared by the
- * sliced decoder's interior nodes and by the ingest pump's cold-path root
- * assembly (per-top-level-child decode, then one node for a single
- * overwrite).
+ * sliced decoder's interior nodes and by the full-root assembly in
+ * decodeFullRootSliced.
  * @internal
  */
 export function assembleChildrenNode(
@@ -216,48 +221,111 @@ export function assembleChildrenNode(
 }
 
 /**
- * Cost surcharge per emitted top-level child, in budget units. The decode
- * budget charges JSON keys, but the pump's per-child APPLY (SyncTree
- * overwrite + event raise + write-through accounting) is uncharged work
- * riding the same slice — many tiny children would otherwise pack hundreds
- * of applies into one task. The surcharge caps a slice at roughly
- * budget/surcharge applies (~60) so slices stay frame-sized either way.
+ * Budgeted structural equality: Node.equals with every compared node
+ * charging the shared slice budget, so grafting a large unchanged subtree
+ * cannot itself become the monolithic walk the decoder exists to remove.
+ * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
+ * child count, PRIORITY_INDEX-iterated pairwise children).
  */
-const CHILD_APPLY_SURCHARGE = 64;
+async function nodesEqualSliced(
+  a: Node,
+  b: Node,
+  state: DecodeSliceState
+): Promise<boolean> {
+  if (a === b) {
+    return true;
+  }
+  const y = charge(state);
+  if (y !== null) {
+    await y;
+  }
+  if (a.isLeafNode() || b.isLeafNode()) {
+    // Leaf equality is bounded — delegate to the node's own equals.
+    return a.equals(b);
+  }
+  const aChildren = a as ChildrenNode;
+  const bChildren = b as ChildrenNode;
+  if (!aChildren.getPriority().equals(bChildren.getPriority())) {
+    return false;
+  }
+  if (aChildren.numChildren() !== bChildren.numChildren()) {
+    return false;
+  }
+  const aIter = aChildren.getIterator(PRIORITY_INDEX);
+  const bIter = bChildren.getIterator(PRIORITY_INDEX);
+  let aCurrent = aIter.getNext();
+  let bCurrent = bIter.getNext();
+  while (aCurrent !== null && bCurrent !== null) {
+    if (aCurrent.name !== bCurrent.name) {
+      return false;
+    }
+    if (!(await nodesEqualSliced(aCurrent.node, bCurrent.node, state))) {
+      return false;
+    }
+    aCurrent = aIter.getNext();
+    bCurrent = bIter.getNext();
+  }
+  return aCurrent === null && bCurrent === null;
+}
 
 /**
- * Streaming top level of a sliced full-root decode: hands each top-level
- * child of a plain-children push to `onChild` as (key, Node) without ever
- * assembling the root — the ingest pump applies changed children as
- * per-child server overwrites against the live base or collects them for a
- * cold single overwrite. Only called for payloads
- * {@link sliceableAsChildren} accepted, so priority/leaf/array roots never
- * reach it.
+ * Decodes one full-root plain-children push into a single Node, sliced, with
+ * IDENTITY GRAFTING against the live base: each decoded top-level child that
+ * is structurally equal to the base's same-named child is replaced by the
+ * base's OBJECT (graft by identity), so the eventual single SyncTree
+ * overwrite diffs the two roots with === short-circuits on every unchanged
+ * child — one atomic apply whose cost tracks the CHANGED portion, never the
+ * whole tree. The equality probe itself is budgeted (nodesEqualSliced), and
+ * unequal children cost one comparison walk only where they diverge.
+ *
+ * `base` null (uninitialized/leaf/prioritized cache) skips grafting — the
+ * apply then diffs against empty/being-replaced state, which is trivial or
+ * bounded by the view processor itself.
+ *
+ * Only called for payloads {@link sliceableAsChildren} accepted, so
+ * priority/leaf/array roots never reach it: the assembled root's priority is
+ * null by construction.
  * @internal
  */
-export async function decodeChildrenSliced(
+export async function decodeFullRootSliced(
   json: Record<string, unknown>,
-  isCurrent: () => boolean,
-  onChild: (key: string, node: Node) => void
-): Promise<void> {
+  base: Node | null,
+  isCurrent: () => boolean
+): Promise<Node> {
   const state: DecodeSliceState = { visits: 0, isCurrent };
+  const children: NamedNode[] = [];
+  let childrenHavePriority = false;
   for (const key in json) {
-    if (json.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+    if (contains(json, key) && key.substring(0, 1) !== '.') {
       const y = charge(state);
       if (y !== null) {
         await y;
       }
       const raw = json[key];
-      const childNode =
+      let childNode =
         typeof raw !== 'object' || raw === null
           ? nodeFromJSON(raw)
           : await decodeNodeSliced(raw, state);
-      if (!childNode.isEmpty()) {
-        onChild(key, childNode);
-        state.visits += CHILD_APPLY_SURCHARGE;
+      if (childNode.isEmpty()) {
+        continue;
       }
+      if (base !== null) {
+        const baseChild = base.getImmediateChild(key);
+        if (
+          !baseChild.isEmpty() &&
+          (await nodesEqualSliced(baseChild, childNode, state))
+        ) {
+          // Equal content: graft the live child by identity so the apply's
+          // diff (and every downstream memoized consumer) sees ===.
+          childNode = baseChild;
+        }
+      }
+      childrenHavePriority =
+        childrenHavePriority || !childNode.getPriority().isEmpty();
+      children.push(new NamedNode(key, childNode));
     }
   }
+  return assembleChildrenNode(children, childrenHavePriority, null);
 }
 
 /**

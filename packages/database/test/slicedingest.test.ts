@@ -26,7 +26,7 @@ import { repoOnDataUpdateForTest, Repo } from '../src/core/Repo';
 import {
   _INGEST_DECODE_SLICE_VISITS,
   decodeNodeSliced,
-  decodeChildrenSliced,
+  decodeFullRootSliced,
   IngestCancelledError,
   sliceableAsChildren
 } from '../src/core/SlicedNodeDecode';
@@ -74,7 +74,16 @@ const DECODE_CORPUS: Array<[string, unknown]> = [
   ['metadata keys skipped', { a: 1, '.info': 'meta' }],
   ['empty children pruned', { a: { b: null }, c: 1 }],
   ['null', null],
-  ['deep mixed', { u1: { name: 'x', todos: { t1: { done: false, note: 'n' } } }, u2: { name: 'y' } }]
+  ['deep mixed', { u1: { name: 'x', todos: { t1: { done: false, note: 'n' } } }, u2: { name: 'y' } }],
+  // Legal child names that shadow Object.prototype members: JSON.parse makes
+  // them own string properties, so any direct obj.hasOwnProperty(...) call
+  // in an enumeration loop would invoke user data and throw.
+  [
+    'prototype-shadowing keys',
+    JSON.parse(
+      '{"hasOwnProperty": {"x": 1}, "toString": 2, "constructor": {"y": 3}, "a": 4}'
+    )
+  ]
 ];
 
 describe('SlicedNodeDecode', () => {
@@ -133,15 +142,53 @@ describe('SlicedNodeDecode', () => {
     expect(threw).to.be.instanceOf(IngestCancelledError);
   });
 
-  it('streams top-level children in key order with the root never built', async () => {
-    const emitted: string[] = [];
-    await decodeChildrenSliced(
-      { b: { x: 1 }, a: 2, '.info': 'meta', c: null },
-      () => true,
-      key => emitted.push(key)
+  it('assembles a full root identical to nodeFromJSON, skipping metadata and empties', async () => {
+    const payload = { b: { x: 1 }, a: 2, '.info': 'meta', c: null };
+    const assembled = await decodeFullRootSliced(payload, null, () => true);
+    expect(assembled.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('grafts structurally equal children from the base by IDENTITY', async () => {
+    const base = nodeFromJSON({
+      stable: { deep: { tree: 'unchanged' } },
+      changing: { v: 1 }
+    });
+    const assembled = await decodeFullRootSliced(
+      { stable: { deep: { tree: 'unchanged' } }, changing: { v: 2 } },
+      base,
+      () => true
     );
-    // '.info' skipped (metadata), 'c' skipped (empty), source order kept.
-    expect(emitted).to.deep.equal(['b', 'a']);
+    // The unchanged child is the base's OBJECT (===), not merely equal —
+    // this is what keeps the single atomic overwrite's diff O(changed).
+    expect(assembled.getImmediateChild('stable')).to.equal(
+      base.getImmediateChild('stable')
+    );
+    expect(assembled.getImmediateChild('changing').equals(
+      nodeFromJSON({ v: 2 })
+    )).to.equal(true);
+  });
+
+  it('does not graft when content differs or the key is absent from the base', async () => {
+    const base = nodeFromJSON({ a: { v: 1 } });
+    const assembled = await decodeFullRootSliced(
+      { a: { v: 2 }, b: { fresh: true } },
+      base,
+      () => true
+    );
+    expect(assembled.getImmediateChild('a')).to.not.equal(
+      base.getImmediateChild('a')
+    );
+    expect(assembled.equals(nodeFromJSON({ a: { v: 2 }, b: { fresh: true } }))).to.equal(
+      true
+    );
+  });
+
+  it('decodes a payload with prototype-shadowing keys without invoking them', async () => {
+    const payload = JSON.parse(
+      '{"hasOwnProperty": {"x": 1}, "a": 2}'
+    ) as Record<string, unknown>;
+    const assembled = await decodeFullRootSliced(payload, null, () => true);
+    expect(assembled.equals(nodeFromJSON(payload))).to.equal(true);
   });
 
   it('sliceableAsChildren accepts only plain children objects', () => {
@@ -325,10 +372,11 @@ describe('sliced full-root push ingestion', () => {
       syncTree,
       new Path(rootPath)
     )!.getImmediateChild('stable');
-    // Not the same object (fresh decode), but equal — and critically the
-    // unchanged child was applied through the child-level equals
-    // short-circuit, never a root-wide diff. Equality is the contract.
-    expect(after.equals(before)).to.equal(true);
+    // The graft preserves IDENTITY (===), not merely equality: unchanged
+    // children keep their live object across a replacement push, so the
+    // single overwrite's diff and every downstream memoized consumer
+    // short-circuit on identity.
+    expect(after).to.equal(before);
   });
 
   it('buffers wire operations during the pump and replays them in order', async () => {
@@ -438,6 +486,93 @@ describe('sliced full-root push ingestion', () => {
     expect(observed).to.deep.equal([1]);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache!.getChild(new Path('b')).val()).to.equal(2);
+  });
+
+  it('a replacement push is ATOMIC to listeners: one value event, no mixed states', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: { v: 'old' }, b: { v: 'old' } })
+    );
+    // A recording value listener on the root: every raised snapshot value
+    // is captured, so a partially replaced root would show up as an
+    // intermediate mixed state.
+    const values: unknown[] = [];
+    const recordingQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      new Path(rootPath),
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(syncTree, recordingQuery, {
+      respondsTo: (eventType: string) => eventType === 'value',
+      createEvent: (
+        change: { snapshotNode: { val: () => unknown } },
+        q: { _path: Path }
+      ) => ({
+        getPath: () => q._path,
+        getEventType: () => 'value',
+        getEventRunner: () => () => values.push(change.snapshotNode.val()),
+        toString: () => 'recording-event'
+      }),
+      getEventRunner: () => () => {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
+      hasAnyCallback: () => true
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    values.length = 0; // drop the registration's initial event, if any
+
+    const payload = { a: { v: 'new' }, c: { v: 'added' } };
+    repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
+    await flushAsync(64);
+    // Exactly one coherent transition: never an intermediate root where
+    // only SOME children were replaced (the per-child-apply failure mode).
+    expect(values).to.deep.equal([payload]);
+  });
+
+  it('a throwing buffered op does not orphan the window or stop the drain', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(10), false, null);
+    // While the pump runs: a poison custom op, then a healthy descendant push.
+    repo.bootBuffers_.get(rootPath)!.push({
+      kind: 'complete',
+      apply: () => {
+        throw new Error('poison op');
+      }
+    });
+    repoOnDataUpdateForTest(repo, rootPath + '/child3/value', 999, false, null);
+    await flushAsync(64);
+    // The poison op was contained: the later op still applied, and the
+    // window came down (no orphaned buffer swallowing future updates).
+    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.getChild(new Path('child3/value')).val()).to.equal(999);
+    // And the repo still advances: a post-drain push applies immediately.
+    repoOnDataUpdateForTest(repo, rootPath + '/child4/value', 1, false, null);
+    expect(
+      syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))!
+        .getChild(new Path('child4/value'))
+        .val()
+    ).to.equal(1);
+  });
+
+  it('a payload with prototype-shadowing keys ingests through the sliced path', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    const payload = JSON.parse(
+      '{"hasOwnProperty": {"x": 1}, "constructor": {"y": 2}, "a": 3}'
+    ) as Record<string, unknown>;
+    repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
+    await flushAsync();
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache).to.not.equal(null);
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
   });
 
   it('a second full push while pumping supersedes via the buffered path', async () => {
