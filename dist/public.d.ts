@@ -462,7 +462,7 @@ export declare interface ListenOutcome {
 /** How a persistent default listen started. @public */
 export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 /** Why a restore fell back cold. @public */
-export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 /**
  * Detaches a callback previously attached with the corresponding `on*()` (`onValue`, `onChildAdded`) listener.
  * Note: This is not the recommended way to remove a listener. Instead, please use the returned callback function from

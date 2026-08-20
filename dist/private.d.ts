@@ -923,7 +923,7 @@ export declare interface ListenOutcome {
 export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 
 /** Why a restore fell back cold. @public */
-export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 
 declare interface ListenOutcomeState {
     outcome: ListenOutcome | null;

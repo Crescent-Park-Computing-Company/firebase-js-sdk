@@ -97,7 +97,7 @@ type BootBufferedOp = {
 /** How a persistent default listen started. @public */
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 /** Why a restore fell back cold. @public */
-export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 /**
  * Restore/certification state of one persistent default listen.
  * @public
@@ -188,7 +188,7 @@ export declare function repoGenerateServerValues(repo: Repo): Indexable;
  */
 /** Test seam: drives a server data push exactly as the connection would. @internal */
 export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
-export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number): void;
+export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number, coldReason?: ListenOutcomeReason): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may
  * still be waiting on its restore — cancel it so it never attaches — and its

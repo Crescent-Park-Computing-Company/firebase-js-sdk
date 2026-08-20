@@ -4,7 +4,7 @@ import { stringify, jsonEval, contains, assert, isNodeSdk, stringToByteArray, Sh
 import { Logger, LogLevel } from '@firebase/logger';
 
 const name = "@firebase/database";
-const version = "1.1.3";
+const version = "1.1.3-cache-seeding.70";
 
 /**
  * @license
@@ -10635,6 +10635,273 @@ class ReadonlyRestClient extends ServerActions {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+let yieldChannel = null;
+const yieldResolvers = [];
+function setPortsReferenced(referenced) {
+    for (const port of [yieldChannel.port1, yieldChannel.port2]) {
+        const p = port;
+        if (referenced) {
+            p.ref?.();
+        }
+        else {
+            p.unref?.();
+        }
+    }
+}
+function yieldMacrotask() {
+    if (typeof MessageChannel === 'undefined') {
+        return new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (yieldChannel === null) {
+        yieldChannel = new MessageChannel();
+        // Installing onmessage references the port in Node; start idle-unref'd.
+        yieldChannel.port1.onmessage = () => {
+            yieldResolvers.shift()?.();
+            if (yieldResolvers.length === 0) {
+                setPortsReferenced(false);
+            }
+        };
+        setPortsReferenced(false);
+    }
+    return new Promise(resolve => {
+        yieldResolvers.push(resolve);
+        setPortsReferenced(true);
+        yieldChannel.port2.postMessage(null);
+    });
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Per-key work units charged per main-thread slice of a sliced server-push
+ * decode (one charge per JSON key visited, at every depth). Sized like the
+ * peek walk's budget (_PEEK_MATERIALIZE_SLICE_VISITS): one slice stays well
+ * inside a frame budget on mobile hardware while keeping total slice count
+ * (and its scheduling overhead) low on large payloads.
+ * @internal
+ */
+const _INGEST_DECODE_SLICE_VISITS = 4000;
+/**
+ * Thrown out of a sliced decode when the caller's continuation check fails
+ * after a yield — the listen this decode serves was torn down (stop, account
+ * switch, dispose, or a successor ingest) and nothing may be applied from it.
+ * @internal
+ */
+class IngestCancelledError extends Error {
+    constructor() {
+        super('sliced ingest cancelled');
+    }
+}
+/**
+ * Charges one work unit; returns a promise EXACTLY when the budget exhausts
+ * (yield + liveness re-check), null otherwise. The null fast path allocates
+ * nothing — with one charge per JSON key, an unconditional await here would
+ * put a microtask on every key of a multi-MB payload, recreating a large
+ * fraction of the overhead this decoder exists to remove.
+ */
+function charge(state) {
+    if (++state.visits < _INGEST_DECODE_SLICE_VISITS) {
+        return null;
+    }
+    state.visits = 0;
+    return yieldMacrotask().then(() => {
+        if (!state.isCurrent()) {
+            throw new IngestCancelledError();
+        }
+    });
+}
+/**
+ * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
+ * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
+ * metadata-key skipping, empty-child pruning, and childSet construction —
+ * but every JSON key visited charges one unit of the shared slice budget,
+ * and the walk yields a macrotask when the budget exhausts so a large
+ * server push can never decode as one monolithic main-thread task.
+ *
+ * Primitive children decode synchronously through nodeFromJSON itself (a
+ * single bounded leaf) — a promise per leaf would dominate allocation on
+ * exactly the wide flat collections this bounds (the peek walk's inline-leaf
+ * precedent). Fidelity is enforced by test corpus equality (node.equals +
+ * hash) against nodeFromJSON; when editing either function, keep them in
+ * lockstep.
+ * @internal
+ */
+async function decodeNodeSliced(json, state, priority = null) {
+    if (json === null) {
+        return ChildrenNode.EMPTY_NODE;
+    }
+    if (typeof json === 'object' && '.priority' in json) {
+        priority = json['.priority'];
+    }
+    assert(priority === null ||
+        typeof priority === 'string' ||
+        typeof priority === 'number' ||
+        (typeof priority === 'object' && '.sv' in priority), 'Invalid priority type found: ' + typeof priority);
+    if (typeof json === 'object' &&
+        '.value' in json &&
+        json['.value'] !== null) {
+        json = json['.value'];
+    }
+    // Valid leaf nodes include non-objects or server-value wrapper objects
+    if (typeof json !== 'object' || '.sv' in json) {
+        const y = charge(state);
+        if (y !== null) {
+            await y;
+        }
+        const jsonLeaf = json;
+        return new LeafNode(jsonLeaf, nodeFromJSON(priority));
+    }
+    if (!(json instanceof Array)) {
+        const children = [];
+        let childrenHavePriority = false;
+        const obj = json;
+        for (const key in obj) {
+            if (obj.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+                // Ignore metadata nodes
+                const y = charge(state);
+                if (y !== null) {
+                    await y;
+                }
+                const raw = obj[key];
+                const childNode = typeof raw !== 'object' || raw === null
+                    ? nodeFromJSON(raw) // primitive leaf / null — bounded, synchronous
+                    : await decodeNodeSliced(raw, state);
+                if (!childNode.isEmpty()) {
+                    childrenHavePriority =
+                        childrenHavePriority || !childNode.getPriority().isEmpty();
+                    children.push(new NamedNode(key, childNode));
+                }
+            }
+        }
+        return assembleChildrenNode(children, childrenHavePriority, priority);
+    }
+    else {
+        let node = ChildrenNode.EMPTY_NODE;
+        const arr = json;
+        for (const key in arr) {
+            if (arr.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+                // ignore metadata nodes.
+                const y = charge(state);
+                if (y !== null) {
+                    await y;
+                }
+                const raw = arr[key];
+                const childNode = typeof raw !== 'object' || raw === null
+                    ? nodeFromJSON(raw)
+                    : await decodeNodeSliced(raw, state);
+                if (childNode.isLeafNode() || !childNode.isEmpty()) {
+                    node = node.updateImmediateChild(key, childNode);
+                }
+            }
+        }
+        return node.updatePriority(nodeFromJSON(priority));
+    }
+}
+/**
+ * The childSet-assembly tail of nodeFromJSON's object branch, shared by the
+ * sliced decoder's interior nodes and by the ingest pump's cold-path root
+ * assembly (per-top-level-child decode, then one node for a single
+ * overwrite).
+ * @internal
+ */
+function assembleChildrenNode(children, childrenHavePriority, priority) {
+    if (children.length === 0) {
+        return ChildrenNode.EMPTY_NODE;
+    }
+    const childSet = buildChildSet(children, NAME_ONLY_COMPARATOR, namedNode => namedNode.name, NAME_COMPARATOR);
+    if (childrenHavePriority) {
+        const sortedChildSet = buildChildSet(children, PRIORITY_INDEX.getCompare());
+        return new ChildrenNode(childSet, nodeFromJSON(priority), new IndexMap({ '.priority': sortedChildSet }, { '.priority': PRIORITY_INDEX }));
+    }
+    else {
+        return new ChildrenNode(childSet, nodeFromJSON(priority), IndexMap.Default);
+    }
+}
+/**
+ * Cost surcharge per emitted top-level child, in budget units. The decode
+ * budget charges JSON keys, but the pump's per-child APPLY (SyncTree
+ * overwrite + event raise + write-through accounting) is uncharged work
+ * riding the same slice — many tiny children would otherwise pack hundreds
+ * of applies into one task. The surcharge caps a slice at roughly
+ * budget/surcharge applies (~60) so slices stay frame-sized either way.
+ */
+const CHILD_APPLY_SURCHARGE = 64;
+/**
+ * Streaming top level of a sliced full-root decode: hands each top-level
+ * child of a plain-children push to `onChild` as (key, Node) without ever
+ * assembling the root — the ingest pump applies changed children as
+ * per-child server overwrites against the live base or collects them for a
+ * cold single overwrite. Only called for payloads
+ * {@link sliceableAsChildren} accepted, so priority/leaf/array roots never
+ * reach it.
+ * @internal
+ */
+async function decodeChildrenSliced(json, isCurrent, onChild) {
+    const state = { visits: 0, isCurrent };
+    for (const key in json) {
+        if (json.hasOwnProperty(key) && key.substring(0, 1) !== '.') {
+            const y = charge(state);
+            if (y !== null) {
+                await y;
+            }
+            const raw = json[key];
+            const childNode = typeof raw !== 'object' || raw === null
+                ? nodeFromJSON(raw)
+                : await decodeNodeSliced(raw, state);
+            if (!childNode.isEmpty()) {
+                onChild(key, childNode);
+                state.visits += CHILD_APPLY_SURCHARGE;
+            }
+        }
+    }
+}
+/**
+ * Whether a server push body is shaped for the sliced children ingest: a
+ * plain JSON object of children — no leaf value, no '.value'/'.sv' wrapper,
+ * no root '.priority', not an array. Everything else takes the ordinary
+ * synchronous path; those shapes are either bounded (leaves) or vanishingly
+ * rare at a persistent root (arrays, prioritized roots).
+ * @internal
+ */
+function sliceableAsChildren(data) {
+    return (typeof data === 'object' &&
+        data !== null &&
+        !(data instanceof Array) &&
+        !('.value' in data) &&
+        !('.priority' in data) &&
+        !('.sv' in data));
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 /**
  * Applies a server range merge against locally cached data: every leaf whose
  * path lies strictly after `optExclusiveStart` and at-or-before
@@ -14977,6 +15244,23 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
             return;
         }
     }
+    if (repoIngestEligible(repo, pathString, data, isMerge, tag)) {
+        // Full-root push at a persistent root: decode and apply in yielded
+        // slices instead of one monolithic task (see repoIngestFullRootPush).
+        // A boot buffer holds later wire operations in order while it runs.
+        // The cast restates repoIngestEligible's sliceableAsChildren guard.
+        void repoRunIngestPump(repo, pathString, data);
+        return;
+    }
+    repoApplyDataUpdate(repo, pathString, data, isMerge, tag);
+}
+/**
+ * The synchronous data-push application (the pre-ingest-pump body of
+ * repoOnDataUpdate): decode, apply to SyncTree, rerun transactions, raise
+ * events, write through to persistence. Bounded payloads only — full-root
+ * pushes at persistent roots divert to the sliced ingest pump above.
+ */
+function repoApplyDataUpdate(repo, pathString, data, isMerge, tag) {
     const path = new Path(pathString);
     data = repo.interceptServerDataCallback_
         ? repo.interceptServerDataCallback_(pathString, data)
@@ -15013,6 +15297,203 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
     }
 }
 /**
+ * Whether a data push takes the sliced ingest pump: an untagged full
+ * overwrite, at EXACTLY a persistence-registered root (the only place a
+ * whole-workspace payload arrives), whose body is a plain children object
+ * (see sliceableAsChildren). Everything else — descendant pushes, merges,
+ * tagged query data, leaf/priority/array roots — is bounded or rare enough
+ * for the ordinary synchronous path.
+ */
+function repoIngestEligible(repo, pathString, data, isMerge, tag) {
+    return (tag == null &&
+        !isMerge &&
+        repo.persistence_ !== null &&
+        repo.persistence_.isPersistentPath(pathString) &&
+        repo.interceptServerDataCallback_ === null &&
+        sliceableAsChildren(data));
+}
+/**
+ * Runs one sliced ingest under a boot-buffer window, then drains the window.
+ * The buffer serves double duty: ORDERING (later server operations for this
+ * root hold until the pumped base is in SyncTree, exactly like the
+ * manifest-first boot window) and LIVENESS (a stop/account-switch/dispose
+ * deletes the buffer, which the pump observes at its next yield and aborts).
+ */
+async function repoRunIngestPump(repo, pathString, data) {
+    const buffer = [];
+    repo.bootBuffers_.set(pathString, buffer);
+    const isCurrent = () => 
+    // Current exactly while OUR buffer array is still installed: stop
+    // listens, account switches, a successor window, and dispose all delete
+    // or replace the entry.
+    repo.bootBuffers_.get(pathString) === buffer;
+    try {
+        await repoIngestOnePush(repo, pathString, data, isCurrent);
+        await repoDrainIngestWindow(repo, pathString, buffer, isCurrent);
+    }
+    catch (e) {
+        if (!(e instanceof IngestCancelledError)) {
+            throw e;
+        }
+        // Deliberate teardown: whoever tore the window down owns the listen's
+        // state; nothing further to run here.
+    }
+}
+/**
+ * Applies one full-root push through the sliced ingest, DEGRADING to the
+ * legacy monolithic apply on an unexpected mid-ingest error: the payload is
+ * still intact, and one synchronous overwrite converges SyncTree to exactly
+ * the tree the push named (partially-applied children are simply replaced).
+ * The long task this costs is the pre-pump status quo, paid only on a path
+ * that indicates an ingest bug. Cancellation is not degradation — it
+ * propagates.
+ */
+async function repoIngestOnePush(repo, pathString, data, isCurrent) {
+    try {
+        await repoIngestFullRootPush(repo, pathString, data, isCurrent);
+    }
+    catch (e) {
+        if (e instanceof IngestCancelledError) {
+            throw e;
+        }
+        warn('sliced ingest failed for ' + pathString + '; applying whole', e);
+        repoApplyDataUpdate(repo, pathString, data, false, null);
+    }
+}
+/**
+ * Drains a boot-buffer window IN PLACE, the window still installed: ops are
+ * consumed from the front while new wire arrivals keep appending behind
+ * them — one live queue, so everything applies in exact arrival order by
+ * construction. (The pre-pump drain deleted the window first and re-entered
+ * the buffered entry points; anything the wire delivered mid-drain then
+ * landed in a NEW window and overtook the not-yet-replayed backlog.)
+ *
+ * A buffered full-root push replays through the sliced ingest against the
+ * just-applied base — the initialized per-child mode — never as one
+ * monolithic apply. Yields between ops; the window closes only when the
+ * queue is empty.
+ */
+async function repoDrainIngestWindow(repo, pathString, buffer, isCurrent) {
+    while (buffer.length > 0) {
+        const op = buffer.shift();
+        if (op.kind === 'data') {
+            if (repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)) {
+                await repoIngestOnePush(repo, op.pathString, op.data, isCurrent);
+            }
+            else {
+                // Direct application — the buffered entry point would just re-queue
+                // the op into the very window being drained.
+                repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+            }
+        }
+        else if (op.kind === 'rm') {
+            repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+        }
+        else {
+            op.apply();
+        }
+        if (buffer.length > 0) {
+            await yieldMacrotask();
+            if (!isCurrent()) {
+                throw new IngestCancelledError();
+            }
+        }
+    }
+    repo.bootBuffers_.delete(pathString);
+}
+/**
+ * Applies one full-root server push in yielded slices: each top-level child
+ * decodes under the shared slice budget and applies as ONE per-child server
+ * overwrite at root/key — semantically the same tree the monolithic
+ * overwrite produced, delivered as the bounded per-child operations the
+ * whole stack (SyncTree diffing, event fan-out, downstream frame coalescing)
+ * already handles. A final pass removes stale children the payload no
+ * longer contains, then records the root's write-through ONCE.
+ *
+ * Two application modes, chosen by the root's live server-cache state:
+ *  - INITIALIZED (fallback replay over a restored base): per-child
+ *    overwrites; unchanged children short-circuit in IndexedFilter's
+ *    child-level equals against bounded subtrees — the root-sized deep diff
+ *    of the monolithic path never happens.
+ *  - UNINITIALIZED (cold boot): per-child server operations would be
+ *    DROPPED by the view processor before the first full snapshot (its
+ *    uninitialized-cache guard), so children accumulate off-tree and apply
+ *    as one root overwrite — whose diff against the empty old tree is
+ *    trivial. The decode (the dominant cost) stays sliced either way.
+ */
+async function repoIngestFullRootPush(repo, pathString, data, isCurrent) {
+    const rootPath = new Path(pathString);
+    // Per-child overwrites can only REPLACE a plain children root: a leaf root
+    // needs the root itself replaced, and a root priority can only be cleared
+    // by a root-level operation (the payload carries none — eligibility
+    // rejected '.priority'). Those exotic shapes take the accumulate-and-
+    // overwrite branch, whose single root apply handles both, at the old
+    // diff cost — acceptable for shapes a persistent workspace root never has.
+    const cacheAtStart = syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath);
+    const initialized = cacheAtStart !== null &&
+        !cacheAtStart.isLeafNode() &&
+        cacheAtStart.getPriority().isEmpty();
+    const seen = new Set();
+    const coldChildren = [];
+    let coldChildrenHavePriority = false;
+    const applyOne = (childPath, node) => {
+        const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, childPath, node);
+        let affectedPath = childPath;
+        if (events.length > 0) {
+            affectedPath = repoRerunTransactions(repo, childPath);
+        }
+        eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+    };
+    await decodeChildrenSliced(data, isCurrent, (key, node) => {
+        seen.add(key);
+        if (initialized) {
+            applyOne(pathChild(rootPath, key), node);
+        }
+        else {
+            coldChildren.push(new NamedNode(key, node));
+            coldChildrenHavePriority =
+                coldChildrenHavePriority || !node.getPriority().isEmpty();
+        }
+    });
+    if (!isCurrent()) {
+        throw new IngestCancelledError();
+    }
+    if (!initialized) {
+        // One overwrite of the assembled root: the view processor initializes
+        // from a full snapshot, and the diff against the empty old tree is
+        // trivial. '.priority' at the root of a plain-children payload was
+        // excluded by eligibility, so priority is null by construction.
+        applyOne(rootPath, assembleChildrenNode(coldChildren, coldChildrenHavePriority, null));
+    }
+    else {
+        // Remove children the payload no longer contains — a full overwrite
+        // REPLACES the root, so absence is deletion. Keys enumerate from the
+        // live server cache, removals apply as bounded per-child overwrites.
+        const serverCache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath);
+        if (serverCache !== null && !serverCache.isLeafNode()) {
+            const stale = [];
+            serverCache.forEachChild(KEY_INDEX, key => {
+                if (!seen.has(key)) {
+                    stale.push(key);
+                }
+            });
+            for (const key of stale) {
+                applyOne(pathChild(rootPath, key), ChildrenNode.EMPTY_NODE);
+                await yieldMacrotask();
+                if (!isCurrent()) {
+                    throw new IngestCancelledError();
+                }
+            }
+        }
+    }
+    // ONE write-through naming the ROOT ('at-path' → changed path [] → every
+    // range dirty), exactly what the monolithic path recorded for a full
+    // overwrite. 'confirmed' (nothing further) would be a lie here — the push
+    // replaced the root, and a flush believing nothing changed would carry
+    // stale ranges over a new baseline tree.
+    repoPersistAfterServerUpdate(repo, rootPath, 'at-path');
+}
+/**
  * Sends a listen for the server sync tree, restoring the persisted server
  * cache first where applicable: a complete default listen on a persisted
  * root is held until the stored tree restores (bounded inside restore()),
@@ -15033,7 +15514,7 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
         exceptionGuard(() => subscriber(outcome));
     }
 }
-function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS) {
+function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS, coldReason) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
     if (isDefaultComplete) {
@@ -15114,7 +15595,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         persistence === null ||
         !isDefaultComplete ||
         !persistence.isPersistentPath(pathString)) {
-        sendListen('cold');
+        // coldReason names WHY a skipPersistence caller went cold (observability
+        // only — e.g. 'auth-timeout'); ordinary non-persistent listens carry none.
+        sendListen('cold', skipPersistence ? coldReason : undefined);
         return;
     }
     if (!persistence.isAuthScopeConfigured()) {
@@ -15156,7 +15639,7 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
             repo.pendingSeedRestores_.delete(pathString);
             // No identity means no safe cache namespace. Fall open to the ordinary
             // network listener rather than stranding the subscription forever.
-            repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs);
+            repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs, 'auth-timeout');
         }, authScopeTimeoutMs);
         // Close the check-to-subscribe race if a pre-auth peek configured the
         // manager between the first readiness check and listener registration.
@@ -15301,18 +15784,15 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         if (buffered === undefined) {
             return;
         }
-        repo.bootBuffers_.delete(pathString);
-        for (const op of buffered) {
-            if (op.kind === 'data') {
-                repoOnDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
-            }
-            else if (op.kind === 'rm') {
-                repoOnRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
-            }
-            else {
-                op.apply();
-            }
-        }
+        // Yielding in-place drain (window stays installed until the queue is
+        // empty): the legacy loop replayed the entire backlog — which can
+        // include a FULL-ROOT push (the fallback-while-restoring race) — in the
+        // same task that applied the base; now a full push replays through the
+        // sliced ingest and later arrivals append behind the backlog in order.
+        void repoDrainIngestWindow(repo, pathString, buffered, () => repo.bootBuffers_.get(pathString) === buffered).catch(() => {
+            // IngestCancelledError: the window was torn down (stop / account
+            // switch / dispose); its owner already put the listen state right.
+        });
     };
     void persistence
         .restoreForListen(pathString, hashes => {
@@ -15353,7 +15833,7 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
                 // collectGraftableDescendants); applying the stored tree over it
                 // would replace live server data with stale bytes.
                 repo.pendingListenHashes_.clear(pathString);
-                finish('cold');
+                finish('cold', 'partial-descendants');
                 return;
             }
         }
@@ -15522,6 +16002,9 @@ function repoNotifyPersistenceAuthScope(repo) {
 function repoDispose(repo) {
     repoInterrupt(repo);
     repoCancelPendingSeedRestores(repo, false);
+    // Buffer identity is every ingest pump's liveness signal: clearing here
+    // cancels any in-flight sliced ingest at its next yield.
+    repo.bootBuffers_.clear();
     repoClearListenOutcomes(repo);
     repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
@@ -15582,6 +16065,15 @@ function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
             return;
         }
     }
+    repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
+}
+/**
+ * The synchronous range-merge application (the post-buffer-check body of
+ * repoOnRangeMergeUpdate), called directly by the boot-window queue drain —
+ * whose window is still installed, so re-entering the buffered entry point
+ * would push the operation back into the very queue being drained.
+ */
+function repoApplyRangeMergeUpdate(repo, pathString, ranges, tag) {
     const path = new Path(pathString);
     const merges = ranges.map(range => new RangeMerge(typeof range.s === 'string' ? new Path(range.s) : null, typeof range.e === 'string' ? new Path(range.e) : null, nodeFromJSON(range.m)));
     let events;
@@ -18446,40 +18938,6 @@ function goOffline(db) {
  * @internal
  */
 const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
-let peekYieldChannel = null;
-const peekYieldResolvers = [];
-function setPeekPortsReferenced(referenced) {
-    for (const port of [peekYieldChannel.port1, peekYieldChannel.port2]) {
-        const p = port;
-        if (referenced) {
-            p.ref?.();
-        }
-        else {
-            p.unref?.();
-        }
-    }
-}
-function yieldMacrotask() {
-    if (typeof MessageChannel === 'undefined') {
-        return new Promise(resolve => setTimeout(resolve, 0));
-    }
-    if (peekYieldChannel === null) {
-        peekYieldChannel = new MessageChannel();
-        // Installing onmessage references the port in Node; start idle-unref'd.
-        peekYieldChannel.port1.onmessage = () => {
-            peekYieldResolvers.shift()?.();
-            if (peekYieldResolvers.length === 0) {
-                setPeekPortsReferenced(false);
-            }
-        };
-        setPeekPortsReferenced(false);
-    }
-    return new Promise(resolve => {
-        peekYieldResolvers.push(resolve);
-        setPeekPortsReferenced(true);
-        peekYieldChannel.port2.postMessage(null);
-    });
-}
 // ChildrenNode.val()'s integer-key grammar (private there; replicated for the
 // sliced walk's array coercion, which must match val() exactly).
 const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
