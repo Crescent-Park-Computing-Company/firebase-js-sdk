@@ -224,12 +224,35 @@ type BootBufferedOp =
        * A connection loss observed while an ingest window was open: the
        * onDisconnect run must apply AFTER the pushes that preceded it on the
        * wire (the sliced pump time-shifts those), so it queues like any
-       * other server-ordered operation. Deduplicated per window — the runs
-       * are cumulative state applications, and disconnect/reconnect cycles
-       * inside one window collapse to the run at the drain point.
+       * other server-ordered operation. Carries the run FROZEN at the
+       * disconnect (see PendingDisconnectRun) — distinct disconnects are
+       * distinct runs, never deduplicated.
        */
       kind: 'disconnect';
+      run: PendingDisconnectRun;
     };
+
+/**
+ * One onDisconnect run, frozen at the moment its disconnect occurred. The
+ * REGISTRATION TREE is snapshotted (and repo.onDisconnect_ reset) at
+ * connectStatus=false — a cancel acked after the reconnect, or a fresh
+ * registration made on the new connection, must not rewrite what THIS
+ * disconnect fires (the live tree they mutate is the next disconnect's).
+ * Server-value/deferred-value RESOLUTION deliberately stays at run time:
+ * the windows time-shift the pushes that preceded the disconnect on the
+ * wire, and increments must resolve against the tree WITH those pushes
+ * applied — exactly the state the legacy synchronous path resolved in.
+ *
+ * `remaining` counts the marker-holding windows (every window open at the
+ * disconnect); the run fires when the LAST one drains or tears down — an
+ * earlier window's run would be overwritten by a later window's
+ * still-pending push. Windows opened after the disconnect hold no marker
+ * and never block or receive it.
+ */
+interface PendingDisconnectRun {
+  tree: SparseSnapshotTree;
+  remaining: number;
+}
 
 /**
  * The boot-buffer root covering `pathString`, if any: operations at or under
@@ -535,6 +558,14 @@ export function repoGenerateServerValues(repo: Repo): Indexable {
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: tears down one ingest window exactly as stop-listen does. @internal */
+export function repoDropIngestWindowForTest(
+  repo: Repo,
+  pathString: string
+): void {
+  repoDropIngestWindow(repo, pathString);
+}
+
 /** Test seam: drives a connection-status flip exactly as the connection would. @internal */
 export function repoOnConnectStatusForTest(
   repo: Repo,
@@ -735,12 +766,17 @@ async function repoRunIngestPump(
       // and a disconnect marker it holds must still run (repo-global state,
       // not account data).
       repoDropIngestWindow(repo, pathString);
-    } else if (buffer.some(op => op.kind === 'disconnect')) {
-      // The entry was removed or replaced externally while OUR array still
-      // holds a disconnect marker. The marker is repo-global state — flush
-      // it through the shared gate (which skips while any other window
-      // still holds one) instead of letting it die with the array.
-      repoRunBufferedDisconnect(repo);
+    } else {
+      // The entry was removed or replaced externally while OUR array may
+      // still hold disconnect markers. Each is one window's hold on a
+      // frozen repo-global run — release them (the counter fires the run
+      // when the last holder anywhere lets go) instead of letting them die
+      // with the array.
+      for (const op of buffer) {
+        if (op.kind === 'disconnect') {
+          repoReleaseDisconnectRun(repo, op.run);
+        }
+      }
     }
   }
 }
@@ -815,7 +851,7 @@ async function repoDrainIngestWindow(
       } else if (op.kind === 'rm') {
         repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
       } else if (op.kind === 'disconnect') {
-        repoRunBufferedDisconnect(repo);
+        repoReleaseDisconnectRun(repo, op.run);
       } else {
         op.apply();
       }
@@ -835,32 +871,27 @@ async function repoDrainIngestWindow(
 }
 
 /**
- * Runs a window-buffered onDisconnect marker with LAST-WINDOW semantics:
- * every window open at disconnect time received a marker, and the run must
- * happen only once every push those windows held has applied — an earlier
- * window's run would be overwritten by a later window's still-pending push
- * (the cross-window form of the same inversion). Skip while any OTHER open
- * window still carries a marker; the final marker performs the run. A
- * window opened AFTER the disconnect carries no marker and never blocks —
- * its content post-dates the disconnect on the wire.
+ * Releases one window's hold on a frozen disconnect run; the LAST release
+ * applies it (see PendingDisconnectRun). Idempotence rides the counter — a
+ * run reaches zero exactly once — so drain-then-teardown of the same window
+ * cannot double-fire it.
  */
-function repoRunBufferedDisconnect(repo: Repo): void {
-  for (const ops of repo.bootBuffers_.values()) {
-    if (ops.some(op => op.kind === 'disconnect')) {
-      return;
-    }
+function repoReleaseDisconnectRun(repo: Repo, run: PendingDisconnectRun): void {
+  if (--run.remaining > 0) {
+    return;
   }
-  repoRunOnDisconnectEvents(repo);
+  repoRunOnDisconnectEvents(repo, run.tree);
 }
 
 /**
- * Tears down one ingest/boot window WITHOUT losing a buffered disconnect
- * run: data/range/complete ops may be dropped (their listens are going away
- * — the legacy cancel paths dropped exactly the same backlog), but the
- * onDisconnect run is repo-global state the legacy path executed IMMEDIATELY
- * at disconnect time; a teardown that dropped its only marker would skip it
- * forever. Remove the window first, THEN run — the run must not see this
- * window as still-blocking.
+ * Tears down one ingest/boot window WITHOUT losing frozen disconnect runs:
+ * data/range/complete ops may be dropped (their listens are going away —
+ * the legacy cancel paths dropped exactly the same backlog), but each
+ * disconnect run is repo-global state the legacy path executed IMMEDIATELY
+ * at disconnect time; a teardown that dropped a window's markers without
+ * releasing them would strand every run they hold (its counter never
+ * reaches zero). Remove the window first, THEN release — a run whose last
+ * holder is THIS window must not see it as still open.
  */
 function repoDropIngestWindow(repo: Repo, pathString: string): void {
   const ops = repo.bootBuffers_.get(pathString);
@@ -868,8 +899,10 @@ function repoDropIngestWindow(repo: Repo, pathString: string): void {
     return;
   }
   repo.bootBuffers_.delete(pathString);
-  if (ops.some(op => op.kind === 'disconnect')) {
-    repoRunBufferedDisconnect(repo);
+  for (const op of ops) {
+    if (op.kind === 'disconnect') {
+      repoReleaseDisconnectRun(repo, op.run);
+    }
   }
 }
 
@@ -1584,19 +1617,13 @@ export function repoNotifyPersistenceAuthScope(repo: Repo): void {
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo, false);
-  // A disconnect observed while a window was open queued its onDisconnect
-  // run behind that window's pushes. Dropping the windows must not drop the
-  // run — the legacy path executed it immediately at disconnect time.
-  let pendingDisconnect = false;
-  for (const ops of repo.bootBuffers_.values()) {
-    pendingDisconnect =
-      pendingDisconnect || ops.some(op => op.kind === 'disconnect');
-  }
-  // Buffer identity is every ingest pump's liveness signal: clearing here
-  // cancels any in-flight sliced ingest at its next yield.
-  repo.bootBuffers_.clear();
-  if (pendingDisconnect) {
-    repoRunOnDisconnectEvents(repo);
+  // Disconnects observed while windows were open queued frozen runs behind
+  // those windows' pushes. Dropping the windows must RELEASE every hold —
+  // the legacy path executed each run immediately at disconnect time — and
+  // the per-window drop below also clears bootBuffers_, which is every
+  // ingest pump's liveness signal (cancellation at the next yield).
+  for (const pathString of [...repo.bootBuffers_.keys()]) {
+    repoDropIngestWindow(repo, pathString);
   }
   repoClearListenOutcomes(repo);
   repo.persistenceAuthScopeListeners_.clear();
@@ -1733,22 +1760,28 @@ function repoOnConnectStatus(repo: Repo, connectStatus: boolean): void {
   // ingest — and must stay immediate either way.
   repoUpdateInfo(repo, 'connected', connectStatus);
   if (connectStatus === false) {
-    // The onDisconnect run writes to serverSyncTree_, so it is ORDERED
-    // against server data: a run applied while an ingest window still holds
-    // an earlier full-root push would be overwritten when that push lands —
-    // wire order inverted. Queue it behind every open window (the sliced
-    // pump time-shifts the pushes; this time-shifts the run identically).
-    // One marker per window suffices: the run applies cumulative state, and
-    // repeated disconnects inside one window collapse to the drain-point run.
-    let buffered = false;
-    for (const ops of repo.bootBuffers_.values()) {
-      if (!ops.some(op => op.kind === 'disconnect')) {
-        ops.push({ kind: 'disconnect' });
-      }
-      buffered = true;
+    // Freeze THIS disconnect's registrations now: the tree is snapshotted
+    // and reset in one motion, so acks landing on the new connection (a
+    // cancel, a fresh registration) mutate the NEXT disconnect's tree and
+    // can never rewrite this one. Same clear-before-user-callbacks ordering
+    // as the legacy run (which reset the tree before raising its events).
+    const tree = repo.onDisconnect_;
+    repo.onDisconnect_ = newSparseSnapshotTree();
+    if (repo.bootBuffers_.size === 0) {
+      repoRunOnDisconnectEvents(repo, tree);
+      return;
     }
-    if (!buffered) {
-      repoRunOnDisconnectEvents(repo);
+    // The run writes to serverSyncTree_, so it is ORDERED against server
+    // data: applied while an ingest window still holds an earlier full-root
+    // push, it would be overwritten when that push lands — wire order
+    // inverted. Queue the frozen run behind every open window; it fires
+    // when the last of them releases it (see PendingDisconnectRun).
+    const run: PendingDisconnectRun = {
+      tree,
+      remaining: repo.bootBuffers_.size
+    };
+    for (const ops of repo.bootBuffers_.values()) {
+      ops.push({ kind: 'disconnect', run });
     }
   }
 }
@@ -2007,26 +2040,26 @@ export function repoUpdate(
 }
 
 /**
- * Applies all of the changes stored up in the onDisconnect_ tree.
+ * Applies one disconnect's registrations — `tree` is the snapshot frozen at
+ * that disconnect (repoOnConnectStatus resets the live repo.onDisconnect_
+ * as it captures, so later acks/registrations belong to the next
+ * disconnect). Deferred values resolve HERE, at apply time, against the
+ * sync tree with every wire-preceding push already applied.
  */
-function repoRunOnDisconnectEvents(repo: Repo): void {
+function repoRunOnDisconnectEvents(repo: Repo, tree: SparseSnapshotTree): void {
   repoLog(repo, 'onDisconnectEvents');
 
   const serverValues = repoGenerateServerValues(repo);
   const resolvedOnDisconnectTree = newSparseSnapshotTree();
-  sparseSnapshotTreeForEachTree(
-    repo.onDisconnect_,
-    newEmptyPath(),
-    (path, node) => {
-      const resolved = resolveDeferredValueTree(
-        path,
-        node,
-        repo.serverSyncTree_,
-        serverValues
-      );
-      sparseSnapshotTreeRemember(resolvedOnDisconnectTree, path, resolved);
-    }
-  );
+  sparseSnapshotTreeForEachTree(tree, newEmptyPath(), (path, node) => {
+    const resolved = resolveDeferredValueTree(
+      path,
+      node,
+      repo.serverSyncTree_,
+      serverValues
+    );
+    sparseSnapshotTreeRemember(resolvedOnDisconnectTree, path, resolved);
+  });
   let events: Event[] = [];
 
   sparseSnapshotTreeForEachTree(
@@ -2041,7 +2074,6 @@ function repoRunOnDisconnectEvents(repo: Repo): void {
     }
   );
 
-  repo.onDisconnect_ = newSparseSnapshotTree();
   eventQueueRaiseEventsForChangedPath(repo.eventQueue_, newEmptyPath(), events);
 }
 

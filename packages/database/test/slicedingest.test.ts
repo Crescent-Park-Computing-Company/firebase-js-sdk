@@ -23,6 +23,7 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
+  repoDropIngestWindowForTest,
   repoOnConnectStatusForTest,
   repoOnDataUpdateForTest,
   Repo
@@ -38,6 +39,7 @@ import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { SnapshotHolder } from '../src/core/SnapshotHolder';
 import {
   newSparseSnapshotTree,
+  sparseSnapshotTreeForget,
   sparseSnapshotTreeRemember
 } from '../src/core/SparseSnapshotTree';
 import {
@@ -617,19 +619,63 @@ describe('sliced full-root push ingestion', () => {
     expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
   });
 
-  it('repeated disconnects inside one window collapse to a single buffered run', async () => {
+  it('distinct disconnects are distinct frozen runs, each applying its own registrations', async () => {
     const rootPath = '/users/alice';
-    const { repo } = makeIngestHarness(rootPath);
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    // First disconnect: only child9 is registered.
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
+      nodeFromJSON('gone-1')
+    );
     repoOnDataUpdateForTest(repo, rootPath, wideRoot(6), false, null);
     repoOnConnectStatusForTest(repo, false);
+    // Reconnect; a NEW registration lands before the pump drains. It must
+    // fire with the SECOND disconnect only — never retroactively with the
+    // first (its tree was frozen at the first disconnect).
     repoOnConnectStatusForTest(repo, true);
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child8/status'),
+      nodeFromJSON('gone-2')
+    );
     repoOnConnectStatusForTest(repo, false);
     const markers = repo.bootBuffers_
       .get(rootPath)!
       .filter(op => op.kind === 'disconnect');
-    expect(markers.length).to.equal(1);
+    expect(markers.length).to.equal(2);
     await flushAsync(64);
     expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    // Both runs applied, in order, each from its own frozen tree.
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone-1');
+    expect(cache!.getChild(new Path('child8/status')).val()).to.equal('gone-2');
+  });
+
+  it('a cancel acked after the disconnect cannot rewrite the frozen run', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
+      nodeFromJSON('gone')
+    );
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(6), false, null);
+    // Disconnect freezes the run; then a cancel ack lands (server processed
+    // an onDisconnectCancel on the new connection) BEFORE the pump drains.
+    // Legacy semantics: the cancel was acknowledged AFTER this disconnect
+    // fired, so it affects the next disconnect — not this one.
+    repoOnConnectStatusForTest(repo, false);
+    sparseSnapshotTreeForget(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status')
+    );
+    await flushAsync(64);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
+    // And the (now-empty) live tree means the NEXT disconnect fires nothing:
+    repoOnConnectStatusForTest(repo, false);
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
   });
 
   it('an auth-scope switch mid-pump cancels the ingest (no cross-account apply)', async () => {
@@ -685,6 +731,47 @@ describe('sliced full-root push ingestion', () => {
     // the pump notices at its next yield and its teardown flushes the run.
     await flushAsync(64);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
+  });
+
+  it('with two open windows, the frozen run fires exactly once — after the LAST holder releases', async () => {
+    const rootA = '/users/alice';
+    const rootB = '/users/bob';
+    const { repo, syncTree } = makeIngestHarness(rootA);
+    // Second persistent root on the same repo/harness.
+    const persistence = repo.persistence_ as unknown as {
+      isPersistentPath: (p: string) => boolean;
+    };
+    persistence.isPersistentPath = (p: string) => p === rootA || p === rootB;
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootA + '/child9/status'),
+      nodeFromJSON('gone')
+    );
+    // Window A pumps; window B is a manually installed boot window that will
+    // be torn down (the stop-listen shape), not drained.
+    repoOnDataUpdateForTest(repo, rootA, wideRoot(6), false, null);
+    repo.bootBuffers_.set(rootB, []);
+    repoOnConnectStatusForTest(repo, false);
+    const markersA = repo.bootBuffers_
+      .get(rootA)!
+      .filter(op => op.kind === 'disconnect');
+    const markersB = repo.bootBuffers_
+      .get(rootB)!
+      .filter(op => op.kind === 'disconnect');
+    expect(markersA.length).to.equal(1);
+    expect(markersB.length).to.equal(1);
+    // Window A drains first — the run must NOT fire yet (B still holds it):
+    await flushAsync(64);
+    expect(repo.bootBuffers_.has(rootA)).to.equal(false);
+    const midCache = syncTreeGetCompleteServerCache(syncTree, new Path(rootA));
+    expect(midCache!.getChild(new Path('child9/status')).isEmpty()).to.equal(
+      true
+    );
+    // B tears down (repoStopServerListen shape → repoDropIngestWindow): the
+    // LAST holder released — the run fires now, exactly once.
+    repoDropIngestWindowForTest(repo, rootB);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootA));
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
   });
 
