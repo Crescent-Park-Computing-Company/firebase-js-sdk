@@ -41,7 +41,6 @@ import {
   fixedSizeSplitStrategy,
   markDirtyRanges,
   rebuildStableRanges,
-  treesShareAnyChildIdentity,
   walkLeafInterval
 } from '../src/core/CompoundHash';
 import {
@@ -4512,13 +4511,22 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     );
   });
 
-  it('a full-reload baseline skips the identity diff via the divorced check', async () => {
+  it('the identity diff bounds its work against a divorced baseline', () => {
     const shape = wideRoot(30, 30);
     const a = nodeFromJSON(shape);
     const b = nodeFromJSON(shape); // equal content, ZERO shared identity
-    expect(treesShareAnyChildIdentity(a, b)).to.equal(false);
-    const evolved = a.updateImmediateChild('p0', nodeFromJSON({ x: 1 }));
-    expect(treesShareAnyChildIdentity(a, evolved)).to.equal(true);
+    // A tiny visit budget must collapse to the root (everything dirty)
+    // instead of walking both trees end to end.
+    const collapsed = collectChangedSubtreePaths(a, b, 8, 512, 10);
+    expect(collapsed).to.deep.equal([[]]);
+    // An incremental change against a shared baseline stays precise well
+    // under the same budget: the diff only visits where identity differs.
+    const evolved = a.updateChild(
+      new Path('p0/c0'),
+      nodeFromJSON('changed-leaf')
+    );
+    const precise = collectChangedSubtreePaths(a, evolved, 8, 512, 10);
+    expect(precise).to.deep.equal([['p0', 'c0']]);
   });
 
   it('manifest estimatedBytes equals the sum of range sizes', async () => {

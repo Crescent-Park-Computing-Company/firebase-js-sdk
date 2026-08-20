@@ -727,43 +727,16 @@ export function walkLeafInterval(
 }
 
 /**
- * Whether any top-level child object is shared (===) between two trees.
- * Immutable updates preserve untouched children's identity, so a live tree
- * evolved from `a` shares almost all of them; a tree rebuilt from a full
- * server reload shares none. One sorted merge over the two child lists —
- * O(children), no descent — lets the flush skip the full identity diff when
- * its answer is already known to be "everything changed".
+ * Node-pair visits the identity-diff may spend before concluding the trees
+ * are too divorced to diff (null: everything changed). The diff's output was
+ * always budgeted (maxPaths); its WORK was not — two trees that share no
+ * structure (a fallback boot's baseline vs a fully re-downloaded root) made
+ * it walk both trees end to end only to conclude "all dirty". Visits accrue
+ * only where identity differs, so a genuine incremental change stays far
+ * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * @internal
  */
-export function treesShareAnyChildIdentity(a: Node, b: Node): boolean {
-  if (a === b) {
-    return true;
-  }
-  const aPairs: Array<[string, Node]> = [];
-  const bPairs: Array<[string, Node]> = [];
-  a.forEachChild(KEY_INDEX, (key, child) => {
-    aPairs.push([key, child]);
-  });
-  b.forEachChild(KEY_INDEX, (key, child) => {
-    bPairs.push([key, child]);
-  });
-  let i = 0;
-  let j = 0;
-  while (i < aPairs.length && j < bPairs.length) {
-    const cmp = nameCompare(aPairs[i][0], bPairs[j][0]);
-    if (cmp === 0) {
-      if (aPairs[i][1] === bPairs[j][1]) {
-        return true;
-      }
-      i++;
-      j++;
-    } else if (cmp < 0) {
-      i++;
-    } else {
-      j++;
-    }
-  }
-  return false;
-}
+export const DIFF_VISIT_BUDGET = 20000;
 
 /**
  * The identity-diff: collects the paths of maximal subtrees that differ
@@ -771,15 +744,20 @@ export function treesShareAnyChildIdentity(a: Node, b: Node): boolean {
  * subtrees are recognized by object identity and never descended. A child
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves.
+ * dirty mapping only needs interval bounds, not precise leaves. Returns
+ * null (everything changed) when the path budget or the visit budget
+ * (`maxVisits` — see DIFF_VISIT_BUDGET) is exhausted, so the diff's cost is
+ * bounded even against a baseline sharing no structure with the live tree.
  */
 export function collectChangedSubtreePaths(
   before: Node,
   after: Node,
   maxDepth = 8,
-  maxPaths = 512
+  maxPaths = 512,
+  maxVisits = DIFF_VISIT_BUDGET
 ): string[][] | null {
   const changed: string[][] = [];
+  let visits = 0;
   /**
    * Returns true when the caller must collapse this branch to stay within the
    * global path budget. A large atomic subtree update should dirty that
@@ -788,6 +766,13 @@ export function collectChangedSubtreePaths(
   const visit = (a: Node, b: Node, path: string[], depth: number): boolean => {
     if (a === b) {
       return false;
+    }
+    if (++visits > maxVisits) {
+      // Work budget exhausted: the trees are too divorced for the diff to
+      // pay off. Signal total collapse (null) through the over-budget path.
+      changed.length = 0;
+      changed.push([]);
+      return true;
     }
     const branchStart = changed.length;
     const collapseBranch = (): boolean => {

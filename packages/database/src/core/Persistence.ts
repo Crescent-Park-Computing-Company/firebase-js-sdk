@@ -24,7 +24,6 @@ import {
   collectChangedSubtreePaths,
   fixedSizeSplitStrategy,
   markDirtyRanges,
-  treesShareAnyChildIdentity,
   walkLeafInterval
 } from './CompoundHash';
 import { SeedCompoundHash, stampSeedHashes } from './ServerCacheSeed';
@@ -3028,26 +3027,10 @@ export class PersistenceManager {
     // snapshots into one stored tree. Stage a fresh full generation; its
     // revision still CASes against the adopted manifest.
     if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
-      // The identity diff only pays off when the trees can share structure.
-      // A live tree that shares NO top-level child identity with the
-      // baseline (a full server reload replaced the root after a fallback
-      // boot — exactly the boots whose accumulator is imprecise/null, set by
-      // restoreForListen) makes the diff a complete double-tree walk whose
-      // conclusion is "everything changed" (path-budget collapse to the
-      // root). Detect the divorced case with one O(children) merge and go
-      // straight to the fresh-full-generation arm (changed null) — the same
-      // ranges the collapsed diff would have produced, minus the walk.
-      const imprecise = accumulated === null || accumulated === undefined;
-      const divorced =
-        imprecise &&
-        !prev.rootNode.isLeafNode() &&
-        !node.isLeafNode() &&
-        !treesShareAnyChildIdentity(prev.rootNode, node);
-      changed = divorced
-        ? null
-        : !imprecise
-        ? accumulated
-        : collectChangedSubtreePaths(prev.rootNode, node);
+      changed =
+        accumulated !== null && accumulated !== undefined
+          ? accumulated
+          : collectChangedSubtreePaths(prev.rootNode, node);
       if (changed !== null) {
         previousRanges = prev.ranges;
         if (changed.length === 0) {
@@ -3276,10 +3259,14 @@ export class PersistenceManager {
           revision,
           updatedAt: now,
           authScope,
-          // Sum of canonical-text range sizes — the same tree measure the
-          // sweep budgets against, already computed by the planner (the old
-          // estimateSerializedNodeSize call here was a second full-tree walk
-          // solely for this field).
+          // Sum of canonical-text range sizes, already computed by the
+          // planner (the old estimateSerializedNodeSize call here was a
+          // second full-tree walk solely for this field). NOTE: a different
+          // measure than that estimate (canonical text vs JSON-ish size) —
+          // same order of magnitude, and the LRU sweep that consumes
+          // estimatedBytes only needs a consistent-scale byte proxy. Old
+          // manifests keep their estimate until content next changes; the
+          // mixed sum drifts the sweep budget by at most that scale gap.
           estimatedBytes: ranges.reduce((sum, range) => sum + range.size, 0),
           hash: '',
           ranges
