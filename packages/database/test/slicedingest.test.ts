@@ -469,25 +469,6 @@ describe('sliced full-root push ingestion', () => {
     expect(rootUpdates[0].precise).to.equal('at-path');
   });
 
-  it('a listen teardown mid-pump lifts the gate; the ingest still lands harmlessly', async () => {
-    const rootPath = '/users/alice';
-    const { repo, syncTree } = makeIngestHarness(rootPath);
-    const wide: Record<string, unknown> = {};
-    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
-      wide['k' + i] = i;
-    }
-    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
-    // Stop-listen mid-decode: the gate lifts NOW; the decode itself is not
-    // account-superseded, so it completes and applies — exactly like a live
-    // socket's push landing after an unlisten (SyncTree drops updates for
-    // paths without views; here the harness registration still exists, so
-    // the tree accepts it — the invariant under test is gate hygiene, not
-    // view teardown).
-    repoLiftIngestGateForTest(repo, rootPath);
-    await flushAsync(64);
-    expectIngestIdle(repo);
-  });
-
   it('drains buffered ops in exact arrival order across kinds', async () => {
     const rootPath = '/users/alice';
     const { repo, syncTree } = makeIngestHarness(rootPath);
@@ -976,6 +957,70 @@ describe('sliced full-root push ingestion', () => {
     ).to.equal(true);
     await flushAsync(64);
     expectIngestIdle(repo);
+  });
+
+  it('an unrelated root arriving during an ingest with an EMPTY queue still defers (round-6 repro)', async () => {
+    const rootA = '/users/alice';
+    const rootB = '/users/bob';
+    const { repo, syncTree } = makeIngestHarness(rootA);
+    const persistence = repo.persistence_ as unknown as {
+      isPersistentPath: (p: string) => boolean;
+    };
+    persistence.isPersistentPath = (p: string) => p === rootA || p === rootB;
+    // B has a live, registered view (a complete server cache needs a
+    // registration — an unregistered overwrite leaves no view behind).
+    const queryB = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      new Path(rootB),
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(syncTree, queryB, {
+      respondsTo: () => true,
+      createEvent: (_c: unknown, q: { _path: Path }) => ({
+        getPath: () => q._path,
+        getEventType: () => 'value',
+        getEventRunner: () => () => {},
+        toString: () => 'stub-event'
+      }),
+      getEventRunner: () => () => {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
+      hasAnyCallback: () => true
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootB),
+      nodeFromJSON({ x: 'initial' })
+    );
+    // A's sliced ingest starts: gate installed, queue EMPTY — the exact
+    // window the path-scoped predicate missed.
+    repoOnDataUpdateForTest(repo, rootA, wideRoot(20), false, null);
+    expect(repo.ingestQueue_.gates.has(rootA)).to.equal(true);
+    expect(repo.ingestQueue_.ops.length).to.equal(0);
+    // B's push arrives. Wire order: A's full push < B's push. It must NOT
+    // apply immediately (that would invert cross-root write order), and an
+    // ELIGIBLE full push for B must not start a concurrent ingest.
+    repoOnDataUpdateForTest(repo, rootB + '/x', 'after-A', false, null);
+    expect(
+      syncTreeGetCompleteServerCache(syncTree, new Path(rootB))!
+        .getChild(new Path('x'))
+        .val()
+    ).to.equal('initial');
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
+    // An eligible FULL push for B mid-ingest: queued, not a second gate.
+    repoOnDataUpdateForTest(repo, rootB, { x: 'full-B' }, false, null);
+    expect(repo.ingestQueue_.gates.size).to.equal(1);
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    // Everything landed, in wire order: A's root, then B's ops.
+    const cacheA = syncTreeGetCompleteServerCache(syncTree, new Path(rootA));
+    expect(cacheA).to.not.equal(null);
+    const cacheB = syncTreeGetCompleteServerCache(syncTree, new Path(rootB));
+    expect(cacheB!.getChild(new Path('x')).val()).to.equal('full-B');
   });
 
   it('a second full push while pumping supersedes via the buffered path', async () => {

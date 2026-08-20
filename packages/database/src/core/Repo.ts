@@ -279,20 +279,23 @@ export function newIngestQueue(): IngestQueue {
 }
 
 /**
- * Whether a fresh wire-ordered operation must DEFER to the repo's ordered
- * queue instead of applying directly. Two conditions, both structural:
- *  - a GATE covers the path (a boot window / sliced ingest owns the
- *    subtree and is still applying its base), or
- *  - the QUEUE IS NON-EMPTY — anything already deferred precedes this
- *    operation on the wire, so applying it now would overtake the deferred
- *    stream (the "ungated root overtakes a pending disconnect run" class).
- *    Once the stream defers, EVERYTHING behind it defers until it drains.
+ * Whether the repo's DEFERRED WIRE STREAM is active: an ingest gate is
+ * installed (a boot window's base or a sliced full-root push is still
+ * applying) or operations are already queued behind one. While active,
+ * EVERY fresh wire-ordered operation defers — on any root, gated or not.
+ * The wire is one totally ordered stream: an operation arriving now comes
+ * AFTER whatever the gate is still applying (and after everything queued),
+ * so applying it immediately would invert observable cross-root write
+ * order (legacy applied pushes synchronously in exact wire order) — and an
+ * eligible full push for a second root would start a CONCURRENT ingest,
+ * with the two applies landing in completion order. Deliberately
+ * PATH-INDEPENDENT: per-path reasoning here is what repeatedly reopened
+ * cross-root ordering holes. The one legitimately path-scoped question —
+ * "will MY subtree's pending base clobber this fresh value?" — belongs to
+ * request-response get() alone (repoIngestGateFor at repoGetValue).
  */
-function repoShouldDeferWireOp(repo: Repo, pathString: string): boolean {
-  return (
-    repo.ingestQueue_.ops.length > 0 ||
-    repoIngestGateFor(repo, pathString) !== null
-  );
+function repoDeferredStreamActive(repo: Repo): boolean {
+  return repo.ingestQueue_.ops.length > 0 || repo.ingestQueue_.gates.size > 0;
 }
 
 /**
@@ -635,7 +638,7 @@ function repoOnDataUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
-  if (repoShouldDeferWireOp(repo, pathString)) {
+  if (repoDeferredStreamActive(repo)) {
     // A gate covers this path, or the ordered queue already holds earlier
     // wire operations: defer. The drain applies it after everything queued
     // before it, across all roots and kinds.
@@ -1085,7 +1088,7 @@ export function repoStartServerListen(
       currentHashFn,
       tag,
       (status, data, wire) => {
-        if (repoShouldDeferWireOp(repo, pathString)) {
+        if (repoDeferredStreamActive(repo)) {
           repo.ingestQueue_.ops.push({
             kind: 'complete',
             apply: () => processListenComplete(status, data, wire),
@@ -1721,7 +1724,7 @@ function repoOnRangeMergeUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
-  if (repoShouldDeferWireOp(repo, pathString)) {
+  if (repoDeferredStreamActive(repo)) {
     repo.ingestQueue_.ops.push({
       kind: 'rm',
       pathString,
@@ -1804,7 +1807,7 @@ function repoOnConnectStatus(repo: Repo, connectStatus: boolean): void {
     const tree = repo.onDisconnect_;
     repo.onDisconnect_ = newSparseSnapshotTree();
     const queue = repo.ingestQueue_;
-    if (queue.gates.size === 0 && queue.ops.length === 0) {
+    if (!repoDeferredStreamActive(repo)) {
       // Nothing deferred anywhere: the legacy immediate run.
       repoRunOnDisconnectEvents(repo, tree);
       return;
