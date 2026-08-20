@@ -23,7 +23,8 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
-  repoDropIngestWindowForTest,
+  newIngestQueue,
+  repoLiftIngestGateForTest,
   repoOnConnectStatusForTest,
   repoOnDataUpdateForTest,
   Repo
@@ -54,6 +55,12 @@ import { EventQueue } from '../src/core/view/EventQueue';
 import { QueryParams } from '../src/core/view/QueryParams';
 
 _setWebLocksForTesting(null);
+
+/** Quiescent: no gates, empty queue. */
+function expectIngestIdle(repo: Repo): void {
+  expect(repo.ingestQueue_.gates.size).to.equal(0);
+  expect(repo.ingestQueue_.ops.length).to.equal(0);
+}
 
 function flushAsync(turns = 12): Promise<void> {
   let chain = Promise.resolve();
@@ -237,7 +244,7 @@ describe('sliced full-root push ingestion', () => {
       dataUpdateCount: 0,
       interceptServerDataCallback_: null,
       pendingSeedRestores_: new Map(),
-      bootBuffers_: new Map(),
+      ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       onDisconnect_: newSparseSnapshotTree(),
       infoData_: new SnapshotHolder(),
@@ -325,10 +332,10 @@ describe('sliced full-root push ingestion', () => {
 
     repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
     // Synchronously: a boot buffer window is open, tree not yet complete.
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
 
     await flushAsync();
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache).to.not.equal(null);
     expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
@@ -413,7 +420,7 @@ describe('sliced full-root push ingestion', () => {
     repoOnDataUpdateForTest(repo, rootPath, payload, false, null);
     // While the pump is mid-flight, a descendant push arrives.
     repoOnDataUpdateForTest(repo, rootPath + '/child3/value', 999, false, null);
-    expect(repo.bootBuffers_.get(rootPath)!.length).to.equal(1);
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
     await flushAsync();
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     // The buffered delta applied AFTER the base: child3/value is 999.
@@ -433,7 +440,7 @@ describe('sliced full-root push ingestion', () => {
     );
     // Descendant push: applies synchronously, no buffer window opens.
     repoOnDataUpdateForTest(repo, rootPath + '/x', { v: 1 }, false, null);
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
     expect(
       syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))!
         .getChild(new Path('x/v'))
@@ -441,7 +448,7 @@ describe('sliced full-root push ingestion', () => {
     ).to.equal(1);
     // Merge at the root: synchronous (merges never take the pump).
     repoOnDataUpdateForTest(repo, rootPath, { y: 2 }, true, null);
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache!.getChild(new Path('y')).val()).to.equal(2);
   });
@@ -462,23 +469,23 @@ describe('sliced full-root push ingestion', () => {
     expect(rootUpdates[0].precise).to.equal('at-path');
   });
 
-  it('a listen teardown mid-pump cancels the ingest cleanly', async () => {
+  it('a listen teardown mid-pump lifts the gate; the ingest still lands harmlessly', async () => {
     const rootPath = '/users/alice';
-    const { repo, syncTree, query } = makeIngestHarness(rootPath);
+    const { repo, syncTree } = makeIngestHarness(rootPath);
     const wide: Record<string, unknown> = {};
     for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
       wide['k' + i] = i;
     }
     repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
-    // Teardown while the pump is between slices: the window is dropped the
-    // way stopListening does it.
-    repo.bootBuffers_.delete(rootPath);
+    // Stop-listen mid-decode: the gate lifts NOW; the decode itself is not
+    // account-superseded, so it completes and applies — exactly like a live
+    // socket's push landing after an unlisten (SyncTree drops updates for
+    // paths without views; here the harness registration still exists, so
+    // the tree accepts it — the invariant under test is gate hygiene, not
+    // view teardown).
+    repoLiftIngestGateForTest(repo, rootPath);
     await flushAsync(64);
-    // Cancelled: no complete root cache was ever installed (cold mode
-    // applies all-or-nothing), and no crash surfaced.
-    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
-    expect(cache).to.equal(null);
-    void query;
+    expectIngestIdle(repo);
   });
 
   it('drains buffered ops in exact arrival order across kinds', async () => {
@@ -490,7 +497,7 @@ describe('sliced full-root push ingestion', () => {
     // marker sees b=1 applied but not b=2.
     const observed: unknown[] = [];
     repoOnDataUpdateForTest(repo, rootPath + '/b', 1, false, null);
-    repo.bootBuffers_.get(rootPath)!.push({
+    repo.ingestQueue_.ops.push({
       kind: 'complete',
       apply: () => {
         observed.push(
@@ -559,7 +566,7 @@ describe('sliced full-root push ingestion', () => {
     const { repo, syncTree } = makeIngestHarness(rootPath);
     repoOnDataUpdateForTest(repo, rootPath, wideRoot(10), false, null);
     // While the pump runs: a poison custom op, then a healthy descendant push.
-    repo.bootBuffers_.get(rootPath)!.push({
+    repo.ingestQueue_.ops.push({
       kind: 'complete',
       apply: () => {
         throw new Error('poison op');
@@ -569,7 +576,7 @@ describe('sliced full-root push ingestion', () => {
     await flushAsync(64);
     // The poison op was contained: the later op still applied, and the
     // window came down (no orphaned buffer swallowing future updates).
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache!.getChild(new Path('child3/value')).val()).to.equal(999);
     // And the repo still advances: a post-drain push applies immediately.
@@ -616,7 +623,7 @@ describe('sliced full-root push ingestion', () => {
     // The push landed AND the later-ordered onDisconnect write survives it.
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
     expect(cache!.getChild(new Path('child3/value')).val()).to.equal(3);
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
   });
 
   it('distinct disconnects are distinct frozen runs, each applying its own registrations', async () => {
@@ -630,7 +637,7 @@ describe('sliced full-root push ingestion', () => {
     );
     repoOnDataUpdateForTest(repo, rootPath, wideRoot(6), false, null);
     repoOnConnectStatusForTest(repo, false);
-    // Reconnect; a NEW registration lands before the pump drains. It must
+    // Reconnect; a NEW registration lands before the queue drains. It must
     // fire with the SECOND disconnect only — never retroactively with the
     // first (its tree was frozen at the first disconnect).
     repoOnConnectStatusForTest(repo, true);
@@ -640,12 +647,12 @@ describe('sliced full-root push ingestion', () => {
       nodeFromJSON('gone-2')
     );
     repoOnConnectStatusForTest(repo, false);
-    const markers = repo.bootBuffers_
-      .get(rootPath)!
-      .filter(op => op.kind === 'disconnect');
-    expect(markers.length).to.equal(2);
+    const queuedRuns = repo.ingestQueue_.ops.filter(
+      op => op.kind === 'disconnect'
+    );
+    expect(queuedRuns.length).to.equal(2);
     await flushAsync(64);
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     // Both runs applied, in order, each from its own frozen tree.
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone-1');
@@ -700,13 +707,12 @@ describe('sliced full-root push ingestion', () => {
     expect(
       syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))
     ).to.equal(null);
-    expect(repo.bootBuffers_.has(rootPath)).to.equal(false);
+    expectIngestIdle(repo);
   });
 
-  it('a window torn down while holding a disconnect marker still runs it', async () => {
+  it('a gate lifted while a disconnect run is queued still fires it, exactly once', async () => {
     const rootPath = '/users/alice';
     const { repo, syncTree } = makeIngestHarness(rootPath);
-    // Initialize so the onDisconnect write has a tree to land in.
     syncTreeApplyServerOverwrite(
       syncTree,
       new Path(rootPath),
@@ -723,56 +729,177 @@ describe('sliced full-root push ingestion', () => {
     }
     repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
     repoOnConnectStatusForTest(repo, false);
-    // Teardown mid-pump (the stop-listen shape): the buffered pushes are
-    // moot, but the repo-global onDisconnect run must not be lost with them.
-    repo.bootBuffers_.delete(rootPath);
-    // Directly dropping the entry (as SDK teardown paths now do via
-    // repoDropIngestWindow) is simulated by the driver's own finally here:
-    // the pump notices at its next yield and its teardown flushes the run.
+    // Stop-listen mid-decode: the gate lifts. The queued run is repo-global
+    // state and must survive the teardown — the queue is never dropped with
+    // a gate — and fire exactly once when the drain reaches it.
+    repoLiftIngestGateForTest(repo, rootPath);
     await flushAsync(64);
+    expectIngestIdle(repo);
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
   });
 
-  it('with two open windows, the frozen run fires exactly once — after the LAST holder releases', async () => {
+  it('a post-disconnect push never overtakes the queued run — and is not clobbered by it', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
+      nodeFromJSON('gone')
+    );
+    // A sliced ingest holds the gate...
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(6), false, null);
+    // ...the connection drops (run queues behind the push)...
+    repoOnConnectStatusForTest(repo, false);
+    // ...and a POST-disconnect (reconnect) push arrives for the same field
+    // the run writes. Wire order: push(base) < disconnect < push(fresh).
+    repoOnDataUpdateForTest(
+      repo,
+      rootPath + '/child9/status',
+      'fresh-after-reconnect',
+      false,
+      null
+    );
+    const kinds = repo.ingestQueue_.ops.map(op => op.kind);
+    // The queue holds them in exact wire order: disconnect BEFORE the push.
+    expect(kinds).to.deep.equal(['disconnect', 'data']);
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    // The post-reconnect push wins: it applied AFTER the run, never before.
+    expect(cache!.getChild(new Path('child9/status')).val()).to.equal(
+      'fresh-after-reconnect'
+    );
+  });
+
+  it('ops on an ungated root queue behind a pending disconnect instead of overtaking it', async () => {
     const rootA = '/users/alice';
     const rootB = '/users/bob';
     const { repo, syncTree } = makeIngestHarness(rootA);
-    // Second persistent root on the same repo/harness.
     const persistence = repo.persistence_ as unknown as {
       isPersistentPath: (p: string) => boolean;
     };
     persistence.isPersistentPath = (p: string) => p === rootA || p === rootB;
+    // Register B's view so its pushes land in SyncTree.
+    const queryB = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      new Path(rootB),
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(syncTree, queryB, {
+      respondsTo: () => true,
+      createEvent: (_c: unknown, q: { _path: Path }) => ({
+        getPath: () => q._path,
+        getEventType: () => 'value',
+        getEventRunner: () => () => {},
+        toString: () => 'stub-event'
+      }),
+      getEventRunner: () => () => {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
+      hasAnyCallback: () => true
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    // Initialize B's root view (an uninitialized view drops descendant ops).
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootB),
+      nodeFromJSON({ flag: 'initial' })
+    );
     sparseSnapshotTreeRemember(
       repo.onDisconnect_,
-      new Path(rootA + '/child9/status'),
+      new Path(rootB + '/flag'),
+      nodeFromJSON('from-disconnect')
+    );
+    // A's ingest gates the queue; the disconnect queues its run.
+    repoOnDataUpdateForTest(repo, rootA, wideRoot(6), false, null);
+    repoOnConnectStatusForTest(repo, false);
+    // A post-disconnect push lands on B — a root with NO gate of its own.
+    // It must still queue BEHIND the disconnect run (single global FIFO),
+    // not apply immediately and be clobbered when the run drains.
+    repoOnDataUpdateForTest(repo, rootB + '/flag', 'fresh', false, null);
+    expect(repo.ingestQueue_.ops.map(op => op.kind)).to.deep.equal([
+      'disconnect',
+      'data'
+    ]);
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cacheB = syncTreeGetCompleteServerCache(syncTree, new Path(rootB));
+    expect(cacheB!.getChild(new Path('flag')).val()).to.equal('fresh');
+  });
+
+  it('teardown during a sliced ingest fires a queued disconnect run exactly ONCE (round-4a repro)', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ counter: { v: 0 } })
+    );
+    // A second (double-released) run would land AFTER the post-disconnect
+    // push below and clobber it back — the visible round-4a signature.
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/ranAt'),
+      nodeFromJSON('run-1')
+    );
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
+    repoOnConnectStatusForTest(repo, false);
+    // Wire order: disconnect < this push. If the run fired TWICE (the
+    // round-4a teardown+finally double release), the second run would land
+    // AFTER this push and clobber it back to 'run-1'.
+    repoOnDataUpdateForTest(
+      repo,
+      rootPath + '/ranAt',
+      'post-disconnect-write',
+      false,
+      null
+    );
+    // Production teardown path (stop-listen shape), then the ingest's own
+    // finally — the round-4a double-release sequence.
+    repoLiftIngestGateForTest(repo, rootPath);
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.getChild(new Path('ranAt')).val()).to.equal(
+      'post-disconnect-write'
+    );
+  });
+
+  it('a stop-listen mid-ingest supersedes the decode: its payload never applies over the drained stream', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ child9: { status: 'up' } })
+    );
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/child9/status'),
       nodeFromJSON('gone')
     );
-    // Window A pumps; window B is a manually installed boot window that will
-    // be torn down (the stop-listen shape), not drained.
-    repoOnDataUpdateForTest(repo, rootA, wideRoot(6), false, null);
-    repo.bootBuffers_.set(rootB, []);
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
     repoOnConnectStatusForTest(repo, false);
-    const markersA = repo.bootBuffers_
-      .get(rootA)!
-      .filter(op => op.kind === 'disconnect');
-    const markersB = repo.bootBuffers_
-      .get(rootB)!
-      .filter(op => op.kind === 'disconnect');
-    expect(markersA.length).to.equal(1);
-    expect(markersB.length).to.equal(1);
-    // Window A drains first — the run must NOT fire yet (B still holds it):
+    repoLiftIngestGateForTest(repo, rootPath);
     await flushAsync(64);
-    expect(repo.bootBuffers_.has(rootA)).to.equal(false);
-    const midCache = syncTreeGetCompleteServerCache(syncTree, new Path(rootA));
-    expect(midCache!.getChild(new Path('child9/status')).isEmpty()).to.equal(
-      true
-    );
-    // B tears down (repoStopServerListen shape → repoDropIngestWindow): the
-    // LAST holder released — the run fires now, exactly once.
-    repoDropIngestWindowForTest(repo, rootB);
-    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootA));
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    // The run fired; the superseded wide payload did NOT apply over it
+    // (isCurrent went false when the gate token was lifted).
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
+    expect(cache!.getChild(new Path('k0')).isEmpty()).to.equal(true);
   });
 
   it('a second full push while pumping supersedes via the buffered path', async () => {

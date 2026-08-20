@@ -200,8 +200,15 @@ interface PendingSeedRestore {
   reattachCold?: () => void;
 }
 
-/** One server operation held during a manifest-first boot window. */
-type BootBufferedOp =
+/**
+ * One wire-ordered operation deferred behind an ingest/boot gate. Data,
+ * range merges, and listen completions are the server stream itself; a
+ * disconnect carries its own registration tree, FROZEN at the moment the
+ * connection dropped (repoOnConnectStatus snapshots and resets the live
+ * repo.onDisconnect_ in one motion, so acks and registrations landing on
+ * the next connection can never rewrite an earlier disconnect's run).
+ */
+type DeferredWireOp =
   | {
       kind: 'data';
       pathString: string;
@@ -220,49 +227,79 @@ type BootBufferedOp =
       apply: () => void;
     }
   | {
-      /**
-       * A connection loss observed while an ingest window was open: the
-       * onDisconnect run must apply AFTER the pushes that preceded it on the
-       * wire (the sliced pump time-shifts those), so it queues like any
-       * other server-ordered operation. Carries the run FROZEN at the
-       * disconnect (see PendingDisconnectRun) — distinct disconnects are
-       * distinct runs, never deduplicated.
-       */
       kind: 'disconnect';
-      run: PendingDisconnectRun;
+      tree: SparseSnapshotTree;
     };
 
 /**
- * One onDisconnect run, frozen at the moment its disconnect occurred. The
- * REGISTRATION TREE is snapshotted (and repo.onDisconnect_ reset) at
- * connectStatus=false — a cancel acked after the reconnect, or a fresh
- * registration made on the new connection, must not rewrite what THIS
- * disconnect fires (the live tree they mutate is the next disconnect's).
- * Server-value/deferred-value RESOLUTION deliberately stays at run time:
- * the windows time-shift the pushes that preceded the disconnect on the
- * wire, and increments must resolve against the tree WITH those pushes
- * applied — exactly the state the legacy synchronous path resolved in.
+ * THE ordering primitive for asynchronous ingestion: one repo-level FIFO of
+ * wire-ordered operations, drained by a single driver, one operation at a
+ * time, yielding between them. The wire is one totally ordered stream;
+ * keeping the deferred portion in ONE queue makes global order STRUCTURAL —
+ * an operation runs after everything enqueued before it and nothing after
+ * it, across roots and across kinds (data, range merges, completions,
+ * disconnect runs), with no cross-queue coordination to get wrong. (The
+ * per-root form of this queue needed refcounted markers and barriers to
+ * approximate exactly this property, and grew a bug per review round —
+ * a queue per root reconstructs badly what one queue gives for free.)
  *
- * `remaining` counts the marker-holding windows (every window open at the
- * disconnect); the run fires when the LAST one drains or tears down — an
- * earlier window's run would be overwritten by a later window's
- * still-pending push. Windows opened after the disconnect hold no marker
- * and never block or receive it.
+ * `gates` records which subtrees are ingest-gated (a manifest-first boot
+ * window or a sliced full-root ingest in flight) and is ROUTING METADATA
+ * ONLY — it decides whether a fresh wire callback defers or applies
+ * directly, never ordering. `generation` invalidates the in-flight sliced
+ * ingest continuation (NOT the queue) on account switch / persistence
+ * toggle / dispose: the superseded payload's decode stands down, while the
+ * queued stream — including disconnect runs, which are repo-global, not
+ * account data — still drains in order.
  */
-interface PendingDisconnectRun {
-  tree: SparseSnapshotTree;
-  remaining: number;
+interface IngestQueue {
+  ops: DeferredWireOp[];
+  /**
+   * Paths whose subtrees defer fresh wire ops into `ops`, each mapped to an
+   * identity token owned by the installer. The token makes lift/supersede
+   * observable to the in-flight ingest (its isCurrent compares identity):
+   * a stop-listen lifts the gate and the decode stands down; a successor
+   * ingest REPLACES the token and the predecessor stands down likewise.
+   */
+  gates: Map<string, object>;
+  /** True while the single drain driver is running. */
+  draining: boolean;
+  /** Bumped to cancel the in-flight sliced decode + its queued payloads. */
+  generation: number;
+}
+
+/** @internal */
+export function newIngestQueue(): IngestQueue {
+  return { ops: [], gates: new Map(), draining: false, generation: 0 };
 }
 
 /**
- * The boot-buffer root covering `pathString`, if any: operations at or under
- * a buffering root are held until its cached base applies.
+ * Whether a fresh wire-ordered operation must DEFER to the repo's ordered
+ * queue instead of applying directly. Two conditions, both structural:
+ *  - a GATE covers the path (a boot window / sliced ingest owns the
+ *    subtree and is still applying its base), or
+ *  - the QUEUE IS NON-EMPTY — anything already deferred precedes this
+ *    operation on the wire, so applying it now would overtake the deferred
+ *    stream (the "ungated root overtakes a pending disconnect run" class).
+ *    Once the stream defers, EVERYTHING behind it defers until it drains.
  */
-function repoBootBufferRootFor(repo: Repo, pathString: string): string | null {
-  if (repo.bootBuffers_.size === 0) {
+function repoShouldDeferWireOp(repo: Repo, pathString: string): boolean {
+  return (
+    repo.ingestQueue_.ops.length > 0 ||
+    repoIngestGateFor(repo, pathString) !== null
+  );
+}
+
+/**
+ * The ingest gate covering `pathString`, if any: operations at or under a
+ * gated root are deferred to the repo's ordered queue until the gate lifts
+ * (its cached base / sliced push is in SyncTree).
+ */
+function repoIngestGateFor(repo: Repo, pathString: string): string | null {
+  if (repo.ingestQueue_.gates.size === 0) {
     return null;
   }
-  for (const root of repo.bootBuffers_.keys()) {
+  for (const root of repo.ingestQueue_.gates.keys()) {
     if (
       pathString === root ||
       root === '/' ||
@@ -378,13 +415,12 @@ export class Repo {
   pendingListenHashes_ = new PendingListenHashStore();
 
   /**
-   * Server operations buffered during a manifest-first boot window: the
-   * range listen is on the wire before the cached base has been applied to
-   * SyncTree, so anything the server sends for that root (range merges —
-   * deltas against the base — or full pushes) is held, in arrival order,
-   * until the base applies, then replayed. Keyed by the listened root path.
+   * The repo-level ordered ingest queue (see IngestQueue): wire operations
+   * deferred behind a manifest-first boot window or an in-flight sliced
+   * ingest, in exact arrival order across roots and kinds, plus the gate
+   * set and the continuation generation.
    */
-  bootBuffers_ = new Map<string, BootBufferedOp[]>();
+  ingestQueue_ = newIngestQueue();
 
   /**
    * Listen-complete state per default complete listen, keyed by path: whether
@@ -558,12 +594,12 @@ export function repoGenerateServerValues(repo: Repo): Indexable {
 /**
  * Called by realtime when we get new messages from the server.
  */
-/** Test seam: tears down one ingest window exactly as stop-listen does. @internal */
-export function repoDropIngestWindowForTest(
+/** Test seam: lifts one ingest gate exactly as stop-listen does. @internal */
+export function repoLiftIngestGateForTest(
   repo: Repo,
   pathString: string
 ): void {
-  repoDropIngestWindow(repo, pathString);
+  repoLiftIngestGate(repo, pathString);
 }
 
 /** Test seam: drives a connection-status flip exactly as the connection would. @internal */
@@ -594,24 +630,29 @@ function repoOnDataUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
-  {
-    // Manifest-first boot window: the listen went out before the cached base
-    // applied. Hold server data for that root — in arrival order with range
-    // merges — until the base is in SyncTree (see repoStartServerListen).
-    const bufferRoot = repoBootBufferRootFor(repo, pathString);
-    if (bufferRoot !== null) {
-      repo.bootBuffers_
-        .get(bufferRoot)!
-        .push({ kind: 'data', pathString, data, isMerge, tag });
-      return;
+  if (repoShouldDeferWireOp(repo, pathString)) {
+    // A gate covers this path, or the ordered queue already holds earlier
+    // wire operations: defer. The drain applies it after everything queued
+    // before it, across all roots and kinds.
+    repo.ingestQueue_.ops.push({
+      kind: 'data',
+      pathString,
+      data,
+      isMerge,
+      tag
+    });
+    // No gate may be holding the stream (queue-only deferral): make sure
+    // the driver is running so the op cannot strand.
+    if (repo.ingestQueue_.gates.size === 0) {
+      repoDrainIngestQueue(repo);
     }
+    return;
   }
   if (repoIngestEligible(repo, pathString, data, isMerge, tag)) {
-    // Full-root push at a persistent root: decode and apply in yielded
-    // slices instead of one monolithic task (see repoIngestFullRootPush).
-    // A boot buffer holds later wire operations in order while it runs.
-    // The cast restates repoIngestEligible's sliceableAsChildren guard.
-    void repoRunIngestPump(repo, pathString, data as Record<string, unknown>);
+    // Full-root push at a persistent root: gate the subtree, decode in
+    // yielded slices, apply atomically (see repoIngestFullRootPush), then
+    // drain whatever the wire delivered meanwhile — in order.
+    void repoRunSlicedIngest(repo, pathString, data as Record<string, unknown>);
     return;
   }
   repoApplyDataUpdate(repo, pathString, data, isMerge, tag);
@@ -709,75 +750,41 @@ function repoIngestEligible(
 }
 
 /**
- * Runs one sliced ingest under a boot-buffer window, then drains the window.
- * The buffer serves double duty: ORDERING (later server operations for this
- * root hold until the pumped push is in SyncTree, exactly like the
- * manifest-first boot window) and LIVENESS (a stop/account-switch/dispose
- * deletes the buffer, which the pump observes at its next yield and aborts).
- *
- * Never rejects, and the window CANNOT outlive this driver: the finally
- * deletes the entry whenever this run still owns it — deliberate teardown
- * (cancellation: the new owner already replaced or removed it, the
- * ownership check makes the delete a no-op), per-op degradation (contained
- * inside repoIngestOnePush / the drain loop), and any unexpected error all
- * end with no orphaned window that would silently swallow every future
- * wire update for the root.
+ * Runs one sliced full-root ingest under a gate on the repo's ordered
+ * queue, then drains the queue. The GATE defers fresh wire callbacks for
+ * this subtree into the queue (ordering is the queue's own FIFO, not the
+ * gate's); the GENERATION check stands the decode down when an account
+ * switch / persistence toggle / dispose supersedes it mid-flight. Never
+ * rejects; the finally lifts the gate and hands off to the drain driver,
+ * so a gate can never outlive its ingest.
  */
-async function repoRunIngestPump(
+async function repoRunSlicedIngest(
   repo: Repo,
   pathString: string,
   data: Record<string, unknown>
 ): Promise<void> {
-  const buffer: BootBufferedOp[] = [];
-  repo.bootBuffers_.set(pathString, buffer);
-  // The window is evidence-scoped two ways (the PR #6 continuation class:
-  // revalidate after every yield):
-  //  - BUFFER IDENTITY: stop listens, a successor window, and dispose all
-  //    delete or replace the entry.
-  //  - AUTH GENERATION: an account switch cancels pending seed restores but
-  //    knows nothing of a standalone ingest window; the generation bump is
-  //    its signal. A pump outliving the switch would apply the PRIOR
-  //    account's payload and write it through into the NEW scope's cache
-  //    namespace — the SDK's precedent is cancellation (peeks null out,
-  //    restores cancel), and the old account's listens are being torn down
-  //    with the switch anyway. Persistence disabled mid-flight reads as a
-  //    mismatch too (undefined !== captured) — its dispose also clears the
-  //    window.
+  const queue = repo.ingestQueue_;
+  const gate = { pathString } as const;
+  queue.gates.set(pathString, gate);
+  const generation = queue.generation;
   const authGeneration = repo.persistence_?.authGeneration();
+  // Current while: no account switch / persistence toggle / dispose
+  // (generation), AND this ingest still owns its gate. A lifted or replaced
+  // gate (stop-listen, restartCold, a successor ingest) supersedes the
+  // decode — its listen is gone, and its payload must not apply over
+  // whatever the drain ran meanwhile (a queued disconnect run, a
+  // successor's base).
   const isCurrent = () =>
-    repo.bootBuffers_.get(pathString) === buffer &&
+    queue.generation === generation &&
+    queue.gates.get(pathString) === gate &&
     repo.persistence_?.authGeneration() === authGeneration;
   try {
     await repoIngestOnePush(repo, pathString, data, isCurrent);
-    await repoDrainIngestWindow(repo, buffer, isCurrent);
-  } catch (e) {
-    if (!(e instanceof IngestCancelledError)) {
-      // repoIngestOnePush and the drain contain ordinary op failures
-      // internally; anything else arriving here is unexpected — surface it
-      // (never rethrow: the callers void this promise, and an orphaned
-      // rejection would be silent anyway). The finally below still
-      // guarantees the window comes down.
-      warn('ingest window failed for ' + pathString, e);
-    }
   } finally {
-    if (repo.bootBuffers_.get(pathString) === buffer) {
-      // Ownership by buffer identity alone: even when the auth generation
-      // moved (isCurrent false), this window is still OURS to take down —
-      // and a disconnect marker it holds must still run (repo-global state,
-      // not account data).
-      repoDropIngestWindow(repo, pathString);
-    } else {
-      // The entry was removed or replaced externally while OUR array may
-      // still hold disconnect markers. Each is one window's hold on a
-      // frozen repo-global run — release them (the counter fires the run
-      // when the last holder anywhere lets go) instead of letting them die
-      // with the array.
-      for (const op of buffer) {
-        if (op.kind === 'disconnect') {
-          repoReleaseDisconnectRun(repo, op.run);
-        }
-      }
+    if (queue.gates.get(pathString) === gate) {
+      queue.gates.delete(pathString);
     }
+    repoDrainIngestQueue(repo);
   }
 }
 
@@ -786,11 +793,11 @@ async function repoRunIngestPump(
  * legacy monolithic apply on an unexpected mid-ingest error: the payload is
  * still intact, and one synchronous overwrite converges SyncTree to exactly
  * the tree the push named. The long task this costs is the pre-pump status
- * quo, paid only on a path that indicates an ingest bug. Cancellation is
- * not degradation — it propagates to the window driver. The degradation
- * apply is itself guarded: if IT also throws (a payload both decoders
- * reject), the error is contained here — op containment — so the window
- * driver's drain and teardown still run.
+ * quo, paid only on a path that indicates an ingest bug. Cancellation
+ * (IngestCancelledError — the continuation was superseded) is not
+ * degradation: the payload belongs to a torn-down listen or a previous
+ * account and is simply dropped. Never throws — op containment, so the
+ * caller's drain always proceeds.
  */
 async function repoIngestOnePush(
   repo: Repo,
@@ -802,7 +809,7 @@ async function repoIngestOnePush(
     await repoIngestFullRootPush(repo, pathString, data, isCurrent);
   } catch (e) {
     if (e instanceof IngestCancelledError) {
-      throw e;
+      return;
     }
     warn('sliced ingest failed for ' + pathString + '; applying whole', e);
     try {
@@ -814,96 +821,111 @@ async function repoIngestOnePush(
 }
 
 /**
- * Drains a boot-buffer window IN PLACE, the window still installed: ops are
- * consumed from the front while new wire arrivals keep appending behind
- * them — one live queue, so everything applies in exact arrival order by
- * construction. A buffered full-root push replays through the sliced
- * ingest; other ops apply through the direct entry points (the buffered
- * ones would re-queue into the very window being drained).
+ * Lifts one ingest gate and hands the stream to the drain driver. The queue
+ * itself is NEVER dropped with a gate: the deferred operations are the wire
+ * stream (including repo-global disconnect runs), and a torn-down listen's
+ * ops apply harmlessly through the normal entry points — SyncTree ignores
+ * updates for paths without views, exactly as a live socket's late pushes
+ * always behaved. Losing them instead would strand every op queued BEHIND
+ * them (the round-4 class: teardown paths that special-cased "this window's
+ * ops" corrupted the global order or double-applied shared state).
+ */
+function repoLiftIngestGate(repo: Repo, pathString: string): void {
+  if (repo.ingestQueue_.gates.delete(pathString)) {
+    repoDrainIngestQueue(repo);
+  }
+}
+
+/**
+ * THE single drain driver for the repo's ordered queue. At most one runs at
+ * a time (queue.draining); every caller that lifts a gate or enqueues while
+ * no gate is left simply invokes it — a no-op when already running, when a
+ * gate still holds the stream, or when the queue is empty.
+ *
+ * Consumes strictly from the front, one operation per iteration, yielding
+ * between operations. Fresh wire callbacks keep APPENDING while it runs —
+ * one live FIFO — so everything applies in exact arrival order, across
+ * roots and kinds, by construction. A queued full-root push re-enters the
+ * sliced ingest: its gate re-defers the stream and the driver stands down
+ * (the ingest's finally resumes it); ordering holds because the push was
+ * consumed from the front and later ops stay queued behind the new gate.
  *
  * PER-OP FAULT CONTAINMENT: one throwing operation must not take down the
- * drain — the remaining backlog still applies and the window still closes
- * (a live socket's op stream has exactly this independence; the buffer only
- * time-shifts it). Cancellation is the one exception: it propagates,
- * because the new owner owns the listen's state and this backlog is moot.
+ * drain — the rest of the stream still applies (a live socket's op stream
+ * has exactly this independence; the queue only time-shifts it). The
+ * driver never rejects. Disconnect runs are repo-global state and drain
+ * like any other op — surviving account switches and persistence toggles
+ * (which bump the GENERATION to cancel in-flight decode continuations, but
+ * never touch the queue).
  */
-async function repoDrainIngestWindow(
-  repo: Repo,
-  buffer: BootBufferedOp[],
-  isCurrent: () => boolean
-): Promise<void> {
-  while (buffer.length > 0) {
-    const op = buffer.shift()!;
+function repoDrainIngestQueue(repo: Repo): void {
+  const queue = repo.ingestQueue_;
+  if (queue.draining) {
+    return;
+  }
+  queue.draining = true;
+  void (async () => {
     try {
-      if (op.kind === 'data') {
-        if (
-          repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)
-        ) {
-          await repoIngestOnePush(
-            repo,
-            op.pathString,
-            op.data as Record<string, unknown>,
-            isCurrent
-          );
-        } else {
-          repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
+      while (queue.ops.length > 0) {
+        if (queue.gates.size > 0) {
+          // A gate re-formed (a queued full-root push re-entered the sliced
+          // ingest): its finally resumes this drain. Stand down WITHOUT
+          // consuming — order is preserved because the queue is untouched.
+          return;
         }
-      } else if (op.kind === 'rm') {
-        repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
-      } else if (op.kind === 'disconnect') {
-        repoReleaseDisconnectRun(repo, op.run);
-      } else {
-        op.apply();
+        const op = queue.ops.shift()!;
+        try {
+          if (op.kind === 'data') {
+            if (
+              repoIngestEligible(
+                repo,
+                op.pathString,
+                op.data,
+                op.isMerge,
+                op.tag
+              )
+            ) {
+              // Re-enter the sliced ingest for a queued full-root push. Its
+              // gate holds the remaining stream; its finally re-invokes the
+              // drain. Consume-then-stand-down keeps the FIFO intact.
+              void repoRunSlicedIngest(
+                repo,
+                op.pathString,
+                op.data as Record<string, unknown>
+              );
+              return;
+            }
+            repoApplyDataUpdate(
+              repo,
+              op.pathString,
+              op.data,
+              op.isMerge,
+              op.tag
+            );
+          } else if (op.kind === 'rm') {
+            repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
+          } else if (op.kind === 'disconnect') {
+            repoRunOnDisconnectEvents(repo, op.tree);
+          } else {
+            op.apply();
+          }
+        } catch (e) {
+          warn('deferred wire operation failed during ingest drain', e);
+        }
+        if (queue.ops.length > 0) {
+          await yieldMacrotask();
+        }
       }
-    } catch (e) {
-      if (e instanceof IngestCancelledError) {
-        throw e;
-      }
-      warn('buffered op failed during ingest drain', e);
-    }
-    if (buffer.length > 0) {
-      await yieldMacrotask();
-      if (!isCurrent()) {
-        throw new IngestCancelledError();
+    } finally {
+      queue.draining = false;
+      // Late arrivals can land between the emptiness check and this flag
+      // flip (or a gate lifted while we were standing down). Re-invoke:
+      // no-op when there is truly nothing to do.
+      if (queue.ops.length > 0 && queue.gates.size === 0) {
+        repoDrainIngestQueue(repo);
       }
     }
-  }
-}
-
-/**
- * Releases one window's hold on a frozen disconnect run; the LAST release
- * applies it (see PendingDisconnectRun). Idempotence rides the counter — a
- * run reaches zero exactly once — so drain-then-teardown of the same window
- * cannot double-fire it.
- */
-function repoReleaseDisconnectRun(repo: Repo, run: PendingDisconnectRun): void {
-  if (--run.remaining > 0) {
-    return;
-  }
-  repoRunOnDisconnectEvents(repo, run.tree);
-}
-
-/**
- * Tears down one ingest/boot window WITHOUT losing frozen disconnect runs:
- * data/range/complete ops may be dropped (their listens are going away —
- * the legacy cancel paths dropped exactly the same backlog), but each
- * disconnect run is repo-global state the legacy path executed IMMEDIATELY
- * at disconnect time; a teardown that dropped a window's markers without
- * releasing them would strand every run they hold (its counter never
- * reaches zero). Remove the window first, THEN release — a run whose last
- * holder is THIS window must not see it as still open.
- */
-function repoDropIngestWindow(repo: Repo, pathString: string): void {
-  const ops = repo.bootBuffers_.get(pathString);
-  if (ops === undefined) {
-    return;
-  }
-  repo.bootBuffers_.delete(pathString);
-  for (const op of ops) {
-    if (op.kind === 'disconnect') {
-      repoReleaseDisconnectRun(repo, op.run);
-    }
-  }
+  })();
 }
 
 /**
@@ -1049,12 +1071,14 @@ export function repoStartServerListen(
       currentHashFn,
       tag,
       (status, data, wire) => {
-        const bufferRoot = repoBootBufferRootFor(repo, pathString);
-        if (bufferRoot !== null) {
-          repo.bootBuffers_.get(bufferRoot)!.push({
+        if (repoShouldDeferWireOp(repo, pathString)) {
+          repo.ingestQueue_.ops.push({
             kind: 'complete',
             apply: () => processListenComplete(status, data, wire)
           });
+          if (repo.ingestQueue_.gates.size === 0) {
+            repoDrainIngestQueue(repo);
+          }
           return;
         }
         processListenComplete(status, data, wire);
@@ -1179,8 +1203,8 @@ export function repoStartServerListen(
   // the cancelled token and exits without touching the new listen.
   token.reattachCold = () => {
     repo.pendingListenHashes_.clear(pathString);
-    if (repo.bootBuffers_.has(pathString)) {
-      repoDropIngestWindow(repo, pathString);
+    if (repo.ingestQueue_.gates.has(pathString)) {
+      repoLiftIngestGate(repo, pathString);
       repo.server_.unlisten(query, tag);
     }
     repoStartServerListen(
@@ -1221,7 +1245,7 @@ export function repoStartServerListen(
     restartedCold = true;
     repo.pendingSeedRestores_.delete(pathString);
     repo.pendingListenHashes_.clear(pathString);
-    repoDropIngestWindow(repo, pathString);
+    repoLiftIngestGate(repo, pathString);
     // The compound response may omit every matching range, so buffered data
     // cannot reconstruct a missing base. Tear down the seeded listen and send
     // exactly one ordinary full listen.
@@ -1325,40 +1349,18 @@ export function repoStartServerListen(
       }
     }
     sentFromManifest = true;
-    repo.bootBuffers_.set(pathString, []);
+    repo.ingestQueue_.gates.set(pathString, { pathString });
     // Keep the pending token until range assembly finishes. A stop after this
     // send must cancel replay/restart as well as unlisten the wire request.
     sendListen('restored');
   };
 
   const drainBootBuffer = () => {
-    const buffered = repo.bootBuffers_.get(pathString);
-    if (buffered === undefined) {
-      return;
-    }
-    // Yielding in-place drain (window stays installed until the queue is
-    // empty): the legacy loop replayed the entire backlog — which can
-    // include a FULL-ROOT push (the fallback-while-restoring race) — in the
-    // same task that applied the base; now a full push replays through the
-    // sliced ingest and later arrivals append behind the backlog in order.
-    const isCurrent = () => repo.bootBuffers_.get(pathString) === buffered;
-    void repoDrainIngestWindow(repo, buffered, isCurrent)
-      .catch((e: unknown) => {
-        // Cancellation: the window was torn down (stop / account switch /
-        // dispose) and its new owner already put the listen state right.
-        // The drain contains every other failure internally.
-        if (!(e instanceof IngestCancelledError)) {
-          warn('boot-window drain failed for ' + pathString, e);
-        }
-      })
-      .finally(() => {
-        // The window must never outlive its driver (ownership-checked: a
-        // successor window installed meanwhile is not ours to remove) — and
-        // a disconnect marker it still holds must run, not drop.
-        if (isCurrent()) {
-          repoDropIngestWindow(repo, pathString);
-        }
-      });
+    // Lift this listen's gate; the shared driver drains the repo-level
+    // ordered queue (which holds anything the wire delivered for this root
+    // while the base was applying — and everything else deferred, in one
+    // global arrival order).
+    repoLiftIngestGate(repo, pathString);
   };
 
   void persistence
@@ -1374,7 +1376,7 @@ export function repoStartServerListen(
       result => {
         if (!isCurrent()) {
           repo.pendingListenHashes_.clear(pathString);
-          repoDropIngestWindow(repo, pathString);
+          repoLiftIngestGate(repo, pathString);
           return;
         }
         const { record, reason } = result;
@@ -1455,7 +1457,7 @@ export function repoStartServerListen(
           );
           if (!isCurrent()) {
             repo.pendingListenHashes_.clear(pathString);
-            repoDropIngestWindow(repo, pathString);
+            repoLiftIngestGate(repo, pathString);
             return;
           }
           if (sentFromManifest) {
@@ -1508,7 +1510,7 @@ export function repoStopServerListen(
     return;
   }
   const pending = repo.pendingSeedRestores_.get(pathString);
-  if (pending && !repo.bootBuffers_.has(pathString)) {
+  if (pending && !repo.ingestQueue_.gates.has(pathString)) {
     // Still waiting on the auth scope or manifest: the listen was never sent.
     repoCancelPendingSeedRestore(pending);
     repo.pendingSeedRestores_.delete(pathString);
@@ -1519,7 +1521,7 @@ export function repoStopServerListen(
     }
     repo.server_.unlisten(query, tag);
   }
-  repoDropIngestWindow(repo, pathString);
+  repoLiftIngestGate(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
   repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
@@ -1587,7 +1589,14 @@ export function repoCancelPendingSeedRestores(
   repo: Repo,
   reattach = true
 ): void {
-  repo.pendingListenHashes_.clearAll();
+  // Supersede any in-flight sliced ingest continuation (account switch /
+  // persistence toggle / dispose): its decode observes the generation at
+  // the next yield and stands down, so a previous account's payload can
+  // never apply under the new scope. The QUEUE is untouched — deferred ops
+  // drain normally (a cancelled listen's ops no-op against SyncTree; a
+  // disconnect run is repo-global and must still fire). Gates lift via the
+  // reattach path below / the ingest's own finally.
+  repo.ingestQueue_.generation++;
   const pendings = [...repo.pendingSeedRestores_.values()];
   repo.pendingSeedRestores_.clear();
   for (const pending of pendings) {
@@ -1617,13 +1626,20 @@ export function repoNotifyPersistenceAuthScope(repo: Repo): void {
 export function repoDispose(repo: Repo): void {
   repoInterrupt(repo);
   repoCancelPendingSeedRestores(repo, false);
-  // Disconnects observed while windows were open queued frozen runs behind
-  // those windows' pushes. Dropping the windows must RELEASE every hold —
-  // the legacy path executed each run immediately at disconnect time — and
-  // the per-window drop below also clears bootBuffers_, which is every
-  // ingest pump's liveness signal (cancellation at the next yield).
-  for (const pathString of [...repo.bootBuffers_.keys()]) {
-    repoDropIngestWindow(repo, pathString);
+  // Cancel any in-flight sliced decode (generation bump), lift every gate,
+  // and synchronously flush the deferred stream's REPO-GLOBAL effects: a
+  // queued disconnect run must still fire (the legacy path executed it
+  // immediately at disconnect time) — but data/range/complete ops for the
+  // torn-down listens are moot and are dropped with the queue.
+  const queue = repo.ingestQueue_;
+  queue.generation++;
+  queue.gates.clear();
+  const deferred = queue.ops;
+  queue.ops = [];
+  for (const op of deferred) {
+    if (op.kind === 'disconnect') {
+      repoRunOnDisconnectEvents(repo, op.tree);
+    }
   }
   repoClearListenOutcomes(repo);
   repo.persistenceAuthScopeListeners_.clear();
@@ -1689,14 +1705,12 @@ function repoOnRangeMergeUpdate(
 ): void {
   // For testing.
   repo.dataUpdateCount++;
-  {
-    const bufferRoot = repoBootBufferRootFor(repo, pathString);
-    if (bufferRoot !== null) {
-      repo.bootBuffers_
-        .get(bufferRoot)!
-        .push({ kind: 'rm', pathString, ranges, tag });
-      return;
+  if (repoShouldDeferWireOp(repo, pathString)) {
+    repo.ingestQueue_.ops.push({ kind: 'rm', pathString, ranges, tag });
+    if (repo.ingestQueue_.gates.size === 0) {
+      repoDrainIngestQueue(repo);
     }
+    return;
   }
   repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
 }
@@ -1767,21 +1781,20 @@ function repoOnConnectStatus(repo: Repo, connectStatus: boolean): void {
     // as the legacy run (which reset the tree before raising its events).
     const tree = repo.onDisconnect_;
     repo.onDisconnect_ = newSparseSnapshotTree();
-    if (repo.bootBuffers_.size === 0) {
+    const queue = repo.ingestQueue_;
+    if (queue.gates.size === 0 && queue.ops.length === 0) {
+      // Nothing deferred anywhere: the legacy immediate run.
       repoRunOnDisconnectEvents(repo, tree);
       return;
     }
-    // The run writes to serverSyncTree_, so it is ORDERED against server
-    // data: applied while an ingest window still holds an earlier full-root
-    // push, it would be overwritten when that push lands — wire order
-    // inverted. Queue the frozen run behind every open window; it fires
-    // when the last of them releases it (see PendingDisconnectRun).
-    const run: PendingDisconnectRun = {
-      tree,
-      remaining: repo.bootBuffers_.size
-    };
-    for (const ops of repo.bootBuffers_.values()) {
-      ops.push({ kind: 'disconnect', run });
+    // The run writes to serverSyncTree_, so it is wire-ordered against the
+    // deferred stream: enqueue it as an ordinary operation. The single FIFO
+    // makes the ordering structural — it runs after every operation that
+    // preceded the disconnect and before every one that follows it, across
+    // all roots; distinct disconnects are simply distinct queue entries.
+    queue.ops.push({ kind: 'disconnect', tree });
+    if (queue.gates.size === 0) {
+      repoDrainIngestQueue(repo);
     }
   }
 }
@@ -1847,7 +1860,7 @@ export function repoGetValue(
       // Resolve the caller with the fresh value but skip the SyncTree side
       // effect; the base + buffered deltas populate the tree consistently,
       // and the listen's certification corrects any residue.
-      if (repoBootBufferRootFor(repo, query._path.toString()) !== null) {
+      if (repoShouldDeferWireOp(repo, query._path.toString())) {
         return node;
       }
       /**

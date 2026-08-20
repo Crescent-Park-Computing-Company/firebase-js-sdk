@@ -49,6 +49,7 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
+  newIngestQueue,
   repoCancelPendingSeedRestores,
   repoClearListenOutcomes,
   repoDispose,
@@ -406,6 +407,12 @@ function scopedManager(
   );
   manager.setAuthScope(null);
   return manager;
+}
+
+/** The deferred-ingest machinery is fully quiescent: no gates, empty queue. */
+function expectIngestIdle(repo: Repo): void {
+  expect(repo.ingestQueue_.gates.size).to.equal(0);
+  expect(repo.ingestQueue_.ops.length).to.equal(0);
 }
 
 function flushAsync(): Promise<void> {
@@ -2324,7 +2331,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
       pendingListenHashes_: pendingHashes,
-      bootBuffers_: new Map(),
+      ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       // The boot-window drain reruns transactions after each replayed push;
       // the real Repo always carries this tree. (The legacy synchronous
@@ -2616,7 +2623,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('a hashless record falls back cold without blocking on rehash', async () => {
@@ -2838,7 +2845,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // certified descendant.
     expect(calls).to.deep.equal(['listen']);
     expect(outcomes[outcomes.length - 1].mode).to.equal('restored');
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // CONVERGENCE ON THE WIRE (what the SyncTree hashFn consults for this
     // listen): the merged base-plus-graft tree matches no stored whole-tree
@@ -2927,7 +2934,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // Mid-window, a component subscribes to a child and issues a get() for
     // it. The get is request-response — it bypasses the push buffer — and
@@ -2965,7 +2972,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // sees one consistent value: the boot-buffered progression (base, then
     // buffered deltas), which the server then certifies or corrects.
     expect(childValues).to.deep.equal([{ msg: 'stale' }]);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('without a manifest callback the listen waits for the restore', async () => {
@@ -3045,7 +3052,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('account switch mid-restore reattaches the listen cold (post-manifest)', async () => {
@@ -3087,14 +3094,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await Promise.resolve();
     expect(calls).to.deep.equal(['listen']); // the seeded manifest-first send
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // The account changes: the seeded wire listen is torn down (its buffered
     // base can never be applied) and exactly one cold listen replaces it.
     repoCancelPendingSeedRestores(repo);
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
@@ -3157,7 +3164,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     release();
     await flushAsync();
     expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
     ).to.deep.equal({ a: 1, b: 2 });
@@ -3197,7 +3204,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     release({ record: null, reason: 'corrupt' });
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('buffers an early listen ok until the cached base is installed', async () => {
@@ -3251,7 +3258,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await Promise.resolve();
     expect(calls).to.deep.equal(['listen']);
     serverCallbacks[0]('ok');
-    expect(repo.bootBuffers_.get(path.toString())?.length).to.equal(1);
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
@@ -3309,12 +3316,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       false,
       77
     );
-    const buffered = repo.bootBuffers_.get(path.toString())!;
+    const buffered = repo.ingestQueue_.ops;
     expect(buffered).to.have.length(1);
     expect((buffered[0] as { tag: number }).tag).to.equal(77);
     release();
     await flushAsync();
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('buffers server pushes that beat the cached base, then replays them', async () => {
@@ -3356,7 +3363,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // The server answers BEFORE the base applied: a range merge for 'a',
     // then a normal overwrite under the root. Both must hold.
     repoOnDataUpdateForTest(repo, path.toString() + '/b', 7, false, null);
-    expect(repo.bootBuffers_.get(path.toString())!.length).to.equal(1);
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
@@ -3364,7 +3371,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     releaseRecord();
     await flushAsync();
     // Base applied, buffer drained in order: cached {a:1} + buffered b=7.
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
     ).to.deep.equal({ a: 1, b: 7 });
@@ -3398,7 +3405,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('a validation miss attaches exactly one cold listen', async () => {
@@ -3660,7 +3667,7 @@ describe('stale restore vs live server data', () => {
     });
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
-      bootBuffers_: new Map(),
+      ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
