@@ -2435,7 +2435,13 @@ declare class PersistenceManager {
      * a failed-open lock acquisition, and the stale-baseline adoption.
      */
     private armWriteWindowIfPending_;
-    /** Arms the non-restarting single-flight write window for a root. */
+    /**
+     * Arms the non-restarting single-flight write window for a root. Two
+     * regimes: a root with a flush baseline coalesces under the ordinary
+     * window; a root with none (first generation — see
+     * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
+     * the two delays so the cache exists before short mobile sessions end.
+     */
     private armWriteWindow_;
     private accumulateChangedPaths_;
     /**
@@ -2529,6 +2535,16 @@ declare class PersistenceManager {
      * hashing.
      */
     private flush_;
+    /**
+     * Second half of a flush: stages the planned dirty ranges and commits the
+     * generation. Split from flush_ so the sliced planner can yield between
+     * slices without holding the whole body in one closure. `entry` is the
+     * latest_ record the flush entered with (its node/revision/authScope are
+     * the generation being written); `rebuilt` is the planned range list —
+     * clean ranges carried with their recordIds, dirty ranges with empty
+     * hashes to be serialized, digested, and staged here.
+     */
+    private finishFlush_;
     private gcRangeRecords_;
 }
 

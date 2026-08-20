@@ -184,26 +184,85 @@ export interface StableRange {
  */
 export declare function compareRangeMarkers(a: string[], b: string[]): number;
 /**
- * Walks the leaves of `node` whose paths lie in the half-open marker interval
- * (fromPost, toPost], feeding the builder exactly the startChild / endChild /
- * processLeaf sequence the natural full-tree walk produces for those leaves.
- * The builder must have been seeded at `fromPost` (seedBoundary) so the first
- * emitted range opens with the same common-ancestor prefix the full walk
- * would write. `toPost === null` walks to the end of the tree.
+ * Explicit-stack traversal of the leaves of `node` whose paths lie in the
+ * half-open marker interval (fromPost, toPost], feeding the builder exactly
+ * the startChild / endChild / processLeaf sequence the natural full-tree walk
+ * produces for those leaves. The builder must have been seeded at `fromPost`
+ * (seedBoundary) so the first emitted range opens with the same
+ * common-ancestor prefix the full walk would write. `toPost === null` walks
+ * to the end of the tree.
+ *
+ * The stack form exists so large intervals can be walked in bounded
+ * main-thread slices (drainUntil): the persistence flush plans and stages
+ * whole-root intervals on a first generation, and the recursive walk there
+ * was a multi-second synchronous stall on large roots. Draining with an
+ * infinite deadline reproduces the recursive walk exactly — walkLeafInterval
+ * below is that wrapper, and the two forms are byte-identical by
+ * construction (same frame order, same builder calls).
  *
  * Subtrees entirely outside the interval are pruned without reading them —
  * the cost is O(interval bytes + pruned fanout), not O(tree).
  */
+export declare class LeafIntervalWalker {
+    private readonly fromPost_;
+    private readonly toPost_;
+    private readonly builder_;
+    private stack_;
+    /** Path of the previously emitted leaf (or the seeded boundary). */
+    private openPath_;
+    private openDepth_;
+    private started_;
+    /** Live path of the frame being processed (mutated by enter/exit). */
+    private readonly path_;
+    constructor(node: Node, fromPost_: string[] | null, toPost_: string[] | null, builder_: CompoundHashBuilder);
+    /**
+     * Processes frames until the walk completes or `deadline` (an epoch-ms
+     * timestamp) passes — always at least one frame, so every slice makes
+     * progress no matter how small its budget. Returns true when the walk is
+     * complete; call finish() then.
+     */
+    drainUntil(deadline: number): boolean;
+    /**
+     * Pops back out of the last emitted leaf's ancestry so a caller chaining
+     * further work sees a balanced builder; endChild is a no-op on text when
+     * no range is open. Call exactly once, after drainUntil returns true.
+     */
+    finish(): void;
+    private processFrame_;
+    private emitLeaf_;
+}
+/**
+ * Synchronous interval walk: drains a LeafIntervalWalker in one go. See the
+ * walker for the traversal contract.
+ */
 export declare function walkLeafInterval(node: Node, fromPost: string[] | null, toPost: string[] | null, builder: CompoundHashBuilder): void;
+/**
+ * Node-pair visits the identity-diff may spend before concluding the trees
+ * are too divorced to diff (collapse to the root path: everything dirty).
+ * The diff's output was
+ * always budgeted (maxPaths); its WORK was not — two trees that share no
+ * structure (a fallback boot's baseline vs a fully re-downloaded root) made
+ * it walk both trees end to end only to conclude "all dirty". Visits accrue
+ * only where identity differs, so a genuine incremental change stays far
+ * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * @internal
+ */
+export declare const DIFF_VISIT_BUDGET = 20000;
 /**
  * The identity-diff: collects the paths of maximal subtrees that differ
  * between two versions of an immutable, structurally shared tree. Unchanged
  * subtrees are recognized by object identity and never descended. A child
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves.
+ * dirty mapping only needs interval bounds, not precise leaves. Exhausting
+ * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
+ * collapses the affected branches toward the root — in the limit to the
+ * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
+ * diff's cost is bounded even against a baseline sharing no structure with
+ * the live tree. The result is always a (possibly collapsed) path list; it
+ * over-approximates but never misses a change.
  */
-export declare function collectChangedSubtreePaths(before: Node, after: Node, maxDepth?: number, maxPaths?: number): string[][] | null;
+export declare function collectChangedSubtreePaths(before: Node, after: Node, maxDepth?: number, maxPaths?: number, maxVisits?: number): string[][];
 /**
  * Marks the ranges whose leaf interval intersects any changed subtree. Range
  * i covers the half-open marker interval (posts[i-1], posts[i]]; the virtual
@@ -222,9 +281,42 @@ export declare function markDirtyRanges(ranges: StableRange[], changedPaths: str
  * are emitted through `builder`, whose hashSink/hashes the caller owns —
  * pass a sink to hash the dirty texts with WebCrypto afterwards.
  *
- * Returns the new range list with hashes for SINK-DEFERRED entries empty
- * (the caller fills them from the sink's completions, matching indexes in
- * builder.hashes/sizes/posts order for the dirty emissions).
+ * Sliceable: drainUntil processes walker frames until a deadline so the
+ * persistence flush can plan a whole-root generation (the cold boot's first
+ * flush, where every range is dirty) in bounded main-thread slices instead
+ * of one multi-second synchronous walk. Draining with an infinite deadline
+ * reproduces the old synchronous behavior exactly — rebuildStableRanges
+ * below is that wrapper.
+ *
+ * result() returns the new range list with hashes for SINK-DEFERRED entries
+ * empty (the caller fills them from the sink's completions, matching indexes
+ * in builder.posts). Boundary invariant: every preserved clean range keeps
+ * its exact post; rewalked runs end exactly at their run's outer boundary
+ * (LeafIntervalWalker's toPost pruning + finish()), so posts remain globally
+ * ordered and disjoint.
+ */
+export declare class StableRangeRebuilder {
+    private readonly node_;
+    private readonly builder_;
+    /** [fromPost, toPost, cleanTailAfter] per dirty run, in order. */
+    private readonly runs_;
+    private readonly result_;
+    private runIndex_;
+    private walker_;
+    private emitFrom_;
+    constructor(node_: Node, previous: StableRange[], dirty: boolean[], tailDirty: boolean, builder_: CompoundHashBuilder, fixedTargetBytes?: number);
+    /**
+     * Advances the rebuild until `deadline` (epoch ms) passes or every run has
+     * been walked — always at least one walker slice, so every call makes
+     * progress. Returns true when planning is complete; call result() then.
+     */
+    drainUntil(deadline: number): boolean;
+    /** The completed range list. Only valid after drainUntil returned true. */
+    result(): StableRange[];
+}
+/**
+ * Synchronous stable-range rebuild: drains a StableRangeRebuilder in one go.
+ * See the rebuilder for the planning contract.
  */
 export declare function rebuildStableRanges(node: Node, previous: StableRange[], dirty: boolean[], tailDirty: boolean, builder: CompoundHashBuilder, fixedTargetBytes?: number): StableRange[];
 export declare class CompoundHashAccumulator {

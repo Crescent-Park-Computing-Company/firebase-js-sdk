@@ -32,6 +32,33 @@ export declare const PERSISTENCE_MAX_CACHE_BYTES: number;
  */
 export declare const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 /**
+ * Write window for a root with NO flush baseline (first generation after a
+ * cold or fallback boot, or after an invalidation). The ordinary window
+ * coalesces steady-state churn; a fresh boot has none to coalesce — the
+ * complete tree just arrived — and the first stored generation is the only
+ * exit from the cold-reload loop (no cache → next boot re-downloads the
+ * root). Short-session mobile boots regularly died before the ordinary
+ * window even fired, so the first generation starts sooner; the sliced
+ * planner and byte-budgeted staging keep it off the critical path. Tests
+ * that shrink writeDelayMs below this keep their configured cadence
+ * (the effective delay is min of the two).
+ * @internal
+ */
+export declare const PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS = 3000;
+/**
+ * Main-thread budget for one slice of flush planning (the stable-range
+ * rewalk). Sized to fit inside a frame budget on mobile hardware.
+ * @internal
+ */
+export declare const FLUSH_PLAN_SLICE_MS = 12;
+/**
+ * Canonical-text bytes staged per task before yielding. Two default-target
+ * ranges (~256 KiB each) per slice keeps serialization work bounded while
+ * the unclamped macrotask yield (yieldMacrotask) lets paint/input interleave.
+ * @internal
+ */
+export declare const FLUSH_STAGE_BATCH_BYTES: number;
+/**
  * Constant canonical-text target for one persisted/hash range. Boundaries are
  * stable across generations and only dirty runs reconsult this target. The
  * constructor accepts an override so 128/256/512 KiB can be benchmarked
@@ -487,7 +514,13 @@ export declare class PersistenceManager {
      * a failed-open lock acquisition, and the stale-baseline adoption.
      */
     private armWriteWindowIfPending_;
-    /** Arms the non-restarting single-flight write window for a root. */
+    /**
+     * Arms the non-restarting single-flight write window for a root. Two
+     * regimes: a root with a flush baseline coalesces under the ordinary
+     * window; a root with none (first generation — see
+     * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
+     * the two delays so the cache exists before short mobile sessions end.
+     */
     private armWriteWindow_;
     private accumulateChangedPaths_;
     /**
@@ -581,6 +614,16 @@ export declare class PersistenceManager {
      * hashing.
      */
     private flush_;
+    /**
+     * Second half of a flush: stages the planned dirty ranges and commits the
+     * generation. Split from flush_ so the sliced planner can yield between
+     * slices without holding the whole body in one closure. `entry` is the
+     * latest_ record the flush entered with (its node/revision/authScope are
+     * the generation being written); `rebuilt` is the planned range list —
+     * clean ranges carried with their recordIds, dirty ranges with empty
+     * hashes to be serialized, digested, and staged here.
+     */
+    private finishFlush_;
     private gcRangeRecords_;
 }
 export {};

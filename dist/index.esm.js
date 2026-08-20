@@ -4,7 +4,7 @@ import { stringify, jsonEval, contains, assert, isNodeSdk, stringToByteArray, Sh
 import { Logger, LogLevel } from '@firebase/logger';
 
 const name = "@firebase/database";
-const version = "1.1.3-cache-seeding.71";
+const version = "1.1.3";
 
 /**
  * @license
@@ -1957,106 +1957,191 @@ function subtreeVsMarker(path, post) {
     return 1;
 }
 /**
- * Walks the leaves of `node` whose paths lie in the half-open marker interval
- * (fromPost, toPost], feeding the builder exactly the startChild / endChild /
- * processLeaf sequence the natural full-tree walk produces for those leaves.
- * The builder must have been seeded at `fromPost` (seedBoundary) so the first
- * emitted range opens with the same common-ancestor prefix the full walk
- * would write. `toPost === null` walks to the end of the tree.
+ * Explicit-stack traversal of the leaves of `node` whose paths lie in the
+ * half-open marker interval (fromPost, toPost], feeding the builder exactly
+ * the startChild / endChild / processLeaf sequence the natural full-tree walk
+ * produces for those leaves. The builder must have been seeded at `fromPost`
+ * (seedBoundary) so the first emitted range opens with the same
+ * common-ancestor prefix the full walk would write. `toPost === null` walks
+ * to the end of the tree.
+ *
+ * The stack form exists so large intervals can be walked in bounded
+ * main-thread slices (drainUntil): the persistence flush plans and stages
+ * whole-root intervals on a first generation, and the recursive walk there
+ * was a multi-second synchronous stall on large roots. Draining with an
+ * infinite deadline reproduces the recursive walk exactly — walkLeafInterval
+ * below is that wrapper, and the two forms are byte-identical by
+ * construction (same frame order, same builder calls).
  *
  * Subtrees entirely outside the interval are pruned without reading them —
  * the cost is O(interval bytes + pruned fanout), not O(tree).
  */
-function walkLeafInterval(node, fromPost, toPost, builder) {
-    // Transition state: the path of the previously emitted leaf (or the seeded
-    // boundary), from which endChild/startChild transitions are derived.
-    let openPath = fromPost === null ? [] : fromPost;
-    let openDepth = openPath.length;
-    let started = fromPost !== null;
-    let stopped = false;
-    const emitLeaf = (path, leaf) => {
-        if (!started) {
-            // First leaf of a from-the-start walk: descend from the root.
-            for (let i = 0; i < path.length; i++) {
-                builder.startChild(path[i]);
-            }
-            started = true;
-        }
-        else {
-            let common = 0;
-            while (common < openDepth &&
-                common < path.length &&
-                openPath[common] === path[common]) {
-                common++;
-            }
-            for (let i = openDepth; i > common; i--) {
-                builder.endChild();
-            }
-            for (let i = common; i < path.length; i++) {
-                builder.startChild(path[i]);
+class LeafIntervalWalker {
+    constructor(node, fromPost_, toPost_, builder_) {
+        this.fromPost_ = fromPost_;
+        this.toPost_ = toPost_;
+        this.builder_ = builder_;
+        /** Live path of the frame being processed (mutated by enter/exit). */
+        this.path_ = [];
+        this.openPath_ = fromPost_ === null ? [] : fromPost_;
+        this.openDepth_ = this.openPath_.length;
+        this.started_ = fromPost_ !== null;
+        this.stack_ = [{ kind: 'enter', key: null, node }];
+    }
+    /**
+     * Processes frames until the walk completes or `deadline` (an epoch-ms
+     * timestamp) passes — always at least one frame, so every slice makes
+     * progress no matter how small its budget. Returns true when the walk is
+     * complete; call finish() then.
+     */
+    drainUntil(deadline) {
+        while (this.stack_.length > 0) {
+            this.processFrame_(this.stack_.pop());
+            if (Date.now() >= deadline) {
+                break;
             }
         }
-        builder.processLeaf(leaf);
-        // Copy: `path` is the walker's live mutable array.
-        openPath = path.slice();
-        openDepth = openPath.length;
-    };
-    const walk = (current, path) => {
-        if (stopped) {
+        return this.stack_.length === 0;
+    }
+    /**
+     * Pops back out of the last emitted leaf's ancestry so a caller chaining
+     * further work sees a balanced builder; endChild is a no-op on text when
+     * no range is open. Call exactly once, after drainUntil returns true.
+     */
+    finish() {
+        this.builder_.forceEndRange();
+    }
+    processFrame_(frame) {
+        if (frame.kind === 'exit') {
+            this.path_.pop();
             return;
         }
-        if (fromPost !== null) {
-            const rel = subtreeVsMarker(path, fromPost);
+        const { key, node } = frame;
+        if (key !== null) {
+            this.path_.push(key);
+        }
+        const popEntered = () => {
+            if (key !== null) {
+                this.path_.pop();
+            }
+        };
+        if (this.fromPost_ !== null) {
+            const rel = subtreeVsMarker(this.path_, this.fromPost_);
             if (rel === -1) {
+                popEntered();
                 return; // entirely at-or-before the opening boundary
             }
-            if (rel === 0 && current.isLeafNode()) {
+            if (rel === 0 && node.isLeafNode()) {
                 // The boundary leaf itself: excluded (interval is open at fromPost).
-                if (compareRangeMarkers(path, fromPost) <= 0) {
+                if (compareRangeMarkers(this.path_, this.fromPost_) <= 0) {
+                    popEntered();
                     return;
                 }
             }
         }
-        if (toPost !== null) {
-            const rel = subtreeVsMarker(path, toPost);
+        if (this.toPost_ !== null) {
+            const rel = subtreeVsMarker(this.path_, this.toPost_);
             if (rel === 1) {
-                stopped = true; // entirely after the closing boundary
+                // Entirely after the closing boundary: nothing further in document
+                // order can be inside the interval — drop every remaining frame.
+                this.stack_.length = 0;
+                popEntered();
                 return;
             }
         }
-        if (current.isLeafNode()) {
-            emitLeaf(path, current);
+        if (node.isLeafNode()) {
+            this.emitLeaf_(node);
+            popEntered();
             return;
         }
         // The mobile wire grammar deliberately drops a trailing interior-node
         // priority. Persistence cannot: store it in the sparse payload without
         // feeding it to the canonical hash builder.
-        builder.processPriorityForPayload(path, current.getPriority());
-        forEachChildWithPriority(current, (key, child) => {
-            if (stopped) {
-                return;
-            }
-            path.push(key);
-            walk(child, path);
-            path.pop();
+        this.builder_.processPriorityForPayload(this.path_, node.getPriority());
+        const children = [];
+        forEachChildWithPriority(node, (childKey, child) => {
+            children.push([childKey, child]);
         });
-    };
-    walk(node, []);
-    // Pop back out of the last emitted leaf's ancestry so a caller chaining
-    // further work sees a balanced builder; endChild is a no-op on text when
-    // no range is open.
-    builder.forceEndRange();
+        if (key !== null) {
+            this.stack_.push({ kind: 'exit' });
+        }
+        for (let i = children.length - 1; i >= 0; i--) {
+            this.stack_.push({
+                kind: 'enter',
+                key: children[i][0],
+                node: children[i][1]
+            });
+        }
+    }
+    emitLeaf_(leaf) {
+        const path = this.path_;
+        if (!this.started_) {
+            // First leaf of a from-the-start walk: descend from the root.
+            for (let i = 0; i < path.length; i++) {
+                this.builder_.startChild(path[i]);
+            }
+            this.started_ = true;
+        }
+        else {
+            let common = 0;
+            while (common < this.openDepth_ &&
+                common < path.length &&
+                this.openPath_[common] === path[common]) {
+                common++;
+            }
+            for (let i = this.openDepth_; i > common; i--) {
+                this.builder_.endChild();
+            }
+            for (let i = common; i < path.length; i++) {
+                this.builder_.startChild(path[i]);
+            }
+        }
+        this.builder_.processLeaf(leaf);
+        // Copy: `path` is the walker's live mutable array.
+        this.openPath_ = path.slice();
+        this.openDepth_ = this.openPath_.length;
+    }
 }
+/**
+ * Synchronous interval walk: drains a LeafIntervalWalker in one go. See the
+ * walker for the traversal contract.
+ */
+function walkLeafInterval(node, fromPost, toPost, builder) {
+    const walker = new LeafIntervalWalker(node, fromPost, toPost, builder);
+    while (!walker.drainUntil(Infinity)) {
+        // drainUntil with an infinite deadline only stops when the stack drains.
+    }
+    walker.finish();
+}
+/**
+ * Node-pair visits the identity-diff may spend before concluding the trees
+ * are too divorced to diff (collapse to the root path: everything dirty).
+ * The diff's output was
+ * always budgeted (maxPaths); its WORK was not — two trees that share no
+ * structure (a fallback boot's baseline vs a fully re-downloaded root) made
+ * it walk both trees end to end only to conclude "all dirty". Visits accrue
+ * only where identity differs, so a genuine incremental change stays far
+ * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * @internal
+ */
+const DIFF_VISIT_BUDGET = 20000;
 /**
  * The identity-diff: collects the paths of maximal subtrees that differ
  * between two versions of an immutable, structurally shared tree. Unchanged
  * subtrees are recognized by object identity and never descended. A child
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves.
+ * dirty mapping only needs interval bounds, not precise leaves. Exhausting
+ * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
+ * collapses the affected branches toward the root — in the limit to the
+ * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
+ * diff's cost is bounded even against a baseline sharing no structure with
+ * the live tree. The result is always a (possibly collapsed) path list; it
+ * over-approximates but never misses a change.
  */
-function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512) {
+function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512, maxVisits = DIFF_VISIT_BUDGET) {
     const changed = [];
+    let visits = 0;
     /**
      * Returns true when the caller must collapse this branch to stay within the
      * global path budget. A large atomic subtree update should dirty that
@@ -2065,6 +2150,13 @@ function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512)
     const visit = (a, b, path, depth) => {
         if (a === b) {
             return false;
+        }
+        if (++visits > maxVisits) {
+            // Work budget exhausted: the trees are too divorced for the diff to
+            // pay off. Collapse to the root path — everything dirty.
+            changed.length = 0;
+            changed.push([]);
+            return true;
         }
         const branchStart = changed.length;
         const collapseBranch = () => {
@@ -2210,92 +2302,145 @@ function markDirtyRanges(ranges, changedPaths) {
  * are emitted through `builder`, whose hashSink/hashes the caller owns —
  * pass a sink to hash the dirty texts with WebCrypto afterwards.
  *
- * Returns the new range list with hashes for SINK-DEFERRED entries empty
- * (the caller fills them from the sink's completions, matching indexes in
- * builder.hashes/sizes/posts order for the dirty emissions).
+ * Sliceable: drainUntil processes walker frames until a deadline so the
+ * persistence flush can plan a whole-root generation (the cold boot's first
+ * flush, where every range is dirty) in bounded main-thread slices instead
+ * of one multi-second synchronous walk. Draining with an infinite deadline
+ * reproduces the old synchronous behavior exactly — rebuildStableRanges
+ * below is that wrapper.
+ *
+ * result() returns the new range list with hashes for SINK-DEFERRED entries
+ * empty (the caller fills them from the sink's completions, matching indexes
+ * in builder.posts). Boundary invariant: every preserved clean range keeps
+ * its exact post; rewalked runs end exactly at their run's outer boundary
+ * (LeafIntervalWalker's toPost pruning + finish()), so posts remain globally
+ * ordered and disjoint.
  */
-function rebuildStableRanges(node, previous, dirty, tailDirty, builder, fixedTargetBytes) {
-    const ideal = fixedTargetBytes === undefined
-        ? Math.max(512, Math.floor(Math.sqrt(estimateSerializedNodeSize(node) * 100)))
-        : Math.max(512, Math.floor(fixedTargetBytes));
-    const minSize = ideal >> 1;
-    // Absorb undersized clean neighbors into adjacent dirty runs (merge side of
-    // the hysteresis): they re-emit merged with the run's bytes.
-    const effectiveDirty = dirty.slice();
-    for (let i = 0; i < effectiveDirty.length; i++) {
-        if (!effectiveDirty[i]) {
-            continue;
+class StableRangeRebuilder {
+    constructor(node_, previous, dirty, tailDirty, builder_, fixedTargetBytes) {
+        this.node_ = node_;
+        this.builder_ = builder_;
+        /** [fromPost, toPost, cleanTailAfter] per dirty run, in order. */
+        this.runs_ = [];
+        this.result_ = [];
+        this.runIndex_ = 0;
+        this.walker_ = null;
+        this.emitFrom_ = 0;
+        const ideal = fixedTargetBytes === undefined
+            ? Math.max(512, Math.floor(Math.sqrt(estimateSerializedNodeSize(node_) * 100)))
+            : Math.max(512, Math.floor(fixedTargetBytes));
+        const minSize = ideal >> 1;
+        // Absorb undersized clean neighbors into adjacent dirty runs (merge side
+        // of the hysteresis): they re-emit merged with the run's bytes.
+        const effectiveDirty = dirty.slice();
+        for (let i = 0; i < effectiveDirty.length; i++) {
+            if (!effectiveDirty[i]) {
+                continue;
+            }
+            for (let p = i - 1; p >= 0 && !effectiveDirty[p] && previous[p].size < minSize; p--) {
+                effectiveDirty[p] = true;
+            }
+            for (let n = i + 1; n < effectiveDirty.length &&
+                !effectiveDirty[n] &&
+                previous[n].size < minSize; n++) {
+                effectiveDirty[n] = true;
+                i = n;
+            }
         }
-        for (let p = i - 1; p >= 0 && !effectiveDirty[p] && previous[p].size < minSize; p--) {
-            effectiveDirty[p] = true;
+        // Plan: leading clean prefix carries immediately; each dirty run walks
+        // its interval, then carries the clean ranges up to the next run.
+        let i = 0;
+        let pendingCarry = [];
+        const flushCarryTo = (target) => {
+            for (const range of pendingCarry) {
+                target.push(range);
+            }
+            pendingCarry = [];
+        };
+        while (i < previous.length) {
+            if (!effectiveDirty[i]) {
+                pendingCarry.push(previous[i]);
+                i++;
+                continue;
+            }
+            let j = i;
+            while (j < previous.length && effectiveDirty[j]) {
+                j++;
+            }
+            const runEndsAtTail = j === previous.length && tailDirty;
+            const run = {
+                from: i === 0 ? null : markerToPath(previous[i - 1].post),
+                to: runEndsAtTail ? null : markerToPath(previous[j - 1].post),
+                carryAfter: []
+            };
+            flushCarryTo(this.result_);
+            this.runs_.push(run);
+            i = j;
+            // Clean ranges after this run attach to it, so they emit in order.
+            while (i < previous.length && !effectiveDirty[i]) {
+                run.carryAfter.push(previous[i]);
+                i++;
+            }
         }
-        for (let n = i + 1; n < effectiveDirty.length &&
-            !effectiveDirty[n] &&
-            previous[n].size < minSize; n++) {
-            effectiveDirty[n] = true;
-            i = n;
-        }
-    }
-    const result = [];
-    let i = 0;
-    while (i < previous.length) {
-        if (!effectiveDirty[i]) {
-            result.push(previous[i]);
-            i++;
-            continue;
-        }
-        let j = i;
-        while (j < previous.length && effectiveDirty[j]) {
-            j++;
-        }
-        const runEndsAtTail = j === previous.length && tailDirty;
-        const fromPost = i === 0 ? null : markerToPath(previous[i - 1].post);
-        const toPost = runEndsAtTail ? null : markerToPath(previous[j - 1].post);
-        const firstEmitIndex = builder.posts.length;
-        if (fromPost !== null) {
-            builder.seedBoundary(fromPost);
-        }
-        walkLeafInterval(node, fromPost, toPost, builder);
-        for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-            result.push({
-                post: builder.posts[k],
-                hash: builder.hashes[k],
-                size: builder.sizes[k]
-            });
-        }
-        i = j;
-    }
-    if (tailDirty && previous.length > 0) {
-        // Tail handled by extending the last run (runEndsAtTail) when the last
-        // range was dirty; when it was clean, walk the pure tail interval.
-        const lastWasClean = !effectiveDirty[previous.length - 1];
-        if (lastWasClean) {
-            const fromPost = markerToPath(previous[previous.length - 1].post);
-            const firstEmitIndex = builder.posts.length;
-            builder.seedBoundary(fromPost);
-            walkLeafInterval(node, fromPost, null, builder);
-            for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-                result.push({
-                    post: builder.posts[k],
-                    hash: builder.hashes[k],
-                    size: builder.sizes[k]
+        flushCarryTo(this.result_);
+        if (tailDirty && previous.length > 0) {
+            // Tail handled by extending the last run (runEndsAtTail) when the last
+            // range was dirty; when it was clean, walk the pure tail interval.
+            const lastWasClean = !effectiveDirty[previous.length - 1];
+            if (lastWasClean) {
+                this.runs_.push({
+                    from: markerToPath(previous[previous.length - 1].post),
+                    to: null,
+                    carryAfter: []
                 });
             }
         }
-    }
-    if (previous.length === 0) {
-        // First-ever generation: one natural full walk.
-        const firstEmitIndex = builder.posts.length;
-        walkLeafInterval(node, null, null, builder);
-        for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-            result.push({
-                post: builder.posts[k],
-                hash: builder.hashes[k],
-                size: builder.sizes[k]
-            });
+        if (previous.length === 0) {
+            // First-ever generation: one natural full walk.
+            this.runs_.push({ from: null, to: null, carryAfter: [] });
         }
     }
-    return result;
+    /**
+     * Advances the rebuild until `deadline` (epoch ms) passes or every run has
+     * been walked — always at least one walker slice, so every call makes
+     * progress. Returns true when planning is complete; call result() then.
+     */
+    drainUntil(deadline) {
+        while (this.runIndex_ < this.runs_.length) {
+            const run = this.runs_[this.runIndex_];
+            if (this.walker_ === null) {
+                this.emitFrom_ = this.builder_.posts.length;
+                if (run.from !== null) {
+                    this.builder_.seedBoundary(run.from);
+                }
+                this.walker_ = new LeafIntervalWalker(this.node_, run.from, run.to, this.builder_);
+            }
+            if (!this.walker_.drainUntil(deadline)) {
+                return false;
+            }
+            this.walker_.finish();
+            this.walker_ = null;
+            for (let k = this.emitFrom_; k < this.builder_.posts.length; k++) {
+                this.result_.push({
+                    post: this.builder_.posts[k],
+                    hash: this.builder_.hashes[k],
+                    size: this.builder_.sizes[k]
+                });
+            }
+            for (const range of run.carryAfter) {
+                this.result_.push(range);
+            }
+            this.runIndex_++;
+            if (Date.now() >= deadline) {
+                return this.runIndex_ >= this.runs_.length;
+            }
+        }
+        return true;
+    }
+    /** The completed range list. Only valid after drainUntil returned true. */
+    result() {
+        return this.result_;
+    }
 }
 /**
  * The compound-hash representation of a leaf: the V2 grammar (strings and
@@ -3920,6 +4065,57 @@ setNodeFromJSON(nodeFromJSON);
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+let yieldChannel = null;
+const yieldResolvers = [];
+function setPortsReferenced(referenced) {
+    for (const port of [yieldChannel.port1, yieldChannel.port2]) {
+        const p = port;
+        if (referenced) {
+            p.ref?.();
+        }
+        else {
+            p.unref?.();
+        }
+    }
+}
+function yieldMacrotask() {
+    if (typeof MessageChannel === 'undefined') {
+        return new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (yieldChannel === null) {
+        yieldChannel = new MessageChannel();
+        // Installing onmessage references the port in Node; start idle-unref'd.
+        yieldChannel.port1.onmessage = () => {
+            yieldResolvers.shift()?.();
+            if (yieldResolvers.length === 0) {
+                setPortsReferenced(false);
+            }
+        };
+        setPortsReferenced(false);
+    }
+    return new Promise(resolve => {
+        yieldResolvers.push(resolve);
+        setPortsReferenced(true);
+        yieldChannel.port2.postMessage(null);
+    });
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 /**
  * Client-side persistence of the server cache, in the spirit of the mobile
  * SDKs' setPersistenceEnabled(true): the SDK itself stores what the server
@@ -4025,6 +4221,39 @@ const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
  * @internal
  */
 const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
+/**
+ * Write window for a root with NO flush baseline (first generation after a
+ * cold or fallback boot, or after an invalidation). The ordinary window
+ * coalesces steady-state churn; a fresh boot has none to coalesce — the
+ * complete tree just arrived — and the first stored generation is the only
+ * exit from the cold-reload loop (no cache → next boot re-downloads the
+ * root). Short-session mobile boots regularly died before the ordinary
+ * window even fired, so the first generation starts sooner; the sliced
+ * planner and byte-budgeted staging keep it off the critical path. Tests
+ * that shrink writeDelayMs below this keep their configured cadence
+ * (the effective delay is min of the two).
+ * @internal
+ */
+const PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS = 3000;
+/**
+ * Main-thread budget for one slice of flush planning (the stable-range
+ * rewalk). Sized to fit inside a frame budget on mobile hardware.
+ * @internal
+ */
+const FLUSH_PLAN_SLICE_MS = 12;
+/**
+ * Canonical-text bytes staged per task before yielding. Two default-target
+ * ranges (~256 KiB each) per slice keeps serialization work bounded while
+ * the unclamped macrotask yield (yieldMacrotask) lets paint/input interleave.
+ * @internal
+ */
+const FLUSH_STAGE_BATCH_BYTES = 512 * 1024;
+/** Thrown out of a sliced flush when the manager was disposed mid-yield. */
+class FlushObsoleteError extends Error {
+    constructor() {
+        super('flush obsolete');
+    }
+}
 /**
  * Constant canonical-text target for one persisted/hash range. Boundaries are
  * stable across generations and only dirty runs reconsult this target. The
@@ -5794,13 +6023,22 @@ class PersistenceManager {
             this.armWriteWindow_(pathString);
         }
     }
-    /** Arms the non-restarting single-flight write window for a root. */
+    /**
+     * Arms the non-restarting single-flight write window for a root. Two
+     * regimes: a root with a flush baseline coalesces under the ordinary
+     * window; a root with none (first generation — see
+     * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
+     * the two delays so the cache exists before short mobile sessions end.
+     */
     armWriteWindow_(pathString) {
         if (!this.writeTimers_.has(pathString)) {
+            const delay = this.lastFlush_.has(pathString)
+                ? this.writeDelayMs_
+                : Math.min(this.writeDelayMs_, PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS);
             this.writeTimers_.set(pathString, setTimeout(() => {
                 this.writeTimers_.delete(pathString);
                 this.scheduleFlush_(pathString);
-            }, this.writeDelayMs_));
+            }, delay));
         }
     }
     accumulateChangedPaths_(pathString, changedPaths) {
@@ -6277,7 +6515,6 @@ class PersistenceManager {
         let previousRanges = [];
         let dirty = [];
         let tailDirty = false;
-        let changed = null;
         // An adopted baseline (rootNode null — another writer's committed
         // manifest) has UNKNOWN content: neither the identity diff nor paths
         // accumulated against our own chain describe differences from it, and
@@ -6285,31 +6522,41 @@ class PersistenceManager {
         // snapshots into one stored tree. Stage a fresh full generation; its
         // revision still CASes against the adopted manifest.
         if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
-            changed =
-                accumulated !== null && accumulated !== undefined
-                    ? accumulated
-                    : collectChangedSubtreePaths(prev.rootNode, node);
-            if (changed !== null) {
-                previousRanges = prev.ranges;
-                if (changed.length === 0) {
-                    dirty = new Array(prev.ranges.length).fill(false);
-                }
-                else {
-                    const marked = markDirtyRanges(prev.ranges, changed);
-                    dirty = marked.dirty;
-                    tailDirty = marked.tailDirty;
-                }
+            const changed = accumulated !== null && accumulated !== undefined
+                ? accumulated
+                : collectChangedSubtreePaths(prev.rootNode, node);
+            previousRanges = prev.ranges;
+            if (changed.length === 0) {
+                dirty = new Array(prev.ranges.length).fill(false);
+            }
+            else {
+                const marked = markDirtyRanges(prev.ranges, changed);
+                dirty = marked.dirty;
+                tailDirty = marked.tailDirty;
             }
         }
         // First pass: boundaries/sizes only. It never creates canonical strings
         // or export payloads, so a first generation cannot retain another full
-        // copy of the root merely to decide its ranges.
+        // copy of the root merely to decide its ranges. Drained in bounded
+        // main-thread slices: a whole-root plan (first generation after a cold
+        // boot — every range dirty) is a full leaf walk, and running it
+        // synchronously was a multi-second stall exactly on the boots that must
+        // complete their first flush to escape the cold-reload loop.
         const planner = new CompoundHashBuilder(fixedSizeSplitStrategy(this.rangeTargetBytes_), true);
-        let rebuilt;
-        try {
-            rebuilt = rebuildStableRanges(node, previousRanges, dirty, tailDirty, planner, this.rangeTargetBytes_);
-        }
-        catch (e) {
+        const planSliced = async () => {
+            const rebuilder = new StableRangeRebuilder(node, previousRanges, dirty, tailDirty, planner, this.rangeTargetBytes_);
+            while (!rebuilder.drainUntil(Date.now() + FLUSH_PLAN_SLICE_MS)) {
+                await yieldMacrotask();
+                if (this.disposed_) {
+                    throw new FlushObsoleteError();
+                }
+            }
+            return rebuilder.result();
+        };
+        return planSliced().then(rebuilt => this.finishFlush_(pathString, entry, prev, accumulated, rebuilt), e => {
+            if (e instanceof FlushObsoleteError) {
+                return;
+            }
             persistenceStats.storageFailures++;
             recordPersistenceEvent(pathString, 'flush-plan-error');
             // Protective cleanup of THIS manager's own possibly-implicated
@@ -6326,7 +6573,21 @@ class PersistenceManager {
             return owned !== null
                 ? this.deleteRecordIfRevision_(pathString, owned)
                 : Promise.resolve();
-        }
+        });
+    }
+    /**
+     * Second half of a flush: stages the planned dirty ranges and commits the
+     * generation. Split from flush_ so the sliced planner can yield between
+     * slices without holding the whole body in one closure. `entry` is the
+     * latest_ record the flush entered with (its node/revision/authScope are
+     * the generation being written); `rebuilt` is the planned range list —
+     * clean ranges carried with their recordIds, dirty ranges with empty
+     * hashes to be serialized, digested, and staged here.
+     */
+    finishFlush_(pathString, entry, prev, accumulated, rebuilt) {
+        const { node, revision, authScope } = entry;
+        const now = Date.now();
+        const key = this.key_(pathString);
         const dirtyPlans = [];
         let previousPost = null;
         let dirtyIndex = 0;
@@ -6404,19 +6665,38 @@ class PersistenceManager {
             stagedIds.push(...records.map(record => record.recordId));
             // Async activation records can otherwise retain completed IDB request
             // inputs until the whole generation settles. Drop every large reference
-            // explicitly and yield a macrotask so WebKit can collect between batches.
+            // explicitly and yield a macrotask so WebKit can collect between
+            // batches (yieldMacrotask: MessageChannel, exempt from the nested
+            // setTimeout clamp that stretched many-batch generations by seconds).
             for (const record of records) {
                 record.tree = undefined;
             }
             records.length = 0;
             texts.length = 0;
             digests.length = 0;
-            await new Promise(resolve => setTimeout(resolve, 0));
+            await yieldMacrotask();
+            if (this.disposed_) {
+                throw new FlushObsoleteError();
+            }
         };
         const stageAll = async () => {
-            const batchSize = 4;
-            for (let i = 0; i < dirtyPlans.length; i += batchSize) {
-                await stageBatch(dirtyPlans.slice(i, i + batchSize));
+            // Batches are cut by planned canonical-text bytes, not range count:
+            // ranges vary from a few bytes to ~2x the split target, and a fixed
+            // count made slice cost swing with them. A single oversized range
+            // still ships alone (the batch admits the first plan unconditionally).
+            let batch = [];
+            let batchBytes = 0;
+            for (const plan of dirtyPlans) {
+                if (batch.length > 0 && batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
+                    await stageBatch(batch);
+                    batch = [];
+                    batchBytes = 0;
+                }
+                batch.push(plan);
+                batchBytes += plan.range.size;
+            }
+            if (batch.length > 0) {
+                await stageBatch(batch);
             }
         };
         return stageAll()
@@ -6429,7 +6709,15 @@ class PersistenceManager {
                 revision,
                 updatedAt: now,
                 authScope,
-                estimatedBytes: estimateSerializedNodeSize(node),
+                // Sum of canonical-text range sizes, already computed by the
+                // planner (the old estimateSerializedNodeSize call here was a
+                // second full-tree walk solely for this field). NOTE: a different
+                // measure than that estimate (canonical text vs JSON-ish size) —
+                // same order of magnitude, and the LRU sweep that consumes
+                // estimatedBytes only needs a consistent-scale byte proxy. Old
+                // manifests keep their estimate until content next changes; the
+                // mixed sum drifts the sweep budget by at most that scale gap.
+                estimatedBytes: ranges.reduce((sum, range) => sum + range.size, 0),
                 hash: '',
                 ranges
             };
@@ -6564,7 +6852,12 @@ class PersistenceManager {
                 }
             });
         })
-            .catch(() => {
+            .catch((e) => {
+            if (e instanceof FlushObsoleteError) {
+                // Disposed mid-stage: staged ids are reclaimed by the next
+                // successful GC/sweep; nothing to merge back — the manager is gone.
+                return;
+            }
             persistenceStats.storageFailures++;
             recordPersistenceEvent(pathString, 'flush-range-stage-error');
             // The flush consumed the accumulated changed-paths at its start, but
@@ -10620,57 +10913,6 @@ class ReadonlyRestClient extends ServerActions {
             xhr.send();
         });
     }
-}
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let yieldChannel = null;
-const yieldResolvers = [];
-function setPortsReferenced(referenced) {
-    for (const port of [yieldChannel.port1, yieldChannel.port2]) {
-        const p = port;
-        if (referenced) {
-            p.ref?.();
-        }
-        else {
-            p.unref?.();
-        }
-    }
-}
-function yieldMacrotask() {
-    if (typeof MessageChannel === 'undefined') {
-        return new Promise(resolve => setTimeout(resolve, 0));
-    }
-    if (yieldChannel === null) {
-        yieldChannel = new MessageChannel();
-        // Installing onmessage references the port in Node; start idle-unref'd.
-        yieldChannel.port1.onmessage = () => {
-            yieldResolvers.shift()?.();
-            if (yieldResolvers.length === 0) {
-                setPortsReferenced(false);
-            }
-        };
-        setPortsReferenced(false);
-    }
-    return new Promise(resolve => {
-        yieldResolvers.push(resolve);
-        setPortsReferenced(true);
-        yieldChannel.port2.postMessage(null);
-    });
 }
 
 /**
