@@ -4598,11 +4598,27 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     const committed = shared.data.get(manifestKey) as { revision: string };
     expect(committed).to.not.equal(undefined);
 
-    // Second generation: dirty everything, then dispose while staging is in
-    // flight (after the flush has started, before its commit).
-    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(120, 60)));
+    // Second generation: dirty everything, then dispose ONCE STAGING HAS
+    // OBSERVABLY STARTED — a fixed sleep could land during planning (before
+    // any store.put), silently degenerating this into the sibling
+    // dispose-during-plan test. Instead poll for the first range record the
+    // new generation stages; several macrotasks of staging + digest + commit
+    // work remain after it appears, so the dispose deterministically lands
+    // between the first staged batch and the manifest commit.
+    const keysBefore = new Set([...shared.data.keys()]);
+    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(240, 60)));
     const flushing = manager.flushNow(path.toString());
-    await new Promise<void>(resolve => setTimeout(resolve, 5));
+    let stagedAppeared = false;
+    for (let i = 0; i < 4000 && !stagedAppeared; i++) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      for (const k of shared.data.keys()) {
+        if (!keysBefore.has(k) && String(k).includes('#range:')) {
+          stagedAppeared = true;
+          break;
+        }
+      }
+    }
+    expect(stagedAppeared).to.equal(true);
     manager.dispose();
     await flushing;
     await flushAsync();
