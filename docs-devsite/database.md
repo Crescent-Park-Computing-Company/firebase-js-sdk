@@ -1521,7 +1521,7 @@ Why a restore fell back cold.
 <b>Signature:</b>
 
 ```typescript
-export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 ```
 
 ## QueryConstraintType

@@ -66,6 +66,7 @@ import {
   enableLogging as enableLoggingImpl
 } from '../core/util/util';
 import { validateRootPathString, validateUrl } from '../core/util/validation';
+import { yieldMacrotask } from '../core/util/yieldMacrotask';
 import { BrowserPollConnection } from '../realtime/BrowserPollConnection';
 import { TransportManager } from '../realtime/TransportManager';
 import { WebSocketConnection } from '../realtime/WebSocketConnection';
@@ -462,58 +463,6 @@ export function goOffline(db: Database): void {
  */
 export const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
 
-/**
- * Yields one macrotask. MessageChannel where available: unlike setTimeout(0),
- * ports are exempt from the nested-timer clamp (~4ms after a few levels),
- * which would otherwise stretch a many-slice materialization by whole
- * seconds exactly on the slow boots it is meant to help.
- *
- * Node port lifecycle: a referenced MessagePort keeps the Node event loop
- * alive, so the ports are referenced only while yields are pending and
- * unref'd once the queue drains — an idle channel must not block a Node
- * consumer's otherwise-clean shutdown. The direction matters both ways: a
- * PERMANENTLY unref'd port is wrong too, because Node drops delivery when
- * no other handle holds the loop and the yield would never resolve.
- * Browsers have no ref/unref on ports; the optional calls are no-ops there.
- */
-interface UnrefablePort {
-  ref?: () => void;
-  unref?: () => void;
-}
-let peekYieldChannel: MessageChannel | null = null;
-const peekYieldResolvers: Array<() => void> = [];
-function setPeekPortsReferenced(referenced: boolean): void {
-  for (const port of [peekYieldChannel!.port1, peekYieldChannel!.port2]) {
-    const p = port as unknown as UnrefablePort;
-    if (referenced) {
-      p.ref?.();
-    } else {
-      p.unref?.();
-    }
-  }
-}
-function yieldMacrotask(): Promise<void> {
-  if (typeof MessageChannel === 'undefined') {
-    return new Promise(resolve => setTimeout(resolve, 0));
-  }
-  if (peekYieldChannel === null) {
-    peekYieldChannel = new MessageChannel();
-    // Installing onmessage references the port in Node; start idle-unref'd.
-    peekYieldChannel.port1.onmessage = () => {
-      peekYieldResolvers.shift()?.();
-      if (peekYieldResolvers.length === 0) {
-        setPeekPortsReferenced(false);
-      }
-    };
-    setPeekPortsReferenced(false);
-  }
-  return new Promise(resolve => {
-    peekYieldResolvers.push(resolve);
-    setPeekPortsReferenced(true);
-    peekYieldChannel!.port2.postMessage(null);
-  });
-}
-
 // ChildrenNode.val()'s integer-key grammar (private there; replicated for the
 // sliced walk's array coercion, which must match val() exactly).
 const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
@@ -650,8 +599,9 @@ export function getPersistedValue(
   // like one that lands before resolution — a public-API caller must never
   // receive the previous account's cached tree.
   const authGeneration = persistence.authGeneration();
-  return persistence.peek(normalizedPath, expectedAuthScope).then(
-    async (record): Promise<unknown | null> => {
+  return persistence
+    .peek(normalizedPath, expectedAuthScope)
+    .then(async (record): Promise<unknown | null> => {
       if (record === null) {
         return null;
       }
@@ -690,8 +640,7 @@ export function getPersistedValue(
         stampMaterializedValue(record.node, value);
       }
       return value;
-    }
-  );
+    });
 }
 
 /**

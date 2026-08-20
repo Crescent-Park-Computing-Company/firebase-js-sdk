@@ -49,6 +49,7 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
+  newIngestQueue,
   repoCancelPendingSeedRestores,
   repoClearListenOutcomes,
   repoDispose,
@@ -77,6 +78,7 @@ import {
   syncTreeRemoveEventRegistration
 } from '../src/core/SyncTree';
 import { Path } from '../src/core/util/Path';
+import { Tree } from '../src/core/util/Tree';
 import { sha1 } from '../src/core/util/util';
 import { EventQueue } from '../src/core/view/EventQueue';
 import {
@@ -405,6 +407,12 @@ function scopedManager(
   );
   manager.setAuthScope(null);
   return manager;
+}
+
+/** The deferred-ingest machinery is fully quiescent: no gates, empty queue. */
+function expectIngestIdle(repo: Repo): void {
+  expect(repo.ingestQueue_.gates.size).to.equal(0);
+  expect(repo.ingestQueue_.ops.length).to.equal(0);
 }
 
 function flushAsync(): Promise<void> {
@@ -2323,8 +2331,13 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
       pendingListenHashes_: pendingHashes,
-      bootBuffers_: new Map(),
+      ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      // The boot-window drain reruns transactions after each replayed push;
+      // the real Repo always carries this tree. (The legacy synchronous
+      // drain crashed here too, but inside a void'd promise chain — the
+      // in-place drain surfaces what was silently swallowed.)
+      transactionQueueTree_: new Tree(),
       persistence_: manager,
       persistenceAuthScope_: null,
       persistenceAuthScopeListeners_: new Set<() => void>(),
@@ -2533,6 +2546,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     harness.repo.persistence_ = manager;
     harness.repo.persistenceAuthScope_ = undefined;
 
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(harness.repo, harness.path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     repoStartServerListen(
       harness.repo,
       harness.query,
@@ -2545,6 +2562,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(harness.calls).to.deep.equal(['listen']);
     expect(harness.repo.persistenceAuthScopeListeners_.size).to.equal(0);
+    // The cold outcome names WHY: identity hydration timed out (not a cache
+    // miss) — observability for attributing forced-cold boots.
+    expect(outcomes[0].mode).to.equal('cold');
+    expect(outcomes[0].reason).to.equal('auth-timeout');
   });
 
   it('a stop during the restore cancels the listen instead of orphaning it', async () => {
@@ -2602,7 +2623,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('a hashless record falls back cold without blocking on rehash', async () => {
@@ -2733,6 +2754,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       nodeFromJSON({ a: 'live', b: 'live' })
     );
 
+    const outcomes: ListenOutcome[] = [];
+    repoOnListenOutcome(repo, path.toString(), outcome =>
+      outcomes.push(outcome)
+    );
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
 
@@ -2742,6 +2767,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
+    // The cold outcome names the graft refusal — a filtered window below
+    // the root, not a cache miss.
+    expect(outcomes[0].mode).to.equal('cold');
+    expect(outcomes[0].reason).to.equal('partial-descendants');
   });
 
   it('grafts certified descendant caches over the restored base instead of going cold', async () => {
@@ -2816,7 +2845,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // certified descendant.
     expect(calls).to.deep.equal(['listen']);
     expect(outcomes[outcomes.length - 1].mode).to.equal('restored');
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // CONVERGENCE ON THE WIRE (what the SyncTree hashFn consults for this
     // listen): the merged base-plus-graft tree matches no stored whole-tree
@@ -2905,7 +2934,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // Mid-window, a component subscribes to a child and issues a get() for
     // it. The get is request-response — it bypasses the push buffer — and
@@ -2943,7 +2972,70 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // sees one consistent value: the boot-buffered progression (base, then
     // buffered deltas), which the server then certifies or corrects.
     expect(childValues).to.deep.equal([{ msg: 'stale' }]);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
+  });
+
+  it('a get() on an UNGATED root keeps its SyncTree side effect while the queue is non-empty', async () => {
+    const { repo, query, hashFn, onComplete, calls, getResponders, data } =
+      makeListenHarness();
+    void data;
+    await persistHarnessRoot(repo, new Path('users/alice'), { a: 1 });
+    // Hold alice's restore open so her gate stays installed with a queued op.
+    const manager = repo.persistence_!;
+    const realRestore = manager.restoreForListen.bind(manager);
+    let releaseRecord: () => void = () => {};
+    const recordGate = new Promise<void>(resolve => {
+      releaseRecord = resolve;
+    });
+    manager.restoreForListen = (pathString, onManifest) =>
+      realRestore(pathString, onManifest).then(async result => {
+        await recordGate;
+        return result;
+      });
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    // A push for alice lands mid-window → the queue is non-empty.
+    repoOnDataUpdateForTest(
+      repo,
+      new Path('users/alice/b').toString(),
+      7,
+      false,
+      null
+    );
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
+
+    // A get() for a completely UNRELATED, ungated root: its normal SyncTree
+    // side effect must NOT be suppressed by alice's queued op (the guard is
+    // path-specific — only a COVERING gate suppresses).
+    const bobPath = new Path('users/bob');
+    const bobValues: unknown[] = [];
+    const bobQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      bobPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      bobQuery,
+      recordingRegistration(bobValues)
+    );
+    const getPromise = repoGetValue(
+      repo,
+      bobQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    getResponders[0]({ profile: 'bob' });
+    const got = await getPromise;
+    expect(got.val()).to.deep.equal({ profile: 'bob' });
+    // The side effect ran: bob's listener saw the fresh value.
+    expect(bobValues).to.deep.equal([{ profile: 'bob' }]);
+
+    releaseRecord();
+    await flushAsync();
+    expectIngestIdle(repo);
   });
 
   it('without a manifest callback the listen waits for the restore', async () => {
@@ -3023,7 +3115,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(calls).to.deep.equal(['listen']);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('account switch mid-restore reattaches the listen cold (post-manifest)', async () => {
@@ -3065,14 +3157,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await Promise.resolve();
     expect(calls).to.deep.equal(['listen']); // the seeded manifest-first send
-    expect(repo.bootBuffers_.has(path.toString())).to.equal(true);
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
 
     // The account changes: the seeded wire listen is torn down (its buffered
     // base can never be applied) and exactly one cold listen replaces it.
     repoCancelPendingSeedRestores(repo);
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
     expect(repo.pendingSeedRestores_.size).to.equal(0);
   });
@@ -3135,7 +3227,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     release();
     await flushAsync();
     expect(repo.pendingListenHashes_.get(path.toString())).to.equal(undefined);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
     ).to.deep.equal({ a: 1, b: 2 });
@@ -3175,7 +3267,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     release({ record: null, reason: 'corrupt' });
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('buffers an early listen ok until the cached base is installed', async () => {
@@ -3229,7 +3321,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await Promise.resolve();
     expect(calls).to.deep.equal(['listen']);
     serverCallbacks[0]('ok');
-    expect(repo.bootBuffers_.get(path.toString())?.length).to.equal(1);
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
@@ -3287,12 +3379,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       false,
       77
     );
-    const buffered = repo.bootBuffers_.get(path.toString())!;
+    const buffered = repo.ingestQueue_.ops;
     expect(buffered).to.have.length(1);
     expect((buffered[0] as { tag: number }).tag).to.equal(77);
     release();
     await flushAsync();
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('buffers server pushes that beat the cached base, then replays them', async () => {
@@ -3334,7 +3426,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // The server answers BEFORE the base applied: a range merge for 'a',
     // then a normal overwrite under the root. Both must hold.
     repoOnDataUpdateForTest(repo, path.toString() + '/b', 7, false, null);
-    expect(repo.bootBuffers_.get(path.toString())!.length).to.equal(1);
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
     expect(syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)).to.equal(
       null
     );
@@ -3342,7 +3434,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     releaseRecord();
     await flushAsync();
     // Base applied, buffer drained in order: cached {a:1} + buffered b=7.
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
     ).to.deep.equal({ a: 1, b: 7 });
@@ -3376,7 +3468,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     await flushAsync();
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
-    expect(repo.bootBuffers_.size).to.equal(0);
+    expectIngestIdle(repo);
   });
 
   it('a validation miss attaches exactly one cold listen', async () => {
@@ -3638,7 +3730,7 @@ describe('stale restore vs live server data', () => {
     });
     const repo = {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
-      bootBuffers_: new Map(),
+      ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),

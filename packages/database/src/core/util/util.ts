@@ -364,7 +364,10 @@ export const splitStringBySize = function (
  */
 export function each(obj: object, fn: (k: string, v: unknown) => void) {
   for (const key in obj) {
-    if (obj.hasOwnProperty(key)) {
+    // Prototype-safe: child keys like "hasOwnProperty" are legal Firebase
+    // names, and JSON.parse makes them own STRING properties — calling the
+    // method through the object would invoke user data and throw.
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
       fn(key, obj[key]);
     }
   }
