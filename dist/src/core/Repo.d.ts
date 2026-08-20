@@ -244,6 +244,12 @@ export declare function repoLiftIngestGateForTest(repo: Repo, pathString: string
 export declare function repoOnConnectStatusForTest(repo: Repo, connectStatus: boolean): void;
 /** Test seam: drives a server data push exactly as the connection would. @internal */
 export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
+/** Test seam: drives a server range merge exactly as the connection would. @internal */
+export declare function repoOnRangeMergeUpdateForTest(repo: Repo, pathString: string, ranges: Array<{
+    s?: string;
+    e?: string;
+    m: unknown;
+}>, tag: number | null): void;
 export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number, coldReason?: ListenOutcomeReason): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may

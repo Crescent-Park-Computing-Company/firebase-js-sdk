@@ -15571,6 +15571,13 @@ function repoGenerateServerValues(repo) {
 function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
     // For testing.
     repo.dataUpdateCount++;
+    // The wire delivers paths in server form ('users/alice', '' for root);
+    // every internal path-string key — persistence roots (setPersistentPath),
+    // ingest gates, queued ops, get()'s gate lookup — is Path.toString()
+    // canonical form ('/users/alice', '/'). Canonicalize once at the wire
+    // boundary so repoIngestEligible, gate coverage, and the drain's re-entry
+    // all compare within one form. Idempotent for already-canonical callers.
+    pathString = new Path(pathString).toString();
     if (repoDeferredStreamActive(repo)) {
         // A gate covers this path, or the ordered queue already holds earlier
         // wire operations: defer. The drain applies it after everything queued
@@ -16433,6 +16440,8 @@ function repoPersistAfterServerUpdate(repo, path, preciseChange) {
 function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
     // For testing.
     repo.dataUpdateCount++;
+    // Wire-form path — canonicalize at the boundary (see repoOnDataUpdate).
+    pathString = new Path(pathString).toString();
     if (repoDeferredStreamActive(repo)) {
         repo.ingestQueue_.ops.push({
             kind: 'rm',
