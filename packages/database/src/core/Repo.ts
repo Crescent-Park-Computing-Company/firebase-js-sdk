@@ -215,18 +215,23 @@ type DeferredWireOp =
       data: unknown;
       isMerge: boolean;
       tag: number | null;
+      /** The queue generation this account-bound op was received under. */
+      generation: number;
     }
   | {
       kind: 'rm';
       pathString: string;
       ranges: Array<{ s?: string; e?: string; m: unknown }>;
       tag: number | null;
+      generation: number;
     }
   | {
       kind: 'complete';
       apply: () => void;
+      generation: number;
     }
   | {
+      /** Repo-global (no generation): fires regardless of account changes. */
       kind: 'disconnect';
       tree: SparseSnapshotTree;
     };
@@ -639,7 +644,8 @@ function repoOnDataUpdate(
       pathString,
       data,
       isMerge,
-      tag
+      tag,
+      generation: repo.ingestQueue_.generation
     });
     // No gate may be holding the stream (queue-only deferral): make sure
     // the driver is running so the op cannot strand.
@@ -874,6 +880,14 @@ function repoDrainIngestQueue(repo: Repo): void {
           return;
         }
         const op = queue.ops.shift()!;
+        // Account-bound operations (data / range merge / listen complete)
+        // from a SUPERSEDED generation are dropped, not applied: they were
+        // received under a previous auth scope, and applying them now would
+        // surface — and write through under — the new account (CWE-200).
+        // Disconnect runs carry no generation: repo-global, always fire.
+        if (op.kind !== 'disconnect' && op.generation !== queue.generation) {
+          continue;
+        }
         try {
           if (op.kind === 'data') {
             if (
@@ -1074,7 +1088,8 @@ export function repoStartServerListen(
         if (repoShouldDeferWireOp(repo, pathString)) {
           repo.ingestQueue_.ops.push({
             kind: 'complete',
-            apply: () => processListenComplete(status, data, wire)
+            apply: () => processListenComplete(status, data, wire),
+            generation: repo.ingestQueue_.generation
           });
           if (repo.ingestQueue_.gates.size === 0) {
             repoDrainIngestQueue(repo);
@@ -1589,13 +1604,14 @@ export function repoCancelPendingSeedRestores(
   repo: Repo,
   reattach = true
 ): void {
-  // Supersede any in-flight sliced ingest continuation (account switch /
-  // persistence toggle / dispose): its decode observes the generation at
-  // the next yield and stands down, so a previous account's payload can
-  // never apply under the new scope. The QUEUE is untouched — deferred ops
-  // drain normally (a cancelled listen's ops no-op against SyncTree; a
-  // disconnect run is repo-global and must still fire). Gates lift via the
-  // reattach path below / the ingest's own finally.
+  // Supersede any in-flight sliced ingest continuation AND every queued
+  // account-bound operation (account switch / persistence toggle /
+  // dispose): the decode observes the generation at its next yield and
+  // stands down, and the drain drops queued data/range/complete ops whose
+  // stamped generation is stale — bytes received under the previous scope
+  // must neither surface nor write through under the new one. Disconnect
+  // runs are repo-global (no generation) and still fire. Gates lift via
+  // the reattach path below / the ingest's own finally.
   repo.ingestQueue_.generation++;
   const pendings = [...repo.pendingSeedRestores_.values()];
   repo.pendingSeedRestores_.clear();
@@ -1706,7 +1722,13 @@ function repoOnRangeMergeUpdate(
   // For testing.
   repo.dataUpdateCount++;
   if (repoShouldDeferWireOp(repo, pathString)) {
-    repo.ingestQueue_.ops.push({ kind: 'rm', pathString, ranges, tag });
+    repo.ingestQueue_.ops.push({
+      kind: 'rm',
+      pathString,
+      ranges,
+      tag,
+      generation: repo.ingestQueue_.generation
+    });
     if (repo.ingestQueue_.gates.size === 0) {
       repoDrainIngestQueue(repo);
     }
@@ -1860,7 +1882,12 @@ export function repoGetValue(
       // Resolve the caller with the fresh value but skip the SyncTree side
       // effect; the base + buffered deltas populate the tree consistently,
       // and the listen's certification corrects any residue.
-      if (repoShouldDeferWireOp(repo, query._path.toString())) {
+      // Path-specific on purpose: a get() is request-response, not part of
+      // the deferred wire stream — only a gate COVERING THIS PATH (whose
+      // pending base/full push would clobber the fresh value moments later)
+      // suppresses the SyncTree side effect. A non-empty queue for other
+      // roots must not skip an unrelated get's normal event delivery.
+      if (repoIngestGateFor(repo, query._path.toString()) !== null) {
         return node;
       }
       /**

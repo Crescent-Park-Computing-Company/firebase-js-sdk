@@ -2975,6 +2975,69 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expectIngestIdle(repo);
   });
 
+  it('a get() on an UNGATED root keeps its SyncTree side effect while the queue is non-empty', async () => {
+    const { repo, query, hashFn, onComplete, calls, getResponders, data } =
+      makeListenHarness();
+    void data;
+    await persistHarnessRoot(repo, new Path('users/alice'), { a: 1 });
+    // Hold alice's restore open so her gate stays installed with a queued op.
+    const manager = repo.persistence_!;
+    const realRestore = manager.restoreForListen.bind(manager);
+    let releaseRecord: () => void = () => {};
+    const recordGate = new Promise<void>(resolve => {
+      releaseRecord = resolve;
+    });
+    manager.restoreForListen = (pathString, onManifest) =>
+      realRestore(pathString, onManifest).then(async result => {
+        await recordGate;
+        return result;
+      });
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    // A push for alice lands mid-window → the queue is non-empty.
+    repoOnDataUpdateForTest(
+      repo,
+      new Path('users/alice/b').toString(),
+      7,
+      false,
+      null
+    );
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
+
+    // A get() for a completely UNRELATED, ungated root: its normal SyncTree
+    // side effect must NOT be suppressed by alice's queued op (the guard is
+    // path-specific — only a COVERING gate suppresses).
+    const bobPath = new Path('users/bob');
+    const bobValues: unknown[] = [];
+    const bobQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      bobPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      bobQuery,
+      recordingRegistration(bobValues)
+    );
+    const getPromise = repoGetValue(
+      repo,
+      bobQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    getResponders[0]({ profile: 'bob' });
+    const got = await getPromise;
+    expect(got.val()).to.deep.equal({ profile: 'bob' });
+    // The side effect ran: bob's listener saw the fresh value.
+    expect(bobValues).to.deep.equal([{ profile: 'bob' }]);
+
+    releaseRecord();
+    await flushAsync();
+    expectIngestIdle(repo);
+  });
+
   it('without a manifest callback the listen waits for the restore', async () => {
     // A restore that resolves without ever surfacing a manifest (stub
     // managers, legacy paths) keeps the pre-manifest-first sequencing:

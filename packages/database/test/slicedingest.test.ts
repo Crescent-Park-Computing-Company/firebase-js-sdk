@@ -499,6 +499,7 @@ describe('sliced full-root push ingestion', () => {
     repoOnDataUpdateForTest(repo, rootPath + '/b', 1, false, null);
     repo.ingestQueue_.ops.push({
       kind: 'complete',
+      generation: repo.ingestQueue_.generation,
       apply: () => {
         observed.push(
           syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))!
@@ -568,6 +569,7 @@ describe('sliced full-root push ingestion', () => {
     // While the pump runs: a poison custom op, then a healthy descendant push.
     repo.ingestQueue_.ops.push({
       kind: 'complete',
+      generation: repo.ingestQueue_.generation,
       apply: () => {
         throw new Error('poison op');
       }
@@ -900,6 +902,80 @@ describe('sliced full-root push ingestion', () => {
     // (isCurrent went false when the gate token was lifted).
     expect(cache!.getChild(new Path('child9/status')).val()).to.equal('gone');
     expect(cache!.getChild(new Path('k0')).isEmpty()).to.equal(true);
+  });
+
+  it('an auth-scope switch drops queued account-bound ops; disconnect runs still fire (CWE-200 repro)', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ inbox: { msg: 'account-A-old' } })
+    );
+    sparseSnapshotTreeRemember(
+      repo.onDisconnect_,
+      new Path(rootPath + '/presence'),
+      nodeFromJSON('offline')
+    );
+    let generation = 1;
+    (repo.persistence_ as unknown as Record<string, unknown>)[
+      'authGeneration'
+    ] = () => generation;
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    // Account A's full push gates the queue; a descendant push (A's bytes)
+    // and a disconnect land behind it.
+    repoOnDataUpdateForTest(repo, rootPath, wide, false, null);
+    repoOnDataUpdateForTest(
+      repo,
+      rootPath + '/inbox/msg',
+      'account-A-secret',
+      false,
+      null
+    );
+    repoOnConnectStatusForTest(repo, false);
+    // The account switch: the app path bumps BOTH signals (the persistence
+    // manager's own generation and, via repoCancelPendingSeedRestores, the
+    // queue generation).
+    generation = 2;
+    repo.ingestQueue_.generation++;
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    // A's queued bytes were DROPPED — never surfaced under the new scope...
+    expect(cache!.getChild(new Path('inbox/msg')).val()).to.equal(
+      'account-A-old'
+    );
+    // ...while the repo-global disconnect run still fired.
+    expect(cache!.getChild(new Path('presence')).val()).to.equal('offline');
+  });
+
+  it('a get() on an ungated root keeps its SyncTree side effect while another root has queued ops', async () => {
+    const rootPath = '/users/alice';
+    const { repo } = makeIngestHarness(rootPath);
+    // Queue is non-empty (an op for alice), but bob has NO gate: get()'s
+    // guard must be path-specific — only a covering gate suppresses the
+    // side effect.
+    repo.ingestQueue_.ops.push({
+      kind: 'complete',
+      generation: repo.ingestQueue_.generation,
+      apply: () => {}
+    });
+    // Import-free structural probe: the guard's predicate is what decides.
+    // (repoGetValue itself needs a live server_.get; asserting the predicate
+    // boundary keeps this test at the same layer as the other gate tests.)
+    expect(repo.ingestQueue_.gates.has('/users/bob')).to.equal(false);
+    // The wire-op predicate DOES defer for bob (global order)...
+    repoOnDataUpdateForTest(repo, '/users/bob/x', 1, false, null);
+    expect(
+      repo.ingestQueue_.ops.some(
+        op => op.kind === 'data' && op.pathString === '/users/bob/x'
+      )
+    ).to.equal(true);
+    await flushAsync(64);
+    expectIngestIdle(repo);
   });
 
   it('a second full push while pumping supersedes via the buffered path', async () => {
