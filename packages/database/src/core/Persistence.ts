@@ -20,11 +20,11 @@ import { base64, isIndexedDBAvailable } from '@firebase/util';
 import {
   CompoundHashBuilder,
   StableRange,
+  StableRangeRebuilder,
   collectChangedSubtreePaths,
-  estimateSerializedNodeSize,
   fixedSizeSplitStrategy,
   markDirtyRanges,
-  rebuildStableRanges,
+  treesShareAnyChildIdentity,
   walkLeafInterval
 } from './CompoundHash';
 import { SeedCompoundHash, stampSeedHashes } from './ServerCacheSeed';
@@ -34,6 +34,7 @@ import { Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { Path } from './util/Path';
 import { sha1 } from './util/util';
+import { yieldMacrotask } from './util/yieldMacrotask';
 
 /**
  * Client-side persistence of the server cache, in the spirit of the mobile
@@ -149,6 +150,43 @@ const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
  * @internal
  */
 export const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
+
+/**
+ * Write window for a root with NO flush baseline (first generation after a
+ * cold or fallback boot, or after an invalidation). The ordinary window
+ * coalesces steady-state churn; a fresh boot has none to coalesce — the
+ * complete tree just arrived — and the first stored generation is the only
+ * exit from the cold-reload loop (no cache → next boot re-downloads the
+ * root). Short-session mobile boots regularly died before the ordinary
+ * window even fired, so the first generation starts sooner; the sliced
+ * planner and byte-budgeted staging keep it off the critical path. Tests
+ * that shrink writeDelayMs below this keep their configured cadence
+ * (the effective delay is min of the two).
+ * @internal
+ */
+export const PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS = 3000;
+
+/**
+ * Main-thread budget for one slice of flush planning (the stable-range
+ * rewalk). Sized to fit inside a frame budget on mobile hardware.
+ * @internal
+ */
+export const FLUSH_PLAN_SLICE_MS = 12;
+
+/**
+ * Canonical-text bytes staged per task before yielding. Two default-target
+ * ranges (~256 KiB each) per slice keeps serialization work bounded while
+ * the unclamped macrotask yield (yieldMacrotask) lets paint/input interleave.
+ * @internal
+ */
+export const FLUSH_STAGE_BATCH_BYTES = 512 * 1024;
+
+/** Thrown out of a sliced flush when the manager was disposed mid-yield. */
+class FlushObsoleteError extends Error {
+  constructor() {
+    super('flush obsolete');
+  }
+}
 
 /**
  * Constant canonical-text target for one persisted/hash range. Boundaries are
@@ -2439,15 +2477,27 @@ export class PersistenceManager {
     }
   }
 
-  /** Arms the non-restarting single-flight write window for a root. */
+  /**
+   * Arms the non-restarting single-flight write window for a root. Two
+   * regimes: a root with a flush baseline coalesces under the ordinary
+   * window; a root with none (first generation — see
+   * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
+   * the two delays so the cache exists before short mobile sessions end.
+   */
   private armWriteWindow_(pathString: string): void {
     if (!this.writeTimers_.has(pathString)) {
+      const delay = this.lastFlush_.has(pathString)
+        ? this.writeDelayMs_
+        : Math.min(
+            this.writeDelayMs_,
+            PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS
+          );
       this.writeTimers_.set(
         pathString,
         setTimeout(() => {
           this.writeTimers_.delete(pathString);
           this.scheduleFlush_(pathString);
-        }, this.writeDelayMs_)
+        }, delay)
       );
     }
   }
@@ -2978,10 +3028,26 @@ export class PersistenceManager {
     // snapshots into one stored tree. Stage a fresh full generation; its
     // revision still CASes against the adopted manifest.
     if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
-      changed =
-        accumulated !== null && accumulated !== undefined
-          ? accumulated
-          : collectChangedSubtreePaths(prev.rootNode, node);
+      // The identity diff only pays off when the trees can share structure.
+      // A live tree that shares NO top-level child identity with the
+      // baseline (a full server reload replaced the root after a fallback
+      // boot — exactly the boots whose accumulator is imprecise/null, set by
+      // restoreForListen) makes the diff a complete double-tree walk whose
+      // conclusion is "everything changed" (path-budget collapse to the
+      // root). Detect the divorced case with one O(children) merge and go
+      // straight to the fresh-full-generation arm (changed null) — the same
+      // ranges the collapsed diff would have produced, minus the walk.
+      const imprecise = accumulated === null || accumulated === undefined;
+      const divorced =
+        imprecise &&
+        !prev.rootNode.isLeafNode() &&
+        !node.isLeafNode() &&
+        !treesShareAnyChildIdentity(prev.rootNode, node);
+      changed = divorced
+        ? null
+        : !imprecise
+        ? accumulated
+        : collectChangedSubtreePaths(prev.rootNode, node);
       if (changed !== null) {
         previousRanges = prev.ranges;
         if (changed.length === 0) {
@@ -2996,14 +3062,17 @@ export class PersistenceManager {
 
     // First pass: boundaries/sizes only. It never creates canonical strings
     // or export payloads, so a first generation cannot retain another full
-    // copy of the root merely to decide its ranges.
+    // copy of the root merely to decide its ranges. Drained in bounded
+    // main-thread slices: a whole-root plan (first generation after a cold
+    // boot — every range dirty) is a full leaf walk, and running it
+    // synchronously was a multi-second stall exactly on the boots that must
+    // complete their first flush to escape the cold-reload loop.
     const planner = new CompoundHashBuilder(
       fixedSizeSplitStrategy(this.rangeTargetBytes_),
       true
     );
-    let rebuilt: StableRange[];
-    try {
-      rebuilt = rebuildStableRanges(
+    const planSliced = async (): Promise<StableRange[]> => {
+      const rebuilder = new StableRangeRebuilder(
         node,
         previousRanges,
         dirty,
@@ -3011,25 +3080,60 @@ export class PersistenceManager {
         planner,
         this.rangeTargetBytes_
       );
-    } catch (e) {
-      persistenceStats.storageFailures++;
-      recordPersistenceEvent(pathString, 'flush-plan-error');
-      // Protective cleanup of THIS manager's own possibly-implicated
-      // generation — housekeeping, so it follows the ownership rule (see
-      // deleteRecordIfRevision_ / the covered-untrack delete): only a
-      // revision this manager itself verified or wrote. An ADOPTED baseline
-      // (rootNode null) is another writer's generation — a local planning
-      // failure says nothing about it — and with no baseline at all there
-      // is nothing of ours to protect against. A lease lost to a steal
-      // while this flush was suspended is covered the same way: the
-      // revision-named delete cannot touch the new holder's generation.
-      const owned =
-        prev !== undefined && prev.rootNode !== null ? prev.revision : null;
-      this.lastFlush_.delete(pathString);
-      return owned !== null
-        ? this.deleteRecordIfRevision_(pathString, owned)
-        : Promise.resolve();
-    }
+      while (!rebuilder.drainUntil(Date.now() + FLUSH_PLAN_SLICE_MS)) {
+        await yieldMacrotask();
+        if (this.disposed_) {
+          throw new FlushObsoleteError();
+        }
+      }
+      return rebuilder.result();
+    };
+    return planSliced().then(
+      rebuilt => this.finishFlush_(pathString, entry, prev, accumulated, rebuilt),
+      e => {
+        if (e instanceof FlushObsoleteError) {
+          return;
+        }
+        persistenceStats.storageFailures++;
+        recordPersistenceEvent(pathString, 'flush-plan-error');
+        // Protective cleanup of THIS manager's own possibly-implicated
+        // generation — housekeeping, so it follows the ownership rule (see
+        // deleteRecordIfRevision_ / the covered-untrack delete): only a
+        // revision this manager itself verified or wrote. An ADOPTED baseline
+        // (rootNode null) is another writer's generation — a local planning
+        // failure says nothing about it — and with no baseline at all there
+        // is nothing of ours to protect against. A lease lost to a steal
+        // while this flush was suspended is covered the same way: the
+        // revision-named delete cannot touch the new holder's generation.
+        const owned =
+          prev !== undefined && prev.rootNode !== null ? prev.revision : null;
+        this.lastFlush_.delete(pathString);
+        return owned !== null
+          ? this.deleteRecordIfRevision_(pathString, owned)
+          : Promise.resolve();
+      }
+    );
+  }
+
+  /**
+   * Second half of a flush: stages the planned dirty ranges and commits the
+   * generation. Split from flush_ so the sliced planner can yield between
+   * slices without holding the whole body in one closure. `entry` is the
+   * latest_ record the flush entered with (its node/revision/authScope are
+   * the generation being written); `rebuilt` is the planned range list —
+   * clean ranges carried with their recordIds, dirty ranges with empty
+   * hashes to be serialized, digested, and staged here.
+   */
+  private finishFlush_(
+    pathString: string,
+    entry: { node: Node; revision: string; authScope: string | null },
+    prev: FlushedState | undefined,
+    accumulated: string[][] | null | undefined,
+    rebuilt: StableRange[]
+  ): Promise<void> {
+    const { node, revision, authScope } = entry;
+    const now = Date.now();
+    const key = this.key_(pathString);
 
     interface DirtyRangePlan {
       range: PersistedRange;
@@ -3126,20 +3230,39 @@ export class PersistenceManager {
       stagedIds.push(...records.map(record => record.recordId));
       // Async activation records can otherwise retain completed IDB request
       // inputs until the whole generation settles. Drop every large reference
-      // explicitly and yield a macrotask so WebKit can collect between batches.
+      // explicitly and yield a macrotask so WebKit can collect between
+      // batches (yieldMacrotask: MessageChannel, exempt from the nested
+      // setTimeout clamp that stretched many-batch generations by seconds).
       for (const record of records) {
         record.tree = undefined;
       }
       records.length = 0;
       texts.length = 0;
       digests.length = 0;
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      await yieldMacrotask();
+      if (this.disposed_) {
+        throw new FlushObsoleteError();
+      }
     };
 
     const stageAll = async (): Promise<void> => {
-      const batchSize = 4;
-      for (let i = 0; i < dirtyPlans.length; i += batchSize) {
-        await stageBatch(dirtyPlans.slice(i, i + batchSize));
+      // Batches are cut by planned canonical-text bytes, not range count:
+      // ranges vary from a few bytes to ~2x the split target, and a fixed
+      // count made slice cost swing with them. A single oversized range
+      // still ships alone (the batch admits the first plan unconditionally).
+      let batch: DirtyRangePlan[] = [];
+      let batchBytes = 0;
+      for (const plan of dirtyPlans) {
+        if (batch.length > 0 && batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
+          await stageBatch(batch);
+          batch = [];
+          batchBytes = 0;
+        }
+        batch.push(plan);
+        batchBytes += plan.range.size;
+      }
+      if (batch.length > 0) {
+        await stageBatch(batch);
       }
     };
 
@@ -3153,7 +3276,11 @@ export class PersistenceManager {
           revision,
           updatedAt: now,
           authScope,
-          estimatedBytes: estimateSerializedNodeSize(node),
+          // Sum of canonical-text range sizes — the same tree measure the
+          // sweep budgets against, already computed by the planner (the old
+          // estimateSerializedNodeSize call here was a second full-tree walk
+          // solely for this field).
+          estimatedBytes: ranges.reduce((sum, range) => sum + range.size, 0),
           hash: '',
           ranges
         };
@@ -3307,7 +3434,12 @@ export class PersistenceManager {
           }
         });
       })
-      .catch(() => {
+      .catch((e: unknown) => {
+        if (e instanceof FlushObsoleteError) {
+          // Disposed mid-stage: staged ids are reclaimed by the next
+          // successful GC/sweep; nothing to merge back — the manager is gone.
+          return;
+        }
         persistenceStats.storageFailures++;
         recordPersistenceEvent(pathString, 'flush-range-stage-error');
         // The flush consumed the accumulated changed-paths at its start, but

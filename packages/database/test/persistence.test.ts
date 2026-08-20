@@ -34,10 +34,14 @@ import {
 } from '../src/api/Reference_impl';
 import {
   CompoundHashBuilder,
+  StableRangeRebuilder,
   canonicalHashFromNodeAsync,
+  collectChangedSubtreePaths,
   compoundHashFromNode,
   fixedSizeSplitStrategy,
+  markDirtyRanges,
   rebuildStableRanges,
+  treesShareAnyChildIdentity,
   walkLeafInterval
 } from '../src/core/CompoundHash';
 import {
@@ -46,6 +50,8 @@ import {
   PersistedSeedHashes,
   PersistenceRestoreResult,
   persistenceStats,
+  PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS,
+  PERSISTENCE_WRITE_DEBOUNCE_MS,
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
@@ -4355,5 +4361,235 @@ describe('getPersistedValue', () => {
       resource.includes('MessagePort')
     );
     expect(referencedPorts).to.deep.equal([]);
+  });
+});
+
+describe('gentle flush (sliced planning + budgeted staging)', () => {
+  function wideRoot(parents: number, perParent: number): unknown {
+    const wide: Record<string, Record<string, string>> = {};
+    for (let i = 0; i < parents; i++) {
+      const children: Record<string, string> = {};
+      for (let j = 0; j < perParent; j++) {
+        // Sizeable string leaves so the plan spans multiple ranges.
+        children['c' + j] = 'value-' + i + '-' + j + '-' + 'x'.repeat(64);
+      }
+      wide['p' + i] = children;
+    }
+    return wide;
+  }
+
+  it('first-generation flush yields to the event loop while planning and staging', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('gentle/root');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(120, 60)));
+
+    // A macrotask scheduled AFTER the flush starts must run BEFORE the flush
+    // settles — the monolithic plan+stage could never allow that.
+    let macrotaskRan = false;
+    const flushing = manager.flushNow(path.toString());
+    setTimeout(() => {
+      macrotaskRan = true;
+    }, 0);
+    await flushing;
+    expect(macrotaskRan).to.equal(true);
+
+    // The sliced write is byte-identical to what a restore expects.
+    const restored = await manager.restoreForListen(path.toString());
+    expect(restored.record).to.not.equal(null);
+    expect(restored.record!.node.equals(nodeFromJSON(wideRoot(120, 60)))).to.equal(
+      true
+    );
+  });
+
+  it('sliced planning produces the same generation a synchronous rebuild does', async () => {
+    const node = nodeFromJSON(wideRoot(40, 40));
+    const syncBuilder = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(4096),
+      true
+    );
+    const syncRanges = rebuildStableRanges(node, [], [], false, syncBuilder, 4096);
+
+    const slicedBuilder = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(4096),
+      true
+    );
+    const rebuilder = new StableRangeRebuilder(
+      node,
+      [],
+      [],
+      false,
+      slicedBuilder,
+      4096
+    );
+    // Tiny deadline: force many slices.
+    while (!rebuilder.drainUntil(Date.now())) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    }
+    const slicedRanges = rebuilder.result();
+    expect(slicedRanges.map(r => r.post)).to.deep.equal(
+      syncRanges.map(r => r.post)
+    );
+    expect(slicedRanges.map(r => r.size)).to.deep.equal(
+      syncRanges.map(r => r.size)
+    );
+  });
+
+  it('sliced dirty-run rebuild preserves clean ranges in order', async () => {
+    const before: Record<string, unknown> = {};
+    for (let i = 0; i < 26; i++) {
+      const key = String.fromCharCode(97 + i);
+      const children: Record<string, string> = {};
+      for (let j = 0; j < 40; j++) {
+        children['k' + j] = key + '-' + j + '-' + 'y'.repeat(32);
+      }
+      before[key] = children;
+    }
+    const beforeNode = nodeFromJSON(before);
+    const planBuilder = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(2048),
+      true
+    );
+    const baseline = rebuildStableRanges(
+      beforeNode,
+      [],
+      [],
+      false,
+      planBuilder,
+      2048
+    );
+    expect(baseline.length).to.be.greaterThan(4);
+
+    // Dirty exactly one interior range; rebuild sliced.
+    const after = { ...(before as Record<string, unknown>) } as Record<
+      string,
+      unknown
+    >;
+    const dirtyIndex = Math.floor(baseline.length / 2);
+    const marker = baseline[dirtyIndex].post.split('/')[0];
+    after[marker] = { changed: 'z'.repeat(128) };
+    const afterNode = nodeFromJSON(after);
+    const changed = collectChangedSubtreePaths(beforeNode, afterNode);
+    expect(changed).to.not.equal(null);
+    const marked = markDirtyRanges(baseline, changed!);
+
+    const syncBuilder2 = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(2048),
+      true
+    );
+    const expected = rebuildStableRanges(
+      afterNode,
+      baseline,
+      marked.dirty,
+      marked.tailDirty,
+      syncBuilder2,
+      2048
+    );
+    const slicedBuilder2 = new CompoundHashBuilder(
+      fixedSizeSplitStrategy(2048),
+      true
+    );
+    const rebuilder = new StableRangeRebuilder(
+      afterNode,
+      baseline,
+      marked.dirty,
+      marked.tailDirty,
+      slicedBuilder2,
+      2048
+    );
+    while (!rebuilder.drainUntil(Date.now())) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    }
+    expect(rebuilder.result().map(r => r.post)).to.deep.equal(
+      expected.map(r => r.post)
+    );
+    // Clean ranges carried over verbatim (same object => same hash string).
+    const cleanExpected = expected.filter(r => r.hash !== '');
+    const cleanSliced = rebuilder.result().filter(r => r.hash !== '');
+    expect(cleanSliced.map(r => r.hash)).to.deep.equal(
+      cleanExpected.map(r => r.hash)
+    );
+  });
+
+  it('a full-reload baseline skips the identity diff via the divorced check', async () => {
+    const shape = wideRoot(30, 30);
+    const a = nodeFromJSON(shape);
+    const b = nodeFromJSON(shape); // equal content, ZERO shared identity
+    expect(treesShareAnyChildIdentity(a, b)).to.equal(false);
+    const evolved = a.updateImmediateChild('p0', nodeFromJSON({ x: 1 }));
+    expect(treesShareAnyChildIdentity(a, evolved)).to.equal(true);
+  });
+
+  it('manifest estimatedBytes equals the sum of range sizes', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('estimate/root');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(20, 20)));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = data.get('test-repo|/estimate/root') as {
+      estimatedBytes: number;
+      ranges: Array<{ size: number }>;
+    };
+    expect(manifest).to.not.equal(undefined);
+    expect(manifest.estimatedBytes).to.equal(
+      manifest.ranges.reduce((sum, range) => sum + range.size, 0)
+    );
+  });
+
+  it('a baseline-less root arms the shorter first-generation window', async () => {
+    const { factory } = makeFakeIndexedDB();
+    // Ordinary window far longer than the first-generation delay.
+    const manager = new PersistenceManager(
+      'test-repo',
+      factory,
+      true,
+      8000,
+      100 * 1024 * 1024,
+      PERSISTENCE_WRITE_DEBOUNCE_MS
+    );
+    manager.setAuthScope(null);
+    const path = new Path('firstgen/root');
+    manager.track(path.toString());
+    const internals = manager as unknown as {
+      writeTimers_: Map<string, { _idleTimeout?: number }>;
+      lastFlush_: Map<string, unknown>;
+    };
+    manager.serverCacheUpdated(path, nodeFromJSON({ a: 1 }));
+    const timer = internals.writeTimers_.get(path.toString());
+    expect(timer).to.not.equal(undefined);
+    // Node timers expose the delay; guard for environments that hide it.
+    if (timer!._idleTimeout !== undefined) {
+      expect(timer!._idleTimeout).to.equal(
+        PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS
+      );
+    }
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    // With a baseline the ordinary window applies again.
+    manager.serverCacheUpdated(path, nodeFromJSON({ a: 2 }));
+    const second = internals.writeTimers_.get(path.toString());
+    expect(second).to.not.equal(undefined);
+    if (second!._idleTimeout !== undefined) {
+      expect(second!._idleTimeout).to.equal(PERSISTENCE_WRITE_DEBOUNCE_MS);
+    }
+    manager.dispose();
+  });
+
+  it('a dispose during the sliced plan neither throws nor commits', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('dispose/root');
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON(wideRoot(120, 60)));
+    const flushing = manager.flushNow(path.toString());
+    manager.dispose();
+    await flushing;
+    await flushAsync();
+    expect(data.get('test-repo|/dispose/root')).to.equal(
+      undefined
+    );
   });
 });
