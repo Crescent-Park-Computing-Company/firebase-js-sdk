@@ -24,7 +24,7 @@ export { getPersistedValue, onListenOutcome, setPersistenceEnabled, setPersisten
 export { consumePersistedMaterialization } from './api/Reference_impl';
 export type { ListenOutcome, ListenOutcomeMode, ListenOutcomeReason } from './core/Repo';
 export { setSDKVersion as _setSDKVersion } from './core/version';
-export { PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/Persistence';
+export { ROW_PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/RowPersistence';
 export { SeedCompoundHash } from './core/ServerCacheSeed';
 export { ReferenceImpl as _ReferenceImpl, QueryImpl as _QueryImpl } from './api/Reference_impl';
 export { repoManagerDatabaseFromApp as _repoManagerDatabaseFromApp } from './api/Database';

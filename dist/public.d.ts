@@ -1059,6 +1059,7 @@ export declare function orderByPriority(): QueryConstraint;
  * {@link https://firebase.google.com/docs/database/web/lists-of-data#sort_data | Sort data}.
  */
 export declare function orderByValue(): QueryConstraint;
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 /**
  * Generates a new child location using a unique key and returns its
  * `Reference`.
@@ -1231,7 +1232,6 @@ export declare function refFromURL(db: Database, url: string): DatabaseReference
  * @returns Resolves when remove on server is complete.
  */
 export declare function remove(ref: DatabaseReference): Promise<void>;
-/* Excluded from this release type: _repoManagerDatabaseFromApp */
 /**
  * Atomically modifies the data at this location.
  *

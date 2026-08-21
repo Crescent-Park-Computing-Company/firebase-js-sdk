@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
-import { ListenHashFn, PendingListenHashes } from './ServerCacheSeed';
+import { ListenHashFn } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
 import { SyncPoint } from './SyncPoint';
@@ -28,8 +28,6 @@ export declare function syncTreeSetReferenceConstructor(val: ReferenceConstructo
 export interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event[]): Event[];
     stopListening(a: QueryContext, b: number | null): void;
-    /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
-    getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
 }
 export declare function resetSyncTreeTag(): void;
 /**
