@@ -365,13 +365,18 @@ describe('RowPersistenceManager property: generational round-trips', () => {
       }
 
       for (let gen = 0; gen < 5; gen++) {
-        const manager = makeManager(makeFakeIdb(shared), { splitThreshold: 96 });
+        const manager = makeManager(makeFakeIdb(shared), {
+          splitThreshold: 96
+        });
         manager.setAuthScope('u');
         manager.setPersistentPath('/r', true);
         manager.track('/r');
         // Reload: stored tree must equal the last flushed tree exactly.
         const restored = await manager.restoreForListen('/r');
-        expect(restored.node, `seed ${seedBase} gen ${gen} restore`).to.not.equal(null);
+        expect(
+          restored.node,
+          `seed ${seedBase} gen ${gen} restore`
+        ).to.not.equal(null);
         expect(
           restored.node!.equals(current),
           `seed ${seedBase} gen ${gen} tree equality`
@@ -433,12 +438,10 @@ describe('RowPersistenceManager sweep', () => {
 
     // An expired root (meta 40 days old) and an orphan row (no meta).
     const sep = '\u0001';
-    shared
-      .get('meta')!
-      .set('bob' + sep + '/old' + sep, {
-        updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
-        formatVersion: 1
-      });
+    shared.get('meta')!.set('bob' + sep + '/old' + sep, {
+      updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
+      formatVersion: 1
+    });
     shared.get('rows')!.set('bob' + sep + '/old' + sep, '{"stale":1}');
     shared.get('rows')!.set('carol' + sep + '/orphan' + sep, '{"torn":1}');
 
@@ -477,10 +480,7 @@ describe('RowPersistenceManager sweep', () => {
 describe('RowPersistenceManager writer lease (Web Locks)', () => {
   /** A fake Web Locks manager: exclusive queued grants per name. */
   function makeFakeLocks() {
-    const queues = new Map<
-      string,
-      Array<{ grant: () => void }>
-    >();
+    const queues = new Map<string, Array<{ grant: () => void }>>();
     const held = new Set<string>();
     const tryGrantNext = (name: string): void => {
       if (held.has(name)) {

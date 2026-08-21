@@ -1553,14 +1553,22 @@ export function repoActivatePersistenceForJoinedListen(
   if (
     persistence === null ||
     !persistence.isPersistentPath(pathString) ||
-    persistence.trackedRootFor(pathString) === pathString ||
     repo.pendingSeedRestores_?.has(pathString)
   ) {
-    // No manager, not selected, already tracked by its own start path, or the
-    // start path is still in flight (it will track on resolution).
+    // No manager, not selected, or the start path is still in flight (it
+    // will track on resolution).
     return;
   }
+  // track() is idempotent AND cancels a pending untrack teardown — a
+  // persistent registration that rejoins while the previous one's async
+  // drain is still running must revive the root, exactly like the direct
+  // re-track path. Never gate this call on "already tracked": an entry
+  // mid-teardown looks tracked but is about to be deleted.
+  const alreadyTracked = persistence.trackedRootFor(pathString) === pathString;
   persistence.track(pathString);
+  if (alreadyTracked) {
+    return;
+  }
   const serverCache = syncTreeGetCompleteServerCache(
     repo.serverSyncTree_,
     path

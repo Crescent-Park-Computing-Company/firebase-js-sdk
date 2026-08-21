@@ -1,10 +1,11 @@
-import { RowPersistenceManager } from '../src/core/RowPersistence';
 import { createRowHashKernel } from '../src/core/RowHashKernel';
+import { RowPersistenceManager } from '../src/core/RowPersistence';
 import { splitNodeIntoRows } from '../src/core/RowStore';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
-import { sha1 } from '../src/core/util/util';
 import { Path } from '../src/core/util/Path';
-import { makeFakeIdb, flushMicrotasks, wait } from './helpers/fakeIdb';
+import { sha1 } from '../src/core/util/util';
+
+import { flushMicrotasks, makeFakeIdb } from './helpers/fakeIdb';
 
 describe('perf smoke (node, fake IDB)', function () {
   this.timeout(120000);
@@ -35,12 +36,23 @@ describe('perf smoke (node, fake IDB)', function () {
     const tSplit = Date.now() - t1;
     // eslint-disable-next-line no-console
     console.log(
-      `      tree=${(totalBytes / 1e6).toFixed(1)}MB rows=${rows.length} build=${tBuild}ms split=${tSplit}ms`
+      `      tree=${(totalBytes / 1e6).toFixed(1)}MB rows=${
+        rows.length
+      } build=${tBuild}ms split=${tSplit}ms`
     );
 
     const shared = new Map<string, Map<string, unknown>>();
     const manager = new RowPersistenceManager(
-      'perf', makeFakeIdb(shared), null, 1, 1, 16 * 1024, 30000, 300000, 60000, 4 << 20
+      'perf',
+      makeFakeIdb(shared),
+      null,
+      1,
+      1,
+      16 * 1024,
+      30000,
+      300000,
+      60000,
+      4 << 20
     );
     manager.setAuthScope('u');
     manager.setPersistentPath('/ws', true);
@@ -66,7 +78,16 @@ describe('perf smoke (node, fake IDB)', function () {
 
     // Restore.
     const reader = new RowPersistenceManager(
-      'perf', makeFakeIdb(shared), null, 1, 1, 16 * 1024, 30000, 300000, 60000, 4 << 20
+      'perf',
+      makeFakeIdb(shared),
+      null,
+      1,
+      1,
+      16 * 1024,
+      30000,
+      300000,
+      60000,
+      4 << 20
     );
     reader.setAuthScope('u');
     reader.setPersistentPath('/ws', true);
@@ -87,7 +108,9 @@ describe('perf smoke (node, fake IDB)', function () {
     );
     // eslint-disable-next-line no-console
     console.log(
-      `      restored equals: ${restored.node !== null && restored.node.equals(node2)}`
+      `      restored equals: ${
+        restored.node !== null && restored.node.equals(node2)
+      }`
     );
     manager.dispose();
     reader.dispose();

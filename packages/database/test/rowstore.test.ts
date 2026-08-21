@@ -21,10 +21,7 @@ import {
   compoundHashFromNode,
   fixedSizeSplitStrategy
 } from '../src/core/CompoundHash';
-import {
-  createRowHashKernel,
-  KernelRow
-} from '../src/core/RowHashKernel';
+import { createRowHashKernel, KernelRow } from '../src/core/RowHashKernel';
 import {
   assembleRows,
   splitNodeIntoRows,
@@ -154,11 +151,7 @@ describe('RowHashKernel parity', () => {
 
   it('interior priority interleaved at its sort position', async () => {
     // String keys: '.priority' sorts before them -> emitted first.
-    await expectParity(
-      { '.priority': 1, alpha: 'a', beta: 'b' },
-      1024,
-      1024
-    );
+    await expectParity({ '.priority': 1, alpha: 'a', beta: 'b' }, 1024, 1024);
     // Mixed: integer keys sort before '.priority', strings after.
     await expectParity(
       { '.priority': 'p', '0': 'zero', '1': 'one', zebra: 'z' },
@@ -245,7 +238,8 @@ describe('RowHashKernel parity', () => {
     };
     for (let trial = 0; trial < 40; trial++) {
       const tree = randTree(4);
-      const rowThreshold = trial % 3 === 0 ? 128 : trial % 3 === 1 ? 512 : 1 << 30;
+      const rowThreshold =
+        trial % 3 === 0 ? 128 : trial % 3 === 1 ? 512 : 1 << 30;
       const hashThreshold = trial % 2 === 0 ? 512 : 2048;
       await expectParity(tree, rowThreshold, hashThreshold);
     }
@@ -287,13 +281,13 @@ describe('RowHashKernel parity', () => {
 describe('RowStore', () => {
   it('row keys round-trip and range-scan safely', () => {
     const key = encodeRowKey('user1', '/users/alice', ['a', 'b']);
-    expect(decodeRowKeyRelativePath(key, 'user1', '/users/alice')).to.deep.equal(
-      ['a', 'b']
-    );
+    expect(
+      decodeRowKeyRelativePath(key, 'user1', '/users/alice')
+    ).to.deep.equal(['a', 'b']);
     const root = encodeRowKey('user1', '/users/alice', []);
-    expect(decodeRowKeyRelativePath(root, 'user1', '/users/alice')).to.deep.equal(
-      []
-    );
+    expect(
+      decodeRowKeyRelativePath(root, 'user1', '/users/alice')
+    ).to.deep.equal([]);
   });
 
   it('splitNodeIntoRows produces disjoint rows that reassemble exactly', () => {
@@ -330,7 +324,13 @@ describe('RowStore', () => {
     expect(index.rowBoundaryFor(['b', 'c', 'z'])).to.deep.equal(['b', 'c']);
     expect(index.rowBoundaryFor(['b'])).to.deep.equal(null);
     expect(index.rowBoundaryFor(['nowhere'])).to.deep.equal(null);
-    index.replaceSubtree(['b'], [['b', 'q'], ['b', 'r']]);
+    index.replaceSubtree(
+      ['b'],
+      [
+        ['b', 'q'],
+        ['b', 'r']
+      ]
+    );
     expect(index.rowBoundaryFor(['b', 'q', 'deep'])).to.deep.equal(['b', 'q']);
     expect(index.rowBoundaryFor(['b', 'c'])).to.deep.equal(null);
     expect(index.rowCount()).to.equal(4);
@@ -338,10 +338,20 @@ describe('RowStore', () => {
 
   it('sortRelativePathsByName orders integer keys numerically', () => {
     const sorted = sortRelativePathsByName([
-      ['10'], ['9'], ['2'], ['abc'], ['2', 'child'], []
+      ['10'],
+      ['9'],
+      ['2'],
+      ['abc'],
+      ['2', 'child'],
+      []
     ]);
     expect(sorted).to.deep.equal([
-      [], ['2'], ['2', 'child'], ['9'], ['10'], ['abc']
+      [],
+      ['2'],
+      ['2', 'child'],
+      ['9'],
+      ['10'],
+      ['abc']
     ]);
   });
 });

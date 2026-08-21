@@ -38,11 +38,7 @@
  * change invalidates everything immediately.
  */
 
-
-import {
-  hashRowsInWorker,
-  workerHashAvailable
-} from './HashWorker';
+import { hashRowsInWorker, workerHashAvailable } from './HashWorker';
 import { createRowHashKernel, KernelCompoundHash } from './RowHashKernel';
 import {
   ROW_KEY_SEPARATOR,
@@ -56,7 +52,7 @@ import {
 } from './RowStore';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
-import { warn , sha1 } from './util/util';
+import { warn, sha1 } from './util/util';
 import { yieldMacrotask } from './util/yieldMacrotask';
 
 const DB_NAME = 'firebase-database-persistence';
@@ -284,7 +280,10 @@ export class RowPersistenceManager {
    */
   trackedRootFor(pathString: string): string | null {
     for (const root of this.tracked_.keys()) {
-      if (pathString === root || pathString.startsWith(root === '/' ? '/' : root + '/')) {
+      if (
+        pathString === root ||
+        pathString.startsWith(root === '/' ? '/' : root + '/')
+      ) {
         return root;
       }
     }
@@ -422,7 +421,12 @@ export class RowPersistenceManager {
       return;
     }
     const name =
-      'firebase-db-rows|' + this.prefix_ + '|' + this.scopeKey_() + '|' + pathString;
+      'firebase-db-rows|' +
+      this.prefix_ +
+      '|' +
+      this.scopeKey_() +
+      '|' +
+      pathString;
     const generation = this.authGeneration_;
     try {
       await this.webLocks_.request(name, { mode: 'exclusive' }, () => {
@@ -714,7 +718,9 @@ export class RowPersistenceManager {
         return { node: null };
       }
       if (result === null) {
-        return timedOut ? { node: null, reason: 'timeout' as const } : { node: null };
+        return timedOut
+          ? { node: null, reason: 'timeout' as const }
+          : { node: null };
       }
       const root = this.tracked_.get(pathString);
       if (root !== null && root !== undefined) {
@@ -1025,7 +1031,11 @@ export class RowPersistenceManager {
     }
     const gen = newMetaGen();
     metaStore.put(
-      { updatedAt: Date.now(), formatVersion: META_FORMAT_VERSION, gen } as RootMeta,
+      {
+        updatedAt: Date.now(),
+        formatVersion: META_FORMAT_VERSION,
+        gen
+      } as RootMeta,
       metaKey
     );
     await this.txnDone_(txn);
@@ -1079,11 +1089,18 @@ export class RowPersistenceManager {
       const segs = chosen[i];
       store.delete(rowKeyRange(scope, rootKey, segs));
       const subtree = node.getChild(new Path(segs.join('/')));
-      const newRows = splitNodeIntoRows(segs, subtree, this.splitThresholdBytes_);
+      const newRows = splitNodeIntoRows(
+        segs,
+        subtree,
+        this.splitThresholdBytes_
+      );
       for (let j = 0; j < newRows.length; j++) {
         store.put(newRows[j][1], encodeRowKey(scope, rootKey, newRows[j][0]));
       }
-      rowIndex.replaceSubtree(segs, newRows.map(r => r[0]));
+      rowIndex.replaceSubtree(
+        segs,
+        newRows.map(r => r[0])
+      );
     }
     const gen = newMetaGen();
     const meta: RootMeta = {
@@ -1182,7 +1199,8 @@ export class RowPersistenceManager {
   invalidate(path: Path): void {
     const rootString = this.trackedRootFor(path.toString());
     void this.deleteRoot_(rootString ?? path.toString());
-    const root = rootString !== null ? this.tracked_.get(rootString) : undefined;
+    const root =
+      rootString !== null ? this.tracked_.get(rootString) : undefined;
     if (root !== undefined) {
       root.rowIndex = null;
       root.hasGeneration = false;

@@ -182,7 +182,8 @@ export function createRowHashKernel(
       const priority = wrapped['.priority'];
       let text = '';
       if (priority !== undefined) {
-        text += 'priority:' + leafHashValueText(priority as string | number) + ':';
+        text +=
+          'priority:' + leafHashValueText(priority as string | number) + ':';
       }
       return (
         text + leafHashValueText(wrapped['.value'] as string | number | boolean)

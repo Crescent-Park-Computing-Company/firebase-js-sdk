@@ -75,7 +75,11 @@ export function encodeRowKey(
   rootString: string,
   relativePath: string[]
 ): string {
-  let key = encodeURIComponent(scope) + ROW_KEY_SEPARATOR + encodeURIComponent(rootString) + ROW_KEY_SEPARATOR;
+  let key =
+    encodeURIComponent(scope) +
+    ROW_KEY_SEPARATOR +
+    encodeURIComponent(rootString) +
+    ROW_KEY_SEPARATOR;
   for (let i = 0; i < relativePath.length; i++) {
     key += encodeURIComponent(relativePath[i]) + ROW_KEY_SEPARATOR;
   }
@@ -88,7 +92,11 @@ export function decodeRowKeyRelativePath(
   scope: string,
   rootString: string
 ): string[] {
-  const prefix = encodeURIComponent(scope) + ROW_KEY_SEPARATOR + encodeURIComponent(rootString) + ROW_KEY_SEPARATOR;
+  const prefix =
+    encodeURIComponent(scope) +
+    ROW_KEY_SEPARATOR +
+    encodeURIComponent(rootString) +
+    ROW_KEY_SEPARATOR;
   assert(key.startsWith(prefix), 'row key does not match scope/root prefix');
   const rest = key.slice(prefix.length);
   if (rest === '') {
@@ -151,10 +159,7 @@ function splitInto_(
   if (node.isEmpty()) {
     return;
   }
-  if (
-    !node.isLeafNode() &&
-    estimateSerializedNodeSize(node) > splitThreshold
-  ) {
+  if (!node.isLeafNode() && estimateSerializedNodeSize(node) > splitThreshold) {
     node.forEachChild(PRIORITY_INDEX, (key: string, child: Node) => {
       splitInto_(relativePath.concat(key), child, splitThreshold, out);
     });

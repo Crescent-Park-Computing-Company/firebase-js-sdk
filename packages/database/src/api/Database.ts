@@ -669,7 +669,9 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   const repo = db._repoInternal;
   if (enabled) {
     if (repo.persistence_ === null) {
-      repo.persistence_ = new RowPersistenceManager(repo.repoInfo_.toURLString());
+      repo.persistence_ = new RowPersistenceManager(
+        repo.repoInfo_.toURLString()
+      );
       // Auth may be configured before persistence is enabled; preserve the
       // explicit undefined-vs-null distinction.
       if (repo.persistenceAuthScope_ !== undefined) {

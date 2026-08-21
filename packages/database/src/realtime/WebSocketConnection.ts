@@ -66,9 +66,11 @@ export function setWebSocketImpl(impl) {
  */
 export class WebSocketConnection implements Transport {
   keepaliveTimer: number | null = null;
-  /** Timestamp (ms) of the last websocket activity; the keepalive tick
+  /**
+   * Timestamp (ms) of the last websocket activity; the keepalive tick
    * compares against this instead of the timer being torn down and
-   * recreated on every frame. */
+   * recreated on every frame.
+   */
   private lastActivity_ = 0;
   frames: string[] | null = null;
   totalFrames = 0;

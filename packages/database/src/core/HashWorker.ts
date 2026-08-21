@@ -148,8 +148,7 @@ function workerMain(): void {
           }
           kernel.hashRows(rows).then(
             result => (self as unknown as Worker).postMessage(result),
-            err =>
-              fail(err instanceof Error ? err.message : 'kernel-failure')
+            err => fail(err instanceof Error ? err.message : 'kernel-failure')
           );
         };
         metaReq.onerror = () => {
@@ -240,9 +239,7 @@ export function hashRowsInWorker(
       complete();
     };
     worker.onmessage = event => {
-      const data = event.data as
-        | KernelCompoundHash
-        | { error: string };
+      const data = event.data as KernelCompoundHash | { error: string };
       if ((data as { error: string }).error !== undefined) {
         finish(() => reject(new Error((data as { error: string }).error)));
       } else {

@@ -210,7 +210,11 @@ async function persistRoot(
 
 /** Waits until `calls` contains `expected` occurrences of 'listen'. */
 async function waitForListen(calls: string[], expected = 1): Promise<void> {
-  for (let i = 0; i < 200 && calls.filter(c => c === 'listen').length < expected; i++) {
+  for (
+    let i = 0;
+    i < 200 && calls.filter(c => c === 'listen').length < expected;
+    i++
+  ) {
     await wait(5);
   }
   expect(calls.filter(c => c === 'listen').length).to.be.at.least(expected);
@@ -573,6 +577,43 @@ describe('getPersistedValue → listener handoff (v2, public API path)', () => {
     // The authenticated listener's restore consumes the SAME decode.
     const restored = await manager.restoreForListen('/users/alice');
     expect(restored.node).to.equal(peeked!.node);
+    manager.dispose();
+  });
+});
+
+describe('joined persistent rejoin during untrack drain', () => {
+  it('a persistent re-subscribe that joins a live plain listener revives the root', async () => {
+    const { manager, path, query } = (function makeQueryHarness() {
+      const m = makeManager(makeFakeIdb());
+      const syncTree = new SyncTree({
+        startListening: () => [],
+        stopListening: () => {}
+      });
+      const repo = {
+        persistence_: m,
+        serverSyncTree_: syncTree,
+        infoSyncTree_: syncTree,
+        eventQueue_: new EventQueue(),
+        pendingSeedRestores_: new Map()
+      } as unknown as Repo;
+      const p = new Path('selected/root');
+      const q = new QueryImpl(repo, p, new QueryParams(), false);
+      return { manager: m, path: p, query: q };
+    })();
+    // A plain listener keeps the view alive the whole time.
+    onValue(query, () => {});
+    // First persistent registration joins the live listen.
+    const unsub = onValue(query, () => {}, { persistent: true });
+    expect(manager.trackedPaths()).to.deep.equal([path.toString()]);
+    // Remove + re-add in one stack: the release untracks (async drain),
+    // the rejoin takes the joined-listen activation path — which must
+    // cancel the pending teardown, not assume "already tracked".
+    unsub();
+    onValue(query, () => {}, { persistent: true });
+    await flushMicrotasks();
+    await wait(10);
+    await flushMicrotasks();
+    expect(manager.trackedPaths()).to.deep.equal([path.toString()]);
     manager.dispose();
   });
 });

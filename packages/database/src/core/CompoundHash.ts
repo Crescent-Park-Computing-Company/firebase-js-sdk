@@ -18,10 +18,7 @@
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
 import { LeafNode } from './snap/LeafNode';
 import { Node } from './snap/Node';
-import {
-  hashQuotedString,
-  leafHashValueText
-} from './snap/snap';
+import { hashQuotedString, leafHashValueText } from './snap/snap';
 import { nameCompare, sha1 } from './util/util';
 
 /**
@@ -241,7 +238,8 @@ export class CompoundHashBuilder {
   private needsComma_ = true;
 
   private readonly splitState_: CompoundHashSplitState = {
-    hashLength: () => (this.currentHash_ === null ? 0 : this.currentHash_.length),
+    hashLength: () =>
+      this.currentHash_ === null ? 0 : this.currentHash_.length,
     currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
   };
 
@@ -314,7 +312,6 @@ export class CompoundHashBuilder {
     this.needsComma_ = true;
   }
 }
-
 
 /**
  * The compound-hash representation of a leaf: the V2 grammar (strings and

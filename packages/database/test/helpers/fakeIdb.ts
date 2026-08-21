@@ -125,9 +125,7 @@ export function makeFakeIdb(
           return request();
         },
         getAllKeys: (range?: unknown) =>
-          request(
-            [...view(name).keys()].filter(k => inRange(k, range)).sort()
-          ),
+          request([...view(name).keys()].filter(k => inRange(k, range)).sort()),
         getAll: (range?: unknown) =>
           request(
             [...view(name).entries()]
