@@ -173,7 +173,8 @@ export class PersistentConnection extends ServerActions {
     private onRangeMergeUpdate_?: (
       path: string,
       ranges: Array<{ s?: string; e?: string; m: unknown }>,
-      tag: number | null
+      tag: number | null,
+      wireBytes?: number
     ) => void
   ) {
     super();
@@ -759,7 +760,8 @@ export class PersistentConnection extends ServerActions {
       this.onRangeMergeUpdate_?.(
         body[/*path*/ 'p'] as string,
         body[/*ranges*/ 'd'] as Array<{ s?: string; e?: string; m: unknown }>,
-        body['t'] as number | null
+        body['t'] as number | null,
+        bytes
       );
     } else if (action === 'c') {
       this.onListenRevoked_(

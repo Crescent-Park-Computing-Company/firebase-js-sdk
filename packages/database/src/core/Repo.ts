@@ -44,12 +44,17 @@ import {
   stampSeedHashes
 } from './ServerCacheSeed';
 import {
+  assembleChildrenNode,
+  chargeSlice,
   decodeFullRootSliced,
+  decodeNodeSliced,
   IngestCancelledError,
+  nodesEqualSliced,
   sliceableAsChildren
 } from './SlicedNodeDecode';
 import { ChildrenNode } from './snap/ChildrenNode';
-import { Node } from './snap/Node';
+import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
+import { NamedNode, Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
@@ -82,6 +87,7 @@ import {
   syncTreeCalcCompleteEventCache,
   syncTreeGetCompleteServerCache,
   syncTreeGetDescendantServerCacheStates,
+  syncTreeGetRangeMergeBase,
   syncTreeGetServerValue,
   syncTreeRemoveEventRegistration,
   syncTreeTagForQuery
@@ -238,6 +244,8 @@ type DeferredWireOp =
       pathString: string;
       ranges: Array<{ s?: string; e?: string; m: unknown }>;
       tag: number | null;
+      /** Wire bytes of the message that carried this merge (0 if unknown). */
+      wireBytes: number;
       generation: number;
     }
   | {
@@ -535,9 +543,10 @@ export function repoStart(
       (
         pathString: string,
         ranges: Array<{ s?: string; e?: string; m: unknown }>,
-        tag: number | null
+        tag: number | null,
+        wireBytes?: number
       ) => {
-        repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
+        repoOnRangeMergeUpdate(repo, pathString, ranges, tag, wireBytes ?? 0);
       }
     );
 
@@ -651,9 +660,10 @@ export function repoOnRangeMergeUpdateForTest(
   repo: Repo,
   pathString: string,
   ranges: Array<{ s?: string; e?: string; m: unknown }>,
-  tag: number | null
+  tag: number | null,
+  wireBytes = 0
 ): void {
-  repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
+  repoOnRangeMergeUpdate(repo, pathString, ranges, tag, wireBytes);
 }
 
 function repoOnDataUpdate(
@@ -809,6 +819,27 @@ function repoIngestEligible(
   // registration. wireBytes is the message's frame bytes — 0 when the
   // transport didn't report (long-poll), which keeps the synchronous path.
   return wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD;
+}
+
+/**
+ * A range merge takes the sliced pump when it is untagged and its message
+ * was giant. Unlike a data push there is no payload-shape gate: the merge
+ * applies against the path's existing view, and the sliced body handles
+ * every range shape the synchronous path does. Tagged merges (filtered
+ * query views) keep the synchronous path — same as tagged data pushes.
+ * Size is the ONLY trigger: small merges are the steady-state hot path
+ * (certification deltas) where a pump cycle would cost more than it saves.
+ */
+function repoRangeMergeIngestEligible(
+  repo: Repo,
+  tag: number | null,
+  wireBytes: number
+): boolean {
+  return (
+    tag == null &&
+    repo.interceptServerDataCallback_ === null &&
+    wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD
+  );
 }
 
 /**
@@ -974,6 +1005,16 @@ function repoDrainIngestQueue(repo: Repo): void {
               op.tag
             );
           } else if (op.kind === 'rm') {
+            if (repoRangeMergeIngestEligible(repo, op.tag, op.wireBytes)) {
+              // Re-enter the sliced range-merge ingest for a queued giant
+              // merge — same consume-then-stand-down as a queued full push.
+              void repoRunSlicedRangeMergeIngest(
+                repo,
+                op.pathString,
+                op.ranges
+              );
+              return;
+            }
             repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
           } else if (op.kind === 'disconnect') {
             repoRunOnDisconnectEvents(repo, op.tree);
@@ -1046,6 +1087,172 @@ async function repoIngestFullRootPush(
   // replaced the root, and a flush believing nothing changed would carry
   // stale ranges over a new baseline tree.
   repoPersistAfterServerUpdate(repo, rootPath, 'at-path');
+}
+
+/**
+ * Runs one sliced range-merge ingest under a gate on the repo's ordered
+ * queue, then drains the queue — the exact lifecycle of
+ * repoRunSlicedIngest (gate ownership, generation/auth supersession,
+ * finally lifts + drains), with a range-merge body.
+ */
+async function repoRunSlicedRangeMergeIngest(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>
+): Promise<void> {
+  const queue = repo.ingestQueue_;
+  const gate = { pathString } as const;
+  queue.gates.set(pathString, gate);
+  const generation = queue.generation;
+  const authGeneration = repo.persistence_?.authGeneration();
+  const isCurrent = () =>
+    queue.generation === generation &&
+    queue.gates.get(pathString) === gate &&
+    repo.persistence_?.authGeneration() === authGeneration;
+  try {
+    await repoIngestOneRangeMerge(repo, pathString, ranges, isCurrent);
+  } finally {
+    if (queue.gates.get(pathString) === gate) {
+      queue.gates.delete(pathString);
+    }
+    repoDrainIngestQueue(repo);
+  }
+}
+
+/**
+ * Applies one giant untagged range merge through the sliced ingest,
+ * DEGRADING to the legacy monolithic apply on an unexpected mid-ingest
+ * error and dropping the payload on cancellation — the exact containment
+ * contract of repoIngestOnePush.
+ */
+async function repoIngestOneRangeMerge(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  isCurrent: () => boolean
+): Promise<void> {
+  try {
+    await repoIngestRangeMerge(repo, pathString, ranges, isCurrent);
+  } catch (e) {
+    if (e instanceof IngestCancelledError) {
+      return;
+    }
+    warn('sliced range-merge ingest failed for ' + pathString, e);
+    try {
+      repoApplyRangeMergeUpdate(repo, pathString, ranges, null);
+    } catch (applyError) {
+      warn('monolithic range-merge apply also failed', applyError);
+    }
+  }
+}
+
+/**
+ * The sliced range-merge body. The synchronous path decodes EVERY range's
+ * update tree with nodeFromJSON and folds each merge over the view's
+ * server cache in one task — on a stale restored listen the server's
+ * resend approaches the whole root and that task ran for ten seconds on
+ * mobile Safari. Here each range's update tree decodes through the
+ * budgeted decoder (one charge per JSON key, macrotask yield per slice),
+ * the merges fold OFF-TREE against a snapshot of the view's server cache
+ * with a yield between ranges, and the result lands as ONE
+ * syncTreeApplyServerOverwrite — one coherent SyncTree transition, one
+ * event batch, exactly the atomicity contract of the data-push pump.
+ *
+ * Wire coherence: the fold's base is captured before the first yield, and
+ * the gate defers every later same-subtree wire operation into the
+ * ordered queue behind this ingest — so nothing can mutate the view's
+ * server cache between the snapshot and the apply except this ingest's
+ * own overwrite (a superseded gate cancels at the next yield instead).
+ */
+async function repoIngestRangeMerge(
+  repo: Repo,
+  pathString: string,
+  ranges: Array<{ s?: string; e?: string; m: unknown }>,
+  isCurrent: () => boolean
+): Promise<void> {
+  const path = new Path(pathString);
+  const state = { visits: 0, isCurrent };
+  const merges: RangeMerge[] = [];
+  for (const range of ranges) {
+    merges.push(
+      new RangeMerge(
+        typeof range.s === 'string' ? new Path(range.s) : null,
+        typeof range.e === 'string' ? new Path(range.e) : null,
+        await decodeNodeSliced(range.m, state)
+      )
+    );
+  }
+  const base = syncTreeGetRangeMergeBase(repo.serverSyncTree_, path);
+  if (base === null) {
+    // Removed / incomplete view: the synchronous path ignores the merge
+    // for exactly this state; converge to the same no-op.
+    return;
+  }
+  let folded = base;
+  for (const merge of merges) {
+    folded = merge.applyTo(folded);
+    const y = chargeSlice(state);
+    if (y !== null) {
+      await y;
+    }
+  }
+  // Identity grafting (the full-push pump's contract, applied post-fold):
+  // RangeMerge.applyTo rebuilds every node on the path of each range
+  // boundary, so even an untouched child can come out structurally equal
+  // but identity-distinct — and the final overwrite's updateFullNode diff
+  // would then deep-compare it (O(subtree)), reopening the long-task class
+  // on near-full-root merges. Walk the folded root's direct children and
+  // graft every one structurally equal to its base counterpart back to
+  // the base's OBJECT, budgeted (nodesEqualSliced charges the shared
+  // slice budget), so the apply's diff short-circuits on === and cost
+  // tracks the CHANGED portion, never the whole tree.
+  if (!folded.isLeafNode() && !base.isLeafNode() && folded !== base) {
+    const foldedChildren: NamedNode[] = [];
+    folded.forEachChild(PRIORITY_INDEX, (key, child) => {
+      foldedChildren.push(new NamedNode(key, child));
+    });
+    const grafted: NamedNode[] = [];
+    let childrenHavePriority = false;
+    for (const named of foldedChildren) {
+      let child = named.node;
+      const y = chargeSlice(state);
+      if (y !== null) {
+        await y;
+      }
+      const baseChild = base.getImmediateChild(named.name);
+      if (
+        child !== baseChild &&
+        !baseChild.isEmpty() &&
+        (await nodesEqualSliced(baseChild, child, state))
+      ) {
+        child = baseChild;
+      }
+      childrenHavePriority =
+        childrenHavePriority || !child.getPriority().isEmpty();
+      grafted.push(new NamedNode(named.name, child));
+    }
+    folded = assembleChildrenNode(
+      grafted,
+      childrenHavePriority,
+      folded.getPriority().val()
+    );
+  }
+  if (!isCurrent()) {
+    throw new IngestCancelledError();
+  }
+  const events = syncTreeApplyServerOverwrite(
+    repo.serverSyncTree_,
+    path,
+    folded
+  );
+  let affectedPath = path;
+  if (events.length > 0) {
+    affectedPath = repoRerunTransactions(repo, path);
+  }
+  eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
+  // Same baseline semantics as the synchronous path: ranges name leaf
+  // intervals, not subtrees — the flush falls back to the identity diff.
+  repoPersistAfterServerUpdate(repo, path, 'unknown');
 }
 
 /**
@@ -1774,7 +1981,8 @@ function repoOnRangeMergeUpdate(
   repo: Repo,
   pathString: string,
   ranges: Array<{ s?: string; e?: string; m: unknown }>,
-  tag: number | null
+  tag: number | null,
+  wireBytes = 0
 ): void {
   // For testing.
   repo.dataUpdateCount++;
@@ -1786,11 +1994,19 @@ function repoOnRangeMergeUpdate(
       pathString,
       ranges,
       tag,
+      wireBytes,
       generation: repo.ingestQueue_.generation
     });
     if (repo.ingestQueue_.gates.size === 0) {
       repoDrainIngestQueue(repo);
     }
+    return;
+  }
+  if (repoRangeMergeIngestEligible(repo, tag, wireBytes)) {
+    // Giant merge (a stale restored listen's near-full resend): gate the
+    // subtree, decode + fold the ranges in yielded slices off-tree, apply
+    // ONE overwrite (see repoRunSlicedRangeMergeIngest).
+    void repoRunSlicedRangeMergeIngest(repo, pathString, ranges);
     return;
   }
   repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
