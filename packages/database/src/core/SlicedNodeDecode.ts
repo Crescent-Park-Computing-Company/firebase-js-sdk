@@ -78,6 +78,15 @@ function charge(state: DecodeSliceState): Promise<void> | null {
 }
 
 /**
+ * Public charge for ingest bodies that do per-unit work OUTSIDE the decoder
+ * (e.g. folding one decoded range merge over a base tree): shares the same
+ * slice budget and yield/liveness contract as the decode itself. @internal
+ */
+export function chargeSlice(state: DecodeSliceState): Promise<void> | null {
+  return charge(state);
+}
+
+/**
  * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
  * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
  * metadata-key skipping, empty-child pruning, and childSet construction —

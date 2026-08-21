@@ -437,6 +437,29 @@ export function syncTreeApplyServerRangeMerges(
 }
 
 /**
+ * The base an untagged range merge at `path` folds over — the complete
+ * view's current server cache (empty node when the cache is absent), or
+ * null when there is no complete view (the merge is ignored for that
+ * state, matching syncTreeApplyServerRangeMerges). Lets an asynchronous
+ * ingest snapshot the base, fold merges OFF-TREE across yields, and apply
+ * the result as one overwrite. @internal
+ */
+export function syncTreeGetRangeMergeBase(
+  syncTree: SyncTree,
+  path: Path
+): Node | null {
+  const syncPoint = syncTree.syncPointTree_.get(path);
+  if (!syncPoint) {
+    return null;
+  }
+  const view = syncPointGetCompleteView(syncPoint);
+  if (!view) {
+    return null;
+  }
+  return viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+}
+
+/**
  * Applies tagged-query server range merges against the query's view.
  *
  * @returns Events to raise.

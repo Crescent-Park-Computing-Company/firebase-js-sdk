@@ -38,6 +38,7 @@ import {
   IngestCancelledError,
   sliceableAsChildren
 } from '../src/core/SlicedNodeDecode';
+import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { SnapshotHolder } from '../src/core/SnapshotHolder';
 import {
@@ -542,6 +543,278 @@ describe('sliced full-root push ingestion', () => {
       new Path('/users/bob')
     );
     expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('a giant untagged range merge takes the sliced pump and lands atomically', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    // Complete server cache to merge against.
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: { v: 1 }, b: { v: 2 }, c: { v: 3 } })
+    );
+    // One unbounded range replacing everything — the stale-cache full
+    // resend shape ('rm' whose ranges approach the whole root).
+    const ranges = [{ m: { a: { v: 10 }, b: { v: 2 }, d: { v: 4 } } }];
+
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      ranges,
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    // Diverted: gate forms, nothing applied synchronously.
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+    const before = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(
+      before!.equals(nodeFromJSON({ a: { v: 1 }, b: { v: 2 }, c: { v: 3 } }))
+    ).to.equal(true, 'nothing may apply before the sliced ingest completes');
+
+    await flushAsync(32);
+    expectIngestIdle(repo);
+    const after = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(
+      after!.equals(nodeFromJSON({ a: { v: 10 }, b: { v: 2 }, d: { v: 4 } }))
+    ).to.equal(true, 'sliced merge must land the full-replacement result');
+  });
+
+  it('the sliced range-merge result matches the synchronous path exactly (bounded ranges)', async () => {
+    const base = {
+      k01: { v: 1 },
+      k05: { v: 5 },
+      k10: { v: 10 },
+      k15: { v: 15 },
+      k20: { v: 20 }
+    };
+    // Two bounded ranges: (k01, k10] replaced by {k05:50,k07:70}; (k15, ∞)
+    // replaced by {k20:200,k25:250}.
+    const ranges = [
+      { s: '/k01', e: '/k10', m: { k05: { v: 50 }, k07: { v: 70 } } },
+      { s: '/k15', m: { k20: { v: 200 }, k25: { v: 250 } } }
+    ];
+
+    // Reference: the synchronous path (small wire size keeps it sync).
+    const rootA = '/users/alice';
+    const ha = makeIngestHarness(rootA);
+    syncTreeApplyServerOverwrite(
+      ha.syncTree,
+      new Path(rootA),
+      nodeFromJSON(base)
+    );
+    repoOnRangeMergeUpdateForTest(ha.repo, 'users/alice', ranges, null, 0);
+    expectIngestIdle(ha.repo);
+    const syncResult = syncTreeGetCompleteServerCache(
+      ha.syncTree,
+      new Path(rootA)
+    )!;
+
+    // Sliced: giant wire size diverts to the pump.
+    const hb = makeIngestHarness(rootA);
+    syncTreeApplyServerOverwrite(
+      hb.syncTree,
+      new Path(rootA),
+      nodeFromJSON(base)
+    );
+    repoOnRangeMergeUpdateForTest(
+      hb.repo,
+      'users/alice',
+      ranges,
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    expect(hb.repo.ingestQueue_.gates.has(rootA)).to.equal(true);
+    await flushAsync(32);
+    expectIngestIdle(hb.repo);
+    const slicedResult = syncTreeGetCompleteServerCache(
+      hb.syncTree,
+      new Path(rootA)
+    )!;
+
+    expect(slicedResult.equals(syncResult)).to.equal(
+      true,
+      'sliced and synchronous range-merge application must be identical'
+    );
+    expect(slicedResult.hash()).to.equal(syncResult.hash());
+  });
+
+  it('a small or tagged range merge keeps the synchronous path', () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: 1 })
+    );
+    // Small untagged merge: applies synchronously, no gate.
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: { a: 2 } }],
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD - 1
+    );
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.equals(nodeFromJSON({ a: 2 }))).to.equal(true);
+
+    // Giant TAGGED merge: stays synchronous too (no gate) — filtered query
+    // views are out of the pump's scope, same as tagged data pushes.
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: { a: 3 } }],
+      99,
+      _INGEST_WIRE_BYTES_THRESHOLD * 4
+    );
+    expectIngestIdle(repo);
+  });
+
+  it('a deferred giant range merge re-enters the sliced pump from the drain', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: { v: 1 } })
+    );
+    // Gate the stream with a registered-root data ingest, then deliver a
+    // giant merge for the same root while the gate holds.
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(5), false, null);
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+    // Wide enough that its sliced decode must yield: the re-entered gate is
+    // observable across turns (the sync fallback never gates).
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: wide }],
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD * 2
+    );
+    expect(
+      repo.ingestQueue_.ops.filter(op => op.kind === 'rm').length
+    ).to.equal(1);
+
+    let sawRmGate = false;
+    for (let i = 0; i < 64 && !sawRmGate; i++) {
+      await flushAsync(1);
+      // The first (data) ingest finishes, the drain pops the rm op and
+      // re-enters the pump: its gate re-forms for the same root while the
+      // rm decode yields.
+      sawRmGate =
+        repo.ingestQueue_.gates.has(rootPath) &&
+        repo.ingestQueue_.ops.length === 0;
+    }
+    expect(sawRmGate).to.equal(
+      true,
+      'queued giant merge must re-enter the sliced pump (gate observed)'
+    );
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.equals(nodeFromJSON(wide))).to.equal(true);
+  });
+
+  it('a giant range merge is ATOMIC to listeners: one value event, no partial folds', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: { v: 1 }, b: { v: 2 } })
+    );
+    const seen: unknown[] = [];
+    const recQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      new Path(rootPath),
+      new QueryParams(),
+      false
+    );
+    const recording = {
+      respondsTo: () => true,
+      createEvent: (
+        change: { type: string; snapshotNode: Node },
+        q: { _path: Path }
+      ) => ({
+        getPath: () => q._path,
+        getEventType: () => change.type,
+        getEventRunner: () => () => {
+          // Only the root 'value' event describes the whole tree — count
+          // those; child_changed events are per-key and expected.
+          if (change.type === 'value') {
+            seen.push(change.snapshotNode.val());
+          }
+        },
+        toString: () => 'recording-event'
+      }),
+      getEventRunner: () => () => {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCancelEvent: () => null as any,
+      matches: () => false,
+      hasAnyCallback: () => true
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    syncTreeAddEventRegistration(syncTree, recQuery, recording);
+
+    // Two ranges, each replacing one half (bounds are LEAF paths: range 1
+    // covers (-inf, /a/v], range 2 covers (/a/v, +inf)) — a partial
+    // (per-range) apply would surface an intermediate state.
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [
+        { e: '/a/v', m: { a: { v: 10 } } },
+        { s: '/a/v', m: { b: { v: 20 } } }
+      ],
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    await flushAsync(32);
+    expectIngestIdle(repo);
+    expect(seen.length).to.equal(1, 'exactly one value event for the merge');
+    expect(seen[0]).to.deep.equal({ a: { v: 10 }, b: { v: 20 } });
+  });
+
+  it('an auth-scope switch cancels a sliced range-merge ingest (no apply)', async () => {
+    const rootPath = '/users/alice';
+    const harness = makeIngestHarness(rootPath);
+    const { repo, syncTree } = harness;
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ a: { v: 1 } })
+    );
+    let authGen = 1;
+    (repo.persistence_ as unknown as Record<string, unknown>)[
+      'authGeneration'
+    ] = () => authGen;
+    // Wide enough to force decode yields, so the switch lands mid-ingest.
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 3; i++) {
+      wide['k' + i] = i;
+    }
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: wide }],
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+    authGen = 2; // account switch mid-decode
+    await flushAsync(64);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.equals(nodeFromJSON({ a: { v: 1 } }))).to.equal(
+      true,
+      'a cancelled merge must not apply'
+    );
   });
 
   it('yields at least one macrotask for a payload wider than one slice budget', async () => {
