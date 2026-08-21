@@ -27,6 +27,7 @@ import {
   repoLiftIngestGateForTest,
   repoOnConnectStatusForTest,
   repoOnDataUpdateForTest,
+  repoOnRangeMergeUpdateForTest,
   Repo
 } from '../src/core/Repo';
 import {
@@ -339,6 +340,74 @@ describe('sliced full-root push ingestion', () => {
     const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
     expect(cache).to.not.equal(null);
     expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('engages for wire-form paths (no leading slash), as the server delivers them', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    const payload = wideRoot(50);
+
+    // The wire delivers server-form paths ('users/alice'; '' for the root),
+    // while persistence roots are registered canonically via
+    // Path.toString() ('/users/alice'). The pump must engage regardless of
+    // which form arrives — this is the production format.
+    repoOnDataUpdateForTest(repo, 'users/alice', payload, false, null);
+    // The gate must be keyed canonically: repoGetValue's gate lookup
+    // compares canonical query paths against gate keys.
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+
+    await flushAsync();
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache).to.not.equal(null);
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('engages for a wire-form push at the database root (empty string)', async () => {
+    const rootPath = '/';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    const payload = wideRoot(10);
+
+    // The server addresses the database root as ''; canonical form is '/'.
+    repoOnDataUpdateForTest(repo, '', payload, false, null);
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+
+    await flushAsync();
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath));
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('queues deferred wire-form operations under canonical path keys', async () => {
+    const rootPath = '/users/alice';
+    const { repo } = makeIngestHarness(rootPath);
+
+    // First push gates the stream; deliver both op kinds in wire form
+    // while the gate holds. Every queued op must carry the canonical key:
+    // the drain's re-entry eligibility and gate-coverage checks compare
+    // path strings, so a raw wire form in the queue would silently fall
+    // back to the monolithic apply.
+    repoOnDataUpdateForTest(repo, 'users/alice', wideRoot(5), false, null);
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+    repoOnDataUpdateForTest(repo, 'users/alice/child0', { v: 2 }, false, null);
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: { child1: { value: 1 } } }],
+      null
+    );
+    const kinds = repo.ingestQueue_.ops.map(op => op.kind);
+    expect(kinds).to.deep.equal(['data', 'rm']);
+    for (const op of repo.ingestQueue_.ops) {
+      if (op.kind === 'data' || op.kind === 'rm') {
+        expect(op.pathString.startsWith('/')).to.equal(
+          true,
+          `queued ${op.kind} op must be canonically keyed, got ${op.pathString}`
+        );
+      }
+    }
+    await flushAsync();
+    expectIngestIdle(repo);
   });
 
   it('yields at least one macrotask for a payload wider than one slice budget', async () => {
