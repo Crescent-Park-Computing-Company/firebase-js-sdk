@@ -28,7 +28,7 @@ export declare const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 export declare const ROW_PERSISTENCE_MAX_AGE_MS: number;
 /** Sweep delay after the first restore — far off every boot-critical path. */
 export declare const ROW_PERSISTENCE_SWEEP_DELAY_MS: number;
-/** Byte budget per first-generation staging transaction. */
+/** Retained for constructor compatibility; whole generations are atomic. */
 export declare const ROW_PERSISTENCE_STAGE_TXN_BYTES: number;
 /** Worker hash wall-clock ceiling before the main-thread fallback runs. */
 export declare const ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS = 20000;
@@ -89,6 +89,15 @@ export declare class RowPersistenceManager {
      * under one re-persists through that root.
      */
     trackedRootFor(pathString: string): string | null;
+    /**
+     * EVERY tracked root a server update at `pathString` touches — roots at
+     * or above the path (the change is inside their subtree) AND roots below
+     * it (an overwrite at an ancestor rewrites their whole tree). Overlapping
+     * persistent registrations are legal (ancestor + descendant listeners),
+     * and each stored root must stay current or its next boot hash would
+     * claim bytes it does not hold.
+     */
+    trackedRootsFor(pathString: string): string[];
     track(pathString: string): void;
     untrack(pathString: string): void;
     private resetTrackedRoot_;
@@ -179,6 +188,7 @@ export declare class RowPersistenceManager {
     private armWindow_;
     /** Single-flight flush of everything dirty at the root. */
     private flushNow_;
+    private flushNowImpl_;
     /**
      * First generation / unknown-change rewrite of the whole root. Byte-
      * budgeted staging with meta LAST: crash mid-stage reads as "no cache"

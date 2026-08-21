@@ -1059,7 +1059,6 @@ export declare function orderByPriority(): QueryConstraint;
  * {@link https://firebase.google.com/docs/database/web/lists-of-data#sort_data | Sort data}.
  */
 export declare function orderByValue(): QueryConstraint;
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 /**
  * Generates a new child location using a unique key and returns its
  * `Reference`.

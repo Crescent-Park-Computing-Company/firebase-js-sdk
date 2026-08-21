@@ -15,10 +15,18 @@
  * limitations under the License.
  */
 /**
- * Minimal fake IndexedDB for the row manager: string keys, getAll/getAllKeys
- * with ranges, range deletes, multi-store transactions, versioned open with
+ * Fake IndexedDB for the row manager: string keys, getAll/getAllKeys with
+ * ranges, range deletes, multi-store transactions, versioned open with
  * upgrade. Shared `stores` gives multi-manager (multi-tab) tests one
  * storage substrate.
+ *
+ * Transaction semantics mirror the real API where the manager depends on
+ * them: WRITES BUFFER per transaction and land on the shared Maps only at
+ * commit (oncomplete); abort() discards the buffer and fires onabort, and
+ * no further requests in that transaction run. Reads see the transaction's
+ * own uncommitted writes layered over the committed state (IndexedDB
+ * read-your-own-writes), while other transactions never observe them —
+ * so tests CAN detect torn/partially-visible generations.
  */
 export declare function makeFakeIdb(shared?: Map<string, Map<string, unknown>>, log?: {
     puts: string[];

@@ -33,6 +33,17 @@ import { KernelCompoundHash } from './RowHashKernel';
 export interface WorkerHashRequest {
     dbName: string;
     storeName: string;
+    metaStoreName: string;
+    /** The meta key of the root (= the row-key prefix with no segments). */
+    metaKey: string;
+    /**
+     * Generation nonce the caller last restored/committed. Read from meta in
+     * the SAME readonly transaction as the rows; a mismatch (foreign tab's
+     * newer commit, staged rows without meta) rejects with 'gen-mismatch' and
+     * the listen goes uncertified — never a hash of rows the live cache does
+     * not hold.
+     */
+    expectedGen: string;
     /** Row-key range bounds for the root (lower inclusive, upper exclusive). */
     lowerKey: string;
     upperKey: string;
