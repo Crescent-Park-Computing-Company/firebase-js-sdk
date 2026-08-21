@@ -752,3 +752,42 @@ describe('transaction atomicity (buffered fake)', () => {
     late.dispose();
   });
 });
+
+describe('untrack/re-track race', () => {
+  it('a synchronous re-registration during untrack keeps the root tracked', async () => {
+    const manager = makeManager(makeFakeIdb());
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    // Remove + re-add in one stack (React effect cleanup then setup).
+    manager.setPersistentPath('/ws', false);
+    manager.untrack('/ws');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    await flushMicrotasks();
+    await wait(10);
+    await flushMicrotasks();
+    expect(manager.trackedPaths()).to.deep.equal(['/ws']);
+    // And the revived root still works end to end.
+    manager.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ ok: 1 }));
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    const restored = await manager.restoreForListen('/ws');
+    expect(restored.node).to.not.equal(null);
+    manager.dispose();
+  });
+
+  it('a plain untrack with no re-registration still tears down', async () => {
+    const manager = makeManager(makeFakeIdb());
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    manager.setPersistentPath('/ws', false);
+    manager.untrack('/ws');
+    await flushMicrotasks();
+    await wait(10);
+    await flushMicrotasks();
+    expect(manager.trackedPaths()).to.deep.equal([]);
+    manager.dispose();
+  });
+});

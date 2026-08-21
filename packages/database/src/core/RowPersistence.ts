@@ -161,6 +161,13 @@ interface TrackedRoot {
   rearm: boolean;
   /** Held Web Lock release callback (null = not the writer). */
   releaseLock: (() => void) | null;
+  /**
+   * Set while an untrack drain is in flight. track() clears it to CANCEL
+   * the teardown — a remove-then-re-add in one stack (React effect
+   * cleanup + setup) must keep the root tracked, its lock held, and its
+   * rearmed dirt flushable.
+   */
+  untrackPending: boolean;
 }
 
 export class RowPersistenceManager {
@@ -309,7 +316,14 @@ export class RowPersistenceManager {
   }
 
   track(pathString: string): void {
-    if (this.disposed_ || this.tracked_.has(pathString)) {
+    if (this.disposed_) {
+      return;
+    }
+    const existing = this.tracked_.get(pathString);
+    if (existing !== undefined) {
+      // Cancel an in-flight untrack teardown: the path was re-selected
+      // while its drain ran. The entry, lock, and any rearmed dirt stay.
+      existing.untrackPending = false;
       return;
     }
     const root: TrackedRoot = {
@@ -323,7 +337,8 @@ export class RowPersistenceManager {
       flushing: false,
       activeFlush: null,
       rearm: false,
-      releaseLock: null
+      releaseLock: null,
+      untrackPending: false
     };
     this.tracked_.set(pathString, root);
     void this.acquireWriterLock_(pathString, root);
@@ -334,6 +349,7 @@ export class RowPersistenceManager {
     if (root === undefined) {
       return;
     }
+    root.untrackPending = true;
     // Drain until clean before releasing writership: awaiting one flush is
     // not enough — dirt that arrived DURING it (rearm) or an already
     // in-flight flush must also settle, or the final tree of a closed
@@ -355,8 +371,9 @@ export class RowPersistenceManager {
       }
     };
     void drain().then(() => {
-      // Re-track since? The new registration owns the entry now.
-      if (this.tracked_.get(pathString) !== root) {
+      // Cancelled (re-tracked mid-drain) or superseded by a fresh entry:
+      // the live registration owns the root now — do not tear it down.
+      if (this.tracked_.get(pathString) !== root || !root.untrackPending) {
         return;
       }
       this.releaseRoot_(root);
