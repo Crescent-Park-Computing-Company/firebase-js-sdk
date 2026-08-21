@@ -609,3 +609,78 @@ describe('RowPersistenceManager writer lease (Web Locks)', () => {
     reader.dispose();
   });
 });
+
+describe('generation-bound listen hashes', () => {
+  it('a foreign commit between restore and hash downgrades the claim (gen mismatch)', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const writer = makeManager(makeFakeIdb(shared));
+    writer.setAuthScope('alice');
+    writer.setPersistentPath('/ws', true);
+    writer.track('/ws');
+    writer.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
+    await writer.flushNow('/ws');
+    await flushMicrotasks();
+    writer.dispose();
+
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    const restored = await manager.restoreForListen('/ws');
+    expect(restored.node).to.not.equal(null);
+
+    // A second tab commits a NEWER generation before this tab hashes.
+    const foreign = makeManager(makeFakeIdb(shared));
+    foreign.setAuthScope('alice');
+    foreign.setPersistentPath('/ws', true);
+    foreign.track('/ws');
+    foreign.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 2 }));
+    await foreign.flushNow('/ws');
+    await flushMicrotasks();
+    foreign.dispose();
+
+    // Hashing the foreign rows would certify bytes this tab does not hold.
+    const hashes = await manager.computeListenHashes('/ws');
+    expect(hashes).to.equal(null);
+    manager.dispose();
+  });
+
+  it('hash succeeds when the stored generation is the one this manager restored', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const writer = makeManager(makeFakeIdb(shared));
+    writer.setAuthScope('alice');
+    writer.setPersistentPath('/ws', true);
+    writer.track('/ws');
+    writer.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
+    await writer.flushNow('/ws');
+    await flushMicrotasks();
+    writer.dispose();
+
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    await manager.restoreForListen('/ws');
+    const hashes = await manager.computeListenHashes('/ws');
+    expect(hashes).to.not.equal(null);
+    manager.dispose();
+  });
+});
+
+describe('overlapping tracked roots', () => {
+  it('trackedRootsFor returns ancestors and descendants of the update path', () => {
+    const manager = makeManager(makeFakeIdb());
+    manager.setAuthScope('alice');
+    for (const p of ['/a', '/a/b/c', '/x']) {
+      manager.setPersistentPath(p, true);
+      manager.track(p);
+    }
+    expect(manager.trackedRootsFor('/a/b').sort()).to.deep.equal([
+      '/a',
+      '/a/b/c'
+    ]);
+    expect(manager.trackedRootsFor('/x/y')).to.deep.equal(['/x']);
+    expect(manager.trackedRootsFor('/unrelated')).to.deep.equal([]);
+    manager.dispose();
+  });
+});

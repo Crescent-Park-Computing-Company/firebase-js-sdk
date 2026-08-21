@@ -86,6 +86,7 @@ import {
   newRelativePath,
   Path,
   pathChild,
+  pathContains,
   pathGetFront,
   pathPopFront,
   pathSlice
@@ -1392,6 +1393,12 @@ export function repoStartServerListen(
         if (!isCurrent()) {
           return;
         }
+        // The view may rebuild an equal-but-distinct root during apply;
+        // capture ITS node now — the identity anchor for the stamp below.
+        const appliedAtApply = syncTreeGetCompleteServerCache(
+          repo.serverSyncTree_,
+          query._path
+        );
         if (grafts.length > 0) {
           // The stored rows lag the applied base by the grafted subtrees.
           // Flush them BEFORE hashing, so the hash describes exactly what
@@ -1416,11 +1423,17 @@ export function repoStartServerListen(
         // the client holds newer data — the one corruption the range
         // handshake cannot heal. Pending dirt (a failed graft flush)
         // therefore downgrades to a plain full listen.
-        const hashes = persistence.hasPendingDirt(pathString)
+        let hashes = persistence.hasPendingDirt(pathString)
           ? null
           : await persistence.computeListenHashes(pathString);
         if (!isCurrent()) {
           return;
+        }
+        // Re-check AFTER the async walk: dirt that arrived while hashing
+        // (a descendant update writing through) means the rows no longer
+        // equal the live cache — drop the claim rather than certify it.
+        if (hashes !== null && persistence.hasPendingDirt(pathString)) {
+          hashes = null;
         }
         // The hashes ride the APPLIED NODE itself (WeakMap stamps), not a
         // side table: PersistentConnection sends listens asynchronously
@@ -1442,8 +1455,17 @@ export function repoStartServerListen(
           repo.serverSyncTree_,
           query._path
         );
+        // Identity check: the compound hash describes the tree this restore
+        // applied. If a server op replaced the cache while the hash walked,
+        // stamping the claim onto the NEW node would certify bytes the
+        // client no longer holds. A replaced cache still gets '' (never a
+        // synchronous full-tree walk), just no compound claim.
         if (applied !== null) {
-          stampSeedHashes(applied, '', hashes?.compoundHash);
+          stampSeedHashes(
+            applied,
+            '',
+            applied === appliedAtApply ? hashes?.compoundHash : undefined
+          );
         }
         repo.pendingSeedRestores_.delete(pathString);
         sendListen(hashes !== null ? 'restored' : 'fallback');
@@ -1634,23 +1656,29 @@ function repoPersistAfterServerUpdate(
   if (persistence === null) {
     return;
   }
-  const rootString = persistence.trackedRootFor(path.toString());
-  if (rootString === null) {
-    return;
-  }
-  const rootPath = new Path(rootString);
-  const serverCache = syncTreeGetCompleteServerCache(
-    repo.serverSyncTree_,
-    rootPath
-  );
-  if (serverCache !== null) {
+  // Every intersecting tracked root updates — overlapping persistent
+  // registrations (ancestor + descendant) are legal, and a root left
+  // stale with no dirty marker would boot-hash bytes it does not hold.
+  for (const rootString of persistence.trackedRootsFor(path.toString())) {
+    const rootPath = new Path(rootString);
+    const serverCache = syncTreeGetCompleteServerCache(
+      repo.serverSyncTree_,
+      rootPath
+    );
+    if (serverCache === null) {
+      continue;
+    }
     // 'at-path' names the changed subtree so the flush rewrites only its
     // row; 'confirmed' (listen certification) re-states known state ([] =
     // nothing dirty, meta touch); 'unknown' (a range merge names leaf
     // INTERVALS, not subtrees) marks the whole root dirty (undefined).
     let changedPaths: string[][] | undefined;
     if (preciseChange === 'at-path') {
-      changedPaths = [pathSlice(newRelativePath(rootPath, path))];
+      changedPaths = pathContains(rootPath, path)
+        ? [pathSlice(newRelativePath(rootPath, path))]
+        : // The change is at an ANCESTOR of this root: its whole subtree
+          // may have been replaced.
+          undefined;
     } else if (preciseChange === 'confirmed') {
       changedPaths = [];
     }

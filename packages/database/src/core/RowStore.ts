@@ -300,7 +300,9 @@ export class RowIndex {
         return relativePath.slice(0, depth);
       }
       if (depth < relativePath.length) {
-        prefix += relativePath[depth] + ROW_KEY_SEPARATOR;
+        // Must match encodeRelative_'s alphabet exactly — keys_ holds
+        // URI-encoded segments.
+        prefix += encodeURIComponent(relativePath[depth]) + ROW_KEY_SEPARATOR;
       }
     }
     return null;

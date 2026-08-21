@@ -254,6 +254,8 @@ describe('sliced full-root push ingestion', () => {
         isPersistentPath: (p: string) => p === rootPath,
         trackedRootFor: (p: string) =>
           p === rootPath || p.startsWith(rootPath + '/') ? rootPath : null,
+        trackedRootsFor: (p: string) =>
+          p === rootPath || p.startsWith(rootPath + '/') ? [rootPath] : [],
         serverCacheUpdated: () => {},
         track: () => {},
         untrack: () => {},

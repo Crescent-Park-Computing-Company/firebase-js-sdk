@@ -36,6 +36,17 @@ import { createRowHashKernel, KernelCompoundHash } from './RowHashKernel';
 export interface WorkerHashRequest {
   dbName: string;
   storeName: string;
+  metaStoreName: string;
+  /** The meta key of the root (= the row-key prefix with no segments). */
+  metaKey: string;
+  /**
+   * Generation nonce the caller last restored/committed. Read from meta in
+   * the SAME readonly transaction as the rows; a mismatch (foreign tab's
+   * newer commit, staged rows without meta) rejects with 'gen-mismatch' and
+   * the listen goes uncertified — never a hash of rows the live cache does
+   * not hold.
+   */
+  expectedGen: string;
   /** Row-key range bounds for the root (lower inclusive, upper exclusive). */
   lowerKey: string;
   upperKey: string;
@@ -88,13 +99,14 @@ function workerMain(): void {
         const db = open.result;
         let txn: IDBTransaction;
         try {
-          txn = db.transaction(req.storeName, 'readonly');
+          txn = db.transaction([req.storeName, req.metaStoreName], 'readonly');
         } catch (e) {
           db.close();
           fail('idb-txn');
           return;
         }
         const store = txn.objectStore(req.storeName);
+        const metaReq = txn.objectStore(req.metaStoreName).get(req.metaKey);
         const range = IDBKeyRange.bound(
           req.lowerKey,
           req.upperKey,
@@ -105,11 +117,17 @@ function workerMain(): void {
         const valuesReq = store.getAll(range);
         let keys: string[] | null = null;
         let values: string[] | null = null;
+        let metaDone = false;
+        let metaGen: string | null = null;
         const maybeRun = (): void => {
-          if (keys === null || values === null) {
+          if (keys === null || values === null || !metaDone) {
             return;
           }
           db.close();
+          if (metaGen !== req.expectedGen) {
+            fail('gen-mismatch');
+            return;
+          }
           const rows = [];
           for (let i = 0; i < keys.length; i++) {
             const rest = keys[i].slice(req.prefixLength);
@@ -119,6 +137,12 @@ function workerMain(): void {
             } else {
               path = rest.split(req.separator);
               path.pop();
+              // Row keys hold URI-encoded segments (RowStore encodeRowKey);
+              // the kernel must hash the REAL child names or its posts and
+              // range text diverge from the server's tree.
+              for (let j = 0; j < path.length; j++) {
+                path[j] = decodeURIComponent(path[j]);
+              }
             }
             rows.push({ path, json: values[i] });
           }
@@ -127,6 +151,16 @@ function workerMain(): void {
             err =>
               fail(err instanceof Error ? err.message : 'kernel-failure')
           );
+        };
+        metaReq.onerror = () => {
+          db.close();
+          fail('idb-meta');
+        };
+        metaReq.onsuccess = () => {
+          const meta = metaReq.result as { gen?: string } | undefined;
+          metaGen = meta && typeof meta.gen === 'string' ? meta.gen : null;
+          metaDone = true;
+          maybeRun();
         };
         keysReq.onerror = () => {
           db.close();

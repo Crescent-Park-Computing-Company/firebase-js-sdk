@@ -1030,10 +1030,20 @@ function addEventListener(
           return;
         }
         persistenceReleased = true;
-        query._repo.persistence_?.setPersistentPath(
-          query._path.toString(),
-          false
-        );
+        const persistence = query._repo.persistence_;
+        if (persistence === undefined || persistence === null) {
+          return;
+        }
+        const pathString = query._path.toString();
+        persistence.setPersistentPath(pathString, false);
+        // A joined registration (repoActivatePersistenceForJoinedListen)
+        // tracked the root without a wire listen of its own; stop-listen
+        // teardown will never run for it. When the LAST persistent
+        // registration releases, storage ownership must end here — the
+        // shared network listener stays untouched.
+        if (!persistence.isPersistentPath(pathString)) {
+          persistence.untrack(pathString);
+        }
       }
     : undefined;
   if (options?.persistent) {

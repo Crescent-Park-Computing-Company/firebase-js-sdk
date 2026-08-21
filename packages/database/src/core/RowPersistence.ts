@@ -84,14 +84,26 @@ const RESTORE_SLICE_BYTES = 256 * 1024;
 /** Worker hash wall-clock ceiling before the main-thread fallback runs. */
 export const ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS = 20000;
 
-/** The auth-scope key used in row keys for the signed-out state. */
-const PUBLIC_SCOPE = '.public';
-
 interface RootMeta {
   updatedAt: number;
   formatVersion: number;
+  /**
+   * Random nonce, fresh on every committed generation. The one binding
+   * between "the rows a restore/flush produced" and "the rows a later hash
+   * read": a hash is only claimable when the generation it read equals the
+   * generation this manager last held (lastGen on the tracked root).
+   * Anything else — a foreign tab's commit in between, staged rows with no
+   * meta, an expired cache — reads as a mismatch and downgrades to a plain
+   * listen. Millisecond timestamps alone cannot carry this (same-ms
+   * cross-tab commits), a nonce can.
+   */
+  gen: string;
 }
-const META_FORMAT_VERSION = 1;
+const META_FORMAT_VERSION = 2;
+
+function newMetaGen(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
 
 export interface RowRestoreResult {
   node: Node | null;
@@ -123,7 +135,7 @@ function defaultWebLocks(): WebLocksLike | null {
 }
 
 interface RetainedPeek {
-  promise: Promise<{ node: Node; rowPaths: string[][] } | null>;
+  promise: Promise<{ node: Node; rowPaths: string[][]; gen: string } | null>;
   /** Set when the read resolves; identity key for the handoff stamps. */
   resolvedNode: Node | null;
   retained: boolean;
@@ -140,6 +152,8 @@ interface TrackedRoot {
   rowIndex: RowIndex | null;
   /** Whether a committed generation exists (meta present). */
   hasGeneration: boolean;
+  /** The meta gen of the generation this manager last restored/committed. */
+  lastGen: string | null;
   windowTimer: ReturnType<typeof setTimeout> | null;
   /** Single-flight: a flush is running; re-arm afterward if set. */
   flushing: boolean;
@@ -227,9 +241,16 @@ export class RowPersistenceManager {
   }
 
   private scopeKey_(): string {
-    // Structural namespace prevents an authenticated scope equal to the
-    // signed-out sentinel from sharing private/public cached bytes.
-    return this.authScope_ === null ? 'public' : 'auth:' + this.authScope_;
+    // The key's first component carries BOTH isolations, structurally:
+    // - repo instance (prefix_ = the database URL) — two databases on one
+    //   origin, or emulator vs production, must never share cached bytes;
+    // - identity, with distinct 'public'/'auth:' tags so an authenticated
+    //   scope can never collide with the signed-out namespace.
+    // encodeRowKey URI-encodes the whole component, so '|' and separators
+    // inside either part cannot forge a different key.
+    const identity =
+      this.authScope_ === null ? 'public' : 'auth:' + this.authScope_;
+    return this.prefix_ + '|' + identity;
   }
 
   // ───────────────────────── root selection ──────────────────────────────
@@ -263,6 +284,30 @@ export class RowPersistenceManager {
     return null;
   }
 
+  /**
+   * EVERY tracked root a server update at `pathString` touches — roots at
+   * or above the path (the change is inside their subtree) AND roots below
+   * it (an overwrite at an ancestor rewrites their whole tree). Overlapping
+   * persistent registrations are legal (ancestor + descendant listeners),
+   * and each stored root must stay current or its next boot hash would
+   * claim bytes it does not hold.
+   */
+  trackedRootsFor(pathString: string): string[] {
+    const roots: string[] = [];
+    for (const root of this.tracked_.keys()) {
+      const rootPrefix = root === '/' ? '/' : root + '/';
+      const pathPrefix = pathString === '/' ? '/' : pathString + '/';
+      if (
+        pathString === root ||
+        pathString.startsWith(rootPrefix) ||
+        root.startsWith(pathPrefix)
+      ) {
+        roots.push(root);
+      }
+    }
+    return roots;
+  }
+
   track(pathString: string): void {
     if (this.disposed_ || this.tracked_.has(pathString)) {
       return;
@@ -273,6 +318,7 @@ export class RowPersistenceManager {
       dirty: undefined,
       rowIndex: null,
       hasGeneration: false,
+      lastGen: null,
       windowTimer: null,
       flushing: false,
       activeFlush: null,
@@ -288,13 +334,27 @@ export class RowPersistenceManager {
     if (root === undefined) {
       return;
     }
-    // Flush what is pending before releasing writership, so the final tree
-    // of a closed listener survives to the next boot.
-    const finalFlush =
-      root.dirty !== undefined && root.latest !== null && !this.networkSuspended_
-        ? this.flushNow_(pathString, root)
-        : Promise.resolve();
-    void finalFlush.then(() => {
+    // Drain until clean before releasing writership: awaiting one flush is
+    // not enough — dirt that arrived DURING it (rearm) or an already
+    // in-flight flush must also settle, or the final tree of a closed
+    // listener is silently dropped with the lock released mid-write.
+    const drain = async (): Promise<void> => {
+      for (let i = 0; i < 10; i++) {
+        if (root.activeFlush !== null) {
+          await root.activeFlush;
+        }
+        if (
+          root.dirty === undefined ||
+          root.latest === null ||
+          this.networkSuspended_ ||
+          !this.isWriter_(root)
+        ) {
+          return;
+        }
+        await this.flushNow_(pathString, root);
+      }
+    };
+    void drain().then(() => {
       // Re-track since? The new registration owns the entry now.
       if (this.tracked_.get(pathString) !== root) {
         return;
@@ -550,7 +610,7 @@ export class RowPersistenceManager {
   /** One physical root read: meta check, row getAll, sliced assemble. */
   private async readRoot_(
     pathString: string
-  ): Promise<{ node: Node; rowPaths: string[][] } | null> {
+  ): Promise<{ node: Node; rowPaths: string[][]; gen: string } | null> {
     const db = await this.open_();
     if (db === null) {
       return null;
@@ -596,7 +656,7 @@ export class RowPersistenceManager {
       if (node.isEmpty() && rows.length > 0) {
         return null;
       }
-      return { node, rowPaths };
+      return { node, rowPaths, gen: (meta as RootMeta).gen };
     } catch (e) {
       warn('persistence read failed: ' + (e as Error | null)?.message);
       return null;
@@ -643,6 +703,7 @@ export class RowPersistenceManager {
       if (root !== null && root !== undefined) {
         root.rowIndex = RowIndex.fromRelativePaths(result.rowPaths);
         root.hasGeneration = true;
+        root.lastGen = result.gen;
       }
       return { node: result.node };
     });
@@ -664,6 +725,17 @@ export class RowPersistenceManager {
   async computeListenHashes(
     pathString: string
   ): Promise<RowListenHashes | null> {
+    // The claim is only sound for the exact generation THIS manager last
+    // restored or committed (root.lastGen). The hash read is a separate IDB
+    // snapshot — a foreign tab may have committed newer rows in between, and
+    // hashing those would stamp a claim onto a live cache that does not hold
+    // them: the one unhealable corruption class. Reading meta.gen inside the
+    // same snapshot as the rows, and requiring it to equal lastGen, makes
+    // the mismatch a plain downgrade to an uncertified listen.
+    const expectedGen = this.tracked_.get(pathString)?.lastGen ?? null;
+    if (expectedGen === null) {
+      return null;
+    }
     const scope = this.scopeKey_();
     const rootKey = this.rootKey_(pathString);
     if (this.idbFactory_ !== null && workerHashAvailable()) {
@@ -673,6 +745,9 @@ export class RowPersistenceManager {
           {
             dbName: DB_NAME,
             storeName: ROWS_STORE,
+            metaStoreName: META_STORE,
+            metaKey: prefix,
+            expectedGen,
             lowerKey: prefix,
             upperKey: prefix + '\uffff',
             prefixLength: prefix.length,
@@ -692,11 +767,12 @@ export class RowPersistenceManager {
         // Fall through to the main-thread sliced kernel.
       }
     }
-    return this.computeListenHashesOnMainThread_(pathString);
+    return this.computeListenHashesOnMainThread_(pathString, expectedGen);
   }
 
   private async computeListenHashesOnMainThread_(
-    pathString: string
+    pathString: string,
+    expectedGen: string
   ): Promise<RowListenHashes | null> {
     const db = await this.open_();
     if (db === null) {
@@ -704,15 +780,24 @@ export class RowPersistenceManager {
     }
     const scope = this.scopeKey_();
     try {
-      const txn = db.transaction(ROWS_STORE, 'readonly');
+      const txn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
+      const metaReq = txn
+        .objectStore(META_STORE)
+        .get(encodeRowKey(scope, this.rootKey_(pathString), []));
       const range = rowKeyRange(scope, this.rootKey_(pathString), []);
       const keysReq = txn.objectStore(ROWS_STORE).getAllKeys(range);
       const valuesReq = txn.objectStore(ROWS_STORE).getAll(range);
-      const [keys, values] = await Promise.all([
+      const [meta, keys, values] = await Promise.all([
+        this.requestDone_(metaReq),
         this.requestDone_(keysReq),
         this.requestDone_(valuesReq)
       ]);
-      if (keys.length === 0) {
+      // Same-snapshot generation check (see computeListenHashes).
+      if (
+        meta === undefined ||
+        (meta as RootMeta).gen !== expectedGen ||
+        keys.length === 0
+      ) {
         return null;
       }
       const rows = [];
@@ -921,13 +1006,15 @@ export class RowPersistenceManager {
       }
       rowStore.put(rows[i][1], encodeRowKey(scope, rootKey, rows[i][0]));
     }
+    const gen = newMetaGen();
     metaStore.put(
-      { updatedAt: Date.now(), formatVersion: META_FORMAT_VERSION } as RootMeta,
+      { updatedAt: Date.now(), formatVersion: META_FORMAT_VERSION, gen } as RootMeta,
       metaKey
     );
     await this.txnDone_(txn);
     root.rowIndex = RowIndex.fromRelativePaths(rows.map(r => r[0]));
     root.hasGeneration = true;
+    root.lastGen = gen;
   }
 
   /**
@@ -981,12 +1068,15 @@ export class RowPersistenceManager {
       }
       rowIndex.replaceSubtree(segs, newRows.map(r => r[0]));
     }
+    const gen = newMetaGen();
     const meta: RootMeta = {
       updatedAt: Date.now(),
-      formatVersion: META_FORMAT_VERSION
+      formatVersion: META_FORMAT_VERSION,
+      gen
     };
     txn.objectStore(META_STORE).put(meta, encodeRowKey(scope, rootKey, []));
     await this.txnDone_(txn);
+    root.lastGen = gen;
   }
 
   /**
