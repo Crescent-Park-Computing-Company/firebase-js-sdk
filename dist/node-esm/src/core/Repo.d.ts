@@ -82,12 +82,26 @@ interface PendingSeedRestore {
  * repo.onDisconnect_ in one motion, so acks and registrations landing on
  * the next connection can never rewrite an earlier disconnect's run).
  */
+/**
+ * Wire size (bytes of websocket frames for the message) above which an
+ * untagged, non-merge, children-shaped data push is ingested through the
+ * sliced pump even when its path is NOT a registered persistent root. Path
+ * registration tracks the app's DECLARED long-lived roots, but the freeze
+ * class is a property of PAYLOAD SIZE: giant pushes also arrive for
+ * unregistered listens (a component's own listener on a large node, a
+ * re-listen racing a remount's deregistration, repos without persistence).
+ * Below the threshold the synchronous path is faster than a pump cycle.
+ * @internal
+ */
+export declare const _INGEST_WIRE_BYTES_THRESHOLD: number;
 type DeferredWireOp = {
     kind: 'data';
     pathString: string;
     data: unknown;
     isMerge: boolean;
     tag: number | null;
+    /** Wire bytes of the message that carried this push (0 if unknown). */
+    wireBytes: number;
     /** The queue generation this account-bound op was received under. */
     generation: number;
 } | {
@@ -243,7 +257,7 @@ export declare function repoLiftIngestGateForTest(repo: Repo, pathString: string
 /** Test seam: drives a connection-status flip exactly as the connection would. @internal */
 export declare function repoOnConnectStatusForTest(repo: Repo, connectStatus: boolean): void;
 /** Test seam: drives a server data push exactly as the connection would. @internal */
-export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
+export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null, wireBytes?: number): void;
 /** Test seam: drives a server range merge exactly as the connection would. @internal */
 export declare function repoOnRangeMergeUpdateForTest(repo: Repo, pathString: string, ranges: Array<{
     s?: string;

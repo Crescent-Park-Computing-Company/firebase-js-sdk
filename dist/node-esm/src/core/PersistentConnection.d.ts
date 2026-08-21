@@ -73,7 +73,7 @@ export declare class PersistentConnection extends ServerActions {
      * @param applicationId_ - The Firebase App ID for this project
      * @param onDataUpdate_ - A callback for new data from the server
      */
-    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
+    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null, wireBytes?: number) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
         s?: string;
         e?: string;
         m: unknown;

@@ -405,20 +405,14 @@ export declare class DataSnapshot {
     val(): any;
 }
 
-/**
- * One wire-ordered operation deferred behind an ingest/boot gate. Data,
- * range merges, and listen completions are the server stream itself; a
- * disconnect carries its own registration tree, FROZEN at the moment the
- * connection dropped (repoOnConnectStatus snapshots and resets the live
- * repo.onDisconnect_ in one motion, so acks and registrations landing on
- * the next connection can never rewrite an earlier disconnect's run).
- */
 declare type DeferredWireOp = {
     kind: 'data';
     pathString: string;
     data: unknown;
     isMerge: boolean;
     tag: number | null;
+    /** Wire bytes of the message that carried this push (0 if unknown). */
+    wireBytes: number;
     /** The queue generation this account-bound op was received under. */
     generation: number;
 } | {
@@ -2563,7 +2557,7 @@ declare class PersistentConnection extends ServerActions {
      * @param applicationId_ - The Firebase App ID for this project
      * @param onDataUpdate_ - A callback for new data from the server
      */
-    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
+    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null, wireBytes?: number) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
         s?: string;
         e?: string;
         m: unknown;

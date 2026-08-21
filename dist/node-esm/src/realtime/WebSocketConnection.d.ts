@@ -26,6 +26,10 @@ export declare class WebSocketConnection implements Transport {
     private appCheckToken?;
     private authToken?;
     keepaliveTimer: number | null;
+    /** Timestamp (ms) of the last websocket activity; the keepalive tick
+     * compares against this instead of the timer being torn down and
+     * recreated on every frame. */
+    private lastActivity_;
     frames: string[] | null;
     totalFrames: number;
     bytesSent: number;
@@ -115,8 +119,16 @@ export declare class WebSocketConnection implements Transport {
      */
     close(): void;
     /**
-     * Kill the current keepalive timer and start a new one, to ensure that it always fires N seconds after
-     * the last activity.
+     * Record websocket activity and make sure the keepalive tick is running.
+     *
+     * The upstream implementation tore down and recreated the interval timer
+     * on EVERY send and EVERY received frame. A large message arrives as
+     * thousands of 16KB frames, so a bulk download spent more main-thread
+     * time in clearInterval/setInterval churn than in its own processing
+     * (measured ~38% of the receive window on a ~90MB message). Instead the
+     * timer is created ONCE and each tick compares against the last-activity
+     * timestamp: activity tracking becomes one Date.now() store per frame,
+     * and the no-op ping still goes out only after a full quiet interval.
      */
     resetKeepAlive(): void;
     /**

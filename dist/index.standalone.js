@@ -942,6 +942,10 @@ class WebSocketConnection {
         this.appCheckToken = appCheckToken;
         this.authToken = authToken;
         this.keepaliveTimer = null;
+        /** Timestamp (ms) of the last websocket activity; the keepalive tick
+         * compares against this instead of the timer being torn down and
+         * recreated on every frame. */
+        this.lastActivity_ = 0;
         this.frames = null;
         this.totalFrames = 0;
         this.bytesSent = 0;
@@ -1211,19 +1215,37 @@ class WebSocketConnection {
         }
     }
     /**
-     * Kill the current keepalive timer and start a new one, to ensure that it always fires N seconds after
-     * the last activity.
+     * Record websocket activity and make sure the keepalive tick is running.
+     *
+     * The upstream implementation tore down and recreated the interval timer
+     * on EVERY send and EVERY received frame. A large message arrives as
+     * thousands of 16KB frames, so a bulk download spent more main-thread
+     * time in clearInterval/setInterval churn than in its own processing
+     * (measured ~38% of the receive window on a ~90MB message). Instead the
+     * timer is created ONCE and each tick compares against the last-activity
+     * timestamp: activity tracking becomes one Date.now() store per frame,
+     * and the no-op ping still goes out only after a full quiet interval.
      */
     resetKeepAlive() {
-        clearInterval(this.keepaliveTimer);
+        this.lastActivity_ = Date.now();
+        if (this.keepaliveTimer !== null) {
+            return;
+        }
+        // Tick at a fraction of the interval so the ping still goes out close
+        // to WEBSOCKET_KEEPALIVE_INTERVAL after the last activity (upstream
+        // fired at exactly the interval; a lazy check delays by at most one
+        // tick). One cheap comparison per tick, instead of a timer teardown
+        // and re-arm on every frame.
         this.keepaliveTimer = setInterval(() => {
-            //If there has been no websocket activity for a while, send a no-op
-            if (this.mySock) {
+            if (this.mySock &&
+                Date.now() - this.lastActivity_ >=
+                    Math.floor(WEBSOCKET_KEEPALIVE_INTERVAL)) {
+                // No websocket activity for a full interval: send a no-op.
                 this.sendString_('0');
+                this.lastActivity_ = Date.now();
             }
-            this.resetKeepAlive();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        }, Math.floor(WEBSOCKET_KEEPALIVE_INTERVAL));
+        }, Math.floor(WEBSOCKET_KEEPALIVE_INTERVAL / 9));
     }
     /**
      * Send a string over the websocket.
@@ -9482,7 +9504,7 @@ class PersistentConnection extends ServerActions {
         }
         if (action === 'd') {
             this.onDataUpdate_(body[ /*path*/'p'], body[ /*data*/'d'], 
-            /*isMerge*/ false, body['t']);
+            /*isMerge*/ false, body['t'], bytes);
         }
         else if (action === 'm') {
             this.onDataUpdate_(body[ /*path*/'p'], body[ /*data*/'d'], 
@@ -15365,6 +15387,26 @@ const INTERRUPT_REASON = 'repo_interrupt';
  * client / server hashes for some data, we won't retry indefinitely.
  */
 const MAX_TRANSACTION_RETRIES = 25;
+/**
+ * One wire-ordered operation deferred behind an ingest/boot gate. Data,
+ * range merges, and listen completions are the server stream itself; a
+ * disconnect carries its own registration tree, FROZEN at the moment the
+ * connection dropped (repoOnConnectStatus snapshots and resets the live
+ * repo.onDisconnect_ in one motion, so acks and registrations landing on
+ * the next connection can never rewrite an earlier disconnect's run).
+ */
+/**
+ * Wire size (bytes of websocket frames for the message) above which an
+ * untagged, non-merge, children-shaped data push is ingested through the
+ * sliced pump even when its path is NOT a registered persistent root. Path
+ * registration tracks the app's DECLARED long-lived roots, but the freeze
+ * class is a property of PAYLOAD SIZE: giant pushes also arrive for
+ * unregistered listens (a component's own listener on a large node, a
+ * re-listen racing a remount's deregistration, repos without persistence).
+ * Below the threshold the synchronous path is faster than a pump cycle.
+ * @internal
+ */
+const _INGEST_WIRE_BYTES_THRESHOLD = 1024 * 1024;
 /** @internal */
 function newIngestQueue() {
     return { ops: [], gates: new Map(), draining: false, generation: 0 };
@@ -15501,8 +15543,8 @@ function repoStart(repo, appId, authOverride) {
                 throw new Error('Invalid authOverride provided: ' + e);
             }
         }
-        repo.persistentConnection_ = new PersistentConnection(repo.repoInfo_, appId, (pathString, data, isMerge, tag) => {
-            repoOnDataUpdate(repo, pathString, data, isMerge, tag);
+        repo.persistentConnection_ = new PersistentConnection(repo.repoInfo_, appId, (pathString, data, isMerge, tag, wireBytes) => {
+            repoOnDataUpdate(repo, pathString, data, isMerge, tag, wireBytes ?? 0);
         }, (connectStatus) => {
             repoOnConnectStatus(repo, connectStatus);
         }, (updates) => {
@@ -15568,7 +15610,7 @@ function repoGenerateServerValues(repo) {
         timestamp: repoServerTime(repo)
     });
 }
-function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
+function repoOnDataUpdate(repo, pathString, data, isMerge, tag, wireBytes = 0) {
     // For testing.
     repo.dataUpdateCount++;
     // The wire delivers paths in server form ('users/alice', '' for root);
@@ -15588,6 +15630,7 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
             data,
             isMerge,
             tag,
+            wireBytes,
             generation: repo.ingestQueue_.generation
         });
         // No gate may be holding the stream (queue-only deferral): make sure
@@ -15597,7 +15640,7 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag) {
         }
         return;
     }
-    if (repoIngestEligible(repo, pathString, data, isMerge, tag)) {
+    if (repoIngestEligible(repo, pathString, data, isMerge, tag, wireBytes)) {
         // Full-root push at a persistent root: gate the subtree, decode in
         // yielded slices, apply atomically (see repoIngestFullRootPush), then
         // drain whatever the wire delivered meanwhile — in order.
@@ -15656,13 +15699,27 @@ function repoApplyDataUpdate(repo, pathString, data, isMerge, tag) {
  * tagged query data, leaf/priority/array roots — is bounded or rare enough
  * for the ordinary synchronous path.
  */
-function repoIngestEligible(repo, pathString, data, isMerge, tag) {
-    return (tag == null &&
-        !isMerge &&
-        repo.persistence_ !== null &&
-        repo.persistence_.isPersistentPath(pathString) &&
-        repo.interceptServerDataCallback_ === null &&
-        sliceableAsChildren(data));
+function repoIngestEligible(repo, pathString, data, isMerge, tag, wireBytes = 0) {
+    if (tag != null ||
+        isMerge ||
+        repo.interceptServerDataCallback_ !== null ||
+        !sliceableAsChildren(data)) {
+        return false;
+    }
+    // Registered persistent roots always take the pump: their pushes are the
+    // declared long-lived subtrees (workspace fallbacks, cold boots).
+    if (repo.persistence_ !== null &&
+        repo.persistence_.isPersistentPath(pathString)) {
+        return true;
+    }
+    // Size-based catch-all: a giant push freezes the main thread no matter
+    // which listen it answers — a component's own listener on a large node, a
+    // re-listen racing a remount's transient deregistration, a repo without
+    // persistence. The pump needs only the SyncTree (write-through already
+    // no-ops for untracked paths), so slice by payload size, not by path
+    // registration. wireBytes is the message's frame bytes — 0 when the
+    // transport didn't report (long-poll), which keeps the synchronous path.
+    return wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD;
 }
 /**
  * Runs one sliced full-root ingest under a gate on the repo's ordered
@@ -15789,7 +15846,7 @@ function repoDrainIngestQueue(repo) {
                 }
                 try {
                     if (op.kind === 'data') {
-                        if (repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag)) {
+                        if (repoIngestEligible(repo, op.pathString, op.data, op.isMerge, op.tag, op.wireBytes)) {
                             // Re-enter the sliced ingest for a queued full-root push. Its
                             // gate holds the remaining stream; its finally re-invokes the
                             // drain. Consume-then-stand-down keeps the FIFO intact.
