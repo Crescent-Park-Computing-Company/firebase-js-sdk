@@ -208,6 +208,19 @@ interface PendingSeedRestore {
  * repo.onDisconnect_ in one motion, so acks and registrations landing on
  * the next connection can never rewrite an earlier disconnect's run).
  */
+/**
+ * Wire size (bytes of websocket frames for the message) above which an
+ * untagged, non-merge, children-shaped data push is ingested through the
+ * sliced pump even when its path is NOT a registered persistent root. Path
+ * registration tracks the app's DECLARED long-lived roots, but the freeze
+ * class is a property of PAYLOAD SIZE: giant pushes also arrive for
+ * unregistered listens (a component's own listener on a large node, a
+ * re-listen racing a remount's deregistration, repos without persistence).
+ * Below the threshold the synchronous path is faster than a pump cycle.
+ * @internal
+ */
+export const _INGEST_WIRE_BYTES_THRESHOLD = 1024 * 1024;
+
 type DeferredWireOp =
   | {
       kind: 'data';
@@ -215,6 +228,8 @@ type DeferredWireOp =
       data: unknown;
       isMerge: boolean;
       tag: number | null;
+      /** Wire bytes of the message that carried this push (0 if unknown). */
+      wireBytes: number;
       /** The queue generation this account-bound op was received under. */
       generation: number;
     }
@@ -503,9 +518,10 @@ export function repoStart(
         pathString: string,
         data: unknown,
         isMerge: boolean,
-        tag: number | null
+        tag: number | null,
+        wireBytes?: number
       ) => {
-        repoOnDataUpdate(repo, pathString, data, isMerge, tag);
+        repoOnDataUpdate(repo, pathString, data, isMerge, tag, wireBytes ?? 0);
       },
       (connectStatus: boolean) => {
         repoOnConnectStatus(repo, connectStatus);
@@ -624,9 +640,10 @@ export function repoOnDataUpdateForTest(
   pathString: string,
   data: unknown,
   isMerge: boolean,
-  tag: number | null
+  tag: number | null,
+  wireBytes = 0
 ): void {
-  repoOnDataUpdate(repo, pathString, data, isMerge, tag);
+  repoOnDataUpdate(repo, pathString, data, isMerge, tag, wireBytes);
 }
 
 /** Test seam: drives a server range merge exactly as the connection would. @internal */
@@ -644,7 +661,8 @@ function repoOnDataUpdate(
   pathString: string,
   data: unknown,
   isMerge: boolean,
-  tag: number | null
+  tag: number | null,
+  wireBytes = 0
 ): void {
   // For testing.
   repo.dataUpdateCount++;
@@ -665,6 +683,7 @@ function repoOnDataUpdate(
       data,
       isMerge,
       tag,
+      wireBytes,
       generation: repo.ingestQueue_.generation
     });
     // No gate may be holding the stream (queue-only deferral): make sure
@@ -674,7 +693,7 @@ function repoOnDataUpdate(
     }
     return;
   }
-  if (repoIngestEligible(repo, pathString, data, isMerge, tag)) {
+  if (repoIngestEligible(repo, pathString, data, isMerge, tag, wireBytes)) {
     // Full-root push at a persistent root: gate the subtree, decode in
     // yielded slices, apply atomically (see repoIngestFullRootPush), then
     // drain whatever the wire delivered meanwhile — in order.
@@ -763,16 +782,33 @@ function repoIngestEligible(
   pathString: string,
   data: unknown,
   isMerge: boolean,
-  tag: number | null
+  tag: number | null,
+  wireBytes = 0
 ): boolean {
-  return (
-    tag == null &&
-    !isMerge &&
+  if (
+    tag != null ||
+    isMerge ||
+    repo.interceptServerDataCallback_ !== null ||
+    !sliceableAsChildren(data)
+  ) {
+    return false;
+  }
+  // Registered persistent roots always take the pump: their pushes are the
+  // declared long-lived subtrees (workspace fallbacks, cold boots).
+  if (
     repo.persistence_ !== null &&
-    repo.persistence_.isPersistentPath(pathString) &&
-    repo.interceptServerDataCallback_ === null &&
-    sliceableAsChildren(data)
-  );
+    repo.persistence_.isPersistentPath(pathString)
+  ) {
+    return true;
+  }
+  // Size-based catch-all: a giant push freezes the main thread no matter
+  // which listen it answers — a component's own listener on a large node, a
+  // re-listen racing a remount's transient deregistration, a repo without
+  // persistence. The pump needs only the SyncTree (write-through already
+  // no-ops for untracked paths), so slice by payload size, not by path
+  // registration. wireBytes is the message's frame bytes — 0 when the
+  // transport didn't report (long-poll), which keeps the synchronous path.
+  return wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD;
 }
 
 /**
@@ -916,7 +952,8 @@ function repoDrainIngestQueue(repo: Repo): void {
                 op.pathString,
                 op.data,
                 op.isMerge,
-                op.tag
+                op.tag,
+                op.wireBytes
               )
             ) {
               // Re-enter the sliced ingest for a queued full-root push. Its
