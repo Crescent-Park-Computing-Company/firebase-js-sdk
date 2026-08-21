@@ -1105,6 +1105,11 @@ export function repoStartServerListen(
 
   let activeMode: ListenOutcomeMode = 'cold';
   let activeReason: ListenOutcomeReason | undefined;
+  // The progress callback lives for the whole wire listen, but provisional
+  // (certified:false) publishes are only meaningful BEFORE the listen
+  // response settles the outcome — a later data push's progress event must
+  // not regress a certified outcome back to uncertified.
+  let listenSettled = false;
   const processListenComplete = (
     status: string,
     data: unknown,
@@ -1115,6 +1120,7 @@ export function repoStartServerListen(
     if (!isDefaultComplete) {
       return;
     }
+    listenSettled = true;
     repoPublishListenOutcome(repo, pathString, {
       mode: activeMode,
       certified: status === 'ok',
@@ -1138,6 +1144,7 @@ export function repoStartServerListen(
   ) => {
     activeMode = mode;
     activeReason = reason;
+    listenSettled = false;
     if (isDefaultComplete) {
       repoPublishListenOutcome(repo, pathString, {
         mode,
@@ -1165,7 +1172,7 @@ export function repoStartServerListen(
         processListenComplete(status, data, wire);
       },
       wire => {
-        if (!isDefaultComplete) {
+        if (!isDefaultComplete || listenSettled) {
           return;
         }
         // Range merges preserve the restored base (incremental/cyan). A normal
@@ -1614,6 +1621,20 @@ export function repoClearListenOutcomes(repo: Repo): void {
 export function repoNotifyPersistenceAuthScope(repo: Repo): void {
   for (const listener of repo.persistenceAuthScopeListeners_) {
     exceptionGuard(listener);
+  }
+  // Late identity arrival: any {persistent:true} root that fell open to a
+  // plain listen (auth-timeout) — or is selected-but-untracked for any
+  // other reason — activates now through the same path a joined listener
+  // uses: track + seed from the live certified cache. Roots still waiting
+  // on a pending restore are skipped by the activation's own guard, so
+  // this is idempotent with the per-listener resume above.
+  const persistence = repo.persistence_;
+  if (persistence !== null && persistence.isAuthScopeConfigured()) {
+    for (const pathString of persistence.persistentPaths()) {
+      if (persistence.trackedRootFor(pathString) !== pathString) {
+        repoActivatePersistenceForJoinedListen(repo, new Path(pathString));
+      }
+    }
   }
 }
 

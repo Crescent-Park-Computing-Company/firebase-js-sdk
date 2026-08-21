@@ -58,11 +58,20 @@ import {
 
 import { makeFakeIdb, flushMicrotasks, wait } from './helpers/fakeIdb';
 
+/** Single-tab environment: every lock request grants immediately. */
+const alwaysGrantedLocks = {
+  request: (
+    _name: string,
+    _options: { mode: 'exclusive' },
+    callback: (lock: unknown) => Promise<unknown>
+  ): Promise<unknown> => Promise.resolve().then(() => callback({}))
+};
+
 function makeManager(idb: IDBFactory): RowPersistenceManager {
   const manager = new RowPersistenceManager(
     'test-repo',
     idb,
-    null, // Node: no Web Locks -> always writer
+    alwaysGrantedLocks,
     1,
     1,
     512,

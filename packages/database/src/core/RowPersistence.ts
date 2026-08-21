@@ -117,7 +117,7 @@ export interface RowListenHashes {
 export interface WebLocksLike {
   request(
     name: string,
-    options: { mode: 'exclusive' },
+    options: { mode: 'exclusive'; ifAvailable?: boolean },
     callback: (lock: unknown | null) => Promise<unknown>
   ): Promise<unknown>;
 }
@@ -159,6 +159,13 @@ interface TrackedRoot {
   rearm: boolean;
   /** Held Web Lock release callback (null = not the writer). */
   releaseLock: (() => void) | null;
+  /**
+   * Resolves once the initial acquisition DECIDED: granted (this tab is
+   * the writer) or queued behind a live holder. flushNow_ awaits it so a
+   * flush issued right after track() — the boot graft flush, a test —
+   * cannot race the in-flight probe and misread "not the writer".
+   */
+  lockDecided: Promise<void> | null;
   /**
    * Set while an untrack drain is in flight. track() clears it to CANCEL
    * the teardown — a remove-then-re-add in one stack (React effect
@@ -275,6 +282,11 @@ export class RowPersistenceManager {
     return this.persistentRoots_.has(pathString);
   }
 
+  /** Every path currently selected with {persistent:true}. */
+  persistentPaths(): string[] {
+    return [...this.persistentRoots_.keys()];
+  }
+
   /**
    * The tracked root at or above `pathString`, or null. Roots are the paths
    * listeners selected with {persistent: true}; a server update anywhere
@@ -339,6 +351,7 @@ export class RowPersistenceManager {
       activeFlush: null,
       rearm: false,
       releaseLock: null,
+      lockDecided: null,
       untrackPending: false
     };
     this.tracked_.set(pathString, root);
@@ -414,12 +427,26 @@ export class RowPersistenceManager {
    * not touch storage. On grant it refreshes the row index (rows on disk
    * may lag its memory) and flushes whatever is pending.
    */
+  /**
+   * Two-phase writer acquisition:
+   *
+   * 1. An `ifAvailable` probe decides IMMEDIATELY: either this tab becomes
+   *    the writer now, or a live holder exists elsewhere. `lockDecided`
+   *    resolves at that decision, so a flush issued right after track()
+   *    (the boot graft flush) can await a definitive answer instead of
+   *    misreading an in-flight request as "not the writer".
+   * 2. When the probe lost, a BLOCKING queued request waits behind the
+   *    holder: the UA grants it when the holder releases or its tab dies —
+   *    automatic succession with zero heartbeat/steal machinery.
+   */
   private async acquireWriterLock_(
     pathString: string,
     root: TrackedRoot
   ): Promise<void> {
     if (this.webLocks_ === null) {
-      // Fail open: no cross-tab exclusion, every tab writes (LWW rows).
+      // Fail open: no cross-tab exclusion, every tab writes (LWW rows;
+      // computeListenHashes independently declines claims in this mode).
+      root.lockDecided = Promise.resolve();
       return;
     }
     const name =
@@ -430,28 +457,50 @@ export class RowPersistenceManager {
       '|' +
       pathString;
     const generation = this.authGeneration_;
+    const usable = (): boolean =>
+      !this.disposed_ &&
+      !this.networkSuspended_ &&
+      this.authGeneration_ === generation &&
+      this.tracked_.get(pathString) === root;
+    const holdLock = (): Promise<void> =>
+      new Promise<void>(resolve => {
+        root.releaseLock = resolve;
+        root.rowIndex = null;
+        if (root.dirty !== undefined && root.windowTimer === null) {
+          this.armWindow_(pathString, root);
+        }
+      });
+
+    let decided!: () => void;
+    root.lockDecided = new Promise<void>(resolve => {
+      decided = resolve;
+    });
     try {
+      let probeWon = false;
+      await this.webLocks_.request(
+        name,
+        { mode: 'exclusive', ifAvailable: true },
+        lock => {
+          decided();
+          if (lock === null || !usable()) {
+            return Promise.resolve();
+          }
+          probeWon = true;
+          return holdLock();
+        }
+      );
+      if (probeWon || !usable()) {
+        return;
+      }
+      // A holder exists elsewhere: queue behind it for succession.
       await this.webLocks_.request(name, { mode: 'exclusive' }, () => {
-        if (
-          this.disposed_ ||
-          this.networkSuspended_ ||
-          this.authGeneration_ !== generation ||
-          this.tracked_.get(pathString) !== root
-        ) {
-          // Granted after this tracking ended (or while deliberately
-          // offline): release immediately so the next queued tab takes
-          // over. Resume queues a fresh request.
+        if (!usable()) {
           return Promise.resolve();
         }
-        return new Promise<void>(resolve => {
-          root.releaseLock = resolve;
-          root.rowIndex = null;
-          if (root.dirty !== undefined && root.windowTimer === null) {
-            this.armWindow_(pathString, root);
-          }
-        });
+        return holdLock();
       });
     } catch (e) {
+      decided();
       // Lock API failure: stay a follower (rows go stale until next boot).
     }
   }
@@ -757,6 +806,17 @@ export class RowPersistenceManager {
     // them: the one unhealable corruption class. Reading meta.gen inside the
     // same snapshot as the rows, and requiring it to equal lastGen, makes
     // the mismatch a plain downgrade to an uncertified listen.
+    // Claims additionally require REAL cross-tab exclusion. The gen check
+    // binds the hash to one committed generation, but a generation is only
+    // guaranteed internally consistent (one writer's tree, never a mix of
+    // two tabs' increments) because exactly one tab can write at a time.
+    // Where Web Locks does not exist that premise is gone — tabs interleave
+    // incremental flushes and the LAST writer's gen can describe mixed
+    // rows. Cache writes stay (they still paint the next boot); the listen
+    // simply goes uncertified, which is the pre-persistence behavior.
+    if (this.webLocks_ === null) {
+      return null;
+    }
     const expectedGen = this.tracked_.get(pathString)?.lastGen ?? null;
     if (expectedGen === null) {
       return null;
@@ -970,6 +1030,12 @@ export class RowPersistenceManager {
     if (root.flushing) {
       root.rearm = true;
       return;
+    }
+    // The initial acquisition decides quickly (ifAvailable probe); waiting
+    // for it means a flush issued right after track() cannot misread an
+    // in-flight request as "not the writer".
+    if (root.lockDecided !== null) {
+      await root.lockDecided;
     }
     if (
       root.latest === null ||

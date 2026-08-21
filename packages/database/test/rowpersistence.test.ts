@@ -29,6 +29,25 @@ import { Path } from '../src/core/util/Path';
 import { makeFakeIdb, flushMicrotasks, wait } from './helpers/fakeIdb';
 
 /** A manager with instant write windows for tests. */
+/**
+ * Grants every request immediately and exclusively — the single-tab
+ * environment. Tests that need contention build their own fake (see the
+ * writer-lease suite); tests for the LOCKLESS environment pass
+ * `webLocks: null` explicitly (claims are then declined by design).
+ */
+function makeAlwaysGrantedLocks(): {
+  request: (
+    name: string,
+    options: { mode: 'exclusive' },
+    callback: (lock: unknown) => Promise<unknown>
+  ) => Promise<unknown>;
+} {
+  return {
+    request: (_name, _options, callback) =>
+      Promise.resolve().then(() => callback({}))
+  };
+}
+
 function makeManager(
   idb: IDBFactory,
   options: {
@@ -40,7 +59,7 @@ function makeManager(
   return new RowPersistenceManager(
     'test-repo',
     idb,
-    options.webLocks ?? null, // Node: no Web Locks -> always writer
+    'webLocks' in options ? options.webLocks ?? null : makeAlwaysGrantedLocks(),
     options.writeDelayMs ?? 1,
     options.writeDelayMs ?? 1,
     options.splitThreshold ?? 512,
@@ -893,6 +912,30 @@ describe('boot-claim protection (amber regression)', () => {
     reader.setAuthScope('alice');
     const restored = await reader.peek('/ws', 'alice');
     expect(restored!.node.equals(v2)).to.equal(true);
+    manager.dispose();
+    reader.dispose();
+  });
+});
+
+describe('claims require cross-tab exclusion', () => {
+  it('no Web Locks -> cache writes proceed but computeListenHashes declines', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const manager = makeManager(makeFakeIdb(shared), { webLocks: null });
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    manager.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    // The cache exists (next boot paints from it)...
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    expect(await reader.peek('/ws', 'alice')).to.not.equal(null);
+    await manager.restoreForListen('/ws');
+    // ...but no compound-hash claim without real cross-tab exclusion:
+    // interleaved incremental flushes from two lockless writers can leave
+    // a mixed generation whose gen check alone cannot detect.
+    expect(await manager.computeListenHashes('/ws')).to.equal(null);
     manager.dispose();
     reader.dispose();
   });
