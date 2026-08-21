@@ -68,7 +68,7 @@ export abstract class Transport {
    * @param onDisconnect - Callback with connection lost.
    */
   abstract open(
-    onMessage: (a: {}) => void,
+    onMessage: (a: {}, bytes?: number) => void,
     onDisconnect: (a?: boolean) => void
   ): void;
 

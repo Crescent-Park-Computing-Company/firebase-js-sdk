@@ -23,6 +23,7 @@ export declare interface ListenOptions
 |  Property | Type | Description |
 |  --- | --- | --- |
 |  [onlyOnce](./database.listenoptions.md#listenoptionsonlyonce) | boolean | Whether to remove the listener after its first invocation. |
+|  [persistent](./database.listenoptions.md#listenoptionspersistent) | boolean | Whether the complete, unfiltered path listened to by this registration should be retained in IndexedDB for cache-first startup. Selection is reference-counted across registrations and released automatically when this registration is removed, including <code>off()</code>, <code>onlyOnce</code>, and server cancellation paths. |
 
 ## ListenOptions.onlyOnce
 
@@ -32,4 +33,14 @@ Whether to remove the listener after its first invocation.
 
 ```typescript
 readonly onlyOnce?: boolean;
+```
+
+## ListenOptions.persistent
+
+Whether the complete, unfiltered path listened to by this registration should be retained in IndexedDB for cache-first startup. Selection is reference-counted across registrations and released automatically when this registration is removed, including `off()`<!-- -->, `onlyOnce`<!-- -->, and server cancellation paths.
+
+<b>Signature:</b>
+
+```typescript
+readonly persistent?: boolean;
 ```

@@ -22,7 +22,7 @@ import { exceptionGuard } from '../../core/util/util';
  * This class takes data from the server and ensures it gets passed into the callbacks in order.
  */
 export class PacketReceiver {
-  pendingResponses: unknown[] = [];
+  pendingResponses: Array<{ data: unknown[]; bytes: number } | undefined> = [];
   currentResponseNum = 0;
   closeAfterResponse = -1;
   onClose: (() => void) | null = null;
@@ -30,7 +30,7 @@ export class PacketReceiver {
   /**
    * @param onMessage_
    */
-  constructor(private onMessage_: (a: {}) => void) {}
+  constructor(private onMessage_: (a: {}, bytes?: number) => void) {}
 
   closeAfter(responseNum: number, callback: () => void) {
     this.closeAfterResponse = responseNum;
@@ -46,17 +46,19 @@ export class PacketReceiver {
    * allows us to ensure that we process them in the right order, since we can't be guaranteed that all
    * browsers will respond in the same order as the requests we sent
    */
-  handleResponse(requestNum: number, data: unknown[]) {
-    this.pendingResponses[requestNum] = data;
+  handleResponse(requestNum: number, data: unknown[], bytes = 0) {
+    this.pendingResponses[requestNum] = { data, bytes };
     while (this.pendingResponses[this.currentResponseNum]) {
-      const toProcess = this.pendingResponses[
-        this.currentResponseNum
-      ] as unknown[];
+      const pending = this.pendingResponses[this.currentResponseNum]!;
+      const toProcess = pending.data;
       delete this.pendingResponses[this.currentResponseNum];
       for (let i = 0; i < toProcess.length; ++i) {
         if (toProcess[i]) {
           exceptionGuard(() => {
-            this.onMessage_(toProcess[i]);
+            // The long-poll callback receives a batch. Attribute its measured
+            // bytes once, to the first message, rather than serializing every
+            // parsed item again.
+            this.onMessage_(toProcess[i] as {}, i === 0 ? pending.bytes : 0);
           });
         }
       }

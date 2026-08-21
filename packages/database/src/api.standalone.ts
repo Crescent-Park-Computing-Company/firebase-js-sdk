@@ -77,8 +77,25 @@ export {
   TransactionResult
 } from './api/Transaction';
 
+// Server-cache persistence (fork extension): a typed public surface —
+// consumers call these like any other database API.
+export {
+  getPersistedValue,
+  onListenOutcome,
+  setPersistenceEnabled,
+  setPersistenceAuthScope
+} from './api/Database';
+export { consumePersistedMaterialization } from './api/Reference_impl';
+export type {
+  ListenOutcome,
+  ListenOutcomeMode,
+  ListenOutcomeReason
+} from './core/Repo';
+
 // internal exports
 export { setSDKVersion as _setSDKVersion } from './core/version';
+export { ROW_PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/RowPersistence';
+export { SeedCompoundHash } from './core/ServerCacheSeed';
 export {
   ReferenceImpl as _ReferenceImpl,
   QueryImpl as _QueryImpl

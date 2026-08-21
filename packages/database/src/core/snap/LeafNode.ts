@@ -25,12 +25,16 @@ import {
   pathIsEmpty,
   pathPopFront
 } from '../util/Path';
-import { doubleToIEEE754String, sha1 } from '../util/util';
+import { sha1 } from '../util/util';
 
 import { ChildrenNodeConstructor } from './ChildrenNode';
 import { Index } from './indexes/Index';
 import { Node } from './Node';
-import { priorityHashText, validatePriorityNode } from './snap';
+import {
+  leafHashValueText,
+  priorityHashText,
+  validatePriorityNode
+} from './snap';
 
 let __childrenNodeConstructor: ChildrenNodeConstructor;
 
@@ -189,17 +193,20 @@ export class LeafNode implements Node {
           priorityHashText(this.priorityNode_.val() as number | string) +
           ':';
       }
-
-      const type = typeof this.value_;
-      toHash += type + ':';
-      if (type === 'number') {
-        toHash += doubleToIEEE754String(this.value_ as number);
-      } else {
-        toHash += this.value_;
-      }
+      toHash += leafHashValueText(
+        this.value_ as string | number | boolean,
+        /* v2= */ false
+      );
       this.lazyHash_ = sha1(toHash);
     }
     return this.lazyHash_;
+  }
+
+  /** @inheritDoc */
+  stampLazyHash(hash: string): void {
+    if (this.lazyHash_ === null) {
+      this.lazyHash_ = hash;
+    }
   }
 
   /**

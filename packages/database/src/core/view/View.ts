@@ -173,14 +173,20 @@ export function viewRemoveEventRegistration(
       const existing = view.eventRegistrations_[i];
       if (!existing.matches(eventRegistration)) {
         remaining.push(existing);
-      } else if (eventRegistration.hasAnyCallback()) {
-        // We're removing just this one
-        remaining = remaining.concat(view.eventRegistrations_.slice(i + 1));
-        break;
+      } else {
+        existing.onRemove?.();
+        if (eventRegistration.hasAnyCallback()) {
+          // We're removing just this one
+          remaining = remaining.concat(view.eventRegistrations_.slice(i + 1));
+          break;
+        }
       }
     }
     view.eventRegistrations_ = remaining;
   } else {
+    for (const existing of view.eventRegistrations_) {
+      existing.onRemove?.();
+    }
     view.eventRegistrations_ = [];
   }
   return cancelEvents;
