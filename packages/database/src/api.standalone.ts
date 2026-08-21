@@ -94,7 +94,6 @@ export type {
 
 // internal exports
 export { setSDKVersion as _setSDKVersion } from './core/version';
-export { ROW_PERSISTENCE_WRITE_DEBOUNCE_MS as _PERSISTENCE_WRITE_DEBOUNCE_MS } from './core/RowPersistence';
 export { SeedCompoundHash } from './core/ServerCacheSeed';
 export {
   ReferenceImpl as _ReferenceImpl,

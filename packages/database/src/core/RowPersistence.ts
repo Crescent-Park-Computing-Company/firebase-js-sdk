@@ -77,7 +77,7 @@ export const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 export const ROW_PERSISTENCE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Sweep delay after the first restore — far off every boot-critical path. */
 export const ROW_PERSISTENCE_SWEEP_DELAY_MS = 60 * 1000;
-/** Byte budget per first-generation staging transaction. */
+/** Retained for constructor compatibility; whole generations are atomic. */
 export const ROW_PERSISTENCE_STAGE_TXN_BYTES = 4 * 1024 * 1024;
 /** Parsed-bytes budget per restore assembly slice. */
 const RESTORE_SLICE_BYTES = 256 * 1024;
@@ -143,6 +143,7 @@ interface TrackedRoot {
   windowTimer: ReturnType<typeof setTimeout> | null;
   /** Single-flight: a flush is running; re-arm afterward if set. */
   flushing: boolean;
+  activeFlush: Promise<void> | null;
   rearm: boolean;
   /** Held Web Lock release callback (null = not the writer). */
   releaseLock: (() => void) | null;
@@ -226,7 +227,9 @@ export class RowPersistenceManager {
   }
 
   private scopeKey_(): string {
-    return this.authScope_ === null ? PUBLIC_SCOPE : this.authScope_;
+    // Structural namespace prevents an authenticated scope equal to the
+    // signed-out sentinel from sharing private/public cached bytes.
+    return this.authScope_ === null ? 'public' : 'auth:' + this.authScope_;
   }
 
   // ───────────────────────── root selection ──────────────────────────────
@@ -272,6 +275,7 @@ export class RowPersistenceManager {
       hasGeneration: false,
       windowTimer: null,
       flushing: false,
+      activeFlush: null,
       rearm: false,
       releaseLock: null
     };
@@ -570,6 +574,9 @@ export class RowPersistenceManager {
       ) {
         return null;
       }
+      if (Date.now() - (meta as RootMeta).updatedAt > this.maxAgeMs_) {
+        return null;
+      }
       const rows: Array<[string[], string]> = [];
       const rowPaths: string[][] = [];
       for (let i = 0; i < keys.length; i++) {
@@ -814,7 +821,22 @@ export class RowPersistenceManager {
   }
 
   /** Single-flight flush of everything dirty at the root. */
-  private async flushNow_(
+  private flushNow_(pathString: string, root: TrackedRoot): Promise<void> {
+    if (root.activeFlush !== null) {
+      root.rearm = true;
+      return root.activeFlush;
+    }
+    const promise = this.flushNowImpl_(pathString, root);
+    root.activeFlush = promise;
+    void promise.finally(() => {
+      if (root.activeFlush === promise) {
+        root.activeFlush = null;
+      }
+    });
+    return promise;
+  }
+
+  private async flushNowImpl_(
     pathString: string,
     root: TrackedRoot
   ): Promise<void> {
@@ -879,46 +901,31 @@ export class RowPersistenceManager {
     const rootKey = this.rootKey_(pathString);
     const metaKey = encodeRowKey(scope, rootKey, []);
     const range = rowKeyRange(scope, rootKey, []);
-    // 1) Invalidate: delete meta + existing rows. From here until the final
-    //    meta put, the cache reads as absent.
-    {
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-      txn.objectStore(META_STORE).delete(metaKey);
-      txn.objectStore(ROWS_STORE).delete(range);
-      await this.txnDone_(txn);
-    }
-    // 2) Stage rows in byte-budgeted transactions (macrotask yields between
-    //    them keep the main thread responsive on a large first generation).
     const rows = splitNodeIntoRows([], node, this.splitThresholdBytes_);
-    let index = 0;
-    while (index < rows.length) {
+
+    // The whole generation is one readwrite transaction. This is deliberately
+    // less clever than v1's staged generations: without a manifest/CAS there
+    // must not be a visible interval where rows from two writers combine.
+    // IndexedDB transactions are atomic across all object stores, so even a
+    // crash or competing tab leaves either the old meta+rows or the new
+    // meta+rows. The one transaction is also the no-Web-Locks correctness
+    // fallback; Web Locks only avoids duplicate work, never protects data.
+    const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+    const rowStore = txn.objectStore(ROWS_STORE);
+    const metaStore = txn.objectStore(META_STORE);
+    rowStore.delete(range);
+    for (let i = 0; i < rows.length; i++) {
       if (this.disposed_ || this.authGeneration_ !== generation) {
+        txn.abort();
         return;
       }
-      const txn = db.transaction(ROWS_STORE, 'readwrite');
-      const store = txn.objectStore(ROWS_STORE);
-      let batchBytes = 0;
-      while (index < rows.length && batchBytes < this.stageTxnBytes_) {
-        const [segs, json] = rows[index];
-        store.put(json, encodeRowKey(scope, rootKey, segs));
-        batchBytes += json.length;
-        index++;
-      }
-      await this.txnDone_(txn);
-      if (index < rows.length) {
-        await yieldMacrotask();
-      }
+      rowStore.put(rows[i][1], encodeRowKey(scope, rootKey, rows[i][0]));
     }
-    // 3) Commit: meta present = generation complete.
-    {
-      const txn = db.transaction(META_STORE, 'readwrite');
-      const meta: RootMeta = {
-        updatedAt: Date.now(),
-        formatVersion: META_FORMAT_VERSION
-      };
-      txn.objectStore(META_STORE).put(meta, metaKey);
-      await this.txnDone_(txn);
-    }
+    metaStore.put(
+      { updatedAt: Date.now(), formatVersion: META_FORMAT_VERSION } as RootMeta,
+      metaKey
+    );
+    await this.txnDone_(txn);
     root.rowIndex = RowIndex.fromRelativePaths(rows.map(r => r[0]));
     root.hasGeneration = true;
   }
@@ -1123,8 +1130,19 @@ export class RowPersistenceManager {
           root.windowTimer = null;
         }
         if (root.releaseLock !== null) {
-          root.releaseLock();
-          root.releaseLock = null;
+          const release = root.releaseLock;
+          const active = root.activeFlush;
+          if (active !== null) {
+            void active.finally(() => {
+              if (root.releaseLock === release) {
+                release();
+                root.releaseLock = null;
+              }
+            });
+          } else {
+            release();
+            root.releaseLock = null;
+          }
         }
       } else {
         void this.acquireWriterLock_(pathString, root);

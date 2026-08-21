@@ -75,9 +75,9 @@ export function encodeRowKey(
   rootString: string,
   relativePath: string[]
 ): string {
-  let key = scope + ROW_KEY_SEPARATOR + rootString + ROW_KEY_SEPARATOR;
+  let key = encodeURIComponent(scope) + ROW_KEY_SEPARATOR + encodeURIComponent(rootString) + ROW_KEY_SEPARATOR;
   for (let i = 0; i < relativePath.length; i++) {
-    key += relativePath[i] + ROW_KEY_SEPARATOR;
+    key += encodeURIComponent(relativePath[i]) + ROW_KEY_SEPARATOR;
   }
   return key;
 }
@@ -88,7 +88,7 @@ export function decodeRowKeyRelativePath(
   scope: string,
   rootString: string
 ): string[] {
-  const prefix = scope + ROW_KEY_SEPARATOR + rootString + ROW_KEY_SEPARATOR;
+  const prefix = encodeURIComponent(scope) + ROW_KEY_SEPARATOR + encodeURIComponent(rootString) + ROW_KEY_SEPARATOR;
   assert(key.startsWith(prefix), 'row key does not match scope/root prefix');
   const rest = key.slice(prefix.length);
   if (rest === '') {
@@ -97,7 +97,7 @@ export function decodeRowKeyRelativePath(
   // Every key ends with a trailing separator; drop the empty tail segment.
   const segments = rest.split(ROW_KEY_SEPARATOR);
   segments.pop();
-  return segments;
+  return segments.map(decodeURIComponent);
 }
 
 /** The IDBKeyRange covering every row of (scope, root) at or under relPath. */
@@ -343,7 +343,7 @@ export class RowIndex {
 function encodeRelative_(segments: string[]): string {
   let key = '';
   for (let i = 0; i < segments.length; i++) {
-    key += segments[i] + ROW_KEY_SEPARATOR;
+    key += encodeURIComponent(segments[i]) + ROW_KEY_SEPARATOR;
   }
   return key;
 }
