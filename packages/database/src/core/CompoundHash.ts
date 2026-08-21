@@ -541,15 +541,177 @@ function subtreeVsMarker(path: string[], post: string[]): -1 | 0 | 1 {
 }
 
 /**
- * Walks the leaves of `node` whose paths lie in the half-open marker interval
- * (fromPost, toPost], feeding the builder exactly the startChild / endChild /
- * processLeaf sequence the natural full-tree walk produces for those leaves.
- * The builder must have been seeded at `fromPost` (seedBoundary) so the first
- * emitted range opens with the same common-ancestor prefix the full walk
- * would write. `toPost === null` walks to the end of the tree.
+ * One traversal frame of a LeafIntervalWalker. An `enter` frame positions the
+ * walk at `node` (pushing `key` onto the live path unless it is the root);
+ * the matching `exit` frame pops the key once every descendant frame ran.
+ */
+type LeafIntervalFrame =
+  | { kind: 'enter'; key: string | null; node: Node }
+  | { kind: 'exit' };
+
+/**
+ * Explicit-stack traversal of the leaves of `node` whose paths lie in the
+ * half-open marker interval (fromPost, toPost], feeding the builder exactly
+ * the startChild / endChild / processLeaf sequence the natural full-tree walk
+ * produces for those leaves. The builder must have been seeded at `fromPost`
+ * (seedBoundary) so the first emitted range opens with the same
+ * common-ancestor prefix the full walk would write. `toPost === null` walks
+ * to the end of the tree.
+ *
+ * The stack form exists so large intervals can be walked in bounded
+ * main-thread slices (drainUntil): the persistence flush plans and stages
+ * whole-root intervals on a first generation, and the recursive walk there
+ * was a multi-second synchronous stall on large roots. Draining with an
+ * infinite deadline reproduces the recursive walk exactly — walkLeafInterval
+ * below is that wrapper, and the two forms are byte-identical by
+ * construction (same frame order, same builder calls).
  *
  * Subtrees entirely outside the interval are pruned without reading them —
  * the cost is O(interval bytes + pruned fanout), not O(tree).
+ */
+export class LeafIntervalWalker {
+  private stack_: LeafIntervalFrame[];
+  /** Path of the previously emitted leaf (or the seeded boundary). */
+  private openPath_: string[];
+  private openDepth_: number;
+  private started_: boolean;
+  /** Live path of the frame being processed (mutated by enter/exit). */
+  private readonly path_: string[] = [];
+
+  constructor(
+    node: Node,
+    private readonly fromPost_: string[] | null,
+    private readonly toPost_: string[] | null,
+    private readonly builder_: CompoundHashBuilder
+  ) {
+    this.openPath_ = fromPost_ === null ? [] : fromPost_;
+    this.openDepth_ = this.openPath_.length;
+    this.started_ = fromPost_ !== null;
+    this.stack_ = [{ kind: 'enter', key: null, node }];
+  }
+
+  /**
+   * Processes frames until the walk completes or `deadline` (an epoch-ms
+   * timestamp) passes — always at least one frame, so every slice makes
+   * progress no matter how small its budget. Returns true when the walk is
+   * complete; call finish() then.
+   */
+  drainUntil(deadline: number): boolean {
+    while (this.stack_.length > 0) {
+      this.processFrame_(this.stack_.pop()!);
+      if (Date.now() >= deadline) {
+        break;
+      }
+    }
+    return this.stack_.length === 0;
+  }
+
+  /**
+   * Pops back out of the last emitted leaf's ancestry so a caller chaining
+   * further work sees a balanced builder; endChild is a no-op on text when
+   * no range is open. Call exactly once, after drainUntil returns true.
+   */
+  finish(): void {
+    this.builder_.forceEndRange();
+  }
+
+  private processFrame_(frame: LeafIntervalFrame): void {
+    if (frame.kind === 'exit') {
+      this.path_.pop();
+      return;
+    }
+    const { key, node } = frame;
+    if (key !== null) {
+      this.path_.push(key);
+    }
+    const popEntered = (): void => {
+      if (key !== null) {
+        this.path_.pop();
+      }
+    };
+    if (this.fromPost_ !== null) {
+      const rel = subtreeVsMarker(this.path_, this.fromPost_);
+      if (rel === -1) {
+        popEntered();
+        return; // entirely at-or-before the opening boundary
+      }
+      if (rel === 0 && node.isLeafNode()) {
+        // The boundary leaf itself: excluded (interval is open at fromPost).
+        if (compareRangeMarkers(this.path_, this.fromPost_) <= 0) {
+          popEntered();
+          return;
+        }
+      }
+    }
+    if (this.toPost_ !== null) {
+      const rel = subtreeVsMarker(this.path_, this.toPost_);
+      if (rel === 1) {
+        // Entirely after the closing boundary: nothing further in document
+        // order can be inside the interval — drop every remaining frame.
+        this.stack_.length = 0;
+        popEntered();
+        return;
+      }
+    }
+    if (node.isLeafNode()) {
+      this.emitLeaf_(node as LeafNode);
+      popEntered();
+      return;
+    }
+    // The mobile wire grammar deliberately drops a trailing interior-node
+    // priority. Persistence cannot: store it in the sparse payload without
+    // feeding it to the canonical hash builder.
+    this.builder_.processPriorityForPayload(this.path_, node.getPriority());
+    const children: Array<[string, Node]> = [];
+    forEachChildWithPriority(node, (childKey, child) => {
+      children.push([childKey, child]);
+    });
+    if (key !== null) {
+      this.stack_.push({ kind: 'exit' });
+    }
+    for (let i = children.length - 1; i >= 0; i--) {
+      this.stack_.push({
+        kind: 'enter',
+        key: children[i][0],
+        node: children[i][1]
+      });
+    }
+  }
+
+  private emitLeaf_(leaf: LeafNode): void {
+    const path = this.path_;
+    if (!this.started_) {
+      // First leaf of a from-the-start walk: descend from the root.
+      for (let i = 0; i < path.length; i++) {
+        this.builder_.startChild(path[i]);
+      }
+      this.started_ = true;
+    } else {
+      let common = 0;
+      while (
+        common < this.openDepth_ &&
+        common < path.length &&
+        this.openPath_[common] === path[common]
+      ) {
+        common++;
+      }
+      for (let i = this.openDepth_; i > common; i--) {
+        this.builder_.endChild();
+      }
+      for (let i = common; i < path.length; i++) {
+        this.builder_.startChild(path[i]);
+      }
+    }
+    this.builder_.processLeaf(leaf);
+    // Copy: `path` is the walker's live mutable array.
+    this.openPath_ = path.slice();
+    this.openDepth_ = this.openPath_.length;
+  }
+}
+
+/**
+ * Synchronous interval walk: drains a LeafIntervalWalker in one go. See the
+ * walker for the traversal contract.
  */
 export function walkLeafInterval(
   node: Node,
@@ -557,89 +719,25 @@ export function walkLeafInterval(
   toPost: string[] | null,
   builder: CompoundHashBuilder
 ): void {
-  // Transition state: the path of the previously emitted leaf (or the seeded
-  // boundary), from which endChild/startChild transitions are derived.
-  let openPath: string[] = fromPost === null ? [] : fromPost;
-  let openDepth = openPath.length;
-  let started = fromPost !== null;
-  let stopped = false;
-
-  const emitLeaf = (path: string[], leaf: LeafNode): void => {
-    if (!started) {
-      // First leaf of a from-the-start walk: descend from the root.
-      for (let i = 0; i < path.length; i++) {
-        builder.startChild(path[i]);
-      }
-      started = true;
-    } else {
-      let common = 0;
-      while (
-        common < openDepth &&
-        common < path.length &&
-        openPath[common] === path[common]
-      ) {
-        common++;
-      }
-      for (let i = openDepth; i > common; i--) {
-        builder.endChild();
-      }
-      for (let i = common; i < path.length; i++) {
-        builder.startChild(path[i]);
-      }
-    }
-    builder.processLeaf(leaf);
-    // Copy: `path` is the walker's live mutable array.
-    openPath = path.slice();
-    openDepth = openPath.length;
-  };
-
-  const walk = (current: Node, path: string[]): void => {
-    if (stopped) {
-      return;
-    }
-    if (fromPost !== null) {
-      const rel = subtreeVsMarker(path, fromPost);
-      if (rel === -1) {
-        return; // entirely at-or-before the opening boundary
-      }
-      if (rel === 0 && current.isLeafNode()) {
-        // The boundary leaf itself: excluded (interval is open at fromPost).
-        if (compareRangeMarkers(path, fromPost) <= 0) {
-          return;
-        }
-      }
-    }
-    if (toPost !== null) {
-      const rel = subtreeVsMarker(path, toPost);
-      if (rel === 1) {
-        stopped = true; // entirely after the closing boundary
-        return;
-      }
-    }
-    if (current.isLeafNode()) {
-      emitLeaf(path, current as LeafNode);
-      return;
-    }
-    // The mobile wire grammar deliberately drops a trailing interior-node
-    // priority. Persistence cannot: store it in the sparse payload without
-    // feeding it to the canonical hash builder.
-    builder.processPriorityForPayload(path, current.getPriority());
-    forEachChildWithPriority(current, (key, child) => {
-      if (stopped) {
-        return;
-      }
-      path.push(key);
-      walk(child, path);
-      path.pop();
-    });
-  };
-
-  walk(node, []);
-  // Pop back out of the last emitted leaf's ancestry so a caller chaining
-  // further work sees a balanced builder; endChild is a no-op on text when
-  // no range is open.
-  builder.forceEndRange();
+  const walker = new LeafIntervalWalker(node, fromPost, toPost, builder);
+  while (!walker.drainUntil(Infinity)) {
+    // drainUntil with an infinite deadline only stops when the stack drains.
+  }
+  walker.finish();
 }
+
+/**
+ * Node-pair visits the identity-diff may spend before concluding the trees
+ * are too divorced to diff (collapse to the root path: everything dirty).
+ * The diff's output was
+ * always budgeted (maxPaths); its WORK was not — two trees that share no
+ * structure (a fallback boot's baseline vs a fully re-downloaded root) made
+ * it walk both trees end to end only to conclude "all dirty". Visits accrue
+ * only where identity differs, so a genuine incremental change stays far
+ * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * @internal
+ */
+export const DIFF_VISIT_BUDGET = 20000;
 
 /**
  * The identity-diff: collects the paths of maximal subtrees that differ
@@ -647,15 +745,23 @@ export function walkLeafInterval(
  * subtrees are recognized by object identity and never descended. A child
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves.
+ * dirty mapping only needs interval bounds, not precise leaves. Exhausting
+ * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
+ * collapses the affected branches toward the root — in the limit to the
+ * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
+ * diff's cost is bounded even against a baseline sharing no structure with
+ * the live tree. The result is always a (possibly collapsed) path list; it
+ * over-approximates but never misses a change.
  */
 export function collectChangedSubtreePaths(
   before: Node,
   after: Node,
   maxDepth = 8,
-  maxPaths = 512
-): string[][] | null {
+  maxPaths = 512,
+  maxVisits = DIFF_VISIT_BUDGET
+): string[][] {
   const changed: string[][] = [];
+  let visits = 0;
   /**
    * Returns true when the caller must collapse this branch to stay within the
    * global path budget. A large atomic subtree update should dirty that
@@ -664,6 +770,13 @@ export function collectChangedSubtreePaths(
   const visit = (a: Node, b: Node, path: string[], depth: number): boolean => {
     if (a === b) {
       return false;
+    }
+    if (++visits > maxVisits) {
+      // Work budget exhausted: the trees are too divorced for the diff to
+      // pay off. Collapse to the root path — everything dirty.
+      changed.length = 0;
+      changed.push([]);
+      return true;
     }
     const branchStart = changed.length;
     const collapseBranch = (): boolean => {
@@ -815,9 +928,188 @@ export function markDirtyRanges(
  * are emitted through `builder`, whose hashSink/hashes the caller owns —
  * pass a sink to hash the dirty texts with WebCrypto afterwards.
  *
- * Returns the new range list with hashes for SINK-DEFERRED entries empty
- * (the caller fills them from the sink's completions, matching indexes in
- * builder.hashes/sizes/posts order for the dirty emissions).
+ * Sliceable: drainUntil processes walker frames until a deadline so the
+ * persistence flush can plan a whole-root generation (the cold boot's first
+ * flush, where every range is dirty) in bounded main-thread slices instead
+ * of one multi-second synchronous walk. Draining with an infinite deadline
+ * reproduces the old synchronous behavior exactly — rebuildStableRanges
+ * below is that wrapper.
+ *
+ * result() returns the new range list with hashes for SINK-DEFERRED entries
+ * empty (the caller fills them from the sink's completions, matching indexes
+ * in builder.posts). Boundary invariant: every preserved clean range keeps
+ * its exact post; rewalked runs end exactly at their run's outer boundary
+ * (LeafIntervalWalker's toPost pruning + finish()), so posts remain globally
+ * ordered and disjoint.
+ */
+export class StableRangeRebuilder {
+  /** [fromPost, toPost, cleanTailAfter] per dirty run, in order. */
+  private readonly runs_: Array<{
+    from: string[] | null;
+    to: string[] | null;
+    /** Clean ranges to carry over verbatim once this run completes. */
+    carryAfter: PersistedCarryRange[];
+  }> = [];
+  private readonly result_: StableRange[] = [];
+  private runIndex_ = 0;
+  private walker_: LeafIntervalWalker | null = null;
+  private emitFrom_ = 0;
+
+  constructor(
+    private readonly node_: Node,
+    previous: StableRange[],
+    dirty: boolean[],
+    tailDirty: boolean,
+    private readonly builder_: CompoundHashBuilder,
+    fixedTargetBytes?: number
+  ) {
+    const ideal =
+      fixedTargetBytes === undefined
+        ? Math.max(
+            512,
+            Math.floor(Math.sqrt(estimateSerializedNodeSize(node_) * 100))
+          )
+        : Math.max(512, Math.floor(fixedTargetBytes));
+    const minSize = ideal >> 1;
+    // Absorb undersized clean neighbors into adjacent dirty runs (merge side
+    // of the hysteresis): they re-emit merged with the run's bytes.
+    const effectiveDirty = dirty.slice();
+    for (let i = 0; i < effectiveDirty.length; i++) {
+      if (!effectiveDirty[i]) {
+        continue;
+      }
+      for (
+        let p = i - 1;
+        p >= 0 && !effectiveDirty[p] && previous[p].size < minSize;
+        p--
+      ) {
+        effectiveDirty[p] = true;
+      }
+      for (
+        let n = i + 1;
+        n < effectiveDirty.length &&
+        !effectiveDirty[n] &&
+        previous[n].size < minSize;
+        n++
+      ) {
+        effectiveDirty[n] = true;
+        i = n;
+      }
+    }
+
+    // Plan: leading clean prefix carries immediately; each dirty run walks
+    // its interval, then carries the clean ranges up to the next run.
+    let i = 0;
+    let pendingCarry: PersistedCarryRange[] = [];
+    const flushCarryTo = (target: PersistedCarryRange[]): void => {
+      for (const range of pendingCarry) {
+        target.push(range);
+      }
+      pendingCarry = [];
+    };
+    while (i < previous.length) {
+      if (!effectiveDirty[i]) {
+        pendingCarry.push(previous[i]);
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < previous.length && effectiveDirty[j]) {
+        j++;
+      }
+      const runEndsAtTail = j === previous.length && tailDirty;
+      const run = {
+        from: i === 0 ? null : markerToPath(previous[i - 1].post),
+        to: runEndsAtTail ? null : markerToPath(previous[j - 1].post),
+        carryAfter: [] as PersistedCarryRange[]
+      };
+      flushCarryTo(this.result_);
+      this.runs_.push(run);
+      i = j;
+      // Clean ranges after this run attach to it, so they emit in order.
+      while (i < previous.length && !effectiveDirty[i]) {
+        run.carryAfter.push(previous[i]);
+        i++;
+      }
+    }
+    flushCarryTo(this.result_);
+    if (tailDirty && previous.length > 0) {
+      // Tail handled by extending the last run (runEndsAtTail) when the last
+      // range was dirty; when it was clean, walk the pure tail interval.
+      const lastWasClean = !effectiveDirty[previous.length - 1];
+      if (lastWasClean) {
+        this.runs_.push({
+          from: markerToPath(previous[previous.length - 1].post),
+          to: null,
+          carryAfter: []
+        });
+      }
+    }
+    if (previous.length === 0) {
+      // First-ever generation: one natural full walk.
+      this.runs_.push({ from: null, to: null, carryAfter: [] });
+    }
+  }
+
+  /**
+   * Advances the rebuild until `deadline` (epoch ms) passes or every run has
+   * been walked — always at least one walker slice, so every call makes
+   * progress. Returns true when planning is complete; call result() then.
+   */
+  drainUntil(deadline: number): boolean {
+    while (this.runIndex_ < this.runs_.length) {
+      const run = this.runs_[this.runIndex_];
+      if (this.walker_ === null) {
+        this.emitFrom_ = this.builder_.posts.length;
+        if (run.from !== null) {
+          this.builder_.seedBoundary(run.from);
+        }
+        this.walker_ = new LeafIntervalWalker(
+          this.node_,
+          run.from,
+          run.to,
+          this.builder_
+        );
+      }
+      if (!this.walker_.drainUntil(deadline)) {
+        return false;
+      }
+      this.walker_.finish();
+      this.walker_ = null;
+      for (let k = this.emitFrom_; k < this.builder_.posts.length; k++) {
+        this.result_.push({
+          post: this.builder_.posts[k],
+          hash: this.builder_.hashes[k],
+          size: this.builder_.sizes[k]
+        });
+      }
+      for (const range of run.carryAfter) {
+        this.result_.push(range);
+      }
+      this.runIndex_++;
+      if (Date.now() >= deadline) {
+        return this.runIndex_ >= this.runs_.length;
+      }
+    }
+    return true;
+  }
+
+  /** The completed range list. Only valid after drainUntil returned true. */
+  result(): StableRange[] {
+    return this.result_;
+  }
+}
+
+/**
+ * A clean range carried over verbatim. Structurally StableRange; persistence
+ * layers a recordId on top (PersistedRange) and carrying preserves it, so
+ * the rebuilder must not clone or narrow the object.
+ */
+type PersistedCarryRange = StableRange;
+
+/**
+ * Synchronous stable-range rebuild: drains a StableRangeRebuilder in one go.
+ * See the rebuilder for the planning contract.
  */
 export function rebuildStableRanges(
   node: Node,
@@ -827,100 +1119,18 @@ export function rebuildStableRanges(
   builder: CompoundHashBuilder,
   fixedTargetBytes?: number
 ): StableRange[] {
-  const ideal =
-    fixedTargetBytes === undefined
-      ? Math.max(
-          512,
-          Math.floor(Math.sqrt(estimateSerializedNodeSize(node) * 100))
-        )
-      : Math.max(512, Math.floor(fixedTargetBytes));
-  const minSize = ideal >> 1;
-  // Absorb undersized clean neighbors into adjacent dirty runs (merge side of
-  // the hysteresis): they re-emit merged with the run's bytes.
-  const effectiveDirty = dirty.slice();
-  for (let i = 0; i < effectiveDirty.length; i++) {
-    if (!effectiveDirty[i]) {
-      continue;
-    }
-    for (
-      let p = i - 1;
-      p >= 0 && !effectiveDirty[p] && previous[p].size < minSize;
-      p--
-    ) {
-      effectiveDirty[p] = true;
-    }
-    for (
-      let n = i + 1;
-      n < effectiveDirty.length &&
-      !effectiveDirty[n] &&
-      previous[n].size < minSize;
-      n++
-    ) {
-      effectiveDirty[n] = true;
-      i = n;
-    }
+  const rebuilder = new StableRangeRebuilder(
+    node,
+    previous,
+    dirty,
+    tailDirty,
+    builder,
+    fixedTargetBytes
+  );
+  while (!rebuilder.drainUntil(Infinity)) {
+    // Infinite deadline: only stops when every run has been walked.
   }
-
-  const result: StableRange[] = [];
-  let i = 0;
-  while (i < previous.length) {
-    if (!effectiveDirty[i]) {
-      result.push(previous[i]);
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < previous.length && effectiveDirty[j]) {
-      j++;
-    }
-    const runEndsAtTail = j === previous.length && tailDirty;
-    const fromPost = i === 0 ? null : markerToPath(previous[i - 1].post);
-    const toPost = runEndsAtTail ? null : markerToPath(previous[j - 1].post);
-    const firstEmitIndex = builder.posts.length;
-    if (fromPost !== null) {
-      builder.seedBoundary(fromPost);
-    }
-    walkLeafInterval(node, fromPost, toPost, builder);
-    for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-      result.push({
-        post: builder.posts[k],
-        hash: builder.hashes[k],
-        size: builder.sizes[k]
-      });
-    }
-    i = j;
-  }
-  if (tailDirty && previous.length > 0) {
-    // Tail handled by extending the last run (runEndsAtTail) when the last
-    // range was dirty; when it was clean, walk the pure tail interval.
-    const lastWasClean = !effectiveDirty[previous.length - 1];
-    if (lastWasClean) {
-      const fromPost = markerToPath(previous[previous.length - 1].post);
-      const firstEmitIndex = builder.posts.length;
-      builder.seedBoundary(fromPost);
-      walkLeafInterval(node, fromPost, null, builder);
-      for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-        result.push({
-          post: builder.posts[k],
-          hash: builder.hashes[k],
-          size: builder.sizes[k]
-        });
-      }
-    }
-  }
-  if (previous.length === 0) {
-    // First-ever generation: one natural full walk.
-    const firstEmitIndex = builder.posts.length;
-    walkLeafInterval(node, null, null, builder);
-    for (let k = firstEmitIndex; k < builder.posts.length; k++) {
-      result.push({
-        post: builder.posts[k],
-        hash: builder.hashes[k],
-        size: builder.sizes[k]
-      });
-    }
-  }
-  return result;
+  return rebuilder.result();
 }
 
 export class CompoundHashAccumulator {
