@@ -1267,7 +1267,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3-persistence-v2.1";
+const version = "1.1.3-persistence-v2.2";
 
 /**
  * @license

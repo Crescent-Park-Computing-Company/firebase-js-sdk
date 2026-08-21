@@ -8,7 +8,7 @@ var util = require('@firebase/util');
 var logger$1 = require('@firebase/logger');
 
 const name = "@firebase/database";
-const version = "1.1.3-persistence-v2.1";
+const version = "1.1.3-persistence-v2.2";
 
 /**
  * @license

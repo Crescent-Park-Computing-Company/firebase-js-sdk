@@ -4,7 +4,7 @@ import { stringify, jsonEval, contains, assert, stringToByteArray, Sha1, base64,
 import { Logger, LogLevel } from '@firebase/logger';
 
 const name = "@firebase/database";
-const version = "1.1.3-persistence-v2.1";
+const version = "1.1.3-persistence-v2.2";
 
 /**
  * @license
