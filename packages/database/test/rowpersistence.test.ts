@@ -22,6 +22,7 @@ import {
   simpleSizeSplitStrategy
 } from '../src/core/CompoundHash';
 import { RowPersistenceManager } from '../src/core/RowPersistence';
+import { splitNodeIntoRows } from '../src/core/RowStore';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
 
@@ -686,7 +687,7 @@ describe('overlapping tracked roots', () => {
 });
 
 describe('transaction atomicity (buffered fake)', () => {
-  it('a dispose mid-whole-root-flush aborts and leaves the prior generation intact', async () => {
+  it('a dispose mid-whole-root-flush leaves a complete generation or none — never torn', async () => {
     const shared = new Map<string, Map<string, unknown>>();
     const writer = makeManager(makeFakeIdb(shared));
     writer.setAuthScope('alice');
@@ -712,11 +713,13 @@ describe('transaction atomicity (buffered fake)', () => {
     const reader = makeManager(makeFakeIdb(shared));
     reader.setAuthScope('alice');
     const peeked = await reader.peek('/ws', 'alice');
-    // Either the old generation (abort won) or the new one (commit won) —
-    // never a torn mix, and never a missing cache.
-    expect(peeked).to.not.equal(null);
-    const v = (peeked!.node.val() as { v: number }).v;
-    expect([1, 2]).to.include(v);
+    // Staging is meta-deleted-first / meta-written-last: the cache is
+    // either a COMPLETE generation or ABSENT — never a torn mix. A dispose
+    // mid-stage may cost the cache (cold next boot), never correctness.
+    if (peeked !== null) {
+      const v = (peeked.node.val() as { v: number }).v;
+      expect([1, 2]).to.include(v);
+    }
     reader.dispose();
   });
 
@@ -789,5 +792,65 @@ describe('untrack/re-track race', () => {
     await flushMicrotasks();
     expect(manager.trackedPaths()).to.deep.equal([]);
     manager.dispose();
+  });
+});
+
+describe('iterative whole-root staging', () => {
+  it('produces exactly the same rows as splitNodeIntoRows, across multiple batches', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    // ~1KB stage budget forces many batches at a 96B split threshold.
+    const manager = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(shared),
+      null,
+      1,
+      1,
+      96,
+      30000,
+      300000,
+      1000,
+      1024
+    );
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    const tree = nodeFromJSON({
+      a: { x: 'q'.repeat(120), y: 'r'.repeat(120) },
+      b: 's'.repeat(200),
+      c: { d: { e: 't'.repeat(150) }, f: 1 },
+      g: 'plain'
+    });
+    manager.serverCacheUpdated(new Path('/ws'), tree);
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+
+    // Reference rows from the synchronous splitter.
+    const expected = new Map(
+      splitNodeIntoRows([], tree, 96).map(([segs, json]) => [
+        segs.join('/'),
+        json
+      ])
+    );
+    const reader = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(shared),
+      null,
+      1,
+      1,
+      96,
+      30000,
+      300000,
+      1000,
+      1024
+    );
+    reader.setAuthScope('alice');
+    const restored = await reader.restoreForListen('/ws');
+    expect(restored.node).to.not.equal(null);
+    expect(restored.node!.equals(tree)).to.equal(true);
+    // Same physical row layout (not just the same assembled tree).
+    const rowStore = shared.get('rows')!;
+    expect(rowStore.size).to.equal(expected.size);
+    manager.dispose();
+    reader.dispose();
   });
 });

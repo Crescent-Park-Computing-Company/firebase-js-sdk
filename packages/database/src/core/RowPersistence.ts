@@ -38,6 +38,7 @@
  * change invalidates everything immediately.
  */
 
+import { estimateSerializedNodeSize } from './CompoundHash';
 import { hashRowsInWorker, workerHashAvailable } from './HashWorker';
 import { createRowHashKernel, KernelCompoundHash } from './RowHashKernel';
 import {
@@ -50,6 +51,7 @@ import {
   rowKeyRange,
   splitNodeIntoRows
 } from './RowStore';
+import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
 import { warn, sha1 } from './util/util';
@@ -73,8 +75,8 @@ export const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 export const ROW_PERSISTENCE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Sweep delay after the first restore — far off every boot-critical path. */
 export const ROW_PERSISTENCE_SWEEP_DELAY_MS = 60 * 1000;
-/** Retained for constructor compatibility; whole generations are atomic. */
-export const ROW_PERSISTENCE_STAGE_TXN_BYTES = 4 * 1024 * 1024;
+/** Byte budget per whole-root staging transaction (and its yield cadence). */
+export const ROW_PERSISTENCE_STAGE_TXN_BYTES = 2 * 1024 * 1024;
 /** Parsed-bytes budget per restore assembly slice. */
 const RESTORE_SLICE_BYTES = 256 * 1024;
 /** Worker hash wall-clock ceiling before the main-thread fallback runs. */
@@ -995,6 +997,24 @@ export class RowPersistenceManager {
    * budgeted staging with meta LAST: crash mid-stage reads as "no cache"
    * on the next boot, never a torn generation claiming completeness.
    */
+  /**
+   * Whole-root rewrite as ITERATIVE, BYTE-BATCHED staging: the tree is
+   * walked with an explicit stack, rows are serialized as they are emitted,
+   * and each ~stageTxnBytes_ of row text commits in its own readwrite
+   * transaction with a macrotask yield after it. Peak memory is one batch
+   * of strings and the main thread is never blocked for more than one
+   * batch's serialization — a multi-MB root previously stringified in one
+   * synchronous pass and committed as one giant buffered transaction, which
+   * is exactly the main-thread stall + memory spike mobile WebKit kills.
+   *
+   * Crash consistency is meta-deleted-FIRST (with the old rows, in the
+   * first batch) / meta-written-LAST (with the new gen, in the final
+   * batch): at every intermediate point the cache reads as ABSENT — "no
+   * cache, never torn". A crash mid-stage costs the cache (cold next boot),
+   * never correctness; orphan rows are reclaimed by the sweep and by the
+   * next staging's range delete. Losing writership or the auth generation
+   * mid-stage simply stops before the next batch.
+   */
   private async flushWholeRoot_(
     pathString: string,
     root: TrackedRoot,
@@ -1009,39 +1029,95 @@ export class RowPersistenceManager {
     const rootKey = this.rootKey_(pathString);
     const metaKey = encodeRowKey(scope, rootKey, []);
     const range = rowKeyRange(scope, rootKey, []);
-    const rows = splitNodeIntoRows([], node, this.splitThresholdBytes_);
+    const live = (): boolean =>
+      !this.disposed_ &&
+      this.authGeneration_ === generation &&
+      this.isWriter_(root) &&
+      !this.networkSuspended_;
 
-    // The whole generation is one readwrite transaction. This is deliberately
-    // less clever than v1's staged generations: without a manifest/CAS there
-    // must not be a visible interval where rows from two writers combine.
-    // IndexedDB transactions are atomic across all object stores, so even a
-    // crash or competing tab leaves either the old meta+rows or the new
-    // meta+rows. The one transaction is also the no-Web-Locks correctness
-    // fallback; Web Locks only avoids duplicate work, never protects data.
-    const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-    const rowStore = txn.objectStore(ROWS_STORE);
-    const metaStore = txn.objectStore(META_STORE);
-    rowStore.delete(range);
-    for (let i = 0; i < rows.length; i++) {
-      if (this.disposed_ || this.authGeneration_ !== generation) {
-        txn.abort();
+    const stack: Array<[string[], Node]> = [[[], node]];
+    const rowPaths: string[][] = [];
+    let batch: Array<[string[], string]> = [];
+    let batchBytes = 0;
+    let firstBatch = true;
+
+    const writeBatch = async (final: boolean): Promise<void> => {
+      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+      const rowStore = txn.objectStore(ROWS_STORE);
+      if (firstBatch) {
+        firstBatch = false;
+        // Invalidate with the first rows: from here until the final meta
+        // put, the cache reads as absent — and this manager's own state
+        // must agree, so an abandoned stage retries as a whole root and
+        // never claims a generation it no longer has.
+        root.hasGeneration = false;
+        root.lastGen = null;
+        root.rowIndex = null;
+        txn.objectStore(META_STORE).delete(metaKey);
+        rowStore.delete(range);
+      }
+      for (let i = 0; i < batch.length; i++) {
+        rowStore.put(batch[i][1], encodeRowKey(scope, rootKey, batch[i][0]));
+      }
+      if (final) {
+        const gen = newMetaGen();
+        txn.objectStore(META_STORE).put(
+          {
+            updatedAt: Date.now(),
+            formatVersion: META_FORMAT_VERSION,
+            gen
+          } as RootMeta,
+          metaKey
+        );
+        await this.txnDone_(txn);
+        root.rowIndex = RowIndex.fromRelativePaths(rowPaths);
+        root.hasGeneration = true;
+        root.lastGen = gen;
         return;
       }
-      rowStore.put(rows[i][1], encodeRowKey(scope, rootKey, rows[i][0]));
+      await this.txnDone_(txn);
+      batch = [];
+      batchBytes = 0;
+      await yieldMacrotask();
+    };
+
+    while (stack.length > 0) {
+      if (!live()) {
+        return;
+      }
+      const [segs, current] = stack.pop()!;
+      if (current.isEmpty()) {
+        continue;
+      }
+      if (
+        !current.isLeafNode() &&
+        estimateSerializedNodeSize(current) > this.splitThresholdBytes_
+      ) {
+        const priority = current.getPriority();
+        if (!priority.isEmpty()) {
+          const priorityJson = JSON.stringify(priority.val());
+          const prioritySegs = segs.concat('.priority');
+          batch.push([prioritySegs, priorityJson]);
+          rowPaths.push(prioritySegs);
+          batchBytes += priorityJson.length;
+        }
+        current.forEachChild(PRIORITY_INDEX, (key: string, child: Node) => {
+          stack.push([segs.concat(key), child]);
+        });
+      } else {
+        const json = JSON.stringify(current.val(true));
+        batch.push([segs, json]);
+        rowPaths.push(segs);
+        batchBytes += json.length;
+      }
+      if (batchBytes >= this.stageTxnBytes_) {
+        await writeBatch(false);
+      }
     }
-    const gen = newMetaGen();
-    metaStore.put(
-      {
-        updatedAt: Date.now(),
-        formatVersion: META_FORMAT_VERSION,
-        gen
-      } as RootMeta,
-      metaKey
-    );
-    await this.txnDone_(txn);
-    root.rowIndex = RowIndex.fromRelativePaths(rows.map(r => r[0]));
-    root.hasGeneration = true;
-    root.lastGen = gen;
+    if (!live()) {
+      return;
+    }
+    await writeBatch(true);
   }
 
   /**

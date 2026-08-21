@@ -81,20 +81,21 @@ function charge(state: DecodeSliceState): Promise<void> | null {
  * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
  * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
  * metadata-key skipping, empty-child pruning, and childSet construction —
- * but every JSON key visited charges one unit of the shared slice budget,
- * and the walk yields a macrotask when the budget exhausts so a large
- * server push can never decode as one monolithic main-thread task.
+ * driven by a SYNCHRONOUS explicit-stack walk that awaits only when the
+ * shared slice budget trips (one charge per JSON key at every depth). The
+ * earlier async-recursive form allocated a promise chain per interior node;
+ * on a multi-MB payload that is hundreds of thousands of microtasks —
+ * observed in Safari field traces as a 70k-microtask storm saturating the
+ * main thread. The explicit stack keeps the hot path 100% synchronous
+ * between budget boundaries.
  *
  * Key enumeration is prototype-safe ({@link contains}) exactly like
  * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
  * a legal child key, and JSON.parse makes it an own string property — a
  * direct method call through the object would invoke user data and throw.
  *
- * Primitive children decode synchronously through nodeFromJSON itself (a
- * single bounded leaf) — a promise per leaf would dominate allocation on
- * exactly the wide flat collections this bounds (the peek walk's inline-leaf
- * precedent). Fidelity is enforced by test corpus equality (node.equals +
- * hash) against nodeFromJSON; when editing either function, keep them in
+ * Fidelity is enforced by test corpus equality (node.equals + hash)
+ * against nodeFromJSON; when editing either function, keep them in
  * lockstep.
  * @internal
  */
@@ -103,86 +104,167 @@ export async function decodeNodeSliced(
   state: DecodeSliceState,
   priority: unknown = null
 ): Promise<Node> {
-  if (json === null) {
-    return ChildrenNode.EMPTY_NODE;
+  interface DecodeFrame {
+    /** Own-key list of the object being decoded, iterated by index. */
+    keys: string[];
+    index: number;
+    obj: Record<string, unknown>;
+    isArray: boolean;
+    priority: unknown;
+    children: NamedNode[];
+    childrenHavePriority: boolean;
+    arrayNode: Node;
+    /** Where the finished node lands: parent frame + key, or the result. */
+    parent: DecodeFrame | null;
+    parentKey: string | null;
   }
 
-  if (typeof json === 'object' && '.priority' in json) {
-    priority = (json as Record<string, unknown>)['.priority'];
+  let result: Node | null = null;
+
+  const finishFrame = (frame: DecodeFrame): void => {
+    let node: Node;
+    if (frame.isArray) {
+      node = frame.arrayNode.updatePriority(nodeFromJSON(frame.priority));
+    } else {
+      node = assembleChildrenNode(
+        frame.children,
+        frame.childrenHavePriority,
+        frame.priority
+      );
+    }
+    if (frame.parent === null) {
+      result = node;
+      return;
+    }
+    attachChild(frame.parent, frame.parentKey!, node);
+  };
+
+  const attachChild = (
+    parent: DecodeFrame,
+    key: string,
+    childNode: Node
+  ): void => {
+    if (parent.isArray) {
+      if (childNode.isLeafNode() || !childNode.isEmpty()) {
+        parent.arrayNode = parent.arrayNode.updateImmediateChild(
+          key,
+          childNode
+        );
+      }
+    } else if (!childNode.isEmpty()) {
+      parent.childrenHavePriority =
+        parent.childrenHavePriority || !childNode.getPriority().isEmpty();
+      parent.children.push(new NamedNode(key, childNode));
+    }
+  };
+
+  /**
+   * Opens a frame for `raw` (or resolves it immediately when it is a
+   * bounded leaf). Returns the frame to descend into, or null.
+   */
+  const openValue = (
+    raw: unknown,
+    parent: DecodeFrame | null,
+    parentKey: string | null
+  ): DecodeFrame | null => {
+    let value = raw;
+    let valuePriority: unknown = null;
+    if (value !== null && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if ('.priority' in record) {
+        valuePriority = record['.priority'];
+      }
+      assert(
+        valuePriority === null ||
+          typeof valuePriority === 'string' ||
+          typeof valuePriority === 'number' ||
+          (typeof valuePriority === 'object' &&
+            '.sv' in (valuePriority as object)),
+        'Invalid priority type found: ' + typeof valuePriority
+      );
+      if ('.value' in record && record['.value'] !== null) {
+        value = record['.value'];
+      }
+    }
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      '.sv' in (value as object)
+    ) {
+      // Bounded leaf (or explicit null): decode synchronously.
+      const leaf =
+        value === null
+          ? ChildrenNode.EMPTY_NODE
+          : new LeafNode(
+              value as string | number | boolean | Indexable,
+              nodeFromJSON(valuePriority)
+            );
+      if (parent === null) {
+        result = leaf;
+      } else {
+        attachChild(parent, parentKey!, leaf);
+      }
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    const isArray = value instanceof Array;
+    const keys: string[] = [];
+    for (const key in record) {
+      if (contains(record, key) && key.substring(0, 1) !== '.') {
+        keys.push(key);
+      }
+    }
+    return {
+      keys,
+      index: 0,
+      obj: record,
+      isArray,
+      priority: valuePriority,
+      children: [],
+      childrenHavePriority: false,
+      arrayNode: ChildrenNode.EMPTY_NODE,
+      parent,
+      parentKey
+    };
+  };
+
+  // Root: honor the explicitly passed priority exactly like the recursive
+  // form (the root's own '.priority' key, when present, overrides it).
+  const rootFrame = openValue(json, null, null);
+  if (rootFrame === null) {
+    // Root was a leaf/null; apply the caller's priority when the JSON did
+    // not carry its own.
+    if (result !== null && priority !== null && result.isLeafNode()) {
+      const leaf = result as LeafNode;
+      if (leaf.getPriority().isEmpty()) {
+        result = new LeafNode(leaf.getValue(), nodeFromJSON(priority));
+      }
+    }
+    return result ?? ChildrenNode.EMPTY_NODE;
+  }
+  if (rootFrame.priority === null) {
+    rootFrame.priority = priority;
   }
 
-  assert(
-    priority === null ||
-      typeof priority === 'string' ||
-      typeof priority === 'number' ||
-      (typeof priority === 'object' && '.sv' in (priority as object)),
-    'Invalid priority type found: ' + typeof priority
-  );
-
-  if (
-    typeof json === 'object' &&
-    '.value' in json &&
-    (json as Record<string, unknown>)['.value'] !== null
-  ) {
-    json = (json as Record<string, unknown>)['.value'];
-  }
-
-  // Valid leaf nodes include non-objects or server-value wrapper objects
-  if (typeof json !== 'object' || '.sv' in (json as object)) {
+  const stack: DecodeFrame[] = [rootFrame];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.keys.length) {
+      stack.pop();
+      finishFrame(frame);
+      continue;
+    }
+    const key = frame.keys[frame.index++];
     const y = charge(state);
     if (y !== null) {
       await y;
     }
-    const jsonLeaf = json as string | number | boolean | Indexable;
-    return new LeafNode(jsonLeaf, nodeFromJSON(priority));
-  }
-
-  if (!(json instanceof Array)) {
-    const children: NamedNode[] = [];
-    let childrenHavePriority = false;
-    const obj = json as Record<string, unknown>;
-    for (const key in obj) {
-      if (contains(obj, key) && key.substring(0, 1) !== '.') {
-        // Ignore metadata nodes
-        const y = charge(state);
-        if (y !== null) {
-          await y;
-        }
-        const raw = obj[key];
-        const childNode =
-          typeof raw !== 'object' || raw === null
-            ? nodeFromJSON(raw) // primitive leaf / null — bounded, synchronous
-            : await decodeNodeSliced(raw, state);
-        if (!childNode.isEmpty()) {
-          childrenHavePriority =
-            childrenHavePriority || !childNode.getPriority().isEmpty();
-          children.push(new NamedNode(key, childNode));
-        }
-      }
+    const child = openValue(frame.obj[key], frame, key);
+    if (child !== null) {
+      stack.push(child);
     }
-    return assembleChildrenNode(children, childrenHavePriority, priority);
-  } else {
-    let node: Node = ChildrenNode.EMPTY_NODE;
-    const arr = json as unknown as Record<string, unknown>;
-    for (const key in arr) {
-      if (contains(arr, key) && key.substring(0, 1) !== '.') {
-        // ignore metadata nodes.
-        const y = charge(state);
-        if (y !== null) {
-          await y;
-        }
-        const raw = arr[key];
-        const childNode =
-          typeof raw !== 'object' || raw === null
-            ? nodeFromJSON(raw)
-            : await decodeNodeSliced(raw, state);
-        if (childNode.isLeafNode() || !childNode.isEmpty()) {
-          node = node.updateImmediateChild(key, childNode);
-        }
-      }
-    }
-    return node.updatePriority(nodeFromJSON(priority));
   }
+  return result ?? ChildrenNode.EMPTY_NODE;
 }
 
 /**
@@ -221,9 +303,13 @@ export function assembleChildrenNode(
 }
 
 /**
- * Budgeted structural equality: Node.equals with every compared node
- * charging the shared slice budget, so grafting a large unchanged subtree
- * cannot itself become the monolithic walk the decoder exists to remove.
+ * Budgeted structural equality: Node.equals semantics driven by a
+ * SYNCHRONOUS explicit-stack walk that awaits only when the shared slice
+ * budget trips. The naive async recursion allocated a promise (plus its
+ * continuation microtasks) for EVERY compared node pair — on a large
+ * mostly-equal graft probe that is millions of microtasks, which saturates
+ * the scheduler and spikes GC on exactly the mobile boots the slicing
+ * exists to protect (observed as a Safari microtask storm in field traces).
  * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
  * child count, PRIORITY_INDEX-iterated pairwise children).
  */
@@ -232,40 +318,63 @@ async function nodesEqualSliced(
   b: Node,
   state: DecodeSliceState
 ): Promise<boolean> {
-  if (a === b) {
+  interface EqFrame {
+    aIter: ReturnType<ChildrenNode['getIterator']>;
+    bIter: ReturnType<ChildrenNode['getIterator']>;
+  }
+  const stack: EqFrame[] = [];
+
+  // Compares one pair without descending; pushes a frame for children.
+  // Returns false on definite inequality, true to continue.
+  const compare = (x: Node, y: Node): boolean => {
+    if (x === y) {
+      return true;
+    }
+    if (x.isLeafNode() || y.isLeafNode()) {
+      // Leaf equality is bounded — delegate to the node's own equals.
+      return x.equals(y);
+    }
+    const xc = x as ChildrenNode;
+    const yc = y as ChildrenNode;
+    if (!xc.getPriority().equals(yc.getPriority())) {
+      return false;
+    }
+    if (xc.numChildren() !== yc.numChildren()) {
+      return false;
+    }
+    stack.push({
+      aIter: xc.getIterator(PRIORITY_INDEX),
+      bIter: yc.getIterator(PRIORITY_INDEX)
+    });
     return true;
-  }
-  const y = charge(state);
-  if (y !== null) {
-    await y;
-  }
-  if (a.isLeafNode() || b.isLeafNode()) {
-    // Leaf equality is bounded — delegate to the node's own equals.
-    return a.equals(b);
-  }
-  const aChildren = a as ChildrenNode;
-  const bChildren = b as ChildrenNode;
-  if (!aChildren.getPriority().equals(bChildren.getPriority())) {
+  };
+
+  if (!compare(a, b)) {
     return false;
   }
-  if (aChildren.numChildren() !== bChildren.numChildren()) {
-    return false;
-  }
-  const aIter = aChildren.getIterator(PRIORITY_INDEX);
-  const bIter = bChildren.getIterator(PRIORITY_INDEX);
-  let aCurrent = aIter.getNext();
-  let bCurrent = bIter.getNext();
-  while (aCurrent !== null && bCurrent !== null) {
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const aCurrent = frame.aIter.getNext();
+    const bCurrent = frame.bIter.getNext();
+    if (aCurrent === null || bCurrent === null) {
+      if (aCurrent !== bCurrent) {
+        return false;
+      }
+      stack.pop();
+      continue;
+    }
     if (aCurrent.name !== bCurrent.name) {
       return false;
     }
-    if (!(await nodesEqualSliced(aCurrent.node, bCurrent.node, state))) {
+    const y = charge(state);
+    if (y !== null) {
+      await y;
+    }
+    if (!compare(aCurrent.node, bCurrent.node)) {
       return false;
     }
-    aCurrent = aIter.getNext();
-    bCurrent = bIter.getNext();
   }
-  return aCurrent === null && bCurrent === null;
+  return true;
 }
 
 /**
