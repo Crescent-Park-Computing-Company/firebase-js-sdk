@@ -98,4 +98,80 @@ describe('WebSocketConnection', () => {
     connection.handleIncomingFrame({ data: payload });
     expect(bytes).to.equal(new TextEncoder().encode(payload).length);
   });
+
+  it('does not tear down and re-arm the keepalive timer on every frame', () => {
+    // A large message arrives as thousands of 16KB frames; recreating the
+    // interval timer per frame burned ~38% of the receive window in
+    // clearInterval/setInterval churn (measured on a ~90MB push). Activity
+    // must be tracked without re-arming the timer.
+    const connection = new WebSocketConnection('connId', testRepoInfo(), 'app');
+    connection.mySock = {} as WebSocket;
+    connection.onMessage = () => {};
+    const originalSetInterval = global.setInterval;
+    let arms = 0;
+    (global as unknown as Record<string, unknown>).setInterval = ((
+      ...args: Parameters<typeof setInterval>
+    ) => {
+      arms++;
+      return originalSetInterval(...args);
+    }) as typeof setInterval;
+    try {
+      connection.handleIncomingFrame({ data: '3' });
+      const payload = JSON.stringify({ t: 'd', d: { value: 'x'.repeat(64) } });
+      const mid = Math.ceil(payload.length / 2);
+      connection.handleIncomingFrame({ data: payload.slice(0, mid) });
+      connection.handleIncomingFrame({ data: payload.slice(mid) });
+      expect(arms).to.be.at.most(1, 'one timer arm for any number of frames');
+    } finally {
+      (global as unknown as Record<string, unknown>).setInterval =
+        originalSetInterval;
+      if (connection.keepaliveTimer !== null) {
+        clearInterval(connection.keepaliveTimer);
+        connection.keepaliveTimer = null;
+      }
+    }
+  });
+
+  it('still sends the no-op ping after a full quiet interval', () => {
+    const connection = new WebSocketConnection('connId', testRepoInfo(), 'app');
+    const sent: string[] = [];
+    connection.mySock = {
+      send: (s: string) => {
+        sent.push(s);
+      }
+    } as unknown as WebSocket;
+    connection.onMessage = () => {};
+    const originalSetInterval = global.setInterval;
+    let tick: (() => void) | null = null;
+    (global as unknown as Record<string, unknown>).setInterval = ((
+      handler: () => void
+    ) => {
+      tick = handler;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval;
+    const originalNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    try {
+      connection.resetKeepAlive();
+      expect(tick).to.not.equal(null);
+      // Activity 1s ago: tick must NOT ping.
+      now += 1_000;
+      tick!();
+      expect(sent).to.deep.equal([]);
+      // A full quiet interval (45s): tick pings exactly once...
+      now += 45_000;
+      tick!();
+      expect(sent).to.deep.equal(['0']);
+      // ...and the ping itself resets the quiet window.
+      now += 1_000;
+      tick!();
+      expect(sent).to.deep.equal(['0']);
+    } finally {
+      Date.now = originalNow;
+      (global as unknown as Record<string, unknown>).setInterval =
+        originalSetInterval;
+      connection.keepaliveTimer = null;
+    }
+  });
 });

@@ -23,6 +23,7 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
+  _INGEST_WIRE_BYTES_THRESHOLD,
   newIngestQueue,
   repoLiftIngestGateForTest,
   repoOnConnectStatusForTest,
@@ -315,7 +316,21 @@ describe('sliced full-root push ingestion', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
     syncTreeAddEventRegistration(syncTree, query, registration);
-    return { repo, syncTree, query };
+    /**
+     * Attach a stub value listener at another path (a view must exist for
+     * the SyncTree to retain server data there).
+     */
+    const listenAt = (path: string) => {
+      const q = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path(path),
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(syncTree, q, registration);
+    };
+    return { repo, syncTree, query, listenAt };
   }
 
   function wideRoot(children: number): Record<string, unknown> {
@@ -408,6 +423,125 @@ describe('sliced full-root push ingestion', () => {
     }
     await flushAsync();
     expectIngestIdle(repo);
+  });
+
+  it('a giant push at an UNREGISTERED path takes the sliced pump (size-based eligibility)', async () => {
+    // The harness registers only rootPath as persistent; this push lands on
+    // a sibling path no one registered — the production shape of a giant
+    // listen answer for a component's own listener (or a re-listen racing a
+    // remount's deregistration). Path registration must not be the only
+    // gate: above the wire-size threshold the pump engages anyway.
+    const rootPath = '/users/alice';
+    const { repo, syncTree, listenAt } = makeIngestHarness(rootPath);
+    const otherPath = '/users/bob';
+    listenAt(otherPath);
+    const payload = wideRoot(50);
+
+    repoOnDataUpdateForTest(
+      repo,
+      'users/bob',
+      payload,
+      false,
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    expect(repo.ingestQueue_.gates.has(otherPath)).to.equal(true);
+
+    await flushAsync();
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(syncTree, new Path(otherPath));
+    expect(cache).to.not.equal(null);
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('a small push at an unregistered path keeps the synchronous path', () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree, listenAt } = makeIngestHarness(rootPath);
+    listenAt('/users/bob');
+    const payload = { v: 1 };
+
+    repoOnDataUpdateForTest(
+      repo,
+      'users/bob',
+      payload,
+      false,
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD - 1
+    );
+    // Applied synchronously: no gate, tree already complete.
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(
+      syncTree,
+      new Path('/users/bob')
+    );
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('a giant push with UNKNOWN wire size (0) keeps the synchronous path off registered roots', () => {
+    // Transports that do not report bytes (long-poll, REST) pass 0; the
+    // size-based catch-all must not fire on an unknown size.
+    const rootPath = '/users/alice';
+    const { repo, syncTree, listenAt } = makeIngestHarness(rootPath);
+    listenAt('/users/bob');
+    const payload = wideRoot(10);
+
+    repoOnDataUpdateForTest(repo, 'users/bob', payload, false, null, 0);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(
+      syncTree,
+      new Path('/users/bob')
+    );
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
+  });
+
+  it('a deferred giant push at an unregistered path re-enters the pump from the drain', async () => {
+    const rootPath = '/users/alice';
+    const { repo, syncTree, listenAt } = makeIngestHarness(rootPath);
+    listenAt('/users/bob');
+
+    // Gate the stream with a registered-root ingest, then deliver a giant
+    // push for an unregistered sibling while the gate holds. The drain's
+    // re-entry must honor the recorded wire size.
+    repoOnDataUpdateForTest(repo, rootPath, wideRoot(5), false, null);
+    expect(repo.ingestQueue_.gates.has(rootPath)).to.equal(true);
+    // Wide enough that the sliced decode must yield at least once, so the
+    // re-entered gate is observable across turns (the monolithic fallback
+    // never gates at all).
+    const bobWide: Record<string, unknown> = {};
+    for (let i = 0; i < _INGEST_DECODE_SLICE_VISITS * 2; i++) {
+      bobWide['k' + i] = i;
+    }
+    const payload = bobWide;
+    repoOnDataUpdateForTest(
+      repo,
+      'users/bob',
+      payload,
+      false,
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD * 2
+    );
+    expect(repo.ingestQueue_.ops.length).to.equal(1);
+
+    // The drain must RE-ENTER the sliced pump for the queued giant push: a
+    // gate for its path forms (the monolithic fallback never gates). Poll
+    // across turns — the first ingest and the drain both yield.
+    let sawBobGate = false;
+    for (let i = 0; i < 64 && !sawBobGate; i++) {
+      await flushAsync(1);
+      sawBobGate = repo.ingestQueue_.gates.has('/users/bob');
+    }
+    expect(sawBobGate).to.equal(
+      true,
+      'queued giant push must re-enter the sliced pump (gate observed)'
+    );
+
+    await flushAsync(32);
+    expectIngestIdle(repo);
+    const cache = syncTreeGetCompleteServerCache(
+      syncTree,
+      new Path('/users/bob')
+    );
+    expect(cache!.equals(nodeFromJSON(payload))).to.equal(true);
   });
 
   it('yields at least one macrotask for a payload wider than one slice budget', async () => {

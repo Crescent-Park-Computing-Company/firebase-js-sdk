@@ -162,7 +162,8 @@ export class PersistentConnection extends ServerActions {
       a: string,
       b: unknown,
       c: boolean,
-      d: number | null
+      d: number | null,
+      wireBytes?: number
     ) => void,
     private onConnectStatus_: (a: boolean) => void,
     private onServerInfoUpdate_: (a: unknown) => void,
@@ -742,7 +743,8 @@ export class PersistentConnection extends ServerActions {
         body[/*path*/ 'p'] as string,
         body[/*data*/ 'd'],
         /*isMerge*/ false,
-        body['t'] as number
+        body['t'] as number,
+        bytes
       );
     } else if (action === 'm') {
       this.onDataUpdate_(
