@@ -76,6 +76,8 @@ Firebase Realtime Database
 |  [setPriority(ref, priority)](./database.md#setpriority_f979832) | Sets a priority for the data at this Database location.<!-- -->Applications need not use priority but can order collections by ordinary properties (see [Sorting and filtering data](https://firebase.google.com/docs/database/web/lists-of-data#sorting_and_filtering_data) ). |
 |  [setWithPriority(ref, value, priority)](./database.md#setwithpriority_dc560e7) | Writes data the Database location. Like <code>set()</code> but also specifies the priority for that data.<!-- -->Applications need not use priority but can order collections by ordinary properties (see [Sorting and filtering data](https://firebase.google.com/docs/database/web/lists-of-data#sorting_and_filtering_data) ). |
 |  [update(ref, values)](./database.md#update_06756b7) | Writes multiple values to the Database at once.<!-- -->The <code>values</code> argument contains multiple property-value pairs that will be written to the Database together. Each child property can either be a simple property (for example, "name") or a relative path (for example, "name/first") from the current location to the data to update.<!-- -->As opposed to the <code>set()</code> method, <code>update()</code> can be use to selectively update only the referenced properties at the current location (instead of replacing all the child properties at the current location).<!-- -->The effect of the write will be visible immediately, and the corresponding events ('value', 'child\_added', etc.) will be triggered. Synchronization of the data to the Firebase servers will also be started, and the returned Promise will resolve when complete. If provided, the <code>onComplete</code> callback will be called asynchronously after synchronization has finished.<!-- -->A single <code>update()</code> will generate a single "value" event at the location where the <code>update()</code> was performed, regardless of how many children were modified.<!-- -->Note that modifying data with <code>update()</code> will cancel any pending transactions at that location, so extreme care should be taken if mixing <code>update()</code> and <code>transaction()</code> to modify the same data.<!-- -->Passing <code>null</code> to <code>update()</code> will remove the data at this location.<!-- -->See [Introducing multi-location updates and more](https://firebase.googleblog.com/2015/09/introducing-multi-location-updates-and_86.html)<!-- -->. |
+|  <b>function(snapshot, ...)</b> |
+|  [consumePersistedMaterialization(snapshot)](./database.md#consumepersistedmaterialization_a159f87) | Consumes the optimistic peek's one-boot materialization for exactly this snapshot's immutable node, or returns <code>undefined</code> when none exists (no peek, a different node, or already consumed — each stamp is returned at most once).<!-- -->This is the deliberate opt-in half of the peek→listener handoff (see ServerCacheSeed): <code>getPersistedValue()</code> materializes the restored tree once, and the listener that replays the SAME immutable nodes can adopt that materialization instead of walking the tree a second time. Correctness is by construction — a Node is immutable, so a stamp can only be returned for exactly the data it was computed from; any server delta between peek and replay creates a new node, which misses.<!-- -->The returned object is the SAME object <code>getPersistedValue()</code> returned to the application — shared by design, so an optimistic paint and the live tree keep child identity (memoized consumers see unchanged branches as unchanged). Treat it as immutable. <code>snapshot.val()</code> itself never consumes a stamp and always returns fresh objects. |
 |  <b>function(value, ...)</b> |
 |  [endAt(value, key)](./database.md#endat_51c2c8b) | Creates a <code>QueryConstraint</code> with the specified ending point.<!-- -->Using <code>startAt()</code>, <code>startAfter()</code>, <code>endBefore()</code>, <code>endAt()</code> and <code>equalTo()</code> allows you to choose arbitrary starting and ending points for your queries.<!-- -->The ending point is inclusive, so children with exactly the specified value will be included in the query. The optional key argument can be used to further limit the range of the query. If it is specified, then children that have exactly the specified value must also have a key name less than or equal to the specified key.<!-- -->You can read more about <code>endAt()</code> in [Filtering data](https://firebase.google.com/docs/database/web/lists-of-data#filtering_data)<!-- -->. |
 |  [endBefore(value, key)](./database.md#endbefore_51c2c8b) | Creates a <code>QueryConstraint</code> with the specified ending point (exclusive).<!-- -->Using <code>startAt()</code>, <code>startAfter()</code>, <code>endBefore()</code>, <code>endAt()</code> and <code>equalTo()</code> allows you to choose arbitrary starting and ending points for your queries.<!-- -->The ending point is exclusive. If only a value is provided, children with a value less than the specified value will be included in the query. If a key is specified, then children must have a value less than or equal to the specified value and a key name less than the specified key. |
@@ -1360,6 +1362,32 @@ export declare function update(ref: DatabaseReference, values: object): Promise<
 Promise&lt;void&gt;
 
 Resolves when update on server is complete.
+
+## function(snapshot, ...)
+
+### consumePersistedMaterialization(snapshot) {:#consumepersistedmaterialization_a159f87}
+
+Consumes the optimistic peek's one-boot materialization for exactly this snapshot's immutable node, or returns `undefined` when none exists (no peek, a different node, or already consumed — each stamp is returned at most once).
+
+This is the deliberate opt-in half of the peek→listener handoff (see ServerCacheSeed): `getPersistedValue()` materializes the restored tree once, and the listener that replays the SAME immutable nodes can adopt that materialization instead of walking the tree a second time. Correctness is by construction — a Node is immutable, so a stamp can only be returned for exactly the data it was computed from; any server delta between peek and replay creates a new node, which misses.
+
+The returned object is the SAME object `getPersistedValue()` returned to the application — shared by design, so an optimistic paint and the live tree keep child identity (memoized consumers see unchanged branches as unchanged). Treat it as immutable. `snapshot.val()` itself never consumes a stamp and always returns fresh objects.
+
+<b>Signature:</b>
+
+```typescript
+export declare function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
+```
+
+#### Parameters
+
+|  Parameter | Type | Description |
+|  --- | --- | --- |
+|  snapshot | [DataSnapshot](./database.datasnapshot.md#datasnapshot_class) |  |
+
+<b>Returns:</b>
+
+unknown \| undefined
 
 ## function(value, ...)
 

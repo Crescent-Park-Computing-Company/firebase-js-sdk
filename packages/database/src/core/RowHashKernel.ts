@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+/* istanbul ignore file — createRowHashKernel/workerMain are serialized
+ * with Function.toString() into the Blob worker; instrumented bodies would
+ * reference module-scope coverage counters that do not exist in the worker. */
+
 /**
  * Streaming compound-hash kernel over persisted rows.
  *
