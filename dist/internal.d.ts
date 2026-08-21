@@ -2689,6 +2689,24 @@ declare class RowPersistenceManager {
      * budgeted staging with meta LAST: crash mid-stage reads as "no cache"
      * on the next boot, never a torn generation claiming completeness.
      */
+    /**
+     * Whole-root rewrite as ITERATIVE, BYTE-BATCHED staging: the tree is
+     * walked with an explicit stack, rows are serialized as they are emitted,
+     * and each ~stageTxnBytes_ of row text commits in its own readwrite
+     * transaction with a macrotask yield after it. Peak memory is one batch
+     * of strings and the main thread is never blocked for more than one
+     * batch's serialization — a multi-MB root previously stringified in one
+     * synchronous pass and committed as one giant buffered transaction, which
+     * is exactly the main-thread stall + memory spike mobile WebKit kills.
+     *
+     * Crash consistency is meta-deleted-FIRST (with the old rows, in the
+     * first batch) / meta-written-LAST (with the new gen, in the final
+     * batch): at every intermediate point the cache reads as ABSENT — "no
+     * cache, never torn". A crash mid-stage costs the cache (cold next boot),
+     * never correctness; orphan rows are reclaimed by the sweep and by the
+     * next staging's range delete. Losing writership or the auth generation
+     * mid-stage simply stops before the next batch.
+     */
     private flushWholeRoot_;
     /**
      * Incremental flush: each dirty path normalizes to its containing row's

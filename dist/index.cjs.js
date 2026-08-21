@@ -8,7 +8,7 @@ var util = require('@firebase/util');
 var logger$1 = require('@firebase/logger');
 
 const name = "@firebase/database";
-const version = "1.1.3-persistence-v2.3";
+const version = "1.1.3-persistence-v2.4";
 
 /**
  * @license
@@ -7075,6 +7075,77 @@ class ReadonlyRestClient extends ServerActions {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/**
+ * Sizes computed for interior (children) nodes, keyed by node identity.
+ * Nodes are immutable and structurally shared across server updates, so a
+ * subtree's estimate stays valid for as long as the subtree object lives —
+ * repeated estimations of a large mostly-unchanged tree (the persistence
+ * write path re-plans its chunks on every flush) only walk the changed
+ * spine. Leaves are cheap to size and are not cached.
+ */
+const serializedSizeCache = new WeakMap();
+/**
+ * Estimates the serialized size of a node in bytes — a cheap approximation
+ * that only drives the default split threshold and the persistence chunk
+ * planner, never a wire value (port of Android NodeSizeEstimator).
+ */
+function estimateSerializedNodeSize(node) {
+    if (node.isEmpty()) {
+        return 4; // null keyword
+    }
+    else if (node.isLeafNode()) {
+        let valueSize;
+        const value = node.val();
+        if (typeof value === 'number') {
+            valueSize = 8; // estimate each float with 8 bytes
+        }
+        else if (typeof value === 'boolean') {
+            valueSize = 4; // true or false need roughly 4 bytes
+        }
+        else {
+            // string: two quotes plus the payload
+            valueSize = 2 + String(value).length;
+        }
+        if (node.getPriority().isEmpty()) {
+            return valueSize;
+        }
+        // Account for the extra overhead of the ".value" and ".priority" keys.
+        return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
+    }
+    else {
+        const cached = serializedSizeCache.get(node);
+        if (cached !== undefined) {
+            return cached;
+        }
+        let sum = 1; // opening brace
+        node.forEachChild(KEY_INDEX, (key, child) => {
+            // key, quotes, colon, comma
+            sum += key.length + 4 + estimateSerializedNodeSize(child);
+        });
+        if (!node.getPriority().isEmpty()) {
+            sum += 12 + estimateSerializedNodeSize(node.getPriority());
+        }
+        serializedSizeCache.set(node, sum);
+        return sum;
+    }
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 function createRowHashKernel(sha1Base64, yieldFn) {
     // ---- name ordering (verbatim port of core/util nameCompare) ----
     const MIN_NAME = '[MIN_NAME]';
@@ -7596,77 +7667,6 @@ function hashRowsInWorker(request, timeoutMs) {
  * limitations under the License.
  */
 /**
- * Sizes computed for interior (children) nodes, keyed by node identity.
- * Nodes are immutable and structurally shared across server updates, so a
- * subtree's estimate stays valid for as long as the subtree object lives —
- * repeated estimations of a large mostly-unchanged tree (the persistence
- * write path re-plans its chunks on every flush) only walk the changed
- * spine. Leaves are cheap to size and are not cached.
- */
-const serializedSizeCache = new WeakMap();
-/**
- * Estimates the serialized size of a node in bytes — a cheap approximation
- * that only drives the default split threshold and the persistence chunk
- * planner, never a wire value (port of Android NodeSizeEstimator).
- */
-function estimateSerializedNodeSize(node) {
-    if (node.isEmpty()) {
-        return 4; // null keyword
-    }
-    else if (node.isLeafNode()) {
-        let valueSize;
-        const value = node.val();
-        if (typeof value === 'number') {
-            valueSize = 8; // estimate each float with 8 bytes
-        }
-        else if (typeof value === 'boolean') {
-            valueSize = 4; // true or false need roughly 4 bytes
-        }
-        else {
-            // string: two quotes plus the payload
-            valueSize = 2 + String(value).length;
-        }
-        if (node.getPriority().isEmpty()) {
-            return valueSize;
-        }
-        // Account for the extra overhead of the ".value" and ".priority" keys.
-        return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
-    }
-    else {
-        const cached = serializedSizeCache.get(node);
-        if (cached !== undefined) {
-            return cached;
-        }
-        let sum = 1; // opening brace
-        node.forEachChild(KEY_INDEX, (key, child) => {
-            // key, quotes, colon, comma
-            sum += key.length + 4 + estimateSerializedNodeSize(child);
-        });
-        if (!node.getPriority().isEmpty()) {
-            sum += 12 + estimateSerializedNodeSize(node.getPriority());
-        }
-        serializedSizeCache.set(node, sum);
-        return sum;
-    }
-}
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
  * Subtrees estimated above this split into per-child rows (Android's
  * CHILDREN_NODE_SPLIT_SIZE_THRESHOLD). 16 KiB keeps single rows small enough
  * that an incremental rewrite of one row is cheap, while a 60 MB workspace
@@ -7999,8 +7999,8 @@ const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 const ROW_PERSISTENCE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Sweep delay after the first restore — far off every boot-critical path. */
 const ROW_PERSISTENCE_SWEEP_DELAY_MS = 60 * 1000;
-/** Retained for constructor compatibility; whole generations are atomic. */
-const ROW_PERSISTENCE_STAGE_TXN_BYTES = 4 * 1024 * 1024;
+/** Byte budget per whole-root staging transaction (and its yield cadence). */
+const ROW_PERSISTENCE_STAGE_TXN_BYTES = 2 * 1024 * 1024;
 /** Parsed-bytes budget per restore assembly slice. */
 const RESTORE_SLICE_BYTES = 256 * 1024;
 /** Worker hash wall-clock ceiling before the main-thread fallback runs. */
@@ -8761,6 +8761,24 @@ class RowPersistenceManager {
      * budgeted staging with meta LAST: crash mid-stage reads as "no cache"
      * on the next boot, never a torn generation claiming completeness.
      */
+    /**
+     * Whole-root rewrite as ITERATIVE, BYTE-BATCHED staging: the tree is
+     * walked with an explicit stack, rows are serialized as they are emitted,
+     * and each ~stageTxnBytes_ of row text commits in its own readwrite
+     * transaction with a macrotask yield after it. Peak memory is one batch
+     * of strings and the main thread is never blocked for more than one
+     * batch's serialization — a multi-MB root previously stringified in one
+     * synchronous pass and committed as one giant buffered transaction, which
+     * is exactly the main-thread stall + memory spike mobile WebKit kills.
+     *
+     * Crash consistency is meta-deleted-FIRST (with the old rows, in the
+     * first batch) / meta-written-LAST (with the new gen, in the final
+     * batch): at every intermediate point the cache reads as ABSENT — "no
+     * cache, never torn". A crash mid-stage costs the cache (cold next boot),
+     * never correctness; orphan rows are reclaimed by the sweep and by the
+     * next staging's range delete. Losing writership or the auth generation
+     * mid-stage simply stops before the next batch.
+     */
     async flushWholeRoot_(pathString, root, node, generation) {
         const db = await this.open_();
         if (db === null || this.authGeneration_ !== generation) {
@@ -8770,35 +8788,87 @@ class RowPersistenceManager {
         const rootKey = this.rootKey_(pathString);
         const metaKey = encodeRowKey(scope, rootKey, []);
         const range = rowKeyRange(scope, rootKey, []);
-        const rows = splitNodeIntoRows([], node, this.splitThresholdBytes_);
-        // The whole generation is one readwrite transaction. This is deliberately
-        // less clever than v1's staged generations: without a manifest/CAS there
-        // must not be a visible interval where rows from two writers combine.
-        // IndexedDB transactions are atomic across all object stores, so even a
-        // crash or competing tab leaves either the old meta+rows or the new
-        // meta+rows. The one transaction is also the no-Web-Locks correctness
-        // fallback; Web Locks only avoids duplicate work, never protects data.
-        const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-        const rowStore = txn.objectStore(ROWS_STORE);
-        const metaStore = txn.objectStore(META_STORE);
-        rowStore.delete(range);
-        for (let i = 0; i < rows.length; i++) {
-            if (this.disposed_ || this.authGeneration_ !== generation) {
-                txn.abort();
+        const live = () => !this.disposed_ &&
+            this.authGeneration_ === generation &&
+            this.isWriter_(root) &&
+            !this.networkSuspended_;
+        const stack = [[[], node]];
+        const rowPaths = [];
+        let batch = [];
+        let batchBytes = 0;
+        let firstBatch = true;
+        const writeBatch = async (final) => {
+            const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+            const rowStore = txn.objectStore(ROWS_STORE);
+            if (firstBatch) {
+                firstBatch = false;
+                // Invalidate with the first rows: from here until the final meta
+                // put, the cache reads as absent — and this manager's own state
+                // must agree, so an abandoned stage retries as a whole root and
+                // never claims a generation it no longer has.
+                root.hasGeneration = false;
+                root.lastGen = null;
+                root.rowIndex = null;
+                txn.objectStore(META_STORE).delete(metaKey);
+                rowStore.delete(range);
+            }
+            for (let i = 0; i < batch.length; i++) {
+                rowStore.put(batch[i][1], encodeRowKey(scope, rootKey, batch[i][0]));
+            }
+            if (final) {
+                const gen = newMetaGen();
+                txn.objectStore(META_STORE).put({
+                    updatedAt: Date.now(),
+                    formatVersion: META_FORMAT_VERSION,
+                    gen
+                }, metaKey);
+                await this.txnDone_(txn);
+                root.rowIndex = RowIndex.fromRelativePaths(rowPaths);
+                root.hasGeneration = true;
+                root.lastGen = gen;
                 return;
             }
-            rowStore.put(rows[i][1], encodeRowKey(scope, rootKey, rows[i][0]));
+            await this.txnDone_(txn);
+            batch = [];
+            batchBytes = 0;
+            await yieldMacrotask();
+        };
+        while (stack.length > 0) {
+            if (!live()) {
+                return;
+            }
+            const [segs, current] = stack.pop();
+            if (current.isEmpty()) {
+                continue;
+            }
+            if (!current.isLeafNode() &&
+                estimateSerializedNodeSize(current) > this.splitThresholdBytes_) {
+                const priority = current.getPriority();
+                if (!priority.isEmpty()) {
+                    const priorityJson = JSON.stringify(priority.val());
+                    const prioritySegs = segs.concat('.priority');
+                    batch.push([prioritySegs, priorityJson]);
+                    rowPaths.push(prioritySegs);
+                    batchBytes += priorityJson.length;
+                }
+                current.forEachChild(PRIORITY_INDEX, (key, child) => {
+                    stack.push([segs.concat(key), child]);
+                });
+            }
+            else {
+                const json = JSON.stringify(current.val(true));
+                batch.push([segs, json]);
+                rowPaths.push(segs);
+                batchBytes += json.length;
+            }
+            if (batchBytes >= this.stageTxnBytes_) {
+                await writeBatch(false);
+            }
         }
-        const gen = newMetaGen();
-        metaStore.put({
-            updatedAt: Date.now(),
-            formatVersion: META_FORMAT_VERSION,
-            gen
-        }, metaKey);
-        await this.txnDone_(txn);
-        root.rowIndex = RowIndex.fromRelativePaths(rows.map(r => r[0]));
-        root.hasGeneration = true;
-        root.lastGen = gen;
+        if (!live()) {
+            return;
+        }
+        await writeBatch(true);
     }
     /**
      * Incremental flush: each dirty path normalizes to its containing row's
@@ -9206,93 +9276,145 @@ function charge(state) {
  * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
  * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
  * metadata-key skipping, empty-child pruning, and childSet construction —
- * but every JSON key visited charges one unit of the shared slice budget,
- * and the walk yields a macrotask when the budget exhausts so a large
- * server push can never decode as one monolithic main-thread task.
+ * driven by a SYNCHRONOUS explicit-stack walk that awaits only when the
+ * shared slice budget trips (one charge per JSON key at every depth). The
+ * earlier async-recursive form allocated a promise chain per interior node;
+ * on a multi-MB payload that is hundreds of thousands of microtasks —
+ * observed in Safari field traces as a 70k-microtask storm saturating the
+ * main thread. The explicit stack keeps the hot path 100% synchronous
+ * between budget boundaries.
  *
  * Key enumeration is prototype-safe ({@link contains}) exactly like
  * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
  * a legal child key, and JSON.parse makes it an own string property — a
  * direct method call through the object would invoke user data and throw.
  *
- * Primitive children decode synchronously through nodeFromJSON itself (a
- * single bounded leaf) — a promise per leaf would dominate allocation on
- * exactly the wide flat collections this bounds (the peek walk's inline-leaf
- * precedent). Fidelity is enforced by test corpus equality (node.equals +
- * hash) against nodeFromJSON; when editing either function, keep them in
+ * Fidelity is enforced by test corpus equality (node.equals + hash)
+ * against nodeFromJSON; when editing either function, keep them in
  * lockstep.
  * @internal
  */
 async function decodeNodeSliced(json, state, priority = null) {
-    if (json === null) {
-        return ChildrenNode.EMPTY_NODE;
+    let result = null;
+    const finishFrame = (frame) => {
+        let node;
+        if (frame.isArray) {
+            node = frame.arrayNode.updatePriority(nodeFromJSON(frame.priority));
+        }
+        else {
+            node = assembleChildrenNode(frame.children, frame.childrenHavePriority, frame.priority);
+        }
+        if (frame.parent === null) {
+            result = node;
+            return;
+        }
+        attachChild(frame.parent, frame.parentKey, node);
+    };
+    const attachChild = (parent, key, childNode) => {
+        if (parent.isArray) {
+            if (childNode.isLeafNode() || !childNode.isEmpty()) {
+                parent.arrayNode = parent.arrayNode.updateImmediateChild(key, childNode);
+            }
+        }
+        else if (!childNode.isEmpty()) {
+            parent.childrenHavePriority =
+                parent.childrenHavePriority || !childNode.getPriority().isEmpty();
+            parent.children.push(new NamedNode(key, childNode));
+        }
+    };
+    /**
+     * Opens a frame for `raw` (or resolves it immediately when it is a
+     * bounded leaf). Returns the frame to descend into, or null.
+     */
+    const openValue = (raw, parent, parentKey) => {
+        let value = raw;
+        let valuePriority = null;
+        if (value !== null && typeof value === 'object') {
+            const record = value;
+            if ('.priority' in record) {
+                valuePriority = record['.priority'];
+            }
+            util.assert(valuePriority === null ||
+                typeof valuePriority === 'string' ||
+                typeof valuePriority === 'number' ||
+                (typeof valuePriority === 'object' &&
+                    '.sv' in valuePriority), 'Invalid priority type found: ' + typeof valuePriority);
+            if ('.value' in record && record['.value'] !== null) {
+                value = record['.value'];
+            }
+        }
+        if (value === null ||
+            typeof value !== 'object' ||
+            '.sv' in value) {
+            // Bounded leaf (or explicit null): decode synchronously.
+            const leaf = value === null
+                ? ChildrenNode.EMPTY_NODE
+                : new LeafNode(value, nodeFromJSON(valuePriority));
+            if (parent === null) {
+                result = leaf;
+            }
+            else {
+                attachChild(parent, parentKey, leaf);
+            }
+            return null;
+        }
+        const record = value;
+        const isArray = value instanceof Array;
+        const keys = [];
+        for (const key in record) {
+            if (util.contains(record, key) && key.substring(0, 1) !== '.') {
+                keys.push(key);
+            }
+        }
+        return {
+            keys,
+            index: 0,
+            obj: record,
+            isArray,
+            priority: valuePriority,
+            children: [],
+            childrenHavePriority: false,
+            arrayNode: ChildrenNode.EMPTY_NODE,
+            parent,
+            parentKey
+        };
+    };
+    // Root: honor the explicitly passed priority exactly like the recursive
+    // form (the root's own '.priority' key, when present, overrides it).
+    const rootFrame = openValue(json, null, null);
+    if (rootFrame === null) {
+        // Root was a leaf/null; apply the caller's priority when the JSON did
+        // not carry its own.
+        if (result !== null && priority !== null && result.isLeafNode()) {
+            const leaf = result;
+            if (leaf.getPriority().isEmpty()) {
+                result = new LeafNode(leaf.getValue(), nodeFromJSON(priority));
+            }
+        }
+        return result ?? ChildrenNode.EMPTY_NODE;
     }
-    if (typeof json === 'object' && '.priority' in json) {
-        priority = json['.priority'];
+    if (rootFrame.priority === null) {
+        rootFrame.priority = priority;
     }
-    util.assert(priority === null ||
-        typeof priority === 'string' ||
-        typeof priority === 'number' ||
-        (typeof priority === 'object' && '.sv' in priority), 'Invalid priority type found: ' + typeof priority);
-    if (typeof json === 'object' &&
-        '.value' in json &&
-        json['.value'] !== null) {
-        json = json['.value'];
-    }
-    // Valid leaf nodes include non-objects or server-value wrapper objects
-    if (typeof json !== 'object' || '.sv' in json) {
+    const stack = [rootFrame];
+    while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        if (frame.index >= frame.keys.length) {
+            stack.pop();
+            finishFrame(frame);
+            continue;
+        }
+        const key = frame.keys[frame.index++];
         const y = charge(state);
         if (y !== null) {
             await y;
         }
-        const jsonLeaf = json;
-        return new LeafNode(jsonLeaf, nodeFromJSON(priority));
-    }
-    if (!(json instanceof Array)) {
-        const children = [];
-        let childrenHavePriority = false;
-        const obj = json;
-        for (const key in obj) {
-            if (util.contains(obj, key) && key.substring(0, 1) !== '.') {
-                // Ignore metadata nodes
-                const y = charge(state);
-                if (y !== null) {
-                    await y;
-                }
-                const raw = obj[key];
-                const childNode = typeof raw !== 'object' || raw === null
-                    ? nodeFromJSON(raw) // primitive leaf / null — bounded, synchronous
-                    : await decodeNodeSliced(raw, state);
-                if (!childNode.isEmpty()) {
-                    childrenHavePriority =
-                        childrenHavePriority || !childNode.getPriority().isEmpty();
-                    children.push(new NamedNode(key, childNode));
-                }
-            }
+        const child = openValue(frame.obj[key], frame, key);
+        if (child !== null) {
+            stack.push(child);
         }
-        return assembleChildrenNode(children, childrenHavePriority, priority);
     }
-    else {
-        let node = ChildrenNode.EMPTY_NODE;
-        const arr = json;
-        for (const key in arr) {
-            if (util.contains(arr, key) && key.substring(0, 1) !== '.') {
-                // ignore metadata nodes.
-                const y = charge(state);
-                if (y !== null) {
-                    await y;
-                }
-                const raw = arr[key];
-                const childNode = typeof raw !== 'object' || raw === null
-                    ? nodeFromJSON(raw)
-                    : await decodeNodeSliced(raw, state);
-                if (childNode.isLeafNode() || !childNode.isEmpty()) {
-                    node = node.updateImmediateChild(key, childNode);
-                }
-            }
-        }
-        return node.updatePriority(nodeFromJSON(priority));
-    }
+    return result ?? ChildrenNode.EMPTY_NODE;
 }
 /**
  * The childSet-assembly tail of nodeFromJSON's object branch, shared by the
@@ -9314,47 +9436,68 @@ function assembleChildrenNode(children, childrenHavePriority, priority) {
     }
 }
 /**
- * Budgeted structural equality: Node.equals with every compared node
- * charging the shared slice budget, so grafting a large unchanged subtree
- * cannot itself become the monolithic walk the decoder exists to remove.
+ * Budgeted structural equality: Node.equals semantics driven by a
+ * SYNCHRONOUS explicit-stack walk that awaits only when the shared slice
+ * budget trips. The naive async recursion allocated a promise (plus its
+ * continuation microtasks) for EVERY compared node pair — on a large
+ * mostly-equal graft probe that is millions of microtasks, which saturates
+ * the scheduler and spikes GC on exactly the mobile boots the slicing
+ * exists to protect (observed as a Safari microtask storm in field traces).
  * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
  * child count, PRIORITY_INDEX-iterated pairwise children).
  */
 async function nodesEqualSliced(a, b, state) {
-    if (a === b) {
+    const stack = [];
+    // Compares one pair without descending; pushes a frame for children.
+    // Returns false on definite inequality, true to continue.
+    const compare = (x, y) => {
+        if (x === y) {
+            return true;
+        }
+        if (x.isLeafNode() || y.isLeafNode()) {
+            // Leaf equality is bounded — delegate to the node's own equals.
+            return x.equals(y);
+        }
+        const xc = x;
+        const yc = y;
+        if (!xc.getPriority().equals(yc.getPriority())) {
+            return false;
+        }
+        if (xc.numChildren() !== yc.numChildren()) {
+            return false;
+        }
+        stack.push({
+            aIter: xc.getIterator(PRIORITY_INDEX),
+            bIter: yc.getIterator(PRIORITY_INDEX)
+        });
         return true;
-    }
-    const y = charge(state);
-    if (y !== null) {
-        await y;
-    }
-    if (a.isLeafNode() || b.isLeafNode()) {
-        // Leaf equality is bounded — delegate to the node's own equals.
-        return a.equals(b);
-    }
-    const aChildren = a;
-    const bChildren = b;
-    if (!aChildren.getPriority().equals(bChildren.getPriority())) {
+    };
+    if (!compare(a, b)) {
         return false;
     }
-    if (aChildren.numChildren() !== bChildren.numChildren()) {
-        return false;
-    }
-    const aIter = aChildren.getIterator(PRIORITY_INDEX);
-    const bIter = bChildren.getIterator(PRIORITY_INDEX);
-    let aCurrent = aIter.getNext();
-    let bCurrent = bIter.getNext();
-    while (aCurrent !== null && bCurrent !== null) {
+    while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        const aCurrent = frame.aIter.getNext();
+        const bCurrent = frame.bIter.getNext();
+        if (aCurrent === null || bCurrent === null) {
+            if (aCurrent !== bCurrent) {
+                return false;
+            }
+            stack.pop();
+            continue;
+        }
         if (aCurrent.name !== bCurrent.name) {
             return false;
         }
-        if (!(await nodesEqualSliced(aCurrent.node, bCurrent.node, state))) {
+        const y = charge(state);
+        if (y !== null) {
+            await y;
+        }
+        if (!compare(aCurrent.node, bCurrent.node)) {
             return false;
         }
-        aCurrent = aIter.getNext();
-        bCurrent = bIter.getNext();
     }
-    return aCurrent === null && bCurrent === null;
+    return true;
 }
 /**
  * Decodes one full-root plain-children push into a single Node, sliced, with
