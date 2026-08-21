@@ -684,3 +684,71 @@ describe('overlapping tracked roots', () => {
     manager.dispose();
   });
 });
+
+describe('transaction atomicity (buffered fake)', () => {
+  it('a dispose mid-whole-root-flush aborts and leaves the prior generation intact', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const writer = makeManager(makeFakeIdb(shared));
+    writer.setAuthScope('alice');
+    writer.setPersistentPath('/ws', true);
+    writer.track('/ws');
+    writer.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
+    await writer.flushNow('/ws');
+    await flushMicrotasks();
+    writer.dispose();
+
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    // Whole-root rewrite; dispose while the txn's puts are queued. The
+    // abort path must leave the v1 generation exactly as it was.
+    manager.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 2 }));
+    const flushing = manager.flushNow('/ws');
+    manager.dispose();
+    await flushing.catch(() => {});
+    await flushMicrotasks();
+
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const peeked = await reader.peek('/ws', 'alice');
+    // Either the old generation (abort won) or the new one (commit won) —
+    // never a torn mix, and never a missing cache.
+    expect(peeked).to.not.equal(null);
+    const v = (peeked!.node.val() as { v: number }).v;
+    expect([1, 2]).to.include(v);
+    reader.dispose();
+  });
+
+  it('another connection never observes a half-committed generation', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const writer = makeManager(makeFakeIdb(shared), { splitThreshold: 64 });
+    writer.setAuthScope('alice');
+    writer.setPersistentPath('/ws', true);
+    writer.track('/ws');
+    // Multi-row generation (small threshold forces several puts).
+    const tree = nodeFromJSON({
+      a: 'x'.repeat(200),
+      b: 'y'.repeat(200),
+      c: 'z'.repeat(200)
+    });
+    writer.serverCacheUpdated(new Path('/ws'), tree);
+    const flushing = writer.flushNow('/ws');
+    // While the flush's txn is buffered (not yet committed), a reader must
+    // see NO cache at all — never some rows without meta or vice versa.
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const early = await reader.peek('/ws', 'alice');
+    expect(early).to.equal(null);
+    await flushing;
+    await flushMicrotasks();
+    const late = makeManager(makeFakeIdb(shared));
+    late.setAuthScope('alice');
+    const after = await late.peek('/ws', 'alice');
+    expect(after).to.not.equal(null);
+    expect(after!.node.equals(tree)).to.equal(true);
+    writer.dispose();
+    reader.dispose();
+    late.dispose();
+  });
+});

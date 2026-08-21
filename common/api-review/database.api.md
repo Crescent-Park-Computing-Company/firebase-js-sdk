@@ -202,9 +202,6 @@ export function orderByPriority(): QueryConstraint;
 // @public
 export function orderByValue(): QueryConstraint;
 
-// @public (undocumented)
-export const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
-
 // @public
 export function push(parent: DatabaseReference, value?: unknown): ThenableReference;
 
