@@ -236,7 +236,7 @@ export function assembleChildrenNode(
  * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
  * child count, PRIORITY_INDEX-iterated pairwise children).
  */
-async function nodesEqualSliced(
+export async function nodesEqualSliced(
   a: Node,
   b: Node,
   state: DecodeSliceState

@@ -639,6 +639,44 @@ describe('sliced full-root push ingestion', () => {
     expect(slicedResult.hash()).to.equal(syncResult.hash());
   });
 
+  it('a giant range merge preserves IDENTITY of unchanged children (grafted from the base)', async () => {
+    // RangeMerge.applyTo rebuilds nodes along range boundaries, so an
+    // untouched child can come out structurally equal but identity-
+    // distinct; without grafting, the final overwrite's diff would
+    // deep-compare it — the residual long-task the graft removes. The
+    // apply's updateFullNode short-circuits on ===, so identity is also
+    // what memoized consumers key on.
+    const rootPath = '/users/alice';
+    const { repo, syncTree } = makeIngestHarness(rootPath);
+    const stable = { deep: { tree: 'stable', wide: { a: 1, b: 2 } } };
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path(rootPath),
+      nodeFromJSON({ stable, changing: { v: 1 } })
+    );
+    const baseStable = syncTreeGetCompleteServerCache(
+      syncTree,
+      new Path(rootPath)
+    )!.getImmediateChild('stable');
+
+    // Full-replacement merge: same 'stable' content, new 'changing' value.
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      'users/alice',
+      [{ m: { stable, changing: { v: 2 } } }],
+      null,
+      _INGEST_WIRE_BYTES_THRESHOLD
+    );
+    await flushAsync(32);
+    expectIngestIdle(repo);
+    const after = syncTreeGetCompleteServerCache(syncTree, new Path(rootPath))!;
+    expect(after.getImmediateChild('changing').val()).to.deep.equal({ v: 2 });
+    expect(after.getImmediateChild('stable')).to.equal(
+      baseStable,
+      'unchanged child must keep the BASE object identity across the merge'
+    );
+  });
+
   it('a small or tagged range merge keeps the synchronous path', () => {
     const rootPath = '/users/alice';
     const { repo, syncTree } = makeIngestHarness(rootPath);

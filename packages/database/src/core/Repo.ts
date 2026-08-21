@@ -44,14 +44,17 @@ import {
   stampSeedHashes
 } from './ServerCacheSeed';
 import {
+  assembleChildrenNode,
   chargeSlice,
   decodeFullRootSliced,
   decodeNodeSliced,
   IngestCancelledError,
+  nodesEqualSliced,
   sliceableAsChildren
 } from './SlicedNodeDecode';
 import { ChildrenNode } from './snap/ChildrenNode';
-import { Node } from './snap/Node';
+import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
+import { NamedNode, Node } from './snap/Node';
 import { nodeFromJSON } from './snap/nodeFromJSON';
 import { RangeMerge } from './snap/RangeMerge';
 import { SnapshotHolder } from './SnapshotHolder';
@@ -1192,6 +1195,47 @@ async function repoIngestRangeMerge(
     if (y !== null) {
       await y;
     }
+  }
+  // Identity grafting (the full-push pump's contract, applied post-fold):
+  // RangeMerge.applyTo rebuilds every node on the path of each range
+  // boundary, so even an untouched child can come out structurally equal
+  // but identity-distinct — and the final overwrite's updateFullNode diff
+  // would then deep-compare it (O(subtree)), reopening the long-task class
+  // on near-full-root merges. Walk the folded root's direct children and
+  // graft every one structurally equal to its base counterpart back to
+  // the base's OBJECT, budgeted (nodesEqualSliced charges the shared
+  // slice budget), so the apply's diff short-circuits on === and cost
+  // tracks the CHANGED portion, never the whole tree.
+  if (!folded.isLeafNode() && !base.isLeafNode() && folded !== base) {
+    const foldedChildren: NamedNode[] = [];
+    folded.forEachChild(PRIORITY_INDEX, (key, child) => {
+      foldedChildren.push(new NamedNode(key, child));
+    });
+    const grafted: NamedNode[] = [];
+    let childrenHavePriority = false;
+    for (const named of foldedChildren) {
+      let child = named.node;
+      const y = chargeSlice(state);
+      if (y !== null) {
+        await y;
+      }
+      const baseChild = base.getImmediateChild(named.name);
+      if (
+        child !== baseChild &&
+        !baseChild.isEmpty() &&
+        (await nodesEqualSliced(baseChild, child, state))
+      ) {
+        child = baseChild;
+      }
+      childrenHavePriority =
+        childrenHavePriority || !child.getPriority().isEmpty();
+      grafted.push(new NamedNode(named.name, child));
+    }
+    folded = assembleChildrenNode(
+      grafted,
+      childrenHavePriority,
+      folded.getPriority().val()
+    );
   }
   if (!isCurrent()) {
     throw new IngestCancelledError();
