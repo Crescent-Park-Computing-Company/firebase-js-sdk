@@ -86,6 +86,15 @@ interface RootMeta {
   updatedAt: number;
   formatVersion: number;
   /**
+   * True while a whole-root staging is IN FLIGHT: rows under this root are
+   * being rewritten batch by batch. Readers treat a staging meta exactly
+   * like no cache; the sweep treats its rows as LIVE (never orphans) until
+   * the marker itself expires (a crashed stage, reclaimed by age). The
+   * marker is what lets multi-transaction staging coexist with an
+   * uncoordinated cross-tab sweep without any lock on the sweep.
+   */
+  staging?: boolean;
+  /**
    * Random nonce, fresh on every committed generation. The one binding
    * between "the rows a restore/flush produced" and "the rows a later hash
    * read": a hash is only claimable when the generation it read equals the
@@ -702,7 +711,8 @@ export class RowPersistenceManager {
       ]);
       if (
         meta === undefined ||
-        (meta as RootMeta).formatVersion !== META_FORMAT_VERSION
+        (meta as RootMeta).formatVersion !== META_FORMAT_VERSION ||
+        (meta as RootMeta).staging === true
       ) {
         return null;
       }
@@ -880,6 +890,7 @@ export class RowPersistenceManager {
       // Same-snapshot generation check (see computeListenHashes).
       if (
         meta === undefined ||
+        (meta as RootMeta).staging === true ||
         (meta as RootMeta).gen !== expectedGen ||
         keys.length === 0
       ) {
@@ -1123,8 +1134,24 @@ export class RowPersistenceManager {
     let batch: Array<[string[], string]> = [];
     let batchBytes = 0;
     let firstBatch = true;
+    // Ownership nonce for THIS stage: every later batch re-reads meta in
+    // its own transaction and proceeds only while the staging marker still
+    // carries this nonce. A concurrent deleteRoot_ (evict from another
+    // tab), a foreign stage, or a foreign complete generation all replace
+    // the marker — this stage then stops instead of committing rows over
+    // someone else's store. One read per ~2MiB batch; no locks, no CAS
+    // machinery beyond the marker the stage already writes.
+    const stageNonce = newMetaGen();
+    /** Resolves false when the marker no longer belongs to this stage. */
+    const ownsMarker = (txn: IDBTransaction): Promise<boolean> =>
+      this.requestDone_(txn.objectStore(META_STORE).get(metaKey)).then(
+        meta =>
+          meta !== undefined &&
+          (meta as RootMeta).staging === true &&
+          (meta as RootMeta).gen === stageNonce
+      );
 
-    const writeBatch = async (final: boolean): Promise<void> => {
+    const writeBatch = async (final: boolean): Promise<boolean> => {
       const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
       const rowStore = txn.objectStore(ROWS_STORE);
       if (firstBatch) {
@@ -1132,12 +1159,28 @@ export class RowPersistenceManager {
         // Invalidate with the first rows: from here until the final meta
         // put, the cache reads as absent — and this manager's own state
         // must agree, so an abandoned stage retries as a whole root and
-        // never claims a generation it no longer has.
+        // never claims a generation it no longer has. The STAGING MARKER
+        // (not a bare delete) protects the in-flight rows from the
+        // cross-tab sweep (rows under a staging meta are live, not
+        // orphans) and carries this stage's ownership nonce. A crashed
+        // stage leaves the marker; readers treat it as no-cache and the
+        // sweep reclaims it by age.
         root.hasGeneration = false;
         root.lastGen = null;
         root.rowIndex = null;
-        txn.objectStore(META_STORE).delete(metaKey);
+        txn.objectStore(META_STORE).put(
+          {
+            updatedAt: Date.now(),
+            formatVersion: META_FORMAT_VERSION,
+            staging: true,
+            gen: stageNonce
+          } as RootMeta,
+          metaKey
+        );
         rowStore.delete(range);
+      } else if (!(await ownsMarker(txn))) {
+        txn.abort();
+        return false;
       }
       for (let i = 0; i < batch.length; i++) {
         rowStore.put(batch[i][1], encodeRowKey(scope, rootKey, batch[i][0]));
@@ -1156,12 +1199,13 @@ export class RowPersistenceManager {
         root.rowIndex = RowIndex.fromRelativePaths(rowPaths);
         root.hasGeneration = true;
         root.lastGen = gen;
-        return;
+        return true;
       }
       await this.txnDone_(txn);
       batch = [];
       batchBytes = 0;
       await yieldMacrotask();
+      return true;
     };
 
     while (stack.length > 0) {
@@ -1194,7 +1238,9 @@ export class RowPersistenceManager {
         batchBytes += json.length;
       }
       if (batchBytes >= this.stageTxnBytes_) {
-        await writeBatch(false);
+        if (!(await writeBatch(false))) {
+          return;
+        }
       }
     }
     if (!live()) {
@@ -1330,6 +1376,10 @@ export class RowPersistenceManager {
         ) {
           expired.push(metaKeys[i] as string);
         } else {
+          // Complete AND staging metas both protect their rows: a staging
+          // marker means another tab is mid-rewrite — its rows are live,
+          // not orphans. A crashed stage's marker ages out above and its
+          // rows are reclaimed with it.
           liveMeta.add(metaKeys[i] as string);
         }
       }
@@ -1372,12 +1422,6 @@ export class RowPersistenceManager {
   invalidate(path: Path): void {
     const rootString = this.trackedRootFor(path.toString());
     void this.deleteRoot_(rootString ?? path.toString());
-    const root =
-      rootString !== null ? this.tracked_.get(rootString) : undefined;
-    if (root !== undefined) {
-      root.rowIndex = null;
-      root.hasGeneration = false;
-    }
   }
 
   /** Removes the stored cache when a persistent listener is torn down. */
@@ -1385,7 +1429,34 @@ export class RowPersistenceManager {
     void this.deleteRoot_(path.toString());
   }
 
+  /**
+   * Deletes a root's stored cache THROUGH the writer discipline. For a
+   * tracked root: first invalidate this manager's own state (drop pending
+   * dirt and the window so no queued flush resurrects the cache), then
+   * await the in-flight flush — deleting BETWEEN a staged flush's batches
+   * would otherwise leave its later batches committing rows over the
+   * deletion, a torn store. An untracked root (plain teardown evict)
+   * deletes directly; ANOTHER tab's in-flight stage is protected by its
+   * staging marker — the interleaved delete removes marker+rows, and the
+   * stage's remaining batches rewrite their rows with the final meta
+   * commit restoring a complete self-consistent generation.
+   */
   private async deleteRoot_(pathString: string): Promise<void> {
+    const root = this.tracked_.get(pathString);
+    if (root !== undefined) {
+      if (root.windowTimer !== null) {
+        clearTimeout(root.windowTimer);
+        root.windowTimer = null;
+      }
+      root.dirty = undefined;
+      root.rearm = false;
+      root.hasGeneration = false;
+      root.lastGen = null;
+      root.rowIndex = null;
+      if (root.activeFlush !== null) {
+        await root.activeFlush.catch(() => {});
+      }
+    }
     const db = await this.open_();
     if (db === null) {
       return;

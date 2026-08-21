@@ -499,6 +499,13 @@ describe('RowPersistenceManager sweep', () => {
 
 describe('RowPersistenceManager writer lease (Web Locks)', () => {
   /** A fake Web Locks manager: exclusive queued grants per name. */
+  /**
+   * Spec-accurate fake Web Locks: exclusive queued grants per name, and
+   * `ifAvailable: true` resolves IMMEDIATELY — callback(null) when the lock
+   * is held or contended, callback(lock) when free — never queues. This is
+   * the semantics the two-phase acquisition depends on (probe decides now,
+   * blocking request queues for succession).
+   */
   function makeFakeLocks() {
     const queues = new Map<string, Array<{ grant: () => void }>>();
     const held = new Set<string>();
@@ -516,9 +523,23 @@ describe('RowPersistenceManager writer lease (Web Locks)', () => {
     return {
       request: (
         name: string,
-        _options: { mode: 'exclusive' },
-        callback: (lock: unknown) => Promise<unknown>
+        options: { mode: 'exclusive'; ifAvailable?: boolean },
+        callback: (lock: unknown | null) => Promise<unknown>
       ): Promise<unknown> => {
+        if (options.ifAvailable === true) {
+          if (held.has(name)) {
+            // Contended: decide immediately with null, never queue.
+            return Promise.resolve().then(() => callback(null));
+          }
+          held.add(name);
+          return Promise.resolve()
+            .then(() => callback({}))
+            .then(result => {
+              held.delete(name);
+              tryGrantNext(name);
+              return result;
+            });
+        }
         return new Promise(resolveRequest => {
           const entry = {
             grant: () => {
@@ -936,6 +957,96 @@ describe('claims require cross-tab exclusion', () => {
     // interleaved incremental flushes from two lockless writers can leave
     // a mixed generation whose gen check alone cannot detect.
     expect(await manager.computeListenHashes('/ws')).to.equal(null);
+    manager.dispose();
+    reader.dispose();
+  });
+});
+
+describe('deletion vs in-flight staging', () => {
+  it('an evict during a multi-batch stage never leaves a torn store', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    // Tiny batch budget forces many staging transactions.
+    const manager = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(shared),
+      makeAlwaysGrantedLocks(),
+      1,
+      1,
+      96,
+      30000,
+      300000,
+      1000,
+      512
+    );
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    const tree = nodeFromJSON(
+      Object.fromEntries(
+        Array.from({ length: 30 }, (_, i) => ['k' + i, 'x'.repeat(120) + i])
+      )
+    );
+    manager.serverCacheUpdated(new Path('/ws'), tree);
+    const staging = manager.flushNow('/ws');
+    // Evict mid-stage: deleteRoot_ awaits the active flush, so the store
+    // ends either fully deleted or a complete generation — never a mix.
+    manager.evict(new Path('/ws'));
+    await staging.catch(() => {});
+    await wait(20);
+    await flushMicrotasks();
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const peeked = await reader.peek('/ws', 'alice');
+    if (peeked !== null) {
+      expect(peeked.node.equals(tree)).to.equal(true);
+    }
+    manager.dispose();
+    reader.dispose();
+  });
+
+  it('a foreign tab replacing the staging marker aborts the stage', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const manager = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(shared),
+      makeAlwaysGrantedLocks(),
+      1,
+      1,
+      96,
+      30000,
+      300000,
+      1000,
+      256
+    );
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    const tree = nodeFromJSON(
+      Object.fromEntries(
+        Array.from({ length: 40 }, (_, i) => ['k' + i, 'y'.repeat(150) + i])
+      )
+    );
+    manager.serverCacheUpdated(new Path('/ws'), tree);
+    const staging = manager.flushNow('/ws');
+    // A foreign deleteRoot_ (another tab's evict) clears marker + rows
+    // while this stage is between batches.
+    await wait(2);
+    const metaStore = shared.get('meta');
+    if (metaStore !== undefined) {
+      metaStore.clear();
+    }
+    await staging.catch(() => {});
+    await wait(20);
+    await flushMicrotasks();
+    // The stage must NOT have completed a generation over the foreign
+    // deletion: either nothing is stored, or (if the marker clear landed
+    // before the first batch) a complete self-consistent generation.
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const peeked = await reader.peek('/ws', 'alice');
+    if (peeked !== null) {
+      expect(peeked.node.equals(tree)).to.equal(true);
+    }
     manager.dispose();
     reader.dispose();
   });

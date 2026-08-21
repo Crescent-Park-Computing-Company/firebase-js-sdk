@@ -86,6 +86,61 @@ export function makeFakeIdb(
       }
       return merged;
     };
+    // Real IndexedDB auto-commits when the REQUEST QUEUE DRAINS: after a
+    // request callback (and its microtask continuations) issues no further
+    // request, the transaction commits. A fixed creation-time timer would
+    // commit under a consumer that awaits one request before issuing the
+    // next (the staging ownership check) — the exact lifetime bug class
+    // this fake exists to surface, so model the drain, not a timer.
+    let pendingRequests = 0;
+    let committed = false;
+    const commit = (): void => {
+      if (committed || state.aborted) {
+        return;
+      }
+      committed = true;
+      for (const [name, overlay] of state.overlays) {
+        const committedStore = committedFor(name);
+        for (const [key, value] of overlay) {
+          if (value === DELETED) {
+            if (committedStore.delete(key)) {
+              log_?.deletes.push(name + ':' + key);
+            }
+          } else {
+            committedStore.set(key, value);
+            log_?.puts.push(name + ':' + key);
+          }
+        }
+      }
+      txn.oncomplete?.();
+    };
+    const maybeCommitAfterDrain = (): void => {
+      // Real IndexedDB keeps a transaction alive across `await`s of its OWN
+      // requests: the continuation runs in the request callback's task, and
+      // auto-commit happens only when control returns to the event loop
+      // with no pending requests. Model that with a run of EMPTY microtask
+      // hops: a consumer's await-chain issues its next request within a
+      // couple of hops, so requiring several consecutive quiet hops lets
+      // arbitrary same-chain continuations (awaited get, then puts) run
+      // first — while staying timer-free so tests that only pump
+      // microtasks still observe commits.
+      let quiet = 0;
+      const tick = (): void => {
+        if (committed || state.aborted) {
+          return;
+        }
+        if (pendingRequests > 0) {
+          return; // the active request's resolution reschedules the check
+        }
+        quiet++;
+        if (quiet >= 8) {
+          commit();
+          return;
+        }
+        async(tick);
+      };
+      async(tick);
+    };
     const request = (
       result?: unknown
     ): {
@@ -98,9 +153,14 @@ export function makeFakeIdb(
         onsuccess: null as null | (() => void),
         onerror: null as null | (() => void)
       };
+      pendingRequests++;
       async(() => {
-        if (!state.aborted) {
+        pendingRequests--;
+        if (!state.aborted && !committed) {
           req.onsuccess?.();
+        }
+        if (pendingRequests === 0) {
+          maybeCommitAfterDrain();
         }
       });
       return req;
@@ -109,13 +169,13 @@ export function makeFakeIdb(
       objectStore: (name: string) => ({
         get: (key: string) => request(view(name).get(key)),
         put: (value: unknown, key: string) => {
-          if (!state.aborted) {
+          if (!state.aborted && !committed) {
             overlayFor(name).set(key, value);
           }
           return request();
         },
         delete: (keyOrRange: unknown) => {
-          if (!state.aborted) {
+          if (!state.aborted && !committed) {
             for (const key of [...view(name).keys()]) {
               if (inRange(key, keyOrRange)) {
                 overlayFor(name).set(key, DELETED);
@@ -135,7 +195,7 @@ export function makeFakeIdb(
           )
       }),
       abort: () => {
-        if (state.aborted) {
+        if (state.aborted || committed) {
           return;
         }
         state.aborted = true;
@@ -146,29 +206,8 @@ export function makeFakeIdb(
       onerror: null as null | (() => void),
       onabort: null as null | (() => void)
     };
-    // Commit after every queued request has resolved: two microtask hops
-    // order it after request callbacks. Aborted transactions never commit.
-    async(() =>
-      async(() => {
-        if (state.aborted) {
-          return;
-        }
-        for (const [name, overlay] of state.overlays) {
-          const committed = committedFor(name);
-          for (const [key, value] of overlay) {
-            if (value === DELETED) {
-              if (committed.delete(key)) {
-                log_?.deletes.push(name + ':' + key);
-              }
-            } else {
-              committed.set(key, value);
-              log_?.puts.push(name + ':' + key);
-            }
-          }
-        }
-        txn.oncomplete?.();
-      })
-    );
+    // A transaction with no requests at all still commits (empty commit).
+    maybeCommitAfterDrain();
     return txn;
   };
 

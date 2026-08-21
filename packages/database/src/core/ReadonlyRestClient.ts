@@ -86,7 +86,8 @@ export class ReadonlyRestClient extends ServerActions {
     currentHashFn: () => string,
     tag: number | null,
     onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
-    onProgress?: (result: ListenWireResult) => void
+    onProgress?: (result: ListenWireResult) => void,
+    _onResend?: () => void
   ) {
     const pathString = query._path.toString();
     this.log_('Listen called for ' + pathString + ' ' + query._queryIdentifier);

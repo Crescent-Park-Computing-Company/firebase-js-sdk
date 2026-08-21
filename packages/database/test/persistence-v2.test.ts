@@ -26,7 +26,9 @@ import {
 import {
   Repo,
   newIngestQueue,
+  repoActivatePersistenceForJoinedListen,
   repoGetValue,
+  repoNotifyPersistenceAuthScope,
   repoOnConnectStatusForTest,
   repoStartServerListen,
   repoStopServerListen
@@ -658,6 +660,59 @@ describe('warm boot stays certified under boot-time write-throughs', () => {
     // range merges — NOT an uncertified full resend).
     expect(getNodeCanonicalHash(cache)).to.equal('');
     expect(getNodeCompoundHash(cache)).to.not.equal(undefined);
+    manager.dispose();
+  });
+});
+
+describe('late-auth activation (v2)', () => {
+  it('joined activation waits for auth; the late-auth sweep then tracks AND seeds', async () => {
+    const manager = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(),
+      alwaysGrantedLocks,
+      1,
+      1,
+      512,
+      30000,
+      300000,
+      1000,
+      1 << 20
+    );
+    // NO auth scope yet (hydration still running).
+    const syncTree = new SyncTree({
+      startListening: () => [],
+      stopListening: () => {}
+    });
+    const repo = {
+      persistence_: manager,
+      serverSyncTree_: syncTree,
+      infoSyncTree_: syncTree,
+      eventQueue_: new EventQueue(),
+      pendingSeedRestores_: new Map(),
+      persistenceAuthScopeListeners_: new Set()
+    } as unknown as Repo;
+    const path = new Path('users/alice');
+    manager.setPersistentPath(path.toString(), true);
+    syncTreeAddEventRegistration(
+      syncTree,
+      new QueryImpl(repo, path, new QueryParams(), false),
+      stubRegistration()
+    );
+    syncTreeApplyServerOverwrite(syncTree, path, nodeFromJSON({ live: 1 }));
+
+    // Pre-auth joined activation must NOT track (a tracked-but-unseedable
+    // root would be skipped by the sweep forever).
+    repoActivatePersistenceForJoinedListen(repo, path);
+    expect(manager.trackedPaths()).to.deep.equal([]);
+
+    // Identity arrives: the sweep tracks AND seeds from the live cache.
+    manager.setAuthScope('alice');
+    repoNotifyPersistenceAuthScope(repo);
+    expect(manager.trackedPaths()).to.deep.equal([path.toString()]);
+    await manager.flushNow(path.toString());
+    await flushMicrotasks();
+    const record = await manager.peek(path.toString(), 'alice');
+    expect(record?.node.val()).to.deep.equal({ live: 1 });
     manager.dispose();
   });
 });

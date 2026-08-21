@@ -38,7 +38,8 @@ export abstract class ServerActions {
     currentHashFn: ListenHashFn,
     tag: number | null,
     onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
-    onProgress?: (result: ListenWireResult) => void
+    onProgress?: (result: ListenWireResult) => void,
+    onResend?: () => void
   ): void;
 
   /**

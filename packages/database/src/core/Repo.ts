@@ -1191,6 +1191,23 @@ export function repoStartServerListen(
           bytes: wire.bytes,
           reason
         });
+      },
+      () => {
+        if (!isDefaultComplete) {
+          return;
+        }
+        // A wire RE-send (reconnect): the previous send's settled outcome
+        // no longer describes this exchange. Reopen provisional state and
+        // republish — the re-send's own hashes decide restored vs
+        // fallback via the progress/response callbacks exactly like a
+        // first send.
+        listenSettled = false;
+        repoPublishListenOutcome(repo, pathString, {
+          mode: activeMode,
+          certified: false,
+          bytes: 0,
+          reason
+        });
       }
     );
   };
@@ -1560,10 +1577,14 @@ export function repoActivatePersistenceForJoinedListen(
   if (
     persistence === null ||
     !persistence.isPersistentPath(pathString) ||
+    !persistence.isAuthScopeConfigured() ||
     repo.pendingSeedRestores_?.has(pathString)
   ) {
-    // No manager, not selected, or the start path is still in flight (it
-    // will track on resolution).
+    // No manager, not selected, no identity yet (tracking pre-auth would
+    // mark the root tracked while serverCacheUpdated drops every seed —
+    // the late-auth sweep below then skips it forever; instead the sweep
+    // re-runs this activation once identity arrives), or the start path is
+    // still in flight (it will track on resolution).
     return;
   }
   // track() is idempotent AND cancels a pending untrack teardown — a

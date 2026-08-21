@@ -56,6 +56,12 @@ const INVALID_TOKEN_THRESHOLD = 3;
 interface ListenSpec {
   onComplete(s: string, p: unknown, result: ListenWireResult): void;
   onProgress?: (result: ListenWireResult) => void;
+  /**
+   * Fires at every wire (re)send of this listen AFTER the request is
+   * serialized — reconnects re-send the same spec, and outcome state that
+   * settled on a previous send must reopen for the new one.
+   */
+  onResend?: () => void;
 
   hashFn: ListenHashFn;
   bytes: number;
@@ -246,7 +252,8 @@ export class PersistentConnection extends ServerActions {
     currentHashFn: ListenHashFn,
     tag: number | null,
     onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
-    onProgress?: (result: ListenWireResult) => void
+    onProgress?: (result: ListenWireResult) => void,
+    onResend?: () => void
   ) {
     this.initConnection_();
 
@@ -267,6 +274,7 @@ export class PersistentConnection extends ServerActions {
     const listenSpec: ListenSpec = {
       onComplete,
       onProgress,
+      onResend,
       hashFn: currentHashFn,
       query,
       tag,
@@ -327,6 +335,7 @@ export class PersistentConnection extends ServerActions {
     listenSpec.bytes = 0;
     listenSpec.dataReceived = false;
     listenSpec.rangeMerged = false;
+    listenSpec.onResend?.();
 
     this.sendRequest(
       action,
