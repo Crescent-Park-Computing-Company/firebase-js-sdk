@@ -17,11 +17,11 @@
 import { ValueEventRegistration } from '../api/Reference_impl';
 import { AppCheckTokenProvider } from './AppCheckTokenProvider';
 import { AuthTokenProvider } from './AuthTokenProvider';
-import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { RepoInfo } from './RepoInfo';
+import { RowPersistenceManager } from './RowPersistence';
 import { ServerActions } from './ServerActions';
-import { ListenHashFn, PendingListenHashStore } from './ServerCacheSeed';
+import { ListenHashFn } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { SnapshotHolder } from './SnapshotHolder';
 import { SparseSnapshotTree } from './SparseSnapshotTree';
@@ -65,12 +65,12 @@ interface PendingSeedRestore {
     authScopeUnsubscribe?: () => void;
     authScopeTimer?: ReturnType<typeof setTimeout>;
     /**
-     * Tears down whatever this pending restore has already put on the wire /
-     * buffered, then re-enters repoStartServerListen for the SAME subscription
-     * without persistence. Installed by repoStartServerListen; called by the
-     * bulk cancel (an account switch) so no live registration is left silent
-     * behind a cancelled token — the restore is moot under the new identity,
-     * but the listen itself must still reach the server.
+     * Re-enters repoStartServerListen for the SAME subscription without
+     * persistence. Installed by repoStartServerListen; called by the bulk
+     * cancel (an account switch) so no live registration is left silent
+     * behind a cancelled token. A pending v2 restore has NOTHING on the wire
+     * (the listen is sent only after restore+hash complete), so reattaching
+     * is a plain cold re-entry — no unlisten, no gate teardown.
      */
     reattachCold?: () => void;
 }
@@ -113,8 +113,6 @@ type DeferredWireOp = {
         m: unknown;
     }>;
     tag: number | null;
-    /** Wire bytes of the message that carried this merge (0 if unknown). */
-    wireBytes: number;
     generation: number;
 } | {
     kind: 'complete';
@@ -205,10 +203,10 @@ export declare class Repo {
     transactionQueueTree_: Tree<Transaction[]>;
     persistentConnection_: PersistentConnection | null;
     /**
-     * Server-cache persistence (see core/Persistence.ts); null unless the app
-     * enabled it before this Repo's first listen.
+     * Server-cache persistence (see core/RowPersistence.ts); null unless the
+     * app enabled it before this Repo's first listen.
      */
-    persistence_: PersistenceManager | null;
+    persistence_: RowPersistenceManager | null;
     /**
      * The application-provided identity scope currently bound to persistence.
      * `undefined` means Auth has not resolved yet; null means signed out.
@@ -221,13 +219,11 @@ export declare class Repo {
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
-    /** Manifest-first hashes scoped to this Repo, never process-global. */
-    pendingListenHashes_: PendingListenHashStore;
     /**
      * The repo-level ordered ingest queue (see IngestQueue): wire operations
-     * deferred behind a manifest-first boot window or an in-flight sliced
-     * ingest, in exact arrival order across roots and kinds, plus the gate
-     * set and the continuation generation.
+     * deferred behind an in-flight sliced full-root ingest, in exact arrival
+     * order across roots and kinds, plus the gate set and the continuation
+     * generation.
      */
     ingestQueue_: IngestQueue;
     /**
@@ -265,7 +261,7 @@ export declare function repoOnRangeMergeUpdateForTest(repo: Repo, pathString: st
     s?: string;
     e?: string;
     m: unknown;
-}>, tag: number | null, wireBytes?: number): void;
+}>, tag: number | null): void;
 export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number, coldReason?: ListenOutcomeReason): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may

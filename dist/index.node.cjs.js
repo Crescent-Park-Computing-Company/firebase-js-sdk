@@ -942,9 +942,11 @@ class WebSocketConnection {
         this.appCheckToken = appCheckToken;
         this.authToken = authToken;
         this.keepaliveTimer = null;
-        /** Timestamp (ms) of the last websocket activity; the keepalive tick
+        /**
+         * Timestamp (ms) of the last websocket activity; the keepalive tick
          * compares against this instead of the timer being torn down and
-         * recreated on every frame. */
+         * recreated on every frame.
+         */
         this.lastActivity_ = 0;
         this.frames = null;
         this.totalFrames = 0;
@@ -1275,7 +1277,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3";
+const version = "1.1.3-persistence-v2.5";
 
 /**
  * @license
@@ -1466,6071 +1468,6 @@ class EmulatorTokenProvider {
 }
 /** A string that is treated as an admin access token by the RTDB emulator. Used by Admin SDK. */
 EmulatorTokenProvider.OWNER = 'owner';
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class NamedNode {
-    constructor(name, node) {
-        this.name = name;
-        this.node = node;
-    }
-    static Wrap(name, node) {
-        return new NamedNode(name, node);
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class Index {
-    /**
-     * @returns A standalone comparison function for
-     * this index
-     */
-    getCompare() {
-        return this.compare.bind(this);
-    }
-    /**
-     * Given a before and after value for a node, determine if the indexed value has changed. Even if they are different,
-     * it's possible that the changes are isolated to parts of the snapshot that are not indexed.
-     *
-     *
-     * @returns True if the portion of the snapshot being indexed changed between oldNode and newNode
-     */
-    indexedValueChanged(oldNode, newNode) {
-        const oldWrapped = new NamedNode(MIN_NAME, oldNode);
-        const newWrapped = new NamedNode(MIN_NAME, newNode);
-        return this.compare(oldWrapped, newWrapped) !== 0;
-    }
-    /**
-     * @returns a node wrapper that will sort equal to or less than
-     * any other node wrapper, using this index
-     */
-    minPost() {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return NamedNode.MIN;
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let __EMPTY_NODE;
-class KeyIndex extends Index {
-    static get __EMPTY_NODE() {
-        return __EMPTY_NODE;
-    }
-    static set __EMPTY_NODE(val) {
-        __EMPTY_NODE = val;
-    }
-    compare(a, b) {
-        return nameCompare(a.name, b.name);
-    }
-    isDefinedOn(node) {
-        // We could probably return true here (since every node has a key), but it's never called
-        // so just leaving unimplemented for now.
-        throw util.assertionError('KeyIndex.isDefinedOn not expected to be called.');
-    }
-    indexedValueChanged(oldNode, newNode) {
-        return false; // The key for a node never changes.
-    }
-    minPost() {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return NamedNode.MIN;
-    }
-    maxPost() {
-        // TODO: This should really be created once and cached in a static property, but
-        // NamedNode isn't defined yet, so I can't use it in a static.  Bleh.
-        return new NamedNode(MAX_NAME, __EMPTY_NODE);
-    }
-    makePost(indexValue, name) {
-        util.assert(typeof indexValue === 'string', 'KeyIndex indexValue must always be a string.');
-        // We just use empty node, but it'll never be compared, since our comparator only looks at name.
-        return new NamedNode(indexValue, __EMPTY_NODE);
-    }
-    /**
-     * @returns String representation for inclusion in a query spec
-     */
-    toString() {
-        return '.key';
-    }
-}
-const KEY_INDEX = new KeyIndex();
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/** Maximum key depth. */
-const MAX_PATH_DEPTH = 32;
-/** Maximum number of (UTF8) bytes in a Firebase path. */
-const MAX_PATH_LENGTH_BYTES = 768;
-/**
- * An immutable object representing a parsed path.  It's immutable so that you
- * can pass them around to other functions without worrying about them changing
- * it.
- */
-class Path {
-    /**
-     * @param pathOrString - Path string to parse, or another path, or the raw
-     * tokens array
-     */
-    constructor(pathOrString, pieceNum) {
-        if (pieceNum === void 0) {
-            this.pieces_ = pathOrString.split('/');
-            // Remove empty pieces.
-            let copyTo = 0;
-            for (let i = 0; i < this.pieces_.length; i++) {
-                if (this.pieces_[i].length > 0) {
-                    this.pieces_[copyTo] = this.pieces_[i];
-                    copyTo++;
-                }
-            }
-            this.pieces_.length = copyTo;
-            this.pieceNum_ = 0;
-        }
-        else {
-            this.pieces_ = pathOrString;
-            this.pieceNum_ = pieceNum;
-        }
-    }
-    toString() {
-        let pathString = '';
-        for (let i = this.pieceNum_; i < this.pieces_.length; i++) {
-            if (this.pieces_[i] !== '') {
-                pathString += '/' + this.pieces_[i];
-            }
-        }
-        return pathString || '/';
-    }
-}
-function newEmptyPath() {
-    return new Path('');
-}
-function pathGetFront(path) {
-    if (path.pieceNum_ >= path.pieces_.length) {
-        return null;
-    }
-    return path.pieces_[path.pieceNum_];
-}
-/**
- * @returns The number of segments in this path
- */
-function pathGetLength(path) {
-    return path.pieces_.length - path.pieceNum_;
-}
-function pathPopFront(path) {
-    let pieceNum = path.pieceNum_;
-    if (pieceNum < path.pieces_.length) {
-        pieceNum++;
-    }
-    return new Path(path.pieces_, pieceNum);
-}
-function pathGetBack(path) {
-    if (path.pieceNum_ < path.pieces_.length) {
-        return path.pieces_[path.pieces_.length - 1];
-    }
-    return null;
-}
-function pathToUrlEncodedString(path) {
-    let pathString = '';
-    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
-        if (path.pieces_[i] !== '') {
-            pathString += '/' + encodeURIComponent(String(path.pieces_[i]));
-        }
-    }
-    return pathString || '/';
-}
-/**
- * Shallow copy of the parts of the path.
- *
- */
-function pathSlice(path, begin = 0) {
-    return path.pieces_.slice(path.pieceNum_ + begin);
-}
-function pathParent(path) {
-    if (path.pieceNum_ >= path.pieces_.length) {
-        return null;
-    }
-    const pieces = [];
-    for (let i = path.pieceNum_; i < path.pieces_.length - 1; i++) {
-        pieces.push(path.pieces_[i]);
-    }
-    return new Path(pieces, 0);
-}
-function pathChild(path, childPathObj) {
-    const pieces = [];
-    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
-        pieces.push(path.pieces_[i]);
-    }
-    if (childPathObj instanceof Path) {
-        for (let i = childPathObj.pieceNum_; i < childPathObj.pieces_.length; i++) {
-            pieces.push(childPathObj.pieces_[i]);
-        }
-    }
-    else {
-        const childPieces = childPathObj.split('/');
-        for (let i = 0; i < childPieces.length; i++) {
-            if (childPieces[i].length > 0) {
-                pieces.push(childPieces[i]);
-            }
-        }
-    }
-    return new Path(pieces, 0);
-}
-/**
- * @returns True if there are no segments in this path
- */
-function pathIsEmpty(path) {
-    return path.pieceNum_ >= path.pieces_.length;
-}
-/**
- * @returns The path from outerPath to innerPath
- */
-function newRelativePath(outerPath, innerPath) {
-    const outer = pathGetFront(outerPath), inner = pathGetFront(innerPath);
-    if (outer === null) {
-        return innerPath;
-    }
-    else if (outer === inner) {
-        return newRelativePath(pathPopFront(outerPath), pathPopFront(innerPath));
-    }
-    else {
-        throw new Error('INTERNAL ERROR: innerPath (' +
-            innerPath +
-            ') is not within ' +
-            'outerPath (' +
-            outerPath +
-            ')');
-    }
-}
-/**
- * @returns -1, 0, 1 if left is less, equal, or greater than the right.
- */
-function pathCompare(left, right) {
-    const leftKeys = pathSlice(left, 0);
-    const rightKeys = pathSlice(right, 0);
-    for (let i = 0; i < leftKeys.length && i < rightKeys.length; i++) {
-        const cmp = nameCompare(leftKeys[i], rightKeys[i]);
-        if (cmp !== 0) {
-            return cmp;
-        }
-    }
-    if (leftKeys.length === rightKeys.length) {
-        return 0;
-    }
-    return leftKeys.length < rightKeys.length ? -1 : 1;
-}
-/**
- * @returns true if paths are the same.
- */
-function pathEquals(path, other) {
-    if (pathGetLength(path) !== pathGetLength(other)) {
-        return false;
-    }
-    for (let i = path.pieceNum_, j = other.pieceNum_; i <= path.pieces_.length; i++, j++) {
-        if (path.pieces_[i] !== other.pieces_[j]) {
-            return false;
-        }
-    }
-    return true;
-}
-/**
- * @returns True if this path is a parent of (or the same as) other
- */
-function pathContains(path, other) {
-    let i = path.pieceNum_;
-    let j = other.pieceNum_;
-    if (pathGetLength(path) > pathGetLength(other)) {
-        return false;
-    }
-    while (i < path.pieces_.length) {
-        if (path.pieces_[i] !== other.pieces_[j]) {
-            return false;
-        }
-        ++i;
-        ++j;
-    }
-    return true;
-}
-/**
- * Dynamic (mutable) path used to count path lengths.
- *
- * This class is used to efficiently check paths for valid
- * length (in UTF8 bytes) and depth (used in path validation).
- *
- * Throws Error exception if path is ever invalid.
- *
- * The definition of a path always begins with '/'.
- */
-class ValidationPath {
-    /**
-     * @param path - Initial Path.
-     * @param errorPrefix_ - Prefix for any error messages.
-     */
-    constructor(path, errorPrefix_) {
-        this.errorPrefix_ = errorPrefix_;
-        this.parts_ = pathSlice(path, 0);
-        /** Initialize to number of '/' chars needed in path. */
-        this.byteLength_ = Math.max(1, this.parts_.length);
-        for (let i = 0; i < this.parts_.length; i++) {
-            this.byteLength_ += util.stringLength(this.parts_[i]);
-        }
-        validationPathCheckValid(this);
-    }
-}
-function validationPathPush(validationPath, child) {
-    // Count the needed '/'
-    if (validationPath.parts_.length > 0) {
-        validationPath.byteLength_ += 1;
-    }
-    validationPath.parts_.push(child);
-    validationPath.byteLength_ += util.stringLength(child);
-    validationPathCheckValid(validationPath);
-}
-function validationPathPop(validationPath) {
-    const last = validationPath.parts_.pop();
-    validationPath.byteLength_ -= util.stringLength(last);
-    // Un-count the previous '/'
-    if (validationPath.parts_.length > 0) {
-        validationPath.byteLength_ -= 1;
-    }
-}
-function validationPathCheckValid(validationPath) {
-    if (validationPath.byteLength_ > MAX_PATH_LENGTH_BYTES) {
-        throw new Error(validationPath.errorPrefix_ +
-            'has a key path longer than ' +
-            MAX_PATH_LENGTH_BYTES +
-            ' bytes (' +
-            validationPath.byteLength_ +
-            ').');
-    }
-    if (validationPath.parts_.length > MAX_PATH_DEPTH) {
-        throw new Error(validationPath.errorPrefix_ +
-            'path specified exceeds the maximum depth that can be written (' +
-            MAX_PATH_DEPTH +
-            ') or object contains a cycle ' +
-            validationPathToErrorString(validationPath));
-    }
-}
-/**
- * String for use in error messages - uses '.' notation for path.
- */
-function validationPathToErrorString(validationPath) {
-    if (validationPath.parts_.length === 0) {
-        return '';
-    }
-    return "in property '" + validationPath.parts_.join('.') + "'";
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let MAX_NODE$2;
-function setMaxNode$1(val) {
-    MAX_NODE$2 = val;
-}
-/**
- * The hash text of a leaf value: `<typeof>:<serialized value>`. Numbers
- * serialize as IEEE-754 hex; everything else via String(). This is the one
- * definition of the leaf grammar shared by Node.hash() (v2 = false) and the
- * compound-hash range serialization (v2 = true, where strings are
- * JSON-quoted so ranges are unambiguous to reparse — Android calls this the
- * "V2" hash representation).
- */
-function leafHashValueText(value, v2) {
-    const type = typeof value;
-    let text = type + ':';
-    if (type === 'number') {
-        text += doubleToIEEE754String(value);
-    }
-    else if (v2 && type === 'string') {
-        text += hashQuotedString(value);
-    }
-    else {
-        text += String(value);
-    }
-    return text;
-}
-/**
- * JSON-style quoting with only backslash and double quote escaped (the V2
- * hash grammar's string form).
- */
-function hashQuotedString(value) {
-    let escaped = value;
-    if (escaped.indexOf('\\') !== -1) {
-        escaped = escaped.replace(/\\/g, '\\\\');
-    }
-    if (escaped.indexOf('"') !== -1) {
-        escaped = escaped.replace(/"/g, '\\"');
-    }
-    return '"' + escaped + '"';
-}
-const priorityHashText = function (priority) {
-    return leafHashValueText(priority, /* v2= */ false);
-};
-/**
- * Validates that a priority snapshot Node is valid.
- */
-const validatePriorityNode = function (priorityNode) {
-    if (priorityNode.isLeafNode()) {
-        const val = priorityNode.val();
-        util.assert(typeof val === 'string' ||
-            typeof val === 'number' ||
-            (typeof val === 'object' && util.contains(val, '.sv')), 'Priority must be a string or number.');
-    }
-    else {
-        util.assert(priorityNode === MAX_NODE$2 || priorityNode.isEmpty(), 'priority of unexpected type.');
-    }
-    // Don't call getPriority() on MAX_NODE to avoid hitting assertion.
-    util.assert(priorityNode === MAX_NODE$2 || priorityNode.getPriority().isEmpty(), "Priority nodes can't have a priority of their own.");
-};
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let __childrenNodeConstructor;
-/**
- * LeafNode is a class for storing leaf nodes in a DataSnapshot.  It
- * implements Node and stores the value of the node (a string,
- * number, or boolean) accessible via getValue().
- */
-class LeafNode {
-    static set __childrenNodeConstructor(val) {
-        __childrenNodeConstructor = val;
-    }
-    static get __childrenNodeConstructor() {
-        return __childrenNodeConstructor;
-    }
-    /**
-     * @param value_ - The value to store in this leaf node. The object type is
-     * possible in the event of a deferred value
-     * @param priorityNode_ - The priority of this node.
-     */
-    constructor(value_, priorityNode_ = LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
-        this.value_ = value_;
-        this.priorityNode_ = priorityNode_;
-        this.lazyHash_ = null;
-        util.assert(this.value_ !== undefined && this.value_ !== null, "LeafNode shouldn't be created with null/undefined value.");
-        validatePriorityNode(this.priorityNode_);
-    }
-    /** @inheritDoc */
-    isLeafNode() {
-        return true;
-    }
-    /** @inheritDoc */
-    getPriority() {
-        return this.priorityNode_;
-    }
-    /** @inheritDoc */
-    updatePriority(newPriorityNode) {
-        return new LeafNode(this.value_, newPriorityNode);
-    }
-    /** @inheritDoc */
-    getImmediateChild(childName) {
-        // Hack to treat priority as a regular child
-        if (childName === '.priority') {
-            return this.priorityNode_;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
-        }
-    }
-    /** @inheritDoc */
-    getChild(path) {
-        if (pathIsEmpty(path)) {
-            return this;
-        }
-        else if (pathGetFront(path) === '.priority') {
-            return this.priorityNode_;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
-        }
-    }
-    hasChild() {
-        return false;
-    }
-    /** @inheritDoc */
-    getPredecessorChildName(childName, childNode) {
-        return null;
-    }
-    /** @inheritDoc */
-    updateImmediateChild(childName, newChildNode) {
-        if (childName === '.priority') {
-            return this.updatePriority(newChildNode);
-        }
-        else if (newChildNode.isEmpty() && childName !== '.priority') {
-            return this;
-        }
-        else {
-            return LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateImmediateChild(childName, newChildNode).updatePriority(this.priorityNode_);
-        }
-    }
-    /** @inheritDoc */
-    updateChild(path, newChildNode) {
-        const front = pathGetFront(path);
-        if (front === null) {
-            return newChildNode;
-        }
-        else if (newChildNode.isEmpty() && front !== '.priority') {
-            return this;
-        }
-        else {
-            util.assert(front !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
-            return this.updateImmediateChild(front, LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateChild(pathPopFront(path), newChildNode));
-        }
-    }
-    /** @inheritDoc */
-    isEmpty() {
-        return false;
-    }
-    /** @inheritDoc */
-    numChildren() {
-        return 0;
-    }
-    /** @inheritDoc */
-    forEachChild(index, action) {
-        return false;
-    }
-    val(exportFormat) {
-        if (exportFormat && !this.getPriority().isEmpty()) {
-            return {
-                '.value': this.getValue(),
-                '.priority': this.getPriority().val()
-            };
-        }
-        else {
-            return this.getValue();
-        }
-    }
-    /** @inheritDoc */
-    hash() {
-        if (this.lazyHash_ === null) {
-            let toHash = '';
-            if (!this.priorityNode_.isEmpty()) {
-                toHash +=
-                    'priority:' +
-                        priorityHashText(this.priorityNode_.val()) +
-                        ':';
-            }
-            toHash += leafHashValueText(this.value_, 
-            /* v2= */ false);
-            this.lazyHash_ = sha1(toHash);
-        }
-        return this.lazyHash_;
-    }
-    /** @inheritDoc */
-    stampLazyHash(hash) {
-        if (this.lazyHash_ === null) {
-            this.lazyHash_ = hash;
-        }
-    }
-    /**
-     * Returns the value of the leaf node.
-     * @returns The value of the node.
-     */
-    getValue() {
-        return this.value_;
-    }
-    compareTo(other) {
-        if (other === LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
-            return 1;
-        }
-        else if (other instanceof LeafNode.__childrenNodeConstructor) {
-            return -1;
-        }
-        else {
-            util.assert(other.isLeafNode(), 'Unknown node type');
-            return this.compareToLeafNode_(other);
-        }
-    }
-    /**
-     * Comparison specifically for two leaf nodes
-     */
-    compareToLeafNode_(otherLeaf) {
-        const otherLeafType = typeof otherLeaf.value_;
-        const thisLeafType = typeof this.value_;
-        const otherIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(otherLeafType);
-        const thisIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(thisLeafType);
-        util.assert(otherIndex >= 0, 'Unknown leaf type: ' + otherLeafType);
-        util.assert(thisIndex >= 0, 'Unknown leaf type: ' + thisLeafType);
-        if (otherIndex === thisIndex) {
-            // Same type, compare values
-            if (thisLeafType === 'object') {
-                // Deferred value nodes are all equal, but we should also never get to this point...
-                return 0;
-            }
-            else {
-                // Note that this works because true > false, all others are number or string comparisons
-                if (this.value_ < otherLeaf.value_) {
-                    return -1;
-                }
-                else if (this.value_ === otherLeaf.value_) {
-                    return 0;
-                }
-                else {
-                    return 1;
-                }
-            }
-        }
-        else {
-            return thisIndex - otherIndex;
-        }
-    }
-    withIndex() {
-        return this;
-    }
-    isIndexed() {
-        return true;
-    }
-    equals(other) {
-        if (other === this) {
-            return true;
-        }
-        else if (other.isLeafNode()) {
-            const otherLeaf = other;
-            return (this.value_ === otherLeaf.value_ &&
-                this.priorityNode_.equals(otherLeaf.priorityNode_));
-        }
-        else {
-            return false;
-        }
-    }
-}
-/**
- * The sort order for comparing leaf nodes of different types. If two leaf nodes have
- * the same type, the comparison falls back to their value
- */
-LeafNode.VALUE_TYPE_ORDER = ['object', 'boolean', 'number', 'string'];
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let nodeFromJSON$1;
-let MAX_NODE$1;
-function setNodeFromJSON(val) {
-    nodeFromJSON$1 = val;
-}
-function setMaxNode(val) {
-    MAX_NODE$1 = val;
-}
-class PriorityIndex extends Index {
-    compare(a, b) {
-        const aPriority = a.node.getPriority();
-        const bPriority = b.node.getPriority();
-        const indexCmp = aPriority.compareTo(bPriority);
-        if (indexCmp === 0) {
-            return nameCompare(a.name, b.name);
-        }
-        else {
-            return indexCmp;
-        }
-    }
-    isDefinedOn(node) {
-        return !node.getPriority().isEmpty();
-    }
-    indexedValueChanged(oldNode, newNode) {
-        return !oldNode.getPriority().equals(newNode.getPriority());
-    }
-    minPost() {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return NamedNode.MIN;
-    }
-    maxPost() {
-        return new NamedNode(MAX_NAME, new LeafNode('[PRIORITY-POST]', MAX_NODE$1));
-    }
-    makePost(indexValue, name) {
-        const priorityNode = nodeFromJSON$1(indexValue);
-        return new NamedNode(name, new LeafNode('[PRIORITY-POST]', priorityNode));
-    }
-    /**
-     * @returns String representation for inclusion in a query spec
-     */
-    toString() {
-        return '.priority';
-    }
-}
-const PRIORITY_INDEX = new PriorityIndex();
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * A constant-size split strategy used by persistence. Unlike the protocol's
- * historical sqrt(tree-size) default, a fixed target gives IndexedDB records
- * a predictable upper bound across roots and generations. Boundaries remain
- * stable between writes; the target is consulted only when a dirty run is
- * re-emitted.
- */
-function fixedSizeSplitStrategy(targetBytes) {
-    const splitThreshold = Math.max(512, Math.floor(targetBytes));
-    return state => state.hashLength() > splitThreshold &&
-        state.currentPath()[state.currentPath().length - 1] !== '.priority';
-}
-/**
- * Iterates children in key order with the node's priority interleaved as a
- * `.priority` pseudo-child, matching the serialization the server hashes
- * (Android ChildrenNode.forEachChild(visitor, includePriority = true)): the
- * priority is emitted immediately before the first child key that sorts
- * after '.priority'. A priority that sorts after every child is dropped, as
- * it is on Android and iOS — both ends of the protocol must agree.
- */
-function forEachChildWithPriority(node, action, includeTrailingPriority = false) {
-    if (node.getPriority().isEmpty()) {
-        node.forEachChild(KEY_INDEX, (key, child) => action(key, child, true));
-        return;
-    }
-    let passedPriority = false;
-    node.forEachChild(KEY_INDEX, (key, child) => {
-        if (!passedPriority && nameCompare(key, '.priority') > 0) {
-            passedPriority = true;
-            action('.priority', node.getPriority(), true);
-        }
-        action(key, child, true);
-    });
-    if (!passedPriority && includeTrailingPriority) {
-        // Android's compound grammar omits a priority that sorts after every
-        // child, but export-format persistence must still serialize it.
-        action('.priority', node.getPriority(), false);
-    }
-}
-class CompoundHashBuilder {
-    constructor(splitStrategy_, lengthOnly_ = false) {
-        this.splitStrategy_ = splitStrategy_;
-        this.lengthOnly_ = lengthOnly_;
-        this.posts = [];
-        this.hashes = [];
-        /** Serialized text length of each completed range (same order as posts). */
-        this.sizes = [];
-        /**
-         * When set, completed range texts are handed to the sink instead of being
-         * hashed synchronously; `hashes` receives a placeholder the caller fills in
-         * (the sink receives the index to fill). Lets the persistence flush hash
-         * ranges with WebCrypto off the main thread's synchronous path.
-         */
-        this.hashSink = null;
-        /**
-         * Optional persistence sink for the export-format fragment represented by
-         * each completed hash range. The fragment contains exactly the leaves in
-         * that range's (exclusiveStart, inclusiveEnd] interval. Persistence unions
-         * these disjoint fragments without range-deletion semantics.
-         */
-        this.payloadSink = null;
-        /** null when not currently inside a range. */
-        this.currentHash_ = null;
-        this.currentHashLength_ = 0;
-        /** Fresh, mutable accumulator for the current persisted range only. */
-        this.currentPayload_ = undefined;
-        /**
-         * Key stack of the node being processed. Kept beyond currentDepth_ so the
-         * path of the last processed leaf survives popping back out of its parent.
-         */
-        this.currentPath_ = [];
-        this.currentDepth_ = 0;
-        this.lastLeafDepth_ = -1;
-        this.needsComma_ = true;
-        this.splitState_ = {
-            hashLength: () => this.currentHash_ === null ? 0 : this.currentHashLength_,
-            currentPath: () => this.currentPath_.slice(0, this.currentDepth_)
-        };
-    }
-    processLeaf(node) {
-        this.ensureRange_();
-        this.lastLeafDepth_ = this.currentDepth_;
-        const leafText = leafHashRepresentation(node);
-        if (!this.lengthOnly_) {
-            this.currentHash_ += leafText;
-        }
-        this.currentHashLength_ += leafText.length;
-        this.appendPayloadLeaf_(node);
-        this.needsComma_ = true;
-        if (this.splitStrategy_(this.splitState_)) {
-            this.endRange_();
-        }
-    }
-    startChild(key) {
-        this.ensureRange_();
-        if (this.needsComma_) {
-            if (!this.lengthOnly_) {
-                this.currentHash_ += ',';
-            }
-            this.currentHashLength_++;
-        }
-        const opening = hashQuotedString(key) + ':(';
-        if (!this.lengthOnly_) {
-            this.currentHash_ += opening;
-        }
-        this.currentHashLength_ += opening.length;
-        if (this.currentDepth_ === this.currentPath_.length) {
-            this.currentPath_.push(key);
-        }
-        else {
-            this.currentPath_[this.currentDepth_] = key;
-        }
-        this.currentDepth_++;
-        this.needsComma_ = false;
-    }
-    endChild() {
-        this.currentDepth_--;
-        if (this.currentHash_ !== null) {
-            // Add closing parenthesis for the child that was just processed.
-            if (!this.lengthOnly_) {
-                this.currentHash_ += ')';
-            }
-            this.currentHashLength_++;
-        }
-        this.needsComma_ = true;
-    }
-    finishHashing() {
-        if (this.currentHash_ !== null) {
-            this.endRange_();
-        }
-        // Always close with the empty hash for the tail range to allow simple
-        // appending at the server.
-        this.hashes.push('');
-    }
-    /**
-     * Seeds the builder into the exact state the natural full-tree walk has
-     * immediately after ending a range at the leaf `path`: no open range, the
-     * walker positioned at that leaf's depth. A subsequent walk of the leaves
-     * AFTER `path` then serializes ranges byte-identically to the corresponding
-     * portion of a full walk — the next range's opening parenthesis prefix is
-     * reconstructed from the common path with this boundary, which is exactly
-     * what ensureRange_ derives from currentPath_/currentDepth_.
-     */
-    seedBoundary(path) {
-        this.currentPath_ = path.slice();
-        this.currentDepth_ = path.length;
-        this.lastLeafDepth_ = path.length;
-        this.currentHash_ = null;
-        this.currentHashLength_ = 0;
-        this.needsComma_ = true;
-    }
-    /**
-     * Ends the open range at the last processed leaf regardless of the split
-     * strategy — used by the stable-range rewalk to close a dirty run exactly
-     * at a preserved boundary post so the following clean range's interval is
-     * untouched. No-op when no range is open.
-     */
-    forceEndRange() {
-        if (this.currentHash_ !== null) {
-            this.endRange_();
-        }
-    }
-    ensureRange_() {
-        if (this.currentHash_ === null) {
-            let hash = '(';
-            for (let i = 0; i < this.currentDepth_; i++) {
-                hash += hashQuotedString(this.currentPath_[i]) + ':(';
-            }
-            this.currentHash_ = this.lengthOnly_ ? '' : hash;
-            this.currentHashLength_ = hash.length;
-            this.needsComma_ = false;
-        }
-    }
-    /** Adds an interior-node priority to the persisted payload only. */
-    processPriorityForPayload(path, priority) {
-        if (!priority.isEmpty()) {
-            this.appendPayloadValue_(path.concat('.priority'), priority.val());
-        }
-    }
-    appendPayloadLeaf_(node) {
-        this.appendPayloadValue_(this.currentPath_.slice(0, this.currentDepth_), node.val(true));
-    }
-    appendPayloadValue_(path, value) {
-        if (this.payloadSink === null) {
-            return;
-        }
-        if (path.length === 0) {
-            this.currentPayload_ = value;
-            return;
-        }
-        if (this.currentPayload_ === undefined ||
-            this.currentPayload_ === null ||
-            typeof this.currentPayload_ !== 'object') {
-            this.currentPayload_ = {};
-        }
-        let cursor = this.currentPayload_;
-        for (let i = 0; i < path.length - 1; i++) {
-            const key = path[i];
-            const existing = Object.prototype.hasOwnProperty.call(cursor, key)
-                ? cursor[key]
-                : undefined;
-            if (existing === null || typeof existing !== 'object') {
-                Object.defineProperty(cursor, key, {
-                    value: {},
-                    enumerable: true,
-                    configurable: true,
-                    writable: true
-                });
-            }
-            cursor = cursor[key];
-        }
-        Object.defineProperty(cursor, path[path.length - 1], {
-            value,
-            enumerable: true,
-            configurable: true,
-            writable: true
-        });
-    }
-    endRange_() {
-        let hash = this.currentHash_;
-        if (!this.lengthOnly_) {
-            for (let i = 0; i < this.currentDepth_; i++) {
-                hash += ')';
-            }
-            hash += ')';
-        }
-        const completedLength = this.currentHashLength_ + this.currentDepth_ + 1;
-        const index = this.hashes.length;
-        this.sizes.push(completedLength);
-        if (this.lengthOnly_) {
-            this.hashes.push('');
-        }
-        else if (this.hashSink !== null) {
-            this.hashes.push('');
-            this.hashSink(hash, index);
-        }
-        else {
-            this.hashes.push(sha1(hash));
-        }
-        if (this.payloadSink !== null) {
-            this.payloadSink(this.currentPayload_, index);
-        }
-        const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
-        this.posts.push(post === '' ? '/' : post);
-        this.currentHash_ = null;
-        this.currentHashLength_ = 0;
-        this.currentPayload_ = undefined;
-        this.needsComma_ = true;
-    }
-}
-/**
- * Compares two range markers (slash-joined leaf paths) in compound-hash leaf
- * order: segment-wise nameCompare, a strict prefix sorting first. Posts are
- * ordering markers only — they need not exist as leaves in the current tree,
- * so the comparison must be total over arbitrary paths.
- */
-function compareRangeMarkers(a, b) {
-    const n = Math.min(a.length, b.length);
-    for (let i = 0; i < n; i++) {
-        const cmp = nameCompare(a[i], b[i]);
-        if (cmp !== 0) {
-            return cmp;
-        }
-    }
-    return a.length - b.length;
-}
-const ROOT_POST = '/';
-function markerToPath(post) {
-    return post === ROOT_POST || post === '' ? [] : post.split('/');
-}
-/**
- * Relation of the subtree rooted at `path` to the marker `post`:
- *   -1 → every leaf in the subtree sorts before-or-at the marker
- *    0 → the marker lies inside (or at the root of) the subtree
- *    1 → every leaf in the subtree sorts after the marker
- */
-function subtreeVsMarker(path, post) {
-    const n = Math.min(path.length, post.length);
-    for (let i = 0; i < n; i++) {
-        const cmp = nameCompare(path[i], post[i]);
-        if (cmp < 0) {
-            return -1;
-        }
-        if (cmp > 0) {
-            return 1;
-        }
-    }
-    if (path.length <= post.length) {
-        // path is a (possibly equal) prefix of post: marker inside subtree. An
-        // exactly-equal leaf path counts as inside; the walk emits it and the
-        // interval's half-open bounds decide inclusion.
-        return 0;
-    }
-    // post is a strict prefix of path: markers sort before their extensions,
-    // so the whole subtree sorts after the marker.
-    return 1;
-}
-/**
- * Explicit-stack traversal of the leaves of `node` whose paths lie in the
- * half-open marker interval (fromPost, toPost], feeding the builder exactly
- * the startChild / endChild / processLeaf sequence the natural full-tree walk
- * produces for those leaves. The builder must have been seeded at `fromPost`
- * (seedBoundary) so the first emitted range opens with the same
- * common-ancestor prefix the full walk would write. `toPost === null` walks
- * to the end of the tree.
- *
- * The stack form exists so large intervals can be walked in bounded
- * main-thread slices (drainUntil): the persistence flush plans and stages
- * whole-root intervals on a first generation, and the recursive walk there
- * was a multi-second synchronous stall on large roots. Draining with an
- * infinite deadline reproduces the recursive walk exactly — walkLeafInterval
- * below is that wrapper, and the two forms are byte-identical by
- * construction (same frame order, same builder calls).
- *
- * Subtrees entirely outside the interval are pruned without reading them —
- * the cost is O(interval bytes + pruned fanout), not O(tree).
- */
-class LeafIntervalWalker {
-    constructor(node, fromPost_, toPost_, builder_) {
-        this.fromPost_ = fromPost_;
-        this.toPost_ = toPost_;
-        this.builder_ = builder_;
-        /** Live path of the frame being processed (mutated by enter/exit). */
-        this.path_ = [];
-        this.openPath_ = fromPost_ === null ? [] : fromPost_;
-        this.openDepth_ = this.openPath_.length;
-        this.started_ = fromPost_ !== null;
-        this.stack_ = [{ kind: 'enter', key: null, node }];
-    }
-    /**
-     * Processes frames until the walk completes or `deadline` (an epoch-ms
-     * timestamp) passes — always at least one frame, so every slice makes
-     * progress no matter how small its budget. Returns true when the walk is
-     * complete; call finish() then.
-     */
-    drainUntil(deadline) {
-        while (this.stack_.length > 0) {
-            this.processFrame_(this.stack_.pop());
-            if (Date.now() >= deadline) {
-                break;
-            }
-        }
-        return this.stack_.length === 0;
-    }
-    /**
-     * Pops back out of the last emitted leaf's ancestry so a caller chaining
-     * further work sees a balanced builder; endChild is a no-op on text when
-     * no range is open. Call exactly once, after drainUntil returns true.
-     */
-    finish() {
-        this.builder_.forceEndRange();
-    }
-    processFrame_(frame) {
-        if (frame.kind === 'exit') {
-            this.path_.pop();
-            return;
-        }
-        const { key, node } = frame;
-        if (key !== null) {
-            this.path_.push(key);
-        }
-        const popEntered = () => {
-            if (key !== null) {
-                this.path_.pop();
-            }
-        };
-        if (this.fromPost_ !== null) {
-            const rel = subtreeVsMarker(this.path_, this.fromPost_);
-            if (rel === -1) {
-                popEntered();
-                return; // entirely at-or-before the opening boundary
-            }
-            if (rel === 0 && node.isLeafNode()) {
-                // The boundary leaf itself: excluded (interval is open at fromPost).
-                if (compareRangeMarkers(this.path_, this.fromPost_) <= 0) {
-                    popEntered();
-                    return;
-                }
-            }
-        }
-        if (this.toPost_ !== null) {
-            const rel = subtreeVsMarker(this.path_, this.toPost_);
-            if (rel === 1) {
-                // Entirely after the closing boundary: nothing further in document
-                // order can be inside the interval — drop every remaining frame.
-                this.stack_.length = 0;
-                popEntered();
-                return;
-            }
-        }
-        if (node.isLeafNode()) {
-            this.emitLeaf_(node);
-            popEntered();
-            return;
-        }
-        // The mobile wire grammar deliberately drops a trailing interior-node
-        // priority. Persistence cannot: store it in the sparse payload without
-        // feeding it to the canonical hash builder.
-        this.builder_.processPriorityForPayload(this.path_, node.getPriority());
-        const children = [];
-        forEachChildWithPriority(node, (childKey, child) => {
-            children.push([childKey, child]);
-        });
-        if (key !== null) {
-            this.stack_.push({ kind: 'exit' });
-        }
-        for (let i = children.length - 1; i >= 0; i--) {
-            this.stack_.push({
-                kind: 'enter',
-                key: children[i][0],
-                node: children[i][1]
-            });
-        }
-    }
-    emitLeaf_(leaf) {
-        const path = this.path_;
-        if (!this.started_) {
-            // First leaf of a from-the-start walk: descend from the root.
-            for (let i = 0; i < path.length; i++) {
-                this.builder_.startChild(path[i]);
-            }
-            this.started_ = true;
-        }
-        else {
-            let common = 0;
-            while (common < this.openDepth_ &&
-                common < path.length &&
-                this.openPath_[common] === path[common]) {
-                common++;
-            }
-            for (let i = this.openDepth_; i > common; i--) {
-                this.builder_.endChild();
-            }
-            for (let i = common; i < path.length; i++) {
-                this.builder_.startChild(path[i]);
-            }
-        }
-        this.builder_.processLeaf(leaf);
-        // Copy: `path` is the walker's live mutable array.
-        this.openPath_ = path.slice();
-        this.openDepth_ = this.openPath_.length;
-    }
-}
-/**
- * Synchronous interval walk: drains a LeafIntervalWalker in one go. See the
- * walker for the traversal contract.
- */
-function walkLeafInterval(node, fromPost, toPost, builder) {
-    const walker = new LeafIntervalWalker(node, fromPost, toPost, builder);
-    while (!walker.drainUntil(Infinity)) {
-        // drainUntil with an infinite deadline only stops when the stack drains.
-    }
-    walker.finish();
-}
-/**
- * Node-pair visits the identity-diff may spend before concluding the trees
- * are too divorced to diff (collapse to the root path: everything dirty).
- * The diff's output was
- * always budgeted (maxPaths); its WORK was not — two trees that share no
- * structure (a fallback boot's baseline vs a fully re-downloaded root) made
- * it walk both trees end to end only to conclude "all dirty". Visits accrue
- * only where identity differs, so a genuine incremental change stays far
- * under this bound while a divorced pair exhausts it in a few milliseconds.
- * @internal
- */
-const DIFF_VISIT_BUDGET = 20000;
-/**
- * The identity-diff: collects the paths of maximal subtrees that differ
- * between two versions of an immutable, structurally shared tree. Unchanged
- * subtrees are recognized by object identity and never descended. A child
- * present in only one version reports that child's path. Descends at most
- * `maxDepth` levels before treating a differing subtree as wholly changed —
- * dirty mapping only needs interval bounds, not precise leaves. Exhausting
- * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
- * collapses the affected branches toward the root — in the limit to the
- * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
- * diff's cost is bounded even against a baseline sharing no structure with
- * the live tree. The result is always a (possibly collapsed) path list; it
- * over-approximates but never misses a change.
- */
-function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512, maxVisits = DIFF_VISIT_BUDGET) {
-    const changed = [];
-    let visits = 0;
-    /**
-     * Returns true when the caller must collapse this branch to stay within the
-     * global path budget. A large atomic subtree update should dirty that
-     * subtree's ranges, never fall back to dirtying the entire persisted root.
-     */
-    const visit = (a, b, path, depth) => {
-        if (a === b) {
-            return false;
-        }
-        if (++visits > maxVisits) {
-            // Work budget exhausted: the trees are too divorced for the diff to
-            // pay off. Collapse to the root path — everything dirty.
-            changed.length = 0;
-            changed.push([]);
-            return true;
-        }
-        const branchStart = changed.length;
-        const collapseBranch = () => {
-            changed.splice(branchStart);
-            changed.push(path.slice());
-            return changed.length > maxPaths;
-        };
-        if (depth >= maxDepth ||
-            a.isLeafNode() ||
-            b.isLeafNode() ||
-            a.isEmpty() ||
-            b.isEmpty()) {
-            changed.push(path.slice());
-            return changed.length > maxPaths;
-        }
-        // Sorted merge over (key, child) PAIRS captured by the iteration itself.
-        // Re-resolving each common key through getImmediateChild would repeat an
-        // O(log n) nameCompare tree descent per key — measured as the dominant
-        // cost of the whole diff on wide roots — for nodes forEachChild already
-        // visited.
-        const aPairs = [];
-        const bPairs = [];
-        a.forEachChild(KEY_INDEX, (key, child) => {
-            aPairs.push([key, child]);
-        });
-        b.forEachChild(KEY_INDEX, (key, child) => {
-            bPairs.push([key, child]);
-        });
-        let i = 0;
-        let j = 0;
-        while (i < aPairs.length || j < bPairs.length) {
-            let key;
-            let cmp;
-            if (i >= aPairs.length) {
-                cmp = 1;
-                key = bPairs[j][0];
-            }
-            else if (j >= bPairs.length) {
-                cmp = -1;
-                key = aPairs[i][0];
-            }
-            else {
-                cmp = nameCompare(aPairs[i][0], bPairs[j][0]);
-                key = cmp <= 0 ? aPairs[i][0] : bPairs[j][0];
-            }
-            path.push(key);
-            let overBudget = false;
-            if (cmp === 0) {
-                overBudget = visit(aPairs[i][1], bPairs[j][1], path, depth + 1);
-                i++;
-                j++;
-            }
-            else {
-                changed.push(path.slice());
-                overBudget = changed.length > maxPaths;
-                if (cmp < 0) {
-                    i++;
-                }
-                else {
-                    j++;
-                }
-            }
-            path.pop();
-            if (overBudget) {
-                return collapseBranch();
-            }
-        }
-        if (a.getPriority() !== b.getPriority()) {
-            if (a.getPriority().isEmpty() !== b.getPriority().isEmpty() ||
-                (!a.getPriority().isEmpty() &&
-                    a.getPriority().val() !== b.getPriority().val())) {
-                changed.push(path.slice());
-                if (changed.length > maxPaths) {
-                    return collapseBranch();
-                }
-            }
-        }
-        return false;
-    };
-    visit(before, after, [], 0);
-    return changed;
-}
-/**
- * Marks the ranges whose leaf interval intersects any changed subtree. Range
- * i covers the half-open marker interval (posts[i-1], posts[i]]; the virtual
- * tail after the last post is reported via the returned `tailDirty` (leaves
- * appended after the previously last leaf fall there).
- */
-function markDirtyRanges(ranges, changedPaths) {
-    const dirty = new Array(ranges.length).fill(false);
-    let tailDirty = false;
-    const posts = ranges.map(r => markerToPath(r.post));
-    for (const path of changedPaths) {
-        if (path.length === 0) {
-            dirty.fill(true);
-            tailDirty = true;
-            break;
-        }
-        // First range not entirely before the subtree: subtree's leaves start at
-        // marker `path` (a prefix sorts before its extensions), so binary-search
-        // the first post >= path.
-        let lo = 0;
-        let hi = ranges.length;
-        while (lo < hi) {
-            const mid = (lo + hi) >> 1;
-            if (compareRangeMarkers(posts[mid], path) < 0) {
-                lo = mid + 1;
-            }
-            else {
-                hi = mid;
-            }
-        }
-        if (lo === ranges.length) {
-            tailDirty = true;
-            continue;
-        }
-        // Mark ranges from lo while their interval intersects the subtree: the
-        // interval (posts[i-1], posts[i]] intersects until the PREVIOUS post
-        // already sorts past every leaf under `path` (after it, not inside it).
-        for (let i = lo; i < ranges.length; i++) {
-            if (i > lo) {
-                // Stop once the subtree's leaves all sort at-or-before the PREVIOUS
-                // post: the interval (posts[i-1], posts[i]] can no longer intersect.
-                if (subtreeVsMarker(path, posts[i - 1]) === -1) {
-                    break;
-                }
-            }
-            dirty[i] = true;
-            if (i === ranges.length - 1 &&
-                subtreeVsMarker(path, posts[ranges.length - 1]) !== -1) {
-                // The subtree extends past the last post into the virtual tail.
-                tailDirty = true;
-            }
-        }
-    }
-    return { dirty, tailDirty };
-}
-/**
- * Produces the next generation's stable ranges: clean ranges carry over
- * verbatim; each maximal dirty run (pre-extended over undersized clean
- * neighbors) is re-serialized over the current tree between its preserved
- * outer boundaries, re-splitting naturally at the current ideal size. Ranges
- * are emitted through `builder`, whose hashSink/hashes the caller owns —
- * pass a sink to hash the dirty texts with WebCrypto afterwards.
- *
- * Sliceable: drainUntil processes walker frames until a deadline so the
- * persistence flush can plan a whole-root generation (the cold boot's first
- * flush, where every range is dirty) in bounded main-thread slices instead
- * of one multi-second synchronous walk. Draining with an infinite deadline
- * reproduces the old synchronous behavior exactly — rebuildStableRanges
- * below is that wrapper.
- *
- * result() returns the new range list with hashes for SINK-DEFERRED entries
- * empty (the caller fills them from the sink's completions, matching indexes
- * in builder.posts). Boundary invariant: every preserved clean range keeps
- * its exact post; rewalked runs end exactly at their run's outer boundary
- * (LeafIntervalWalker's toPost pruning + finish()), so posts remain globally
- * ordered and disjoint.
- */
-class StableRangeRebuilder {
-    constructor(node_, previous, dirty, tailDirty, builder_, fixedTargetBytes) {
-        this.node_ = node_;
-        this.builder_ = builder_;
-        /** [fromPost, toPost, cleanTailAfter] per dirty run, in order. */
-        this.runs_ = [];
-        this.result_ = [];
-        this.runIndex_ = 0;
-        this.walker_ = null;
-        this.emitFrom_ = 0;
-        const ideal = fixedTargetBytes === undefined
-            ? Math.max(512, Math.floor(Math.sqrt(estimateSerializedNodeSize(node_) * 100)))
-            : Math.max(512, Math.floor(fixedTargetBytes));
-        const minSize = ideal >> 1;
-        // Absorb undersized clean neighbors into adjacent dirty runs (merge side
-        // of the hysteresis): they re-emit merged with the run's bytes.
-        const effectiveDirty = dirty.slice();
-        for (let i = 0; i < effectiveDirty.length; i++) {
-            if (!effectiveDirty[i]) {
-                continue;
-            }
-            for (let p = i - 1; p >= 0 && !effectiveDirty[p] && previous[p].size < minSize; p--) {
-                effectiveDirty[p] = true;
-            }
-            for (let n = i + 1; n < effectiveDirty.length &&
-                !effectiveDirty[n] &&
-                previous[n].size < minSize; n++) {
-                effectiveDirty[n] = true;
-                i = n;
-            }
-        }
-        // Plan: leading clean prefix carries immediately; each dirty run walks
-        // its interval, then carries the clean ranges up to the next run.
-        let i = 0;
-        let pendingCarry = [];
-        const flushCarryTo = (target) => {
-            for (const range of pendingCarry) {
-                target.push(range);
-            }
-            pendingCarry = [];
-        };
-        while (i < previous.length) {
-            if (!effectiveDirty[i]) {
-                pendingCarry.push(previous[i]);
-                i++;
-                continue;
-            }
-            let j = i;
-            while (j < previous.length && effectiveDirty[j]) {
-                j++;
-            }
-            const runEndsAtTail = j === previous.length && tailDirty;
-            const run = {
-                from: i === 0 ? null : markerToPath(previous[i - 1].post),
-                to: runEndsAtTail ? null : markerToPath(previous[j - 1].post),
-                carryAfter: []
-            };
-            flushCarryTo(this.result_);
-            this.runs_.push(run);
-            i = j;
-            // Clean ranges after this run attach to it, so they emit in order.
-            while (i < previous.length && !effectiveDirty[i]) {
-                run.carryAfter.push(previous[i]);
-                i++;
-            }
-        }
-        flushCarryTo(this.result_);
-        if (tailDirty && previous.length > 0) {
-            // Tail handled by extending the last run (runEndsAtTail) when the last
-            // range was dirty; when it was clean, walk the pure tail interval.
-            const lastWasClean = !effectiveDirty[previous.length - 1];
-            if (lastWasClean) {
-                this.runs_.push({
-                    from: markerToPath(previous[previous.length - 1].post),
-                    to: null,
-                    carryAfter: []
-                });
-            }
-        }
-        if (previous.length === 0) {
-            // First-ever generation: one natural full walk.
-            this.runs_.push({ from: null, to: null, carryAfter: [] });
-        }
-    }
-    /**
-     * Advances the rebuild until `deadline` (epoch ms) passes or every run has
-     * been walked — always at least one walker slice, so every call makes
-     * progress. Returns true when planning is complete; call result() then.
-     */
-    drainUntil(deadline) {
-        while (this.runIndex_ < this.runs_.length) {
-            const run = this.runs_[this.runIndex_];
-            if (this.walker_ === null) {
-                this.emitFrom_ = this.builder_.posts.length;
-                if (run.from !== null) {
-                    this.builder_.seedBoundary(run.from);
-                }
-                this.walker_ = new LeafIntervalWalker(this.node_, run.from, run.to, this.builder_);
-            }
-            if (!this.walker_.drainUntil(deadline)) {
-                return false;
-            }
-            this.walker_.finish();
-            this.walker_ = null;
-            for (let k = this.emitFrom_; k < this.builder_.posts.length; k++) {
-                this.result_.push({
-                    post: this.builder_.posts[k],
-                    hash: this.builder_.hashes[k],
-                    size: this.builder_.sizes[k]
-                });
-            }
-            for (const range of run.carryAfter) {
-                this.result_.push(range);
-            }
-            this.runIndex_++;
-            if (Date.now() >= deadline) {
-                return this.runIndex_ >= this.runs_.length;
-            }
-        }
-        return true;
-    }
-    /** The completed range list. Only valid after drainUntil returned true. */
-    result() {
-        return this.result_;
-    }
-}
-/**
- * The compound-hash representation of a leaf: the V2 grammar (strings and
- * keys JSON-quoted so range serializations are unambiguous to reparse; see
- * leafHashValueText), with the priority prefixed exactly as in Node.hash().
- */
-function leafHashRepresentation(node) {
-    let representation = '';
-    const priority = node.getPriority();
-    if (!priority.isEmpty()) {
-        representation +=
-            'priority:' +
-                leafHashValueText(priority.val(), true) +
-                ':';
-    }
-    representation += leafHashValueText(node.val(), true);
-    return representation;
-}
-/**
- * Sizes computed for interior (children) nodes, keyed by node identity.
- * Nodes are immutable and structurally shared across server updates, so a
- * subtree's estimate stays valid for as long as the subtree object lives —
- * repeated estimations of a large mostly-unchanged tree (the persistence
- * write path re-plans its chunks on every flush) only walk the changed
- * spine. Leaves are cheap to size and are not cached.
- */
-const serializedSizeCache = new WeakMap();
-/**
- * Estimates the serialized size of a node in bytes — a cheap approximation
- * that only drives the default split threshold and the persistence chunk
- * planner, never a wire value (port of Android NodeSizeEstimator).
- */
-function estimateSerializedNodeSize(node) {
-    if (node.isEmpty()) {
-        return 4; // null keyword
-    }
-    else if (node.isLeafNode()) {
-        let valueSize;
-        const value = node.val();
-        if (typeof value === 'number') {
-            valueSize = 8; // estimate each float with 8 bytes
-        }
-        else if (typeof value === 'boolean') {
-            valueSize = 4; // true or false need roughly 4 bytes
-        }
-        else {
-            // string: two quotes plus the payload
-            valueSize = 2 + String(value).length;
-        }
-        if (node.getPriority().isEmpty()) {
-            return valueSize;
-        }
-        // Account for the extra overhead of the ".value" and ".priority" keys.
-        return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
-    }
-    else {
-        const cached = serializedSizeCache.get(node);
-        if (cached !== undefined) {
-            return cached;
-        }
-        let sum = 1; // opening brace
-        node.forEachChild(KEY_INDEX, (key, child) => {
-            // key, quotes, colon, comma
-            sum += key.length + 4 + estimateSerializedNodeSize(child);
-        });
-        if (!node.getPriority().isEmpty()) {
-            sum += 12 + estimateSerializedNodeSize(node.getPriority());
-        }
-        serializedSizeCache.set(node, sum);
-        return sum;
-    }
-}
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
- * hash() returns it without an O(tree) walk) and attaches the precomputed
- * compound hash for the listen to send. Both must describe exactly this
- * tree — the server certifies whatever the listen carries.
- *
- * An empty tree is returned unstamped: an empty node is the shared
- * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
- * empty node in the app.
- */
-function stampSeedHashes(node, hash, compoundHash) {
-    if (node.isEmpty()) {
-        return node;
-    }
-    if (typeof hash === 'string') {
-        nodeCanonicalHashes.set(node, hash);
-        if (hash.length > 0) {
-            node.stampLazyHash(hash);
-        }
-    }
-    if (compoundHash &&
-        Array.isArray(compoundHash.hashes) &&
-        Array.isArray(compoundHash.posts) &&
-        compoundHash.hashes.length === compoundHash.posts.length + 1) {
-        setNodeCompoundHash(node, compoundHash);
-    }
-    return node;
-}
-/**
- * The compound hash rides on the seeded node itself: once a server update
- * replaces the cached node the stamp is gone, so re-listens after real data
- * arrived send only the simple hash (which is then correct by construction).
- */
-const nodeCompoundHashes = new WeakMap();
-const nodeCanonicalHashes = new WeakMap();
-function setNodeCompoundHash(node, compoundHash) {
-    nodeCompoundHashes.set(node, compoundHash);
-}
-function getNodeCompoundHash(node) {
-    return nodeCompoundHashes.get(node);
-}
-/**
- * The persisted canonical hash associated with a seeded node. This rides in
- * a WeakMap instead of being stamped into every subtree by node.hash(): a
- * compound-hash-only seed deliberately stores the empty simple hash, letting
- * the server validate its ranges without a full-tree hash pass that would
- * permanently retain one SHA string per node.
- */
-function getNodeCanonicalHash(node) {
-    return nodeCanonicalHashes.get(node);
-}
-/**
- * One-boot materialization handoff. The optimistic pre-auth peek
- * (getPersistedValue) materializes the restored tree to JS objects once;
- * the authenticated listener that adopts the SAME immutable Node then
- * replays it as a child_added burst whose per-child `snapshot.val()` calls
- * would materialize the identical tree a second time — two full JS copies
- * of a large workspace alive at the peak of boot.
- *
- * The peek stamps each materialized value here, keyed by its Node instance;
- * a consumer that OPTS IN via consumePersistedMaterialization() (api/
- * Reference_impl) takes a stamp (get + delete) instead of walking the node.
- * `DataSnapshot.val()` never consumes a stamp — its fresh-objects contract
- * is untouched. Consume-once means only the single designed peek→listener
- * handoff ever receives shared objects (which is the point — the optimistic
- * tree and the live tree then share child identity, so downstream
- * memoization sees unchanged branches as unchanged).
- *
- * Correctness is by construction: a Node is immutable, so a stamp can only
- * ever be returned for exactly the data it was computed from. Any server
- * delta between peek and replay produces a NEW child Node instance, which
- * misses the WeakMap and materializes fresh.
- *
- * Only non-null object values are stamped (a leaf's val() is O(1) already),
- * and never on an empty node — the empty ChildrenNode is a shared singleton
- * and stamping it would leak one boot's subtree to unrelated paths.
- */
-const nodeMaterializedValues = new WeakMap();
-function stampMaterializedValue(node, value) {
-    if (value === null || typeof value !== 'object' || node.isEmpty()) {
-        return;
-    }
-    nodeMaterializedValues.set(node, value);
-}
-function consumeMaterializedValue(node) {
-    const value = nodeMaterializedValues.get(node);
-    if (value !== undefined) {
-        nodeMaterializedValues.delete(node);
-    }
-    return value;
-}
-/**
- * Repo-scoped manifest-first hash registry. Different Database instances can
- * listen to the same relative path while holding different caches; keeping
- * this store on Repo prevents one restore from overwriting or clearing
- * another Repo's pending hashes.
- */
-class PendingListenHashStore {
-    constructor() {
-        this.pending_ = new Map();
-    }
-    set(pathString, hash, compoundHash) {
-        this.pending_.set(pathString, { hash, compoundHash });
-    }
-    clear(pathString) {
-        this.pending_.delete(pathString);
-    }
-    get(pathString) {
-        return this.pending_.get(pathString);
-    }
-    clearAll() {
-        this.pending_.clear();
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * An iterator over an LLRBNode.
- */
-class SortedMapIterator {
-    /**
-     * @param node - Node to iterate.
-     * @param isReverse_ - Whether or not to iterate in reverse
-     */
-    constructor(node, startKey, comparator, isReverse_, resultGenerator_ = null) {
-        this.isReverse_ = isReverse_;
-        this.resultGenerator_ = resultGenerator_;
-        this.nodeStack_ = [];
-        let cmp = 1;
-        while (!node.isEmpty()) {
-            node = node;
-            cmp = startKey ? comparator(node.key, startKey) : 1;
-            // flip the comparison if we're going in reverse
-            if (isReverse_) {
-                cmp *= -1;
-            }
-            if (cmp < 0) {
-                // This node is less than our start key. ignore it
-                if (this.isReverse_) {
-                    node = node.left;
-                }
-                else {
-                    node = node.right;
-                }
-            }
-            else if (cmp === 0) {
-                // This node is exactly equal to our start key. Push it on the stack, but stop iterating;
-                this.nodeStack_.push(node);
-                break;
-            }
-            else {
-                // This node is greater than our start key, add it to the stack and move to the next one
-                this.nodeStack_.push(node);
-                if (this.isReverse_) {
-                    node = node.right;
-                }
-                else {
-                    node = node.left;
-                }
-            }
-        }
-    }
-    getNext() {
-        if (this.nodeStack_.length === 0) {
-            return null;
-        }
-        let node = this.nodeStack_.pop();
-        let result;
-        if (this.resultGenerator_) {
-            result = this.resultGenerator_(node.key, node.value);
-        }
-        else {
-            result = { key: node.key, value: node.value };
-        }
-        if (this.isReverse_) {
-            node = node.left;
-            while (!node.isEmpty()) {
-                this.nodeStack_.push(node);
-                node = node.right;
-            }
-        }
-        else {
-            node = node.right;
-            while (!node.isEmpty()) {
-                this.nodeStack_.push(node);
-                node = node.left;
-            }
-        }
-        return result;
-    }
-    hasNext() {
-        return this.nodeStack_.length > 0;
-    }
-    peek() {
-        if (this.nodeStack_.length === 0) {
-            return null;
-        }
-        const node = this.nodeStack_[this.nodeStack_.length - 1];
-        if (this.resultGenerator_) {
-            return this.resultGenerator_(node.key, node.value);
-        }
-        else {
-            return { key: node.key, value: node.value };
-        }
-    }
-}
-/**
- * Represents a node in a Left-leaning Red-Black tree.
- */
-class LLRBNode {
-    /**
-     * @param key - Key associated with this node.
-     * @param value - Value associated with this node.
-     * @param color - Whether this node is red.
-     * @param left - Left child.
-     * @param right - Right child.
-     */
-    constructor(key, value, color, left, right) {
-        this.key = key;
-        this.value = value;
-        this.color = color != null ? color : LLRBNode.RED;
-        this.left =
-            left != null ? left : SortedMap.EMPTY_NODE;
-        this.right =
-            right != null ? right : SortedMap.EMPTY_NODE;
-    }
-    /**
-     * Returns a copy of the current node, optionally replacing pieces of it.
-     *
-     * @param key - New key for the node, or null.
-     * @param value - New value for the node, or null.
-     * @param color - New color for the node, or null.
-     * @param left - New left child for the node, or null.
-     * @param right - New right child for the node, or null.
-     * @returns The node copy.
-     */
-    copy(key, value, color, left, right) {
-        return new LLRBNode(key != null ? key : this.key, value != null ? value : this.value, color != null ? color : this.color, left != null ? left : this.left, right != null ? right : this.right);
-    }
-    /**
-     * @returns The total number of nodes in the tree.
-     */
-    count() {
-        return this.left.count() + 1 + this.right.count();
-    }
-    /**
-     * @returns True if the tree is empty.
-     */
-    isEmpty() {
-        return false;
-    }
-    /**
-     * Traverses the tree in key order and calls the specified action function
-     * for each node.
-     *
-     * @param action - Callback function to be called for each
-     *   node.  If it returns true, traversal is aborted.
-     * @returns The first truthy value returned by action, or the last falsey
-     *   value returned by action
-     */
-    inorderTraversal(action) {
-        return (this.left.inorderTraversal(action) ||
-            !!action(this.key, this.value) ||
-            this.right.inorderTraversal(action));
-    }
-    /**
-     * Traverses the tree in reverse key order and calls the specified action function
-     * for each node.
-     *
-     * @param action - Callback function to be called for each
-     * node.  If it returns true, traversal is aborted.
-     * @returns True if traversal was aborted.
-     */
-    reverseTraversal(action) {
-        return (this.right.reverseTraversal(action) ||
-            action(this.key, this.value) ||
-            this.left.reverseTraversal(action));
-    }
-    /**
-     * @returns The minimum node in the tree.
-     */
-    min_() {
-        if (this.left.isEmpty()) {
-            return this;
-        }
-        else {
-            return this.left.min_();
-        }
-    }
-    /**
-     * @returns The maximum key in the tree.
-     */
-    minKey() {
-        return this.min_().key;
-    }
-    /**
-     * @returns The maximum key in the tree.
-     */
-    maxKey() {
-        if (this.right.isEmpty()) {
-            return this.key;
-        }
-        else {
-            return this.right.maxKey();
-        }
-    }
-    /**
-     * @param key - Key to insert.
-     * @param value - Value to insert.
-     * @param comparator - Comparator.
-     * @returns New tree, with the key/value added.
-     */
-    insert(key, value, comparator) {
-        let n = this;
-        const cmp = comparator(key, n.key);
-        if (cmp < 0) {
-            n = n.copy(null, null, null, n.left.insert(key, value, comparator), null);
-        }
-        else if (cmp === 0) {
-            n = n.copy(null, value, null, null, null);
-        }
-        else {
-            n = n.copy(null, null, null, null, n.right.insert(key, value, comparator));
-        }
-        return n.fixUp_();
-    }
-    /**
-     * @returns New tree, with the minimum key removed.
-     */
-    removeMin_() {
-        if (this.left.isEmpty()) {
-            return SortedMap.EMPTY_NODE;
-        }
-        let n = this;
-        if (!n.left.isRed_() && !n.left.left.isRed_()) {
-            n = n.moveRedLeft_();
-        }
-        n = n.copy(null, null, null, n.left.removeMin_(), null);
-        return n.fixUp_();
-    }
-    /**
-     * @param key - The key of the item to remove.
-     * @param comparator - Comparator.
-     * @returns New tree, with the specified item removed.
-     */
-    remove(key, comparator) {
-        let n, smallest;
-        n = this;
-        if (comparator(key, n.key) < 0) {
-            if (!n.left.isEmpty() && !n.left.isRed_() && !n.left.left.isRed_()) {
-                n = n.moveRedLeft_();
-            }
-            n = n.copy(null, null, null, n.left.remove(key, comparator), null);
-        }
-        else {
-            if (n.left.isRed_()) {
-                n = n.rotateRight_();
-            }
-            if (!n.right.isEmpty() && !n.right.isRed_() && !n.right.left.isRed_()) {
-                n = n.moveRedRight_();
-            }
-            if (comparator(key, n.key) === 0) {
-                if (n.right.isEmpty()) {
-                    return SortedMap.EMPTY_NODE;
-                }
-                else {
-                    smallest = n.right.min_();
-                    n = n.copy(smallest.key, smallest.value, null, null, n.right.removeMin_());
-                }
-            }
-            n = n.copy(null, null, null, null, n.right.remove(key, comparator));
-        }
-        return n.fixUp_();
-    }
-    /**
-     * @returns Whether this is a RED node.
-     */
-    isRed_() {
-        return this.color;
-    }
-    /**
-     * @returns New tree after performing any needed rotations.
-     */
-    fixUp_() {
-        let n = this;
-        if (n.right.isRed_() && !n.left.isRed_()) {
-            n = n.rotateLeft_();
-        }
-        if (n.left.isRed_() && n.left.left.isRed_()) {
-            n = n.rotateRight_();
-        }
-        if (n.left.isRed_() && n.right.isRed_()) {
-            n = n.colorFlip_();
-        }
-        return n;
-    }
-    /**
-     * @returns New tree, after moveRedLeft.
-     */
-    moveRedLeft_() {
-        let n = this.colorFlip_();
-        if (n.right.left.isRed_()) {
-            n = n.copy(null, null, null, null, n.right.rotateRight_());
-            n = n.rotateLeft_();
-            n = n.colorFlip_();
-        }
-        return n;
-    }
-    /**
-     * @returns New tree, after moveRedRight.
-     */
-    moveRedRight_() {
-        let n = this.colorFlip_();
-        if (n.left.left.isRed_()) {
-            n = n.rotateRight_();
-            n = n.colorFlip_();
-        }
-        return n;
-    }
-    /**
-     * @returns New tree, after rotateLeft.
-     */
-    rotateLeft_() {
-        const nl = this.copy(null, null, LLRBNode.RED, null, this.right.left);
-        return this.right.copy(null, null, this.color, nl, null);
-    }
-    /**
-     * @returns New tree, after rotateRight.
-     */
-    rotateRight_() {
-        const nr = this.copy(null, null, LLRBNode.RED, this.left.right, null);
-        return this.left.copy(null, null, this.color, null, nr);
-    }
-    /**
-     * @returns Newt ree, after colorFlip.
-     */
-    colorFlip_() {
-        const left = this.left.copy(null, null, !this.left.color, null, null);
-        const right = this.right.copy(null, null, !this.right.color, null, null);
-        return this.copy(null, null, !this.color, left, right);
-    }
-    /**
-     * For testing.
-     *
-     * @returns True if all is well.
-     */
-    checkMaxDepth_() {
-        const blackDepth = this.check_();
-        return Math.pow(2.0, blackDepth) <= this.count() + 1;
-    }
-    check_() {
-        if (this.isRed_() && this.left.isRed_()) {
-            throw new Error('Red node has red child(' + this.key + ',' + this.value + ')');
-        }
-        if (this.right.isRed_()) {
-            throw new Error('Right child of (' + this.key + ',' + this.value + ') is red');
-        }
-        const blackDepth = this.left.check_();
-        if (blackDepth !== this.right.check_()) {
-            throw new Error('Black depths differ');
-        }
-        else {
-            return blackDepth + (this.isRed_() ? 0 : 1);
-        }
-    }
-}
-LLRBNode.RED = true;
-LLRBNode.BLACK = false;
-/**
- * Represents an empty node (a leaf node in the Red-Black Tree).
- */
-class LLRBEmptyNode {
-    /**
-     * Returns a copy of the current node.
-     *
-     * @returns The node copy.
-     */
-    copy(key, value, color, left, right) {
-        return this;
-    }
-    /**
-     * Returns a copy of the tree, with the specified key/value added.
-     *
-     * @param key - Key to be added.
-     * @param value - Value to be added.
-     * @param comparator - Comparator.
-     * @returns New tree, with item added.
-     */
-    insert(key, value, comparator) {
-        return new LLRBNode(key, value, null);
-    }
-    /**
-     * Returns a copy of the tree, with the specified key removed.
-     *
-     * @param key - The key to remove.
-     * @param comparator - Comparator.
-     * @returns New tree, with item removed.
-     */
-    remove(key, comparator) {
-        return this;
-    }
-    /**
-     * @returns The total number of nodes in the tree.
-     */
-    count() {
-        return 0;
-    }
-    /**
-     * @returns True if the tree is empty.
-     */
-    isEmpty() {
-        return true;
-    }
-    /**
-     * Traverses the tree in key order and calls the specified action function
-     * for each node.
-     *
-     * @param action - Callback function to be called for each
-     * node.  If it returns true, traversal is aborted.
-     * @returns True if traversal was aborted.
-     */
-    inorderTraversal(action) {
-        return false;
-    }
-    /**
-     * Traverses the tree in reverse key order and calls the specified action function
-     * for each node.
-     *
-     * @param action - Callback function to be called for each
-     * node.  If it returns true, traversal is aborted.
-     * @returns True if traversal was aborted.
-     */
-    reverseTraversal(action) {
-        return false;
-    }
-    minKey() {
-        return null;
-    }
-    maxKey() {
-        return null;
-    }
-    check_() {
-        return 0;
-    }
-    /**
-     * @returns Whether this node is red.
-     */
-    isRed_() {
-        return false;
-    }
-}
-/**
- * An immutable sorted map implementation, based on a Left-leaning Red-Black
- * tree.
- */
-class SortedMap {
-    /**
-     * @param comparator_ - Key comparator.
-     * @param root_ - Optional root node for the map.
-     */
-    constructor(comparator_, root_ = SortedMap.EMPTY_NODE) {
-        this.comparator_ = comparator_;
-        this.root_ = root_;
-    }
-    /**
-     * Returns a copy of the map, with the specified key/value added or replaced.
-     * (TODO: We should perhaps rename this method to 'put')
-     *
-     * @param key - Key to be added.
-     * @param value - Value to be added.
-     * @returns New map, with item added.
-     */
-    insert(key, value) {
-        return new SortedMap(this.comparator_, this.root_
-            .insert(key, value, this.comparator_)
-            .copy(null, null, LLRBNode.BLACK, null, null));
-    }
-    /**
-     * Returns a copy of the map, with the specified key removed.
-     *
-     * @param key - The key to remove.
-     * @returns New map, with item removed.
-     */
-    remove(key) {
-        return new SortedMap(this.comparator_, this.root_
-            .remove(key, this.comparator_)
-            .copy(null, null, LLRBNode.BLACK, null, null));
-    }
-    /**
-     * Returns the value of the node with the given key, or null.
-     *
-     * @param key - The key to look up.
-     * @returns The value of the node with the given key, or null if the
-     * key doesn't exist.
-     */
-    get(key) {
-        let cmp;
-        let node = this.root_;
-        while (!node.isEmpty()) {
-            cmp = this.comparator_(key, node.key);
-            if (cmp === 0) {
-                return node.value;
-            }
-            else if (cmp < 0) {
-                node = node.left;
-            }
-            else if (cmp > 0) {
-                node = node.right;
-            }
-        }
-        return null;
-    }
-    /**
-     * Returns the key of the item *before* the specified key, or null if key is the first item.
-     * @param key - The key to find the predecessor of
-     * @returns The predecessor key.
-     */
-    getPredecessorKey(key) {
-        let cmp, node = this.root_, rightParent = null;
-        while (!node.isEmpty()) {
-            cmp = this.comparator_(key, node.key);
-            if (cmp === 0) {
-                if (!node.left.isEmpty()) {
-                    node = node.left;
-                    while (!node.right.isEmpty()) {
-                        node = node.right;
-                    }
-                    return node.key;
-                }
-                else if (rightParent) {
-                    return rightParent.key;
-                }
-                else {
-                    return null; // first item.
-                }
-            }
-            else if (cmp < 0) {
-                node = node.left;
-            }
-            else if (cmp > 0) {
-                rightParent = node;
-                node = node.right;
-            }
-        }
-        throw new Error('Attempted to find predecessor key for a nonexistent key.  What gives?');
-    }
-    /**
-     * @returns True if the map is empty.
-     */
-    isEmpty() {
-        return this.root_.isEmpty();
-    }
-    /**
-     * @returns The total number of nodes in the map.
-     */
-    count() {
-        return this.root_.count();
-    }
-    /**
-     * @returns The minimum key in the map.
-     */
-    minKey() {
-        return this.root_.minKey();
-    }
-    /**
-     * @returns The maximum key in the map.
-     */
-    maxKey() {
-        return this.root_.maxKey();
-    }
-    /**
-     * Traverses the map in key order and calls the specified action function
-     * for each key/value pair.
-     *
-     * @param action - Callback function to be called
-     * for each key/value pair.  If action returns true, traversal is aborted.
-     * @returns The first truthy value returned by action, or the last falsey
-     *   value returned by action
-     */
-    inorderTraversal(action) {
-        return this.root_.inorderTraversal(action);
-    }
-    /**
-     * Traverses the map in reverse key order and calls the specified action function
-     * for each key/value pair.
-     *
-     * @param action - Callback function to be called
-     * for each key/value pair.  If action returns true, traversal is aborted.
-     * @returns True if the traversal was aborted.
-     */
-    reverseTraversal(action) {
-        return this.root_.reverseTraversal(action);
-    }
-    /**
-     * Returns an iterator over the SortedMap.
-     * @returns The iterator.
-     */
-    getIterator(resultGenerator) {
-        return new SortedMapIterator(this.root_, null, this.comparator_, false, resultGenerator);
-    }
-    getIteratorFrom(key, resultGenerator) {
-        return new SortedMapIterator(this.root_, key, this.comparator_, false, resultGenerator);
-    }
-    getReverseIteratorFrom(key, resultGenerator) {
-        return new SortedMapIterator(this.root_, key, this.comparator_, true, resultGenerator);
-    }
-    getReverseIterator(resultGenerator) {
-        return new SortedMapIterator(this.root_, null, this.comparator_, true, resultGenerator);
-    }
-}
-/**
- * Always use the same empty node, to reduce memory.
- */
-SortedMap.EMPTY_NODE = new LLRBEmptyNode();
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-function NAME_ONLY_COMPARATOR(left, right) {
-    return nameCompare(left.name, right.name);
-}
-function NAME_COMPARATOR(left, right) {
-    return nameCompare(left, right);
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const LOG_2 = Math.log(2);
-class Base12Num {
-    constructor(length) {
-        const logBase2 = (num) => 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        parseInt((Math.log(num) / LOG_2), 10);
-        const bitMask = (bits) => parseInt(Array(bits + 1).join('1'), 2);
-        this.count = logBase2(length + 1);
-        this.current_ = this.count - 1;
-        const mask = bitMask(this.count);
-        this.bits_ = (length + 1) & mask;
-    }
-    nextBitIsOne() {
-        //noinspection JSBitwiseOperatorUsage
-        const result = !(this.bits_ & (0x1 << this.current_));
-        this.current_--;
-        return result;
-    }
-}
-/**
- * Takes a list of child nodes and constructs a SortedSet using the given comparison
- * function
- *
- * Uses the algorithm described in the paper linked here:
- * http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.46.1458
- *
- * @param childList - Unsorted list of children
- * @param cmp - The comparison method to be used
- * @param keyFn - An optional function to extract K from a node wrapper, if K's
- * type is not NamedNode
- * @param mapSortFn - An optional override for comparator used by the generated sorted map
- */
-const buildChildSet = function (childList, cmp, keyFn, mapSortFn) {
-    childList.sort(cmp);
-    const buildBalancedTree = function (low, high) {
-        const length = high - low;
-        let namedNode;
-        let key;
-        if (length === 0) {
-            return null;
-        }
-        else if (length === 1) {
-            namedNode = childList[low];
-            key = keyFn ? keyFn(namedNode) : namedNode;
-            return new LLRBNode(key, namedNode.node, LLRBNode.BLACK, null, null);
-        }
-        else {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const middle = parseInt((length / 2), 10) + low;
-            const left = buildBalancedTree(low, middle);
-            const right = buildBalancedTree(middle + 1, high);
-            namedNode = childList[middle];
-            key = keyFn ? keyFn(namedNode) : namedNode;
-            return new LLRBNode(key, namedNode.node, LLRBNode.BLACK, left, right);
-        }
-    };
-    const buildFrom12Array = function (base12) {
-        let node = null;
-        let root = null;
-        let index = childList.length;
-        const buildPennant = function (chunkSize, color) {
-            const low = index - chunkSize;
-            const high = index;
-            index -= chunkSize;
-            const childTree = buildBalancedTree(low + 1, high);
-            const namedNode = childList[low];
-            const key = keyFn ? keyFn(namedNode) : namedNode;
-            attachPennant(new LLRBNode(key, namedNode.node, color, null, childTree));
-        };
-        const attachPennant = function (pennant) {
-            if (node) {
-                node.left = pennant;
-                node = pennant;
-            }
-            else {
-                root = pennant;
-                node = pennant;
-            }
-        };
-        for (let i = 0; i < base12.count; ++i) {
-            const isOne = base12.nextBitIsOne();
-            // The number of nodes taken in each slice is 2^(arr.length - (i + 1))
-            const chunkSize = Math.pow(2, base12.count - (i + 1));
-            if (isOne) {
-                buildPennant(chunkSize, LLRBNode.BLACK);
-            }
-            else {
-                // current == 2
-                buildPennant(chunkSize, LLRBNode.BLACK);
-                buildPennant(chunkSize, LLRBNode.RED);
-            }
-        }
-        return root;
-    };
-    const base12 = new Base12Num(childList.length);
-    const root = buildFrom12Array(base12);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new SortedMap(mapSortFn || cmp, root);
-};
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let _defaultIndexMap;
-const fallbackObject = {};
-class IndexMap {
-    /**
-     * The default IndexMap for nodes without a priority
-     */
-    static get Default() {
-        util.assert(fallbackObject && PRIORITY_INDEX, 'ChildrenNode.ts has not been loaded');
-        _defaultIndexMap =
-            _defaultIndexMap ||
-                new IndexMap({ '.priority': fallbackObject }, { '.priority': PRIORITY_INDEX });
-        return _defaultIndexMap;
-    }
-    constructor(indexes_, indexSet_) {
-        this.indexes_ = indexes_;
-        this.indexSet_ = indexSet_;
-    }
-    get(indexKey) {
-        const sortedMap = util.safeGet(this.indexes_, indexKey);
-        if (!sortedMap) {
-            throw new Error('No index defined for ' + indexKey);
-        }
-        if (sortedMap instanceof SortedMap) {
-            return sortedMap;
-        }
-        else {
-            // The index exists, but it falls back to just name comparison. Return null so that the calling code uses the
-            // regular child map
-            return null;
-        }
-    }
-    hasIndex(indexDefinition) {
-        return util.contains(this.indexSet_, indexDefinition.toString());
-    }
-    addIndex(indexDefinition, existingChildren) {
-        util.assert(indexDefinition !== KEY_INDEX, "KeyIndex always exists and isn't meant to be added to the IndexMap.");
-        const childList = [];
-        let sawIndexedValue = false;
-        const iter = existingChildren.getIterator(NamedNode.Wrap);
-        let next = iter.getNext();
-        while (next) {
-            sawIndexedValue =
-                sawIndexedValue || indexDefinition.isDefinedOn(next.node);
-            childList.push(next);
-            next = iter.getNext();
-        }
-        let newIndex;
-        if (sawIndexedValue) {
-            newIndex = buildChildSet(childList, indexDefinition.getCompare());
-        }
-        else {
-            newIndex = fallbackObject;
-        }
-        const indexName = indexDefinition.toString();
-        const newIndexSet = { ...this.indexSet_ };
-        newIndexSet[indexName] = indexDefinition;
-        const newIndexes = { ...this.indexes_ };
-        newIndexes[indexName] = newIndex;
-        return new IndexMap(newIndexes, newIndexSet);
-    }
-    /**
-     * Ensure that this node is properly tracked in any indexes that we're maintaining
-     */
-    addToIndexes(namedNode, existingChildren) {
-        const newIndexes = util.map(this.indexes_, (indexedChildren, indexName) => {
-            const index = util.safeGet(this.indexSet_, indexName);
-            util.assert(index, 'Missing index implementation for ' + indexName);
-            if (indexedChildren === fallbackObject) {
-                // Check to see if we need to index everything
-                if (index.isDefinedOn(namedNode.node)) {
-                    // We need to build this index
-                    const childList = [];
-                    const iter = existingChildren.getIterator(NamedNode.Wrap);
-                    let next = iter.getNext();
-                    while (next) {
-                        if (next.name !== namedNode.name) {
-                            childList.push(next);
-                        }
-                        next = iter.getNext();
-                    }
-                    childList.push(namedNode);
-                    return buildChildSet(childList, index.getCompare());
-                }
-                else {
-                    // No change, this remains a fallback
-                    return fallbackObject;
-                }
-            }
-            else {
-                const existingSnap = existingChildren.get(namedNode.name);
-                let newChildren = indexedChildren;
-                if (existingSnap) {
-                    newChildren = newChildren.remove(new NamedNode(namedNode.name, existingSnap));
-                }
-                return newChildren.insert(namedNode, namedNode.node);
-            }
-        });
-        return new IndexMap(newIndexes, this.indexSet_);
-    }
-    /**
-     * Create a new IndexMap instance with the given value removed
-     */
-    removeFromIndexes(namedNode, existingChildren) {
-        const newIndexes = util.map(this.indexes_, (indexedChildren) => {
-            if (indexedChildren === fallbackObject) {
-                // This is the fallback. Just return it, nothing to do in this case
-                return indexedChildren;
-            }
-            else {
-                const existingSnap = existingChildren.get(namedNode.name);
-                if (existingSnap) {
-                    return indexedChildren.remove(new NamedNode(namedNode.name, existingSnap));
-                }
-                else {
-                    // No record of this child
-                    return indexedChildren;
-                }
-            }
-        });
-        return new IndexMap(newIndexes, this.indexSet_);
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-// TODO: For memory savings, don't store priorityNode_ if it's empty.
-let EMPTY_NODE;
-/**
- * ChildrenNode is a class for storing internal nodes in a DataSnapshot
- * (i.e. nodes with children).  It implements Node and stores the
- * list of children in the children property, sorted by child name.
- */
-class ChildrenNode {
-    static get EMPTY_NODE() {
-        return (EMPTY_NODE ||
-            (EMPTY_NODE = new ChildrenNode(new SortedMap(NAME_COMPARATOR), null, IndexMap.Default)));
-    }
-    /**
-     * @param children_ - List of children of this node..
-     * @param priorityNode_ - The priority of this node (as a snapshot node).
-     */
-    constructor(children_, priorityNode_, indexMap_) {
-        this.children_ = children_;
-        this.priorityNode_ = priorityNode_;
-        this.indexMap_ = indexMap_;
-        this.lazyHash_ = null;
-        /**
-         * Note: The only reason we allow null priority is for EMPTY_NODE, since we can't use
-         * EMPTY_NODE as the priority of EMPTY_NODE.  We might want to consider making EMPTY_NODE its own
-         * class instead of an empty ChildrenNode.
-         */
-        if (this.priorityNode_) {
-            validatePriorityNode(this.priorityNode_);
-        }
-        if (this.children_.isEmpty()) {
-            util.assert(!this.priorityNode_ || this.priorityNode_.isEmpty(), 'An empty node cannot have a priority');
-        }
-    }
-    /** @inheritDoc */
-    isLeafNode() {
-        return false;
-    }
-    /** @inheritDoc */
-    getPriority() {
-        return this.priorityNode_ || EMPTY_NODE;
-    }
-    /** @inheritDoc */
-    updatePriority(newPriorityNode) {
-        if (this.children_.isEmpty()) {
-            // Don't allow priorities on empty nodes
-            return this;
-        }
-        else {
-            return new ChildrenNode(this.children_, newPriorityNode, this.indexMap_);
-        }
-    }
-    /** @inheritDoc */
-    getImmediateChild(childName) {
-        // Hack to treat priority as a regular child
-        if (childName === '.priority') {
-            return this.getPriority();
-        }
-        else {
-            const child = this.children_.get(childName);
-            return child === null ? EMPTY_NODE : child;
-        }
-    }
-    /** @inheritDoc */
-    getChild(path) {
-        const front = pathGetFront(path);
-        if (front === null) {
-            return this;
-        }
-        return this.getImmediateChild(front).getChild(pathPopFront(path));
-    }
-    /** @inheritDoc */
-    hasChild(childName) {
-        return this.children_.get(childName) !== null;
-    }
-    /** @inheritDoc */
-    updateImmediateChild(childName, newChildNode) {
-        util.assert(newChildNode, 'We should always be passing snapshot nodes');
-        if (childName === '.priority') {
-            return this.updatePriority(newChildNode);
-        }
-        else {
-            const namedNode = new NamedNode(childName, newChildNode);
-            let newChildren, newIndexMap;
-            if (newChildNode.isEmpty()) {
-                newChildren = this.children_.remove(childName);
-                newIndexMap = this.indexMap_.removeFromIndexes(namedNode, this.children_);
-            }
-            else {
-                newChildren = this.children_.insert(childName, newChildNode);
-                newIndexMap = this.indexMap_.addToIndexes(namedNode, this.children_);
-            }
-            const newPriority = newChildren.isEmpty()
-                ? EMPTY_NODE
-                : this.priorityNode_;
-            return new ChildrenNode(newChildren, newPriority, newIndexMap);
-        }
-    }
-    /** @inheritDoc */
-    updateChild(path, newChildNode) {
-        const front = pathGetFront(path);
-        if (front === null) {
-            return newChildNode;
-        }
-        else {
-            util.assert(pathGetFront(path) !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
-            const newImmediateChild = this.getImmediateChild(front).updateChild(pathPopFront(path), newChildNode);
-            return this.updateImmediateChild(front, newImmediateChild);
-        }
-    }
-    /** @inheritDoc */
-    isEmpty() {
-        return this.children_.isEmpty();
-    }
-    /** @inheritDoc */
-    numChildren() {
-        return this.children_.count();
-    }
-    /** @inheritDoc */
-    val(exportFormat) {
-        if (this.isEmpty()) {
-            return null;
-        }
-        const obj = {};
-        let numKeys = 0, maxKey = 0, allIntegerKeys = true;
-        this.forEachChild(PRIORITY_INDEX, (key, childNode) => {
-            obj[key] = childNode.val(exportFormat);
-            numKeys++;
-            // charCode fast-reject: named keys can never be integers; skip the
-            // regex for them (val() over a large workspace calls this per key).
-            if (allIntegerKeys &&
-                key.charCodeAt(0) >= 48 /* '0' */ &&
-                key.charCodeAt(0) <= 57 /* '9' */ &&
-                ChildrenNode.INTEGER_REGEXP_.test(key)) {
-                maxKey = Math.max(maxKey, Number(key));
-            }
-            else {
-                allIntegerKeys = false;
-            }
-        });
-        if (!exportFormat && allIntegerKeys && maxKey < 2 * numKeys) {
-            // convert to array.
-            const array = [];
-            // eslint-disable-next-line guard-for-in
-            for (const key in obj) {
-                array[key] = obj[key];
-            }
-            return array;
-        }
-        else {
-            if (exportFormat && !this.getPriority().isEmpty()) {
-                obj['.priority'] = this.getPriority().val();
-            }
-            return obj;
-        }
-    }
-    /** @inheritDoc */
-    hash() {
-        if (this.lazyHash_ === null) {
-            let toHash = '';
-            if (!this.getPriority().isEmpty()) {
-                toHash +=
-                    'priority:' +
-                        priorityHashText(this.getPriority().val()) +
-                        ':';
-            }
-            this.forEachChild(PRIORITY_INDEX, (key, childNode) => {
-                const childHash = childNode.hash();
-                if (childHash !== '') {
-                    toHash += ':' + key + ':' + childHash;
-                }
-            });
-            this.lazyHash_ = toHash === '' ? '' : sha1(toHash);
-        }
-        return this.lazyHash_;
-    }
-    /** @inheritDoc */
-    stampLazyHash(hash) {
-        if (this.lazyHash_ === null) {
-            this.lazyHash_ = hash;
-        }
-    }
-    /** @inheritDoc */
-    getPredecessorChildName(childName, childNode, index) {
-        const idx = this.resolveIndex_(index);
-        if (idx) {
-            const predecessor = idx.getPredecessorKey(new NamedNode(childName, childNode));
-            return predecessor ? predecessor.name : null;
-        }
-        else {
-            return this.children_.getPredecessorKey(childName);
-        }
-    }
-    getFirstChildName(indexDefinition) {
-        const idx = this.resolveIndex_(indexDefinition);
-        if (idx) {
-            const minKey = idx.minKey();
-            return minKey && minKey.name;
-        }
-        else {
-            return this.children_.minKey();
-        }
-    }
-    getFirstChild(indexDefinition) {
-        const minKey = this.getFirstChildName(indexDefinition);
-        if (minKey) {
-            return new NamedNode(minKey, this.children_.get(minKey));
-        }
-        else {
-            return null;
-        }
-    }
-    /**
-     * Given an index, return the key name of the largest value we have, according to that index
-     */
-    getLastChildName(indexDefinition) {
-        const idx = this.resolveIndex_(indexDefinition);
-        if (idx) {
-            const maxKey = idx.maxKey();
-            return maxKey && maxKey.name;
-        }
-        else {
-            return this.children_.maxKey();
-        }
-    }
-    getLastChild(indexDefinition) {
-        const maxKey = this.getLastChildName(indexDefinition);
-        if (maxKey) {
-            return new NamedNode(maxKey, this.children_.get(maxKey));
-        }
-        else {
-            return null;
-        }
-    }
-    forEachChild(index, action) {
-        const idx = this.resolveIndex_(index);
-        if (idx) {
-            return idx.inorderTraversal(wrappedNode => {
-                return action(wrappedNode.name, wrappedNode.node);
-            });
-        }
-        else {
-            return this.children_.inorderTraversal(action);
-        }
-    }
-    getIterator(indexDefinition) {
-        return this.getIteratorFrom(indexDefinition.minPost(), indexDefinition);
-    }
-    getIteratorFrom(startPost, indexDefinition) {
-        const idx = this.resolveIndex_(indexDefinition);
-        if (idx) {
-            return idx.getIteratorFrom(startPost, key => key);
-        }
-        else {
-            const iterator = this.children_.getIteratorFrom(startPost.name, NamedNode.Wrap);
-            let next = iterator.peek();
-            while (next != null && indexDefinition.compare(next, startPost) < 0) {
-                iterator.getNext();
-                next = iterator.peek();
-            }
-            return iterator;
-        }
-    }
-    getReverseIterator(indexDefinition) {
-        return this.getReverseIteratorFrom(indexDefinition.maxPost(), indexDefinition);
-    }
-    getReverseIteratorFrom(endPost, indexDefinition) {
-        const idx = this.resolveIndex_(indexDefinition);
-        if (idx) {
-            return idx.getReverseIteratorFrom(endPost, key => {
-                return key;
-            });
-        }
-        else {
-            const iterator = this.children_.getReverseIteratorFrom(endPost.name, NamedNode.Wrap);
-            let next = iterator.peek();
-            while (next != null && indexDefinition.compare(next, endPost) > 0) {
-                iterator.getNext();
-                next = iterator.peek();
-            }
-            return iterator;
-        }
-    }
-    compareTo(other) {
-        if (this.isEmpty()) {
-            if (other.isEmpty()) {
-                return 0;
-            }
-            else {
-                return -1;
-            }
-        }
-        else if (other.isLeafNode() || other.isEmpty()) {
-            return 1;
-        }
-        else if (other === MAX_NODE) {
-            return -1;
-        }
-        else {
-            // Must be another node with children.
-            return 0;
-        }
-    }
-    withIndex(indexDefinition) {
-        if (indexDefinition === KEY_INDEX ||
-            this.indexMap_.hasIndex(indexDefinition)) {
-            return this;
-        }
-        else {
-            const newIndexMap = this.indexMap_.addIndex(indexDefinition, this.children_);
-            return new ChildrenNode(this.children_, this.priorityNode_, newIndexMap);
-        }
-    }
-    isIndexed(index) {
-        return index === KEY_INDEX || this.indexMap_.hasIndex(index);
-    }
-    equals(other) {
-        if (other === this) {
-            return true;
-        }
-        else if (other.isLeafNode()) {
-            return false;
-        }
-        else {
-            const otherChildrenNode = other;
-            if (!this.getPriority().equals(otherChildrenNode.getPriority())) {
-                return false;
-            }
-            else if (this.children_.count() === otherChildrenNode.children_.count()) {
-                const thisIter = this.getIterator(PRIORITY_INDEX);
-                const otherIter = otherChildrenNode.getIterator(PRIORITY_INDEX);
-                let thisCurrent = thisIter.getNext();
-                let otherCurrent = otherIter.getNext();
-                while (thisCurrent && otherCurrent) {
-                    if (thisCurrent.name !== otherCurrent.name ||
-                        !thisCurrent.node.equals(otherCurrent.node)) {
-                        return false;
-                    }
-                    thisCurrent = thisIter.getNext();
-                    otherCurrent = otherIter.getNext();
-                }
-                return thisCurrent === null && otherCurrent === null;
-            }
-            else {
-                return false;
-            }
-        }
-    }
-    /**
-     * Returns a SortedMap ordered by index, or null if the default (by-key) ordering can be used
-     * instead.
-     *
-     */
-    resolveIndex_(indexDefinition) {
-        if (indexDefinition === KEY_INDEX) {
-            return null;
-        }
-        else {
-            return this.indexMap_.get(indexDefinition.toString());
-        }
-    }
-}
-ChildrenNode.INTEGER_REGEXP_ = /^(0|[1-9]\d*)$/;
-class MaxNode extends ChildrenNode {
-    constructor() {
-        super(new SortedMap(NAME_COMPARATOR), ChildrenNode.EMPTY_NODE, IndexMap.Default);
-    }
-    compareTo(other) {
-        if (other === this) {
-            return 0;
-        }
-        else {
-            return 1;
-        }
-    }
-    equals(other) {
-        // Not that we every compare it, but MAX_NODE is only ever equal to itself
-        return other === this;
-    }
-    getPriority() {
-        return this;
-    }
-    getImmediateChild(childName) {
-        return ChildrenNode.EMPTY_NODE;
-    }
-    isEmpty() {
-        return false;
-    }
-}
-/**
- * Marker that will sort higher than any other snapshot.
- */
-const MAX_NODE = new MaxNode();
-Object.defineProperties(NamedNode, {
-    MIN: {
-        value: new NamedNode(MIN_NAME, ChildrenNode.EMPTY_NODE)
-    },
-    MAX: {
-        value: new NamedNode(MAX_NAME, MAX_NODE)
-    }
-});
-/**
- * Reference Extensions
- */
-KeyIndex.__EMPTY_NODE = ChildrenNode.EMPTY_NODE;
-LeafNode.__childrenNodeConstructor = ChildrenNode;
-setMaxNode$1(MAX_NODE);
-setMaxNode(MAX_NODE);
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const USE_HINZE = true;
-/**
- * Constructs a snapshot node representing the passed JSON and returns it.
- * @param json - JSON to create a node for.
- * @param priority - Optional priority to use.  This will be ignored if the
- * passed JSON contains a .priority property.
- */
-function nodeFromJSON(json, priority = null) {
-    if (json === null) {
-        return ChildrenNode.EMPTY_NODE;
-    }
-    if (typeof json === 'object' && '.priority' in json) {
-        priority = json['.priority'];
-    }
-    util.assert(priority === null ||
-        typeof priority === 'string' ||
-        typeof priority === 'number' ||
-        (typeof priority === 'object' && '.sv' in priority), 'Invalid priority type found: ' + typeof priority);
-    if (typeof json === 'object' && '.value' in json && json['.value'] !== null) {
-        json = json['.value'];
-    }
-    // Valid leaf nodes include non-objects or server-value wrapper objects
-    if (typeof json !== 'object' || '.sv' in json) {
-        const jsonLeaf = json;
-        return new LeafNode(jsonLeaf, nodeFromJSON(priority));
-    }
-    if (!(json instanceof Array) && USE_HINZE) {
-        const children = [];
-        let childrenHavePriority = false;
-        const hinzeJsonObj = json;
-        each(hinzeJsonObj, (key, child) => {
-            if (key.substring(0, 1) !== '.') {
-                // Ignore metadata nodes
-                const childNode = nodeFromJSON(child);
-                if (!childNode.isEmpty()) {
-                    childrenHavePriority =
-                        childrenHavePriority || !childNode.getPriority().isEmpty();
-                    children.push(new NamedNode(key, childNode));
-                }
-            }
-        });
-        if (children.length === 0) {
-            return ChildrenNode.EMPTY_NODE;
-        }
-        const childSet = buildChildSet(children, NAME_ONLY_COMPARATOR, namedNode => namedNode.name, NAME_COMPARATOR);
-        if (childrenHavePriority) {
-            const sortedChildSet = buildChildSet(children, PRIORITY_INDEX.getCompare());
-            return new ChildrenNode(childSet, nodeFromJSON(priority), new IndexMap({ '.priority': sortedChildSet }, { '.priority': PRIORITY_INDEX }));
-        }
-        else {
-            return new ChildrenNode(childSet, nodeFromJSON(priority), IndexMap.Default);
-        }
-    }
-    else {
-        let node = ChildrenNode.EMPTY_NODE;
-        each(json, (key, childData) => {
-            if (util.contains(json, key)) {
-                if (key.substring(0, 1) !== '.') {
-                    // ignore metadata nodes.
-                    const childNode = nodeFromJSON(childData);
-                    if (childNode.isLeafNode() || !childNode.isEmpty()) {
-                        node = node.updateImmediateChild(key, childNode);
-                    }
-                }
-            }
-        });
-        return node.updatePriority(nodeFromJSON(priority));
-    }
-}
-setNodeFromJSON(nodeFromJSON);
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-let yieldChannel = null;
-const yieldResolvers = [];
-function setPortsReferenced(referenced) {
-    for (const port of [yieldChannel.port1, yieldChannel.port2]) {
-        const p = port;
-        if (referenced) {
-            p.ref?.();
-        }
-        else {
-            p.unref?.();
-        }
-    }
-}
-function yieldMacrotask() {
-    if (typeof MessageChannel === 'undefined') {
-        return new Promise(resolve => setTimeout(resolve, 0));
-    }
-    if (yieldChannel === null) {
-        yieldChannel = new MessageChannel();
-        // Installing onmessage references the port in Node; start idle-unref'd.
-        yieldChannel.port1.onmessage = () => {
-            yieldResolvers.shift()?.();
-            if (yieldResolvers.length === 0) {
-                setPortsReferenced(false);
-            }
-        };
-        setPortsReferenced(false);
-    }
-    return new Promise(resolve => {
-        yieldResolvers.push(resolve);
-        setPortsReferenced(true);
-        yieldChannel.port2.postMessage(null);
-    });
-}
-
-/**
- * @license
- * Copyright 2026 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
- * Client-side persistence of the server cache, in the spirit of the mobile
- * SDKs' setPersistenceEnabled(true): the SDK itself stores what the server
- * sent for each listened root and restores it on the next startup, so a
- * reload serves cached data immediately and revalidates with the server via
- * the hash protocol (see ServerCacheSeed) instead of re-downloading.
- *
- * STORAGE MODEL — one manifest plus immutable fixed-target range records.
- * Each persisted root stores:
- *
- *   - a MANIFEST (`<prefix>|<path>`): revision, timestamps, auth scope, and
- *     ordered stable ranges `{recordId, post, hash, size}`. It is the complete
- *     compound-listen descriptor and reads in milliseconds.
- *   - one structured-clone RANGE record per stable interval
- *     (`<prefix>|<path>#range:<recordId>`): start/end markers plus a sparse
- *     export-format fragment containing exactly that interval's leaves.
- *
- * Dirty/split/merged ranges receive new immutable ids; clean ranges keep the
- * exact prior record. New records and the manifest commit in ONE transaction.
- * An optimistic manifest-revision check prevents a stale tab from reusing a
- * different tab's records; on conflict it retries with a self-contained full
- * range generation. Retired ids are deleted in the commit, and a guarded
- * key-only GC plus the expiry sweep reclaim older crash/legacy/orphan ids.
- * No full-root val(true) or full-root structured clone occurs on a steady
- * state flush.
- *
- * MANIFEST-FIRST BOOT. Because the manifest alone carries the protocol
- * hashes, a warm boot reads it first and hands the hashes to the caller
- * (see restoreForListen's onManifest) so the range listen can be sent
- * IMMEDIATELY — the server round-trip overlaps the tree record's read and
- * Node construction. A warm boot computes NO hashes.
- *
- * SELF-CONSISTENT GENERATIONS. Range hashes are maintained at write time,
- * inside the flush: an identity-diff of the immutable trees marks the
- * ranges a change dirtied, only those ranges are re-serialized and
- * re-hashed (between preserved boundary posts — see CompoundHash's stable
- * ranges), and the manifest commits with hashes that exactly describe the
- * tree record beside it. Clean ranges carry over without their bytes ever
- * being read. Stale hashes are never persisted: a stale hash could falsely
- * match a reverted server range, the one corruption the range handshake
- * cannot self-heal.
- *
- * WRITE POLICY — single-flight coalescing flush. The first change after a
- * committed generation arms a NON-restarting timer (writeDelayMs, default
- * PERSISTENCE_WRITE_DEBOUNCE_MS); later changes coalesce into the pending
- * window without resetting it. At most one flush is ever in flight; changes
- * landing mid-flush only re-arm the next window. Effective cadence is
- * max(delay, flush duration) — natural backpressure, bounded staleness.
- * Cache writes are never awaited by the UI, certification, or navigation.
- *
- * All storage failures degrade to cold loads; nothing here may ever break
- * the live connection.
- */
-const STORE = 'firebase-server-cache';
-// Version 3 invalidated pre-chunking caches; version 8 is current. The
-// upgrade clears the store inside IndexedDB without materializing old
-// (potentially huge) values into JavaScript memory.
-const PERSISTENCE_DB_VERSION = 9;
-// Format 11: immutable fixed-target range records + one stable-range
-// manifest. Earlier monolithic/chunked formats restore as misses and are
-// reclaimed without materializing their payloads.
-const PERSISTENCE_FORMAT_VERSION = 11;
-const PERSISTENCE_SCHEMA_MARKER_KEY = 'firebase-database-persistence-schema';
-function readSchemaMarker() {
-    if (typeof localStorage === 'undefined') {
-        // Node/tests and non-browser embeddings: let IndexedDB itself decide.
-        return true;
-    }
-    try {
-        return (localStorage.getItem(PERSISTENCE_SCHEMA_MARKER_KEY) ===
-            String(PERSISTENCE_DB_VERSION));
-    }
-    catch (e) {
-        // Storage-disabled browsers still get best-effort persistence.
-        return true;
-    }
-}
-function writeSchemaMarker() {
-    if (typeof localStorage === 'undefined') {
-        return;
-    }
-    try {
-        localStorage.setItem(PERSISTENCE_SCHEMA_MARKER_KEY, String(PERSISTENCE_DB_VERSION));
-    }
-    catch (e) {
-        // Best-effort optimization only.
-    }
-}
-/**
- * Records older than this are dropped (staleness makes a full download
- * likely anyway; bounded retention caps disk use).
- */
-const PERSISTENCE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-const PERSISTENCE_MAX_CACHE_BYTES = 100 * 1024 * 1024;
-const PERSISTENCE_MAX_PRUNABLE_ROOTS = 1000;
-const PERSISTENCE_PRUNE_TARGET_RATIO = 0.8;
-const PERSISTENCE_MAX_CONCURRENT_RESTORES = 4;
-/**
- * Default width of the flush coalescing window (see the write policy in the
- * file header). Configurable per manager (writeDelayMs). The window is
- * non-restarting: a root that churns continuously still flushes every
- * window, and never more often than one in-flight flush allows.
- * @internal
- */
-const PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
-/**
- * Write window for a root with NO flush baseline (first generation after a
- * cold or fallback boot, or after an invalidation). The ordinary window
- * coalesces steady-state churn; a fresh boot has none to coalesce — the
- * complete tree just arrived — and the first stored generation is the only
- * exit from the cold-reload loop (no cache → next boot re-downloads the
- * root). Short-session mobile boots regularly died before the ordinary
- * window even fired, so the first generation starts sooner; the sliced
- * planner and byte-budgeted staging keep it off the critical path. Tests
- * that shrink writeDelayMs below this keep their configured cadence
- * (the effective delay is min of the two).
- * @internal
- */
-const PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS = 3000;
-/**
- * Main-thread budget for one slice of flush planning (the stable-range
- * rewalk). Sized to fit inside a frame budget on mobile hardware.
- * @internal
- */
-const FLUSH_PLAN_SLICE_MS = 12;
-/**
- * Canonical-text bytes staged per task before yielding. Two default-target
- * ranges (~256 KiB each) per slice keeps serialization work bounded while
- * the unclamped macrotask yield (yieldMacrotask) lets paint/input interleave.
- * @internal
- */
-const FLUSH_STAGE_BATCH_BYTES = 512 * 1024;
-/** Thrown out of a sliced flush when the manager was disposed mid-yield. */
-class FlushObsoleteError extends Error {
-    constructor() {
-        super('flush obsolete');
-    }
-}
-/**
- * Constant canonical-text target for one persisted/hash range. Boundaries are
- * stable across generations and only dirty runs reconsult this target. The
- * constructor accepts an override so 128/256/512 KiB can be benchmarked
- * without changing protocol code.
- * @internal
- */
-const PERSISTENCE_RANGE_TARGET_BYTES = 256 * 1024;
-/**
- * Maximum gap with NO restore progress before the listen attaches unseeded.
- * Progress (a completed manifest or tree read) resets this budget. The same
- * bound applies to each IndexedDB open/transaction, so a request that fires
- * neither success nor error can never hold the live listen forever.
- */
-const PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
-/**
- * How long a completed optimistic peek's decoded tree stays retained for its
- * real (authenticated) listener AFTER the app has confirmed the auth scope.
- * From that moment the listener is normally milliseconds away, so a short
- * grace suffices.
- */
-const PERSISTENCE_PEEK_HANDOFF_MS = 30000;
-/**
- * The same retention while the auth scope is only PRIMED by the peek itself
- * (getPersistedValue's trusted expected identity) and real app auth has not
- * confirmed it yet. Auth hydration is local but can be arbitrarily slow on a
- * loaded profile (service-worker congestion, IndexedDB contention); racing it
- * with a short wall-clock timer silently defeats the one-decode-per-boot
- * handoff exactly on the machines that need it most — the listener then
- * re-reads and re-decodes the full tree while the peek's copy is still alive,
- * doubling peak boot memory. A mismatching or signed-out identity still
- * clears the retained read IMMEDIATELY via setAuthScope; this long backstop
- * only bounds the true leak case (auth never resolving at all), where the
- * page is stuck on its auth spinner anyway.
- */
-const PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS = 5 * 60 * 1000;
-/**
- * A stored tree whose content hasn't changed is left untouched by flushes
- * until its manifest is this old, then the manifest alone is rewritten with
- * a fresh timestamp (the tree record stays put) — so a tree that never
- * changes but is used daily never ages into the expiry cutoff.
- * @internal
- */
-const PERSISTENCE_REFRESH_AGE_MS = 24 * 60 * 60 * 1000;
-/**
- * How long after startup the expiry sweep runs. Deferred so the sweep's
- * store-wide transaction can never delay the boot restores, which IndexedDB
- * would otherwise queue behind it.
- * @internal
- */
-const PERSISTENCE_SWEEP_DELAY_MS = 15000;
-/**
- * Cap on precisely-accumulated changed paths per root between flushes.
- * Matches collectChangedSubtreePaths' default budget: past it the identity
- * diff is the cheaper, equally-correct answer.
- */
-const MAX_ACCUMULATED_CHANGED_PATHS = 512;
-/**
- * Counters for observing persistence effectiveness.
- * @internal
- */
-const persistenceStats = {
-    restoredRoots: [],
-    restoreMisses: [],
-    writeThroughs: 0,
-    rangesHashed: 0,
-    rangesReused: 0,
-    evictions: 0,
-    storageFailures: 0,
-    events: []
-};
-function recordPersistenceEvent(path, event, detail) {
-    persistenceStats.events.push({ at: Date.now(), path, event, detail });
-    if (persistenceStats.events.length > 100) {
-        persistenceStats.events.splice(0, persistenceStats.events.length - 100);
-    }
-}
-const RANGE_KEY_INFIX = '#range:';
-function wireCompoundHashFromRanges(ranges) {
-    const posts = [];
-    const hashes = [];
-    for (const range of ranges) {
-        posts.push(range.post);
-        hashes.push(range.hash);
-    }
-    // The empty tail hash lets the server append past the last post.
-    hashes.push('');
-    return { posts, hashes };
-}
-/**
- * Hashes the dirty ranges' serialized texts — WebCrypto where available
- * (native, off the JavaScript thread, ~40x the JS implementation), the
- * synchronous JS sha1 otherwise (Node without webcrypto, insecure contexts).
- * Falls back wholesale on any WebCrypto failure: a flush must never fail on
- * the choice of hash backend.
- */
-function digestRangeTexts(texts) {
-    if (texts.length === 0) {
-        return Promise.resolve([]);
-    }
-    const subtle = typeof crypto !== 'undefined' &&
-        typeof TextEncoder !== 'undefined' &&
-        crypto.subtle &&
-        typeof crypto.subtle.digest === 'function'
-        ? crypto.subtle
-        : null;
-    if (subtle === null) {
-        return Promise.resolve(texts.map(sha1));
-    }
-    const encoder = new TextEncoder();
-    return Promise.all(texts.map(text => subtle
-        .digest('SHA-1', encoder.encode(text))
-        .then(digest => util.base64.encodeByteArray(new Uint8Array(digest))))).catch(() => texts.map(sha1));
-}
-/**
- * Unions two disjoint sparse export fragments without range-deletion
- * semantics. RangeMerge is correct for authoritative server deltas, where an
- * omitted value inside the interval means delete; persisted fragments instead
- * partition one complete snapshot, so omission means "owned by another
- * record". In particular this preserves a prioritized leaf at the exclusive
- * boundary of the following range.
- */
-function mergePersistedFragment(base, fragment) {
-    if (base.isEmpty()) {
-        return fragment;
-    }
-    if (fragment.isEmpty()) {
-        return base;
-    }
-    if (fragment.isLeafNode()) {
-        return fragment;
-    }
-    let result = base;
-    fragment.forEachChild(KEY_INDEX, (key, child) => {
-        result = result.updateImmediateChild(key, mergePersistedFragment(result.getImmediateChild(key), child));
-    });
-    if (!fragment.getPriority().isEmpty()) {
-        result = result.updatePriority(fragment.getPriority());
-    }
-    return result;
-}
-/**
- * Structural validation of a stored manifest: current format, string
- * revision, and a non-empty, well-formed range list. Shared by the full
- * restore read and the manifest-only baseline adoption.
- */
-function structurallyValidManifest(manifest) {
-    return (manifest !== null &&
-        manifest !== undefined &&
-        manifest.formatVersion === PERSISTENCE_FORMAT_VERSION &&
-        typeof manifest.revision === 'string' &&
-        typeof manifest.updatedAt === 'number' &&
-        typeof manifest.hash === 'string' &&
-        Array.isArray(manifest.ranges) &&
-        manifest.ranges.length > 0 &&
-        manifest.ranges.every(range => range !== null &&
-            typeof range === 'object' &&
-            typeof range.recordId === 'string' &&
-            range.recordId.length > 0 &&
-            typeof range.post === 'string' &&
-            typeof range.hash === 'string' &&
-            typeof range.size === 'number'));
-}
-/** Heartbeat cadence while holding the writer lease. @internal */
-const LEASE_HEARTBEAT_MS = 20000;
-/**
- * A holder whose heartbeat is older than this is considered suspended and
- * may be stolen from. Must comfortably exceed the worst legitimate
- * heartbeat gap (Chrome background timer clamping is 60s). @internal
- */
-const LEASE_STALE_MS = 120000;
-function defaultHeartbeatStore() {
-    try {
-        if (typeof localStorage !== 'undefined' && localStorage !== null) {
-            return localStorage;
-        }
-    }
-    catch (e) {
-        // Access itself can throw (storage-disabled documents).
-    }
-    return null;
-}
-function webLocks() {
-    if (typeof navigator === 'undefined') {
-        return null;
-    }
-    const locks = navigator.locks;
-    return locks && typeof locks.request === 'function' ? locks : null;
-}
-class PersistenceManager {
-    isAuthScopeConfigured() {
-        return this.authScopeConfigured_;
-    }
-    /**
-     * The current identity-scope generation — bumped by every setAuthScope
-     * that changes the scope. Callers whose continuation spans an await after
-     * peek() resolves capture this before the wait and compare after, so a
-     * scope switch mid-continuation invalidates the result exactly like
-     * peek()'s own resolution-time check. @internal
-     */
-    authGeneration() {
-        return this.authGeneration_;
-    }
-    /**
-     * True while THE read that decoded `node` is still RETAINED at this root
-     * for a future listener join (see readRecord_'s retainAfterResolve) — the
-     * only window in which materialization stamps have a consumer. Identity-
-     * bound on purpose: a path-only check would also pass for a REPLACEMENT
-     * read (the original consumed by a listener mid-walk, a second peek
-     * retained since), and stamps would then ride the consumed read's live
-     * nodes with no replay ever taking them — a session-long pinned copy of
-     * each subtree. False once the read was consumed, expired, superseded,
-     * or the manager disposed. @internal
-     */
-    hasRetainedPeek(pathString, node) {
-        const entry = this.activeReads_.get(pathString);
-        return entry?.retainAfterResolve === true && entry.resolvedNode === node;
-    }
-    setAuthScope(scope, confirmedByApp = true) {
-        const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
-        this.authScopeConfigured_ = true;
-        if (confirmedByApp) {
-            if (!this.authScopeConfirmed_) {
-                this.authScopeConfirmed_ = true;
-                if (!changed) {
-                    // Real auth confirmed the exact scope a pre-auth peek primed: the
-                    // handoff window is open NOW. Retained reads waiting under the
-                    // long pre-auth backstop drop to the short post-auth grace —
-                    // counted from this moment, not from when the read finished.
-                    this.rearmRetainedReads_();
-                }
-            }
-        }
-        else if (changed) {
-            // A prime that CHANGES the scope describes an identity the app has not
-            // confirmed yet; its retentions must run under the pre-auth backstop.
-            this.authScopeConfirmed_ = false;
-        }
-        if (!changed) {
-            return false;
-        }
-        this.authGeneration_++;
-        for (const timer of this.writeTimers_.values()) {
-            clearTimeout(timer);
-        }
-        this.writeTimers_.clear();
-        this.flushPending_.clear();
-        this.writesDeferredUntilRestores_.clear();
-        this.latest_.clear();
-        this.lastFlush_.clear();
-        this.changedSinceFlush_.clear();
-        // Clear retention timers BEFORE dropping the map: a pending cleanupTimer's
-        // closure otherwise keeps the entry (and its decoded tree) alive until it
-        // fires — minutes, under the pre-auth backstop.
-        for (const read of this.activeReads_.values()) {
-            if (read.cleanupTimer !== null) {
-                clearTimeout(read.cleanupTimer);
-            }
-        }
-        this.activeReads_.clear();
-        this.restoreReasons_.clear();
-        this.authScope_ = scope;
-        recordPersistenceEvent('*', 'auth-scope-change', scope ? 'signed-in' : 'signed-out');
-        return true;
-    }
-    constructor(prefix_, idbFactory_ = util.isIndexedDBAvailable()
-        ? indexedDB
-        : null, schemaKnownCurrent_ = readSchemaMarker(), operationTimeoutMs_ = PERSISTENCE_RESTORE_TIMEOUT_MS, cacheMaxBytes_ = PERSISTENCE_MAX_CACHE_BYTES, writeDelayMs_ = PERSISTENCE_WRITE_DEBOUNCE_MS, rangeTargetBytes_ = PERSISTENCE_RANGE_TARGET_BYTES, peekHandoffMs_ = PERSISTENCE_PEEK_HANDOFF_MS, peekPreAuthHandoffMs_ = PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS, leaseHeartbeatMs_ = LEASE_HEARTBEAT_MS, leaseStaleMs_ = LEASE_STALE_MS, heartbeatStore = defaultHeartbeatStore()) {
-        this.prefix_ = prefix_;
-        this.idbFactory_ = idbFactory_;
-        this.schemaKnownCurrent_ = schemaKnownCurrent_;
-        this.operationTimeoutMs_ = operationTimeoutMs_;
-        this.cacheMaxBytes_ = cacheMaxBytes_;
-        this.writeDelayMs_ = writeDelayMs_;
-        this.rangeTargetBytes_ = rangeTargetBytes_;
-        this.peekHandoffMs_ = peekHandoffMs_;
-        this.peekPreAuthHandoffMs_ = peekPreAuthHandoffMs_;
-        this.leaseHeartbeatMs_ = leaseHeartbeatMs_;
-        this.leaseStaleMs_ = leaseStaleMs_;
-        this.db_ = null;
-        /** Roots explicitly selected by the application (keepSynced semantics). */
-        this.persistentRoots_ = new Map();
-        /** Active selected roots currently flowing through persistence. */
-        this.trackedRoots_ = new Set();
-        /**
-         * Latest server tree per root. Revisions come from a single manager-wide
-         * counter, so no revision is ever reissued — an in-flight flush can never
-         * collide with a tree that arrived after its root was evicted and
-         * re-tracked.
-         */
-        /**
-         * Changed subtree paths accumulated since the flush baseline
-         * (lastFlush_.rootNode), keyed by root. The server names the exact path of
-         * every ordinary data push, so steady-state flushes can mark dirty ranges
-         * from this list directly instead of re-discovering the same information
-         * with a full-width identity diff of two ~60MB trees (the diff's sorted
-         * child merges were the single largest CPU slice of a flush).
-         *
-         * `null` = imprecise: an update arrived whose changed path is unknown or
-         * at/above the root (range merges, listen completions, foreign rebases) —
-         * the flush falls back to the identity diff, which is exactly today's
-         * behavior. Entries reset to [] whenever lastFlush_ gains a fresh baseline.
-         */
-        this.changedSinceFlush_ = new Map();
-        this.latest_ = new Map();
-        /**
-         * What IndexedDB currently holds per root (see FlushedState) — the basis
-         * for identity-diff dirty marking and no-op flushes.
-         */
-        this.lastFlush_ = new Map();
-        /**
-         * Distinguishes this manager's write tokens from every other tab's and
-         * session's — numeric counters restart at zero on reload, which would let
-         * a new data write pair up with a write token from another manager
-         * instance.
-         */
-        this.instanceId_ = Math.random().toString(36).slice(2, 10);
-        this.writeCounter_ = 0;
-        /**
-         * The single-flight coalescing window per root: `timer` is the pending
-         * (non-restarting) window; `rearm` marks a change that landed while the
-         * root's queue was busy flushing — exactly one follow-up window is armed
-         * when the queue drains, however many changes landed meanwhile.
-         */
-        this.writeTimers_ = new Map();
-        this.flushPending_ = new Set();
-        /** In-flight storage operations per root (see enqueue_). */
-        this.queues_ = new Map();
-        /**
-         * One physical IndexedDB decode per root. The pre-auth peek and the
-         * authenticated listener often overlap; without coalescing they each read
-         * the tree record and rebuilt the same large Node tree concurrently.
-         */
-        this.activeReads_ = new Map();
-        this.restoreReasons_ = new Map();
-        /** One writer lease per TRACKED root (see the WriterLease notes). */
-        this.writerLeases_ = new Map();
-        /**
-         * True while the repo's network is deliberately interrupted (goOffline /
-         * repoInterrupt). LIVENESS is not ELIGIBILITY: an offline tab's JS keeps
-         * running and heartbeating, but its server cache is frozen — if it kept
-         * its leases (or the fail-open gate), an online tab receiving newer
-         * server state could never persist it, and storage would hold the
-         * disconnected tab's stale tree. While suspended this manager holds no
-         * leases, queues none, steals none, and the write gate is CLOSED even
-         * where Web Locks don't exist — a stale flush from an offline tab must
-         * not overwrite an online writer's fresh generation in the CAS-only
-         * environment either. Roots stay tracked; trees stay in memory; resume
-         * re-acquires and the armed write windows flush whatever was pending.
-         * (Deliberate-offline only: an involuntary network drop hits every tab
-         * on the machine alike — no online follower exists to starve — and the
-         * connection self-reconnects, so leases follow repoInterrupt/repoResume,
-         * not transient socket state.)
-         */
-        this.networkSuspended_ = false;
-        /** One timer for all leases: held → heartbeat, requested → steal check. */
-        this.leaseTimer_ = null;
-        /**
-         * Identifies THIS manager's heartbeat stamps (`<ms>|<token>`), so a
-         * clean release can remove its own stamp without ever deleting a
-         * successor's. Without cleanup, a departed holder's stamp lingers: a
-         * later holder whose storage cannot WRITE never overwrites it, and a
-         * follower that can READ sees a PRESENT-but-stale heartbeat — and
-         * steals from a perfectly healthy writer, contradicting the documented
-         * page-death fallback for storage-denied holders.
-         */
-        this.heartbeatToken_ = Date.now().toString(36) + Math.random().toString(36).slice(2);
-        this.activeRestoreCount_ = 0;
-        this.restoreQueue_ = [];
-        this.writesDeferredUntilRestores_ = new Set();
-        this.sweepTimer_ = null;
-        this.sweepInFlight_ = null;
-        this.disposed_ = false;
-        this.authScope_ = null;
-        this.authScopeConfigured_ = false;
-        /**
-         * True once the APP's auth integration (setPersistenceAuthScope) has
-         * confirmed the scope — as opposed to a pre-auth peek merely priming it
-         * with a trusted expected identity. Selects the peek-retention budget:
-         * a primed-only scope holds the long pre-auth backstop, a confirmed one
-         * the short handoff grace (see PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS).
-         */
-        this.authScopeConfirmed_ = false;
-        this.authGeneration_ = 0;
-        this.heartbeatStore_ = heartbeatStore;
-        if (!this.schemaKnownCurrent_) {
-            // Do not put the cold server listen behind a potentially slow Safari
-            // version-change transaction. Migration runs in the background; restore
-            // APIs return a cache miss synchronously for this boot.
-            void this.open_();
-        }
-    }
-    rebindTo(prefix) {
-        const scope = this.authScope_;
-        const selectedRoots = [...this.persistentRoots_];
-        this.dispose();
-        const rebound = new PersistenceManager(prefix, this.idbFactory_, this.schemaKnownCurrent_, this.operationTimeoutMs_, this.cacheMaxBytes_, this.writeDelayMs_, this.rangeTargetBytes_, this.peekHandoffMs_, this.peekPreAuthHandoffMs_, this.leaseHeartbeatMs_, this.leaseStaleMs_, this.heartbeatStore_);
-        rebound.networkSuspended_ = this.networkSuspended_;
-        if (this.authScopeConfigured_) {
-            rebound.setAuthScope(scope, this.authScopeConfirmed_);
-        }
-        for (const [pathString, count] of selectedRoots) {
-            rebound.persistentRoots_.set(pathString, count);
-        }
-        return rebound;
-    }
-    setPersistentPath(pathString, enabled) {
-        const current = this.persistentRoots_.get(pathString) ?? 0;
-        if (enabled) {
-            this.persistentRoots_.set(pathString, current + 1);
-        }
-        else if (current <= 1) {
-            this.persistentRoots_.delete(pathString);
-            this.untrack(pathString);
-        }
-        else {
-            this.persistentRoots_.set(pathString, current - 1);
-        }
-    }
-    isPersistentPath(pathString) {
-        return this.persistentRoots_.has(pathString);
-    }
-    /**
-     * Marks a root as persistence-managed; write-throughs only run for
-     * tracked roots (and their descendants' updates).
-     */
-    track(pathString) {
-        this.trackedRoots_.add(pathString);
-        this.ensureWriterLease_(pathString);
-    }
-    /**
-     * Follows the repo's DELIBERATE network state (repoInterrupt/repoResume,
-     * i.e. goOffline/goOnline — see networkSuspended_). Suspending returns
-     * every lease so an online tab becomes each root's writer; roots stay
-     * tracked and trees stay in memory. Resuming re-queues politely (never
-     * steals) and re-arms the write windows, so data seen before or during
-     * the offline stretch persists once this tab is eligible again — in the
-     * lock-less environment the re-armed window is the whole story, since
-     * eligibility there is only the gate.
-     */
-    setNetworkSuspended(suspended) {
-        if (this.networkSuspended_ === suspended || this.disposed_) {
-            return;
-        }
-        this.networkSuspended_ = suspended;
-        if (suspended) {
-            this.releaseAllWriterLeases_();
-            return;
-        }
-        for (const pathString of this.trackedRoots_) {
-            this.ensureWriterLease_(pathString);
-            this.armWriteWindowIfPending_(pathString);
-        }
-    }
-    /**
-     * True when this manager may write the root: it holds the root's writer
-     * lease, or leases are unenforceable here (no Web Locks, or the root has
-     * no lease entry — the manifest CAS remains the correctness backstop).
-     */
-    holdsWriterLease_(pathString) {
-        if (this.networkSuspended_) {
-            // Ineligible, not merely lease-less: with no lease entry the gate
-            // would fail OPEN, and an offline tab's adopt-then-restage would
-            // overwrite an online writer's fresh generation with stale data.
-            return false;
-        }
-        const lease = this.writerLeases_.get(pathString);
-        return lease === undefined ? true : lease.state === 'held';
-    }
-    /** The root's shared heartbeat key. */
-    heartbeatKey_(pathString) {
-        return 'firebase-database-persistence-writer|' + this.key_(pathString);
-    }
-    writeHeartbeat_(pathString) {
-        try {
-            this.heartbeatStore_?.setItem(this.heartbeatKey_(pathString), Date.now() + '|' + this.heartbeatToken_);
-        }
-        catch (e) {
-            // Storage that exists but THROWS (storage-disabled documents, quota)
-            // means this manager cannot participate in the heartbeat protocol at
-            // all: keep trying and every holder stamp fails silently while
-            // followers keep reading whatever is there. Disable the channel for
-            // this manager's lifetime — takeover degrades to page death, which is
-            // the documented no-shared-storage mode.
-            this.heartbeatStore_ = null;
-        }
-    }
-    readHeartbeat_(pathString) {
-        try {
-            const raw = this.heartbeatStore_?.getItem(this.heartbeatKey_(pathString));
-            // `<ms>|<token>` (and bare `<ms>` from older stamps) both parse.
-            const value = raw === null || raw === undefined
-                ? NaN
-                : Number(String(raw).split('|')[0]);
-            return isNaN(value) ? 0 : value;
-        }
-        catch (e) {
-            // See writeHeartbeat_: a throwing store is a dead channel, and a
-            // reader that cannot see heartbeats must never steal (the tick's
-            // null-store guard makes this permanent, not just this tick).
-            this.heartbeatStore_ = null;
-            return 0;
-        }
-    }
-    /**
-     * One tick, role by lease state: a holder proves liveness (heartbeat); a
-     * queued follower checks the holder's liveness and STEALS the lock when
-     * the heartbeat is PRESENT but stale — the holder stamped once (every
-     * holder stamps at grant) and then went silent: frozen, cached,
-     * suspended, or wedged, and would otherwise starve every live tab's
-     * writes for as long as it existed. An ABSENT heartbeat never justifies a
-     * steal: it means the liveness protocol is not operating for this lock —
-     * the holder's storage throws, the stamp was cleared, or nothing was
-     * ever granted — and stealing on silence alone would take the lock from
-     * a perfectly healthy writer over and over (each stolen holder re-queues
-     * and, reading the same absence, steals right back). Without a readable
-     * heartbeat, takeover degrades to page death — the documented
-     * no-shared-storage mode. The request-time anchor additionally prevents
-     * stealing within the staleness budget of first joining the queue.
-     */
-    onLeaseTick_() {
-        if (this.disposed_) {
-            return;
-        }
-        for (const [pathString, lease] of this.writerLeases_) {
-            if (lease.state === 'held') {
-                this.writeHeartbeat_(pathString);
-                continue;
-            }
-            if (this.heartbeatStore_ === null) {
-                return;
-            }
-            const heartbeat = this.readHeartbeat_(pathString);
-            if (heartbeat <= 0) {
-                continue;
-            }
-            const freshest = Math.max(heartbeat, lease.requestedAt);
-            if (Date.now() - freshest > this.leaseStaleMs_) {
-                this.requestWriterLease_(pathString, true);
-            }
-        }
-    }
-    /** Requests the root's writer lease once (idempotent per root). */
-    ensureWriterLease_(pathString) {
-        if (this.writerLeases_.has(pathString) ||
-            this.disposed_ ||
-            this.networkSuspended_) {
-            return;
-        }
-        const locks = webLocks();
-        if (locks === null) {
-            return;
-        }
-        this.requestWriterLease_(pathString, false);
-        if (this.leaseTimer_ === null && this.writerLeases_.size > 0) {
-            this.leaseTimer_ = setInterval(() => {
-                this.onLeaseTick_();
-            }, this.leaseHeartbeatMs_);
-            this.leaseTimer_.unref?.();
-        }
-    }
-    /**
-     * Puts a lease request for the root in the browser's queue, superseding
-     * any current one (`steal` preempts a stale holder; see onLeaseTick_).
-     */
-    requestWriterLease_(pathString, steal) {
-        const locks = webLocks();
-        if (locks === null) {
-            return;
-        }
-        const previous = this.writerLeases_.get(pathString);
-        const lease = {
-            state: 'requested',
-            release: null,
-            // The Web Locks spec FORBIDS combining `signal` with `steal`
-            // (NotSupportedError — verified in Chrome: the request rejects
-            // immediately and no steal happens). A steal needs no abort path
-            // anyway: it is granted almost at once, and a steal that lands after
-            // this lease was superseded/disposed is handed straight back by the
-            // grant callback's identity check.
-            controller: !steal && typeof AbortController !== 'undefined'
-                ? new AbortController()
-                : null,
-            requestedAt: Date.now()
-        };
-        this.writerLeases_.set(pathString, lease);
-        // Replace-then-abort: the superseded request's rejection sees a
-        // different current lease and is a no-op.
-        if (previous !== undefined && previous.state === 'requested') {
-            previous.controller?.abort();
-        }
-        const options = { mode: 'exclusive' };
-        if (lease.controller !== null) {
-            options.signal = lease.controller.signal;
-        }
-        if (steal) {
-            options.steal = true;
-        }
-        const onSettled = (failed) => {
-            if (this.writerLeases_.get(pathString) !== lease) {
-                return; // superseded or released: nothing to do
-            }
-            if (lease.state === 'held') {
-                // A held lock's request promise only settles early when another
-                // tab STOLE it (a stale-heartbeat takeover while this page was
-                // suspended, or a lock-manager failure treated the same way). Stop
-                // writing at once and re-queue politely — never steal back
-                // unprompted; any stale baseline reconciles through the flush CAS.
-                //
-                // Settle the STOLEN callback first: the UA keeps the holder
-                // callback pending until the promise it returned settles, and
-                // re-queueing replaces the map entry, so no later release or
-                // dispose could ever reach this resolver again. Left unsettled,
-                // every steal leaks one pending callback — whose closure retains
-                // this manager (and, once disposed, its baselines) indefinitely.
-                lease.release?.();
-                lease.release = null;
-                this.requestWriterLease_(pathString, false);
-                return;
-            }
-            if (failed) {
-                // Queued-request failure (not a supersede — those hit the identity
-                // guard above): fail open rather than never persisting, and re-arm
-                // the write window a skipped flush may have consumed.
-                this.writerLeases_.delete(pathString);
-                this.stopLeaseTimerIfIdle_();
-                this.armWriteWindowIfPending_(pathString);
-            }
-        };
-        try {
-            void locks
-                .request(this.writerLeaseName_(pathString), options, () => {
-                if (this.writerLeases_.get(pathString) !== lease || this.disposed_) {
-                    // Superseded/released/disposed while queued: hand the lock
-                    // straight back so the next tab's request is granted.
-                    return Promise.resolve();
-                }
-                lease.state = 'held';
-                this.writeHeartbeat_(pathString);
-                // Writes for this root were skipped while another tab held its
-                // lease; whatever is pending in memory enters the ordinary write
-                // window now. A stale baseline (the old holder committed)
-                // resolves through the flush CAS + adoptCommittedBaseline_,
-                // exactly once.
-                this.armWriteWindowIfPending_(pathString);
-                return new Promise(resolve => {
-                    lease.release = resolve;
-                });
-            })
-                .then(() => onSettled(false), () => onSettled(true));
-        }
-        catch (e) {
-            // A synchronously-throwing request() must not break the listen path
-            // that called track().
-            onSettled(true);
-        }
-    }
-    writerLeaseName_(pathString) {
-        return 'firebase-database-persistence-write|' + this.key_(pathString);
-    }
-    /**
-     * Removes THIS manager's own heartbeat stamp (token-checked, so a
-     * successor's stamp is never deleted). The get→remove pair is not
-     * atomic; the benign worst case is deleting a successor stamp written
-     * in between — absence never justifies a steal, and the successor
-     * re-stamps on its next tick. A crashed holder never runs this, so its
-     * stamp can linger: a follower may then steal once from a write-denied
-     * successor — accepted residual; the stealer stamps and it stabilizes.
-     */
-    clearOwnHeartbeat_(pathString) {
-        const store = this.heartbeatStore_;
-        if (store === null || typeof store.removeItem !== 'function') {
-            return;
-        }
-        try {
-            const key = this.heartbeatKey_(pathString);
-            const raw = store.getItem(key);
-            if (typeof raw === 'string' && raw.endsWith('|' + this.heartbeatToken_)) {
-                store.removeItem(key);
-            }
-        }
-        catch (e) {
-            this.heartbeatStore_ = null;
-        }
-    }
-    /** Returns the root's writer lease to the browser (idempotent). */
-    releaseWriterLease_(pathString) {
-        const lease = this.writerLeases_.get(pathString);
-        if (lease === undefined) {
-            return;
-        }
-        this.writerLeases_.delete(pathString);
-        this.stopLeaseTimerIfIdle_();
-        if (lease.state === 'held') {
-            // Clean handoff: take the stamp with us, so a successor that cannot
-            // write storage is judged by ABSENCE (page-death handoff), not by
-            // our lingering, eventually-stale stamp (see heartbeatToken_).
-            this.clearOwnHeartbeat_(pathString);
-            lease.release?.();
-        }
-        else {
-            lease.controller?.abort();
-        }
-    }
-    /**
-     * Cleanup-completion rule shared by untrack paths: return the root's
-     * lease unless the root was re-tracked meanwhile — the new listen owns
-     * it now.
-     */
-    releaseWriterLeaseIfUntracked_(pathString) {
-        if (!this.trackedRoots_.has(pathString)) {
-            this.releaseWriterLease_(pathString);
-        }
-    }
-    /** Returns every lease (dispose). */
-    releaseAllWriterLeases_() {
-        for (const pathString of [...this.writerLeases_.keys()]) {
-            this.releaseWriterLease_(pathString);
-        }
-    }
-    /**
-     * A tab tracking nothing must neither heartbeat nor evaluate steals: the
-     * tick stops with the last lease and restarts with the next track().
-     */
-    stopLeaseTimerIfIdle_() {
-        if (this.writerLeases_.size === 0 && this.leaseTimer_ !== null) {
-            clearInterval(this.leaseTimer_);
-            this.leaseTimer_ = null;
-        }
-    }
-    /**
-     * The root's last listen stopped. When a live tracked ancestor covers the
-     * root, its record — which contains this subtree and keeps flushing — is
-     * the one future sessions should restore, so the child's own record is
-     * deleted rather than left to shadow it. Otherwise any pending
-     * write-through is flushed so IndexedDB holds the final tree for the next
-     * session. Either way the in-memory copies are released — only live
-     * listens need them.
-     */
-    untrack(pathString) {
-        if (!this.trackedRoots_.has(pathString)) {
-            return;
-        }
-        this.trackedRoots_.delete(pathString);
-        const timer = this.writeTimers_.get(pathString);
-        if (timer) {
-            clearTimeout(timer);
-            this.writeTimers_.delete(pathString);
-        }
-        this.flushPending_.delete(pathString);
-        if (this.trackedRootFor(pathString) !== null) {
-            // Housekeeping delete (the covering ancestor's record is the one
-            // future sessions should restore): guarded to the one generation
-            // this manager itself verified or wrote — a revision-NAMED delete is
-            // safe without lock ownership by construction, because it can never
-            // remove a successor generation some other writer committed. An
-            // ADOPTED baseline (rootNode null) carries another writer's revision
-            // for content this manager never saw — it authorizes nothing, and
-            // skipping is safe (a leftover record is at worst a slightly stale
-            // shadow the hash protocol revalidates).
-            const prev = this.lastFlush_.get(pathString);
-            const ownedRevision = prev !== undefined && prev.rootNode !== null ? prev.revision : null;
-            this.latest_.delete(pathString);
-            this.lastFlush_.delete(pathString);
-            this.changedSinceFlush_.delete(pathString);
-            if (ownedRevision !== null) {
-                void this.enqueue_(pathString, () => this.deleteRecordIfRevision_(pathString, ownedRevision));
-            }
-            // The delete authorizes itself (revision-named), so the lease can
-            // return right away; the re-track guard keeps a fresh listen's lease.
-            this.releaseWriterLeaseIfUntracked_(pathString);
-            return;
-        }
-        // Release the tree only after the final flush settles (flush_ reads
-        // latest_ when it runs). Skip the delete if the root was re-tracked
-        // meanwhile — the new listen owns the entry now. flushNow never rejects
-        // today, but cleanup on both callbacks keeps this leak-proof either way.
-        const release = () => {
-            if (!this.trackedRoots_.has(pathString)) {
-                this.latest_.delete(pathString);
-                this.lastFlush_.delete(pathString);
-                this.changedSinceFlush_.delete(pathString);
-            }
-            // AFTER the final flush so the last tree still writes under this
-            // tab's lease; a re-tracked root keeps it (the new listen owns it).
-            this.releaseWriterLeaseIfUntracked_(pathString);
-        };
-        void this.flushNow(pathString).then(release, release);
-    }
-    /**
-     * The nearest (deepest) tracked root at-or-above `pathString`, or null.
-     */
-    trackedRootFor(pathString) {
-        let best = null;
-        for (const root of this.trackedRoots_) {
-            if (pathString === root ||
-                (pathString.length > root.length &&
-                    pathString.startsWith(root === '/' ? root : root + '/'))) {
-                if (best === null || root.length > best.length) {
-                    best = root;
-                }
-            }
-        }
-        return best;
-    }
-    open_() {
-        if (this.db_) {
-            return this.db_;
-        }
-        this.db_ = this.openAtVersion_(undefined)
-            .then(db => {
-            if (db === null) {
-                return null;
-            }
-            // One-time migration away from monolithic / shared-transaction cache
-            // formats. Close and upgrade BEFORE any get(): clearing in the version
-            // change transaction drops the old values inside IndexedDB, without
-            // structured-cloning them into the WebKit heap (which is exactly what
-            // crashed large legacy accounts during restore).
-            if (db.version < PERSISTENCE_DB_VERSION) {
-                db.close();
-                return this.openAtVersion_(PERSISTENCE_DB_VERSION);
-            }
-            if (db.objectStoreNames.contains(STORE)) {
-                return db;
-            }
-            const nextVersion = db.version + 1;
-            db.close();
-            return this.openAtVersion_(nextVersion);
-        })
-            .then(db => {
-            if (db !== null && !db.objectStoreNames.contains(STORE)) {
-                persistenceStats.storageFailures++;
-                db.close();
-                return null;
-            }
-            if (db !== null) {
-                this.schemaKnownCurrent_ = true;
-                writeSchemaMarker();
-            }
-            return db;
-        });
-        void this.db_.then(db => {
-            if (db !== null && !this.disposed_ && this.sweepTimer_ === null) {
-                this.sweepTimer_ = setTimeout(() => {
-                    void this.sweepExpired_();
-                }, PERSISTENCE_SWEEP_DELAY_MS);
-                this.sweepTimer_.unref?.();
-            }
-        });
-        return this.db_;
-    }
-    /**
-     * Test seam: runs the deferred expiry sweep immediately.
-     * @internal
-     */
-    sweepNow() {
-        if (this.sweepTimer_ !== null) {
-            clearTimeout(this.sweepTimer_);
-        }
-        return this.sweepExpired_();
-    }
-    /**
-     * Deletes this manager's expired records (see PERSISTENCE_MAX_AGE_MS).
-     * Expiry is decided by each root's manifest: the '#'-suffixed tree record
-     * carries no authority of its own and is dropped exactly when its
-     * manifest is dropped, is missing (an orphan), or belongs to a different
-     * revision. Scoped to this manager's key range and reading keys before
-     * values, where the platform allows, so foreign records are never
-     * materialized. Best-effort: any failure leaves the records for the next
-     * session's sweep.
-     */
-    sweepExpired_() {
-        if (this.activeRestoreCount_ > 0 ||
-            this.restoreQueue_.length > 0 ||
-            this.queues_.size > 0) {
-            if (!this.disposed_) {
-                this.sweepTimer_ = setTimeout(() => {
-                    void this.sweepExpired_();
-                }, 5000);
-                this.sweepTimer_.unref?.();
-            }
-            return Promise.resolve();
-        }
-        this.sweepTimer_ = null;
-        if (this.sweepInFlight_ !== null) {
-            return this.sweepInFlight_;
-        }
-        const cutoff = Date.now() - PERSISTENCE_MAX_AGE_MS;
-        const prefix = this.key_('');
-        let range;
-        try {
-            // Not in every embedding (Node test environments) — without it the
-            // cursor walks the whole store and filters by prefix in JS.
-            range =
-                typeof IDBKeyRange !== 'undefined'
-                    ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
-                    : undefined;
-        }
-        catch (e) {
-            range = undefined;
-        }
-        const work = this.withStore_('readonly', [], (store, done) => {
-            const keys = [];
-            // openKeyCursor never materializes values; the value-cursor fallback
-            // (test fakes) walks values but only retains keys.
-            const keyCursorStore = store;
-            const req = typeof keyCursorStore.openKeyCursor === 'function'
-                ? keyCursorStore.openKeyCursor(range)
-                : store.openCursor(range);
-            req.onsuccess = () => {
-                const cursor = req.result;
-                if (!cursor) {
-                    done(keys);
-                    return;
-                }
-                if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
-                    keys.push(cursor.key);
-                }
-                cursor.continue();
-            };
-        }).then(keys => {
-            if (keys.length === 0) {
-                return;
-            }
-            const baseKeys = [];
-            const suffixedKeys = [];
-            for (const key of keys) {
-                if (key.indexOf('#', prefix.length) === -1) {
-                    baseKeys.push(key);
-                }
-                else {
-                    suffixedKeys.push(key);
-                }
-            }
-            return this.withStore_('readwrite', undefined, store => {
-                // Decide each base record (manifests are small), then settle the
-                // suffixed records against those decisions — all in one transaction,
-                // so a flush cannot interleave between the read and the delete.
-                const decisions = new Map();
-                let index = 0;
-                const pruneLru = () => {
-                    const activeKeys = new Set([...this.trackedRoots_].map(path => this.key_(path)));
-                    const live = [...decisions.entries()].filter(([, d]) => !d.expired);
-                    let totalBytes = live.reduce((sum, [, d]) => sum + d.estimatedBytes, 0);
-                    if (totalBytes <= this.cacheMaxBytes_ &&
-                        live.length <= PERSISTENCE_MAX_PRUNABLE_ROOTS) {
-                        return;
-                    }
-                    const targetBytes = this.cacheMaxBytes_ * PERSISTENCE_PRUNE_TARGET_RATIO;
-                    const targetRoots = Math.floor(PERSISTENCE_MAX_PRUNABLE_ROOTS * PERSISTENCE_PRUNE_TARGET_RATIO);
-                    const candidates = live
-                        .filter(([key]) => !activeKeys.has(key))
-                        .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
-                    let liveRoots = live.length;
-                    for (const [, decision] of candidates) {
-                        if (totalBytes <= targetBytes && liveRoots <= targetRoots) {
-                            break;
-                        }
-                        decision.expired = true;
-                        totalBytes -= decision.estimatedBytes;
-                        liveRoots--;
-                    }
-                };
-                const settleSuffixed = () => {
-                    for (const key of suffixedKeys) {
-                        const base = key.slice(0, key.indexOf('#', prefix.length));
-                        const decision = decisions.get(base);
-                        // Keep only immutable payloads referenced by the current live
-                        // manifest. Retired range versions and every legacy sidecar are
-                        // garbage-collected without materializing their values.
-                        const drop = decision === undefined ||
-                            decision.expired ||
-                            !decision.liveRangeKeys.has(key);
-                        if (drop) {
-                            store.delete(key);
-                        }
-                    }
-                };
-                const step = () => {
-                    if (index >= baseKeys.length) {
-                        pruneLru();
-                        for (const [key, decision] of decisions) {
-                            if (decision.expired) {
-                                persistenceStats.evictions++;
-                                store.delete(key);
-                            }
-                        }
-                        settleSuffixed();
-                        return;
-                    }
-                    const key = baseKeys[index++];
-                    const req = store.get(key);
-                    req.onsuccess = () => {
-                        const record = req.result;
-                        const expired = !record ||
-                            record.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-                            typeof record.updatedAt !== 'number' ||
-                            record.updatedAt < cutoff;
-                        decisions.set(key, {
-                            expired,
-                            updatedAt: record && typeof record.updatedAt === 'number'
-                                ? record.updatedAt
-                                : 0,
-                            estimatedBytes: record && typeof record.estimatedBytes === 'number'
-                                ? record.estimatedBytes
-                                : 0,
-                            revision: record && typeof record.revision === 'string'
-                                ? record.revision
-                                : null,
-                            liveRangeKeys: record &&
-                                record.formatVersion === PERSISTENCE_FORMAT_VERSION &&
-                                Array.isArray(record.ranges)
-                                ? new Set(record.ranges
-                                    .filter((range) => range !== null &&
-                                    typeof range === 'object' &&
-                                    typeof range.recordId ===
-                                        'string')
-                                    .map(range => key + RANGE_KEY_INFIX + range.recordId))
-                                : new Set()
-                        });
-                        step();
-                    };
-                };
-                step();
-            });
-        });
-        this.sweepInFlight_ = work.finally(() => {
-            this.sweepInFlight_ = null;
-        });
-        return this.sweepInFlight_;
-    }
-    openAtVersion_(version) {
-        return new Promise(resolve => {
-            if (!this.idbFactory_) {
-                resolve(null);
-                return;
-            }
-            let settled = false;
-            const finish = (db, failed = false) => {
-                if (settled) {
-                    db?.close();
-                    return;
-                }
-                settled = true;
-                clearTimeout(timer);
-                if (failed) {
-                    persistenceStats.storageFailures++;
-                }
-                resolve(db);
-            };
-            const timer = setTimeout(() => {
-                // Some WebKit IndexedDB requests fire neither success nor error. A
-                // cache miss is always safer than blocking the network listen.
-                finish(null, true);
-            }, this.operationTimeoutMs_);
-            try {
-                const req = version === undefined
-                    ? this.idbFactory_.open('firebase-database-persistence')
-                    : this.idbFactory_.open('firebase-database-persistence', version);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains(STORE)) {
-                        db.createObjectStore(STORE);
-                    }
-                    else if (version === PERSISTENCE_DB_VERSION) {
-                        // Clear in-IDB: no old record is cloned into JS memory.
-                        req.transaction.objectStore(STORE).clear();
-                    }
-                };
-                req.onsuccess = () => {
-                    const db = req.result;
-                    if (settled) {
-                        // An open that completed after the timeout must not leak a
-                        // connection or block a future schema upgrade.
-                        db.close();
-                        return;
-                    }
-                    db.onversionchange = () => db.close();
-                    finish(db);
-                };
-                req.onerror = () => finish(null, true);
-                req.onblocked = () => finish(null);
-            }
-            catch (e) {
-                finish(null, true);
-            }
-        });
-    }
-    key_(pathString) {
-        return this.prefix_ + '|' + pathString;
-    }
-    /**
-     * Runs `body` against the object store in a transaction of the given mode
-     * and resolves with what `body` chose to deliver (via its `done` callback)
-     * once the transaction completes. Every failure path — no database, a
-     * throwing store call, an aborted transaction — resolves `fallback` and
-     * counts one storageFailure (except when IndexedDB is absent altogether,
-     * which is a supported cold-load configuration, not a failure).
-     */
-    withStore_(mode, fallback, body, onProgress = () => { }) {
-        return this.open_().then(db => new Promise(resolve => {
-            if (!db) {
-                resolve(fallback);
-                return;
-            }
-            let settled = false;
-            let timer = null;
-            const finish = (value, failed = false) => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                if (timer !== null) {
-                    clearTimeout(timer);
-                }
-                if (failed) {
-                    persistenceStats.storageFailures++;
-                }
-                resolve(value);
-            };
-            try {
-                const tx = db.transaction(STORE, mode);
-                let value = fallback;
-                const arm = () => {
-                    if (settled) {
-                        return;
-                    }
-                    if (timer !== null) {
-                        clearTimeout(timer);
-                    }
-                    timer = setTimeout(() => {
-                        // Abort a stalled transaction so an abandoned cache read
-                        // cannot keep buffering network data indefinitely.
-                        try {
-                            tx.abort();
-                        }
-                        catch (e) {
-                            // It may have completed between the timer firing and abort().
-                        }
-                        finish(fallback, true);
-                    }, this.operationTimeoutMs_);
-                    onProgress();
-                };
-                body(tx.objectStore(STORE), v => {
-                    value = v;
-                }, arm);
-                arm();
-                tx.oncomplete = () => finish(value);
-                tx.onabort = tx.onerror = () => finish(fallback, true);
-            }
-            catch (e) {
-                finish(fallback, true);
-            }
-        }));
-    }
-    /**
-     * Reads a root's committed manifest and every immutable range it references
-     * in one readonly transaction. `onManifest` fires as soon as the requests
-     * are queued, overlapping network reconciliation with structured-clone
-     * range reads and private Node assembly. Missing/mismatched ranges fail the
-     * whole restore; Repo then performs the structural-failure cold relisten.
-     */
-    readRecord_(pathString, onProgress = () => { }, retainAfterResolve = false, expectedAuthScope = this.authScope_, onManifest = () => { }) {
-        const active = this.activeReads_.get(pathString);
-        if (active) {
-            active.progress.add(onProgress);
-            // Joining an already-progressing read is itself progress. A pre-auth
-            // peek may have started the physical read, so replay any already-read
-            // manifest to the real listener instead of making it wait for assembly.
-            onProgress();
-            if (active.manifestHashes !== null) {
-                onManifest(active.manifestHashes);
-            }
-            else {
-                active.manifestCallbacks.add(onManifest);
-            }
-            if (retainAfterResolve) {
-                active.retainAfterResolve = true;
-            }
-            else if (active.retainAfterResolve) {
-                // A real listener consumes the optimistic peek's completed read. The
-                // returned promise still owns the result; the manager no longer needs
-                // a second retained handle to it.
-                active.retainAfterResolve = false;
-                if (active.cleanupTimer !== null) {
-                    clearTimeout(active.cleanupTimer);
-                    this.activeReads_.delete(pathString);
-                }
-            }
-            return active.promise;
-        }
-        const progress = new Set([onProgress]);
-        const emitProgress = () => {
-            for (const callback of progress) {
-                callback();
-            }
-        };
-        const entry = {
-            promise: Promise.resolve(null),
-            progress,
-            retainAfterResolve,
-            cleanupTimer: null,
-            manifestHashes: null,
-            manifestCallbacks: new Set([onManifest]),
-            resolvedNode: null
-        };
-        const promise = this.readRecordOnce_(pathString, emitProgress, expectedAuthScope, hashes => {
-            entry.manifestHashes = hashes;
-            for (const callback of entry.manifestCallbacks) {
-                callback(hashes);
-            }
-            entry.manifestCallbacks.clear();
-        });
-        entry.promise = promise;
-        this.activeReads_.set(pathString, entry);
-        const release = (result) => {
-            entry.progress.clear();
-            entry.manifestCallbacks.clear();
-            entry.resolvedNode = result === null ? null : result.record.node;
-            if (this.activeReads_.get(pathString) !== entry) {
-                return;
-            }
-            if (!entry.retainAfterResolve) {
-                this.activeReads_.delete(pathString);
-                return;
-            }
-            // Only a completed DECODE earns the long pre-auth budget: it is the
-            // one-tree-per-boot handoff auth must not race. A miss/failed read
-            // retains nothing worth waiting for — keep the short expiry so a
-            // record written meanwhile (another tab) is re-read fresh.
-            entry.cleanupTimer = setTimeout(() => {
-                if (this.activeReads_.get(pathString) === entry) {
-                    this.activeReads_.delete(pathString);
-                }
-            }, result !== null && !this.authScopeConfirmed_
-                ? this.peekPreAuthHandoffMs_
-                : this.peekHandoffMs_);
-        };
-        void promise.then(release, () => release(null));
-        return promise;
-    }
-    /**
-     * Auth just confirmed the scope a pre-auth peek primed: every retained
-     * completed read waiting under the long pre-auth backstop switches to the
-     * short post-auth grace, counted from now. Entries still resolving (no
-     * cleanupTimer yet) pick the right budget in their own release().
-     */
-    rearmRetainedReads_() {
-        for (const [pathString, entry] of this.activeReads_) {
-            if (entry.cleanupTimer === null || !entry.retainAfterResolve) {
-                continue;
-            }
-            clearTimeout(entry.cleanupTimer);
-            entry.cleanupTimer = setTimeout(() => {
-                if (this.activeReads_.get(pathString) === entry) {
-                    this.activeReads_.delete(pathString);
-                }
-            }, this.peekHandoffMs_);
-        }
-    }
-    readRecordOnce_(pathString, onProgress, expectedAuthScope = this.authScope_, onManifest = () => { }) {
-        const key = this.key_(pathString);
-        // The revision of the generation a corrupt/expired verdict was reached
-        // ON — the cleanup below deletes only THAT generation (a revision-named
-        // delete cannot remove a successor another writer commits between this
-        // read and the cleanup transaction). Null when the stored manifest is
-        // too malformed to even carry a string revision (nothing current can be
-        // named; see the cleanup site).
-        let cleanupRevision = null;
-        // One readonly transaction is the consistency boundary for manifest +
-        // immutable range records. The manifest callback fires after every range
-        // request has been synchronously queued, but before those payloads finish
-        // cloning, so the network comparison overlaps the complete local restore.
-        // The transaction itself only VALIDATES and collects raw structured
-        // clones; decode runs after it resolves, in yielded slices (below).
-        return this.withStore_('readonly', null, (store, done, progress) => {
-            const manifestReq = store.get(key);
-            manifestReq.onsuccess = () => {
-                progress();
-                // ABSENT (undefined) is a plain miss; a stored literal `null` is
-                // NOT — it is garbage that must flow to the corrupt branch so the
-                // in-transaction cleanup reclaims it and its sidecars (folding it
-                // into the miss would leave it cached forever).
-                if (manifestReq.result === undefined) {
-                    done(null);
-                    return;
-                }
-                const manifest = manifestReq.result;
-                if (!structurallyValidManifest(manifest)) {
-                    const rawRevision = manifest === null
-                        ? undefined
-                        : manifest.revision;
-                    if (typeof rawRevision === 'string') {
-                        cleanupRevision = rawRevision;
-                    }
-                    this.restoreReasons_.set(pathString, 'corrupt');
-                    done(null);
-                    return;
-                }
-                if (manifest.authScope !== expectedAuthScope) {
-                    this.restoreReasons_.set(pathString, 'auth');
-                    done(null);
-                    return;
-                }
-                if (manifest.updatedAt < Date.now() - PERSISTENCE_MAX_AGE_MS) {
-                    cleanupRevision = manifest.revision;
-                    this.restoreReasons_.set(pathString, 'expired');
-                    done(null);
-                    return;
-                }
-                // The onsuccess callbacks only VALIDATE and collect the raw
-                // structured clones — decoding (nodeFromJSON + merge) is deferred
-                // to a yielded post-transaction loop below. Chrome coalesces
-                // same-transaction request callbacks into one task, so decoding
-                // inline produced multi-hundred-ms long tasks (and held every raw
-                // clone alive until the last record decoded). The deferred loop
-                // bounds task length and releases each clone as it is consumed —
-                // both matter on mobile WebKit, where a long-task + peak-memory
-                // spike at boot is what gets the page killed.
-                let failed = false;
-                let remaining = manifest.ranges.length;
-                let previousPost = null;
-                const rawTrees = new Array(manifest.ranges.length).fill(null);
-                manifest.ranges.forEach((range, index) => {
-                    const expectedStart = previousPost;
-                    previousPost = range.post;
-                    const req = store.get(key + RANGE_KEY_INFIX + range.recordId);
-                    req.onsuccess = () => {
-                        progress();
-                        if (!failed) {
-                            const record = req.result;
-                            if (!record ||
-                                record.recordId !== range.recordId ||
-                                record.start !== expectedStart ||
-                                record.end !== range.post ||
-                                record.tree === null ||
-                                record.tree === undefined) {
-                                failed = true;
-                                cleanupRevision = manifest.revision;
-                                this.restoreReasons_.set(pathString, 'corrupt');
-                            }
-                            else {
-                                rawTrees[index] = record.tree;
-                            }
-                        }
-                        remaining--;
-                        if (remaining === 0) {
-                            done(failed ? null : { manifest, rawTrees });
-                        }
-                    };
-                });
-                // Every referenced get is now queued in this same snapshot. It is
-                // safe to put the range listen on the wire immediately.
-                onManifest({
-                    hash: manifest.hash,
-                    compoundHash: wireCompoundHashFromRanges(manifest.ranges)
-                });
-            };
-        }, onProgress).then(async (collected) => {
-            let result = null;
-            if (collected !== null) {
-                const assembled = await this.decodeFragmentsSliced_(collected.rawTrees, onProgress);
-                if (this.disposed_) {
-                    // Disposed mid-decode: the record on disk is fine — do not mark it
-                    // corrupt (which would delete it below).
-                    return null;
-                }
-                if (assembled === null || assembled.isEmpty()) {
-                    cleanupRevision = collected.manifest.revision;
-                    this.restoreReasons_.set(pathString, 'corrupt');
-                }
-                else {
-                    result = {
-                        record: {
-                            node: assembled,
-                            hash: collected.manifest.hash,
-                            compoundHash: wireCompoundHashFromRanges(collected.manifest.ranges),
-                            updatedAt: collected.manifest.updatedAt,
-                            revision: collected.manifest.revision
-                        },
-                        ranges: collected.manifest.ranges
-                    };
-                }
-            }
-            if (result === null) {
-                const reason = this.restoreReasons_.get(pathString);
-                if (reason === 'corrupt' || reason === 'expired') {
-                    // Best-effort cleanup, NAMED to the generation the verdict was
-                    // reached on: a successor committed meanwhile (this manager may
-                    // be a follower queued behind another tab's lease) must survive.
-                    // Auth/missing misses must not delete another identity's
-                    // otherwise valid cache record. A manifest too malformed to carry
-                    // a revision cannot be named — its cleanup re-reaches the verdict
-                    // INSIDE the delete transaction instead (deleteRecordIfInvalid_):
-                    // "no CAS writer produced this" was established by a readonly
-                    // read and does not hold across the transaction boundary — a
-                    // concurrent writer may have replaced the garbage with a valid
-                    // generation by the time the delete runs.
-                    void (cleanupRevision !== null
-                        ? this.deleteRecordIfRevision_(pathString, cleanupRevision)
-                        : this.deleteRecordIfInvalid_(pathString));
-                }
-            }
-            return result;
-        });
-    }
-    /**
-     * Decodes and merges raw persisted range clones into one Node in yielded
-     * slices. Each slice decodes a few records, then yields a macrotask so the
-     * main thread can paint/GC between slices; consumed entries are nulled so
-     * the structured clones are collectable while later slices run. Returns
-     * null when any fragment fails to decode.
-     */
-    async decodeFragmentsSliced_(rawTrees, progress) {
-        const SLICE_SIZE = 8;
-        let assembled = ChildrenNode.EMPTY_NODE;
-        for (let i = 0; i < rawTrees.length; i++) {
-            if (i > 0 && i % SLICE_SIZE === 0) {
-                await new Promise(resolve => setTimeout(resolve, 0));
-                if (this.disposed_) {
-                    return null;
-                }
-                progress();
-            }
-            const raw = rawTrees[i];
-            rawTrees[i] = null;
-            try {
-                assembled = mergePersistedFragment(assembled, nodeFromJSON(raw));
-            }
-            catch (e) {
-                return null;
-            }
-        }
-        return assembled;
-    }
-    /**
-     * Cleanup for a manifest judged structurally invalid: the verdict is
-     * re-reached INSIDE the readwrite transaction, so a valid generation a
-     * concurrent writer committed after the (readonly) judgement is never
-     * touched. Still-invalid garbage — whatever garbage it is by now — goes.
-     */
-    deleteRecordIfInvalid_(pathString) {
-        const key = this.key_(pathString);
-        return this.withStore_('readwrite', undefined, (store, done) => {
-            const req = store.get(key);
-            req.onsuccess = () => {
-                const manifest = req.result;
-                if (manifest === undefined || structurallyValidManifest(manifest)) {
-                    done(undefined);
-                    return;
-                }
-                this.deleteRecordInStore_(store, key);
-                done(undefined);
-            };
-        });
-    }
-    /**
-     * Housekeeping variant of deleteRecord_: deletes the root's record only
-     * while the committed manifest still carries `expectedRevision` — the one
-     * generation this manager itself verified or wrote. An unconditional
-     * housekeeping delete could erase a FRESH generation another tab
-     * committed for this root after this manager last looked (that tab keeps
-     * flushing under its own lease and would skip identical rewrites against
-     * a lastFlush_ that no longer describes storage). Check and delete run in
-     * ONE readwrite transaction, so a concurrent commit cannot interleave
-     * between them. Skipping is always safe: a record left behind is at
-     * worst a slightly stale shadow, and every restored record is
-     * revalidated against the server by the hash protocol anyway.
-     */
-    deleteRecordIfRevision_(pathString, expectedRevision) {
-        const key = this.key_(pathString);
-        return this.withStore_('readwrite', undefined, store => {
-            const req = store.get(key);
-            req.onsuccess = () => {
-                const manifest = req.result;
-                if (!manifest || manifest.revision !== expectedRevision) {
-                    return;
-                }
-                this.deleteRecordInStore_(store, key);
-            };
-        });
-    }
-    /** Deletes a root's manifest and every '#'-suffixed sidecar in `store`. */
-    deleteRecordInStore_(store, key) {
-        store.delete(key);
-        // Immutable ranges and legacy chunk/hash/tree sidecars share '#'.
-        // suffix namespace. Range-delete where the platform has IDBKeyRange;
-        // cursor-walk otherwise (Node, test fakes) — key-only, no values.
-        if (typeof IDBKeyRange !== 'undefined') {
-            try {
-                store.delete(IDBKeyRange.bound(key + '#', key + '#' + String.fromCharCode(0xffff)));
-                return;
-            }
-            catch (e) {
-                // Fall through to the cursor walk.
-            }
-        }
-        try {
-            const req = store.openCursor();
-            req.onsuccess = () => {
-                const cursor = req.result;
-                if (!cursor) {
-                    return;
-                }
-                if (typeof cursor.key === 'string' &&
-                    cursor.key.startsWith(key + '#')) {
-                    cursor.delete();
-                }
-                cursor.continue();
-            };
-        }
-        catch (e) {
-            // Sidecar cleanup is best-effort; the sweep reclaims leftovers.
-        }
-    }
-    withRestoreSlot_(work) {
-        const run = () => {
-            this.activeRestoreCount_++;
-            return work().finally(() => {
-                this.activeRestoreCount_--;
-                const next = this.restoreQueue_.shift();
-                if (next) {
-                    next();
-                }
-                else if (this.activeRestoreCount_ === 0) {
-                    this.flushWritesDeferredUntilRestores_();
-                }
-            });
-        };
-        if (this.activeRestoreCount_ < PERSISTENCE_MAX_CONCURRENT_RESTORES) {
-            return run();
-        }
-        return new Promise((resolve, reject) => {
-            this.restoreQueue_.push(() => {
-                if (this.disposed_) {
-                    resolve(null);
-                    return;
-                }
-                void run().then(resolve, reject);
-            });
-        });
-    }
-    /**
-     * Projects an exact-path peek from a covering root that is already restored
-     * or actively restoring in this manager. This never starts a large ancestor
-     * read just to answer a tiny token lookup; it only reuses work the app is
-     * already paying for, preserving the exact-root fast path on direct boots.
-     */
-    peekFromCoveringRead_(pathString, expectedAuthScope) {
-        if (!this.authScopeConfigured_ || expectedAuthScope !== this.authScope_) {
-            return null;
-        }
-        let bestRoot = null;
-        let source = null;
-        for (const [root, read] of this.activeReads_) {
-            if (pathString !== root &&
-                (root === '/' || pathString.startsWith(root + '/')) &&
-                (bestRoot === null || root.length > bestRoot.length)) {
-                bestRoot = root;
-                source = read.promise;
-            }
-        }
-        for (const [root, state] of this.lastFlush_) {
-            if (state.rootNode !== null &&
-                pathString !== root &&
-                (root === '/' || pathString.startsWith(root + '/')) &&
-                (bestRoot === null || root.length > bestRoot.length)) {
-                const rootNode = state.rootNode;
-                bestRoot = root;
-                source = Promise.resolve({
-                    record: {
-                        node: rootNode,
-                        updatedAt: state.storedUpdatedAt,
-                        revision: state.revision
-                    },
-                    ranges: state.ranges
-                });
-            }
-        }
-        if (bestRoot === null || source === null) {
-            return null;
-        }
-        const relative = bestRoot === '/'
-            ? pathString.replace(/^\/+/, '')
-            : pathString.slice(bestRoot.length).replace(/^\/+/, '');
-        return source.then(result => {
-            if (result === null) {
-                return null;
-            }
-            const node = result.record.node.getChild(new Path(relative));
-            return node.isEmpty()
-                ? null
-                : {
-                    node,
-                    updatedAt: result.record.updatedAt,
-                    revision: result.record.revision
-                };
-        });
-    }
-    /**
-     * Exact-root optimistic peek. The completed range assembly is retained briefly
-     * so the authenticated listener consumes the same immutable Node instead of
-     * reconstructing the root twice during boot.
-     */
-    peek(pathString, expectedAuthScope = this.authScope_) {
-        if (this.disposed_ ||
-            !this.schemaKnownCurrent_ ||
-            !this.authScopeConfigured_) {
-            recordPersistenceEvent(pathString, 'peek-miss', this.disposed_
-                ? 'disposed'
-                : !this.authScopeConfigured_
-                    ? 'auth-scope-unconfigured'
-                    : 'schema-migration');
-            return Promise.resolve(null);
-        }
-        const authGeneration = this.authGeneration_;
-        const covering = this.peekFromCoveringRead_(pathString, expectedAuthScope);
-        if (covering !== null) {
-            return covering.then(record => authGeneration === this.authGeneration_ &&
-                expectedAuthScope === this.authScope_
-                ? record
-                : null);
-        }
-        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, true, expectedAuthScope).then(result => {
-            recordPersistenceEvent(pathString, result ? 'peek-hit' : 'peek-miss');
-            return result === null ? null : result.record;
-        }), this.operationTimeoutMs_, () => recordPersistenceEvent(pathString, 'peek-idle-timeout'))).then(record => authGeneration === this.authGeneration_ &&
-            expectedAuthScope === this.authScope_
-            ? record
-            : null);
-    }
-    /**
-     * Listener restore with an idle (no-progress) bound. `onManifest` fires as
-     * soon as the stored generation's hashes are known — typically
-     * milliseconds — letting the caller send the range listen while immutable
-     * range records are still being read and assembled. The callback is suppressed after
-     * a timeout/miss resolution, and never fires once the returned promise has
-     * settled null.
-     */
-    restoreForListen(pathString, onManifest = () => { }) {
-        this.restoreReasons_.delete(pathString);
-        const authGeneration = this.authGeneration_;
-        const expectedAuthScope = this.authScope_;
-        if (this.disposed_ ||
-            !this.schemaKnownCurrent_ ||
-            !this.authScopeConfigured_) {
-            const reason = this.authScopeConfigured_
-                ? 'missing'
-                : 'auth';
-            this.restoreReasons_.set(pathString, reason);
-            recordPersistenceEvent(pathString, 'restore-miss', this.disposed_
-                ? 'disposed'
-                : !this.authScopeConfigured_
-                    ? 'auth-scope-unconfigured'
-                    : 'schema-migration');
-            return Promise.resolve({ record: null, reason });
-        }
-        let settledNull = false;
-        const guardedOnManifest = (hashes) => {
-            if (!settledNull &&
-                authGeneration === this.authGeneration_ &&
-                !this.disposed_ &&
-                this.trackedRoots_.has(pathString)) {
-                onManifest(hashes);
-            }
-        };
-        return this.withRestoreSlot_(() => this.raceRestoreTimeout_(onProgress => this.readRecord_(pathString, onProgress, false, expectedAuthScope, guardedOnManifest).then(result => {
-            if (result === null ||
-                authGeneration !== this.authGeneration_ ||
-                expectedAuthScope !== this.authScope_ ||
-                this.disposed_ ||
-                !this.trackedRoots_.has(pathString)) {
-                return null;
-            }
-            // Updates accumulated before this point were named against a
-            // pre-restore chain; the restored record starts a new baseline.
-            this.changedSinceFlush_.set(pathString, null);
-            this.lastFlush_.set(pathString, {
-                rootNode: result.record.node,
-                revision: result.record.revision,
-                ranges: result.ranges,
-                storedUpdatedAt: result.record.updatedAt
-            });
-            persistenceStats.restoredRoots.push(pathString);
-            return result.record;
-        }), this.operationTimeoutMs_, () => {
-            this.restoreReasons_.set(pathString, 'timeout');
-            recordPersistenceEvent(pathString, 'restore-idle-timeout');
-        })).then(record => {
-            if (authGeneration !== this.authGeneration_ ||
-                expectedAuthScope !== this.authScope_) {
-                this.restoreReasons_.set(pathString, 'auth');
-                record = null;
-            }
-            if (record === null) {
-                settledNull = true;
-            }
-            const reason = record
-                ? undefined
-                : this.restoreReasons_.get(pathString) ?? 'missing';
-            recordPersistenceEvent(pathString, record ? 'restore-hit' : 'restore-miss', reason);
-            return record ? { record } : { record: null, reason };
-        });
-    }
-    /**
-     * Bounds a read by an IDLE (no-progress) timeout. The factory form lets
-     * chunked restores reset the timer after every completed chunk; callers
-     * that pass an already-started Promise retain the old total-time bound.
-     */
-    raceRestoreTimeout_(readOrStart, timeoutMs = this.operationTimeoutMs_, onTimeout = () => { }) {
-        let timer;
-        let settled = false;
-        let timeoutResolve = () => { };
-        const timeout = new Promise(resolve => {
-            timeoutResolve = resolve;
-        });
-        const arm = () => {
-            if (settled) {
-                return;
-            }
-            clearTimeout(timer);
-            timer = setTimeout(() => {
-                onTimeout();
-                timeoutResolve(null);
-            }, timeoutMs);
-        };
-        const read = typeof readOrStart === 'function' ? readOrStart(arm) : readOrStart;
-        arm();
-        return Promise.race([read, timeout]).then(result => {
-            settled = true;
-            clearTimeout(timer);
-            return result;
-        });
-    }
-    /**
-     * Write-through: the server confirmed `node` as the state of the tracked
-     * root `path`. Coalesced per root under the single-flight window (see the
-     * file header): the first change arms a non-restarting timer; later
-     * changes coalesce; a change landing while a flush is in flight re-arms
-     * exactly one follow-up window when the queue drains. A tree the store is
-     * known to already hold — the warm boot's listen-'ok' certifying the
-     * restored tree unchanged — is skipped outright unless its stored
-     * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
-     */
-    flushWritesDeferredUntilRestores_() {
-        const paths = [...this.writesDeferredUntilRestores_];
-        this.writesDeferredUntilRestores_.clear();
-        for (const pathString of paths) {
-            // The deferral must not bypass the write window: draining the restore
-            // wave IS the cold-boot moment (LCP, initial render). Re-arm the same
-            // non-restarting window a direct write-through would have entered.
-            this.armWriteWindow_(pathString);
-        }
-    }
-    /**
-     * Re-enters the ordinary write window when the root still has work: it is
-     * tracked and holds a pending tree in latest_ (flush_ reads latest_ when
-     * it runs, so whatever landed meanwhile is covered). The one definition
-     * used by every deferred-retry path — a lease grant after skipped writes,
-     * a failed-open lock acquisition, and the stale-baseline adoption.
-     */
-    armWriteWindowIfPending_(pathString) {
-        if (!this.disposed_ &&
-            this.trackedRoots_.has(pathString) &&
-            this.latest_.has(pathString)) {
-            this.armWriteWindow_(pathString);
-        }
-    }
-    /**
-     * Arms the non-restarting single-flight write window for a root. Two
-     * regimes: a root with a flush baseline coalesces under the ordinary
-     * window; a root with none (first generation — see
-     * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
-     * the two delays so the cache exists before short mobile sessions end.
-     */
-    armWriteWindow_(pathString) {
-        if (!this.writeTimers_.has(pathString)) {
-            const delay = this.lastFlush_.has(pathString)
-                ? this.writeDelayMs_
-                : Math.min(this.writeDelayMs_, PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS);
-            this.writeTimers_.set(pathString, setTimeout(() => {
-                this.writeTimers_.delete(pathString);
-                this.scheduleFlush_(pathString);
-            }, delay));
-        }
-    }
-    accumulateChangedPaths_(pathString, changedPaths) {
-        if (changedPaths === undefined) {
-            this.changedSinceFlush_.set(pathString, null);
-            return;
-        }
-        const existing = this.changedSinceFlush_.get(pathString);
-        if (existing === null) {
-            return; // already imprecise until the next flush baseline
-        }
-        const list = existing ?? [];
-        for (const changedPath of changedPaths) {
-            if (list.length >= MAX_ACCUMULATED_CHANGED_PATHS) {
-                this.changedSinceFlush_.set(pathString, null);
-                return;
-            }
-            list.push(changedPath);
-        }
-        this.changedSinceFlush_.set(pathString, list);
-    }
-    /**
-     * `changedPaths` — the root-relative paths of the subtrees this update
-     * changed, when the caller knows them precisely: an ordinary server data
-     * push names its own path (`[relative]`), a listen certification confirms
-     * already-accounted state (`[]`, nothing new). Omitted/undefined marks the
-     * accumulated change-set imprecise — a range merge, or any update whose
-     * shape the caller cannot name — falling the next flush back to the
-     * identity diff.
-     */
-    serverCacheUpdated(path, node, changedPaths) {
-        if (this.disposed_ || !this.authScopeConfigured_) {
-            return;
-        }
-        const pathString = path.toString();
-        if (!this.trackedRoots_.has(pathString)) {
-            return;
-        }
-        const prev = this.lastFlush_.get(pathString);
-        if (prev &&
-            prev.rootNode === node &&
-            Date.now() - prev.storedUpdatedAt < PERSISTENCE_REFRESH_AGE_MS) {
-            return;
-        }
-        this.accumulateChangedPaths_(pathString, changedPaths);
-        this.latest_.set(pathString, {
-            node,
-            revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
-            authScope: this.authScope_
-        });
-        // IndexedDB serializes readwrite transactions for this object store. A
-        // cold root must not begin a large write while another selected root is
-        // still restoring, or the restore can hit its idle timeout behind its own
-        // write-through. Android gets this ordering from one persistence runloop;
-        // the web manager reproduces it explicitly.
-        if (this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0) {
-            this.writesDeferredUntilRestores_.add(pathString);
-            return;
-        }
-        // Every generation, including the first, enters the non-restarting
-        // window. Cache creation is an optional accelerator and must not compete
-        // with the cold page's initial render/LCP. The flush reads
-        // latest_ when it runs, so it always writes the newest tree.
-        this.armWriteWindow_(pathString);
-    }
-    /**
-     * Enqueues a flush unless the root's queue is still working — then one
-     * flush is marked pending and enqueued when the queue drains. Without the
-     * mark, a root whose flush takes longer than the window would queue
-     * flushes faster than they complete, unboundedly. This is the
-     * single-flight guarantee: at most one flush in flight per root, effective
-     * cadence max(writeDelayMs, flush duration).
-     */
-    scheduleFlush_(pathString) {
-        if (this.queues_.has(pathString)) {
-            this.flushPending_.add(pathString);
-            return;
-        }
-        void this.enqueue_(pathString, () => this.flush_(pathString));
-    }
-    /** Drop an unusable persisted record but keep the live root tracked. */
-    invalidate(path) {
-        const pathString = path.toString();
-        // The record being invalidated is the one this manager just RESTORED —
-        // its revision sits in lastFlush_ (set by restoreForListen). Name the
-        // delete to it so a successor generation another writer committed
-        // meanwhile survives. Unnamable (no verified baseline): skip — the next
-        // restore of a genuinely bad record fails again and readRecordOnce_'s
-        // own named cleanup removes it.
-        const prev = this.lastFlush_.get(pathString);
-        const restoredRevision = prev !== undefined && prev.rootNode !== null ? prev.revision : null;
-        this.latest_.delete(pathString);
-        this.lastFlush_.delete(pathString);
-        this.changedSinceFlush_.delete(pathString);
-        recordPersistenceEvent(pathString, 'invalidate', 'corrupt-or-incompatible');
-        if (restoredRevision !== null) {
-            void this.enqueue_(pathString, () => this.deleteRecordIfRevision_(pathString, restoredRevision));
-        }
-    }
-    /**
-     * The viewer lost access to a root: a cached copy must not outlive the
-     * access that produced it, and the root leaves write-through tracking
-     * entirely — SyncTree never calls stopListening for server-revoked
-     * listens, so nothing else would ever untrack it.
-     */
-    evict(path) {
-        const pathString = path.toString();
-        this.trackedRoots_.delete(pathString);
-        this.latest_.delete(pathString);
-        this.lastFlush_.delete(pathString);
-        this.changedSinceFlush_.delete(pathString);
-        this.flushPending_.delete(pathString);
-        const timer = this.writeTimers_.get(pathString);
-        if (timer) {
-            clearTimeout(timer);
-            this.writeTimers_.delete(pathString);
-        }
-        persistenceStats.evictions++;
-        recordPersistenceEvent(pathString, 'evict', 'permission-or-revocation');
-        // The root left tracking: return its lease so a tab that still tracks
-        // it can write. Order relative to the queued purge is free — the purge
-        // authorizes itself inside its own transaction, never via the lease.
-        this.releaseWriterLease_(pathString);
-        // The purge is IMMEDIATE and atomic — it must never wait for the
-        // writer lease. The lease is held for the holder tab's lifetime, and a
-        // holder that does not listen to this root never receives the
-        // revocation itself: a purge deferred to lease grant would leave the
-        // revoked bytes cached for as long as that tab lives, violating the
-        // invariant above. Deleting without the lease is made safe by SCOPE,
-        // checked in the same readwrite transaction: only the writer can have
-        // committed a newer generation here, and a same-scope writer tracking
-        // this root receives the same revocation and evicts too (clearing its
-        // own lastFlush_, so no stale identical-rewrite short-circuit
-        // survives); a writer NOT tracking this root never writes it at all. A
-        // manifest under ANOTHER identity's scope is left alone — this user's
-        // revoked bytes are not in it, and the other identity's access is its
-        // own. (Residual, accepted: a same-scope writer that legitimately
-        // RETAINS access through different query-level rules can have a fresh
-        // generation purged and skip identical rewrites against its stale
-        // lastFlush_ until the manifest-refresh path self-heals it — bounded
-        // cache staleness, never corruption.) Through the root's queue, so a
-        // flush of this manager already in flight finishes first.
-        // The scope whose access was revoked is CAPTURED NOW, not read later:
-        // the purge runs behind any in-flight per-root work, and an account
-        // switch (setAuthScope) can land in that gap. Compared against the
-        // manager's LIVE scope, the old identity's revoked record would read
-        // as "another identity's" and be preserved, while a fresh record the
-        // NEW identity just committed would match and be deleted — exactly
-        // backwards. The reference value for in-transaction validation must be
-        // immutable, like deleteRecordIfRevision_'s expectedRevision.
-        const revokedScope = this.authScope_;
-        void this.enqueue_(pathString, () => this.purgeEvictedRecord_(pathString, revokedScope));
-    }
-    /**
-     * Eviction's delete: manifest + sidecars in one transaction, gated on the
-     * stored manifest belonging to the REVOKED scope (captured at evict();
-     * see the comment there). `null` is a REAL scope — the anonymous
-     * identity — not malformation: an anonymous user's valid record must
-     * survive a signed-in tab's eviction exactly like any other identity's.
-     * The unconditional purge is reserved for values no live writer produced
-     * — a structurally invalid manifest, a malformed scope field (neither
-     * string nor null), or a stored value that is not an object at all
-     * (null, primitives): eviction is exactly the moment to drop those WITH
-     * their sidecars, which may still carry revoked bytes. Only a truly
-     * ABSENT record (undefined) is a no-op. Field reads happen only after
-     * structural validation — a stored literal `null` passes an
-     * undefined-check and then throws on property access, aborting the
-     * transaction and silently RETAINING the revoked record.
-     */
-    purgeEvictedRecord_(pathString, revokedScope) {
-        const key = this.key_(pathString);
-        return this.withStore_('readwrite', undefined, (store, done) => {
-            const req = store.get(key);
-            req.onsuccess = () => {
-                const stored = req.result;
-                if (stored === undefined) {
-                    done(undefined);
-                    return;
-                }
-                if (structurallyValidManifest(stored)) {
-                    const scope = stored.authScope;
-                    if ((typeof scope === 'string' || scope === null) &&
-                        scope !== revokedScope) {
-                        // Another identity's valid record: the revoked bytes are not
-                        // in it, and the other identity's access is its own.
-                        done(undefined);
-                        return;
-                    }
-                }
-                this.deleteRecordInStore_(store, key);
-                done(undefined);
-            };
-        });
-    }
-    dispose() {
-        this.disposed_ = true;
-        this.releaseAllWriterLeases_();
-        for (const timer of this.writeTimers_.values()) {
-            clearTimeout(timer);
-        }
-        this.writeTimers_.clear();
-        if (this.sweepTimer_ !== null) {
-            clearTimeout(this.sweepTimer_);
-        }
-        this.flushPending_.clear();
-        const queuedRestores = this.restoreQueue_;
-        this.restoreQueue_ = [];
-        for (const resume of queuedRestores) {
-            resume();
-        }
-        for (const read of this.activeReads_.values()) {
-            if (read.cleanupTimer !== null) {
-                clearTimeout(read.cleanupTimer);
-            }
-        }
-        this.activeReads_.clear();
-        this.persistentRoots_.clear();
-        this.latest_.clear();
-        this.lastFlush_.clear();
-        this.changedSinceFlush_.clear();
-        void this.db_?.then(db => db?.close());
-    }
-    /**
-     * Test seam: forces a pending flush window to fire now.
-     */
-    flushNow(pathString) {
-        const timer = this.writeTimers_.get(pathString);
-        if (timer) {
-            clearTimeout(timer);
-            this.writeTimers_.delete(pathString);
-        }
-        this.flushPending_.delete(pathString);
-        return this.enqueue_(pathString, () => this.flush_(pathString));
-    }
-    /**
-     * Chains an operation onto the root's queue. One writer per root at a
-     * time: a flush's manifest, chunks, and integrated hashes stay revision-coupled
-     * before the next flush or delete for that root starts, which is the
-     * whole storage consistency argument — no cross-operation races to
-     * reason about.
-     */
-    enqueue_(pathString, op) {
-        const next = (this.queues_.get(pathString) ?? Promise.resolve()).then(op);
-        // Settle-or-not, the chain must continue; storage failures are already
-        // absorbed (and counted) inside withStore_.
-        const settled = next.catch(() => { });
-        this.queues_.set(pathString, settled);
-        void settled.then(() => {
-            if (this.queues_.get(pathString) === settled) {
-                this.queues_.delete(pathString);
-                if (this.flushPending_.delete(pathString) && !this.disposed_) {
-                    void this.enqueue_(pathString, () => this.flush_(pathString));
-                }
-            }
-        });
-        return next;
-    }
-    /**
-     * Adopts the currently COMMITTED generation as the next flush baseline
-     * WITHOUT reading or decoding its range payloads — a manifest-only read.
-     *
-     * Used when this manager discovers its baseline is stale (the flush CAS
-     * lost to another writer, or the stored generation vanished): the
-     * winner's revision + ranges are all the next CAS needs, while its tree
-     * stays undecoded (rootNode: null). The follow-up flush cannot diff
-     * against an absent tree, so it stages a fresh self-contained generation
-     * — the same write the old adopt-and-diff produced anyway (a freshly
-     * decoded tree shares no identity with the live one, so its identity
-     * diff marked every range dirty) minus the full IndexedDB read and Node
-     * decode of the entire root that made every cross-tab conflict as
-     * expensive as a cold restore.
-     *
-     * The retry enters the ordinary NON-RESTARTING write window instead of
-     * re-flushing immediately: under sustained cross-tab churn an immediate
-     * retry conflicts again back-to-back — full-tree work with no pause
-     * between attempts (the multi-tab thrash the write leases exist to
-     * prevent, kept bounded here for lease-less environments too).
-     */
-    adoptCommittedBaseline_(pathString) {
-        const key = this.key_(pathString);
-        return this.withStore_('readonly', null, (store, done) => {
-            const req = store.get(key);
-            req.onsuccess = () => {
-                done(req.result ?? null);
-            };
-        }).then(manifest => {
-            if (this.disposed_) {
-                return;
-            }
-            // The adopted baseline is another generation's tree; paths named
-            // against our own chain do not describe diffs from it.
-            this.changedSinceFlush_.set(pathString, null);
-            if (structurallyValidManifest(manifest) &&
-                manifest.authScope === this.authScope_) {
-                this.lastFlush_.set(pathString, {
-                    rootNode: null,
-                    revision: manifest.revision,
-                    ranges: manifest.ranges,
-                    storedUpdatedAt: manifest.updatedAt
-                });
-            }
-            else {
-                // Missing, foreign-scope, or unreadable: the next flush stages
-                // under the absent / replaceable-foreign CAS arm instead.
-                this.lastFlush_.delete(pathString);
-            }
-            // The write window is the ONLY retry path. A window that elapsed
-            // while the losing flush was in flight marked flushPending_, and the
-            // queue drain would re-flush IMMEDIATELY on settle — full-tree
-            // staging back-to-back under sustained lease-less churn, bypassing
-            // the debounce this adoption exists to provide. The armed window
-            // supersedes it: flush_ reads latest_ when it runs, so the update
-            // that marked the queue pending is still fully covered, just
-            // deferred. For an untracked root (the final flush from untrack lost
-            // the CAS) there is deliberately no retry at all: the winner's
-            // generation is a coherent snapshot seconds-fresh at most, and the
-            // hash protocol revalidates it on the next boot — not worth keeping
-            // the tree and lease alive past untrack (this matches the pre-lease
-            // behavior, whose drain retry always found latest_ already released).
-            this.flushPending_.delete(pathString);
-            this.armWriteWindowIfPending_(pathString);
-        });
-    }
-    /**
-     * One generation: identity-diff against the last known stored tree marks
-     * the dirty ranges; only those are re-serialized (between preserved
-     * boundary posts), re-hashed, and written under new immutable ids. Clean
-     * range records carry over verbatim and are never cloned. New records plus
-     * the manifest commit in ONE transaction, so every
-     * committed generation's hashes exactly describe its stored tree — which
-     * is what lets the next boot listen straight off the manifest with zero
-     * hashing.
-     */
-    flush_(pathString) {
-        if (this.sweepInFlight_ !== null) {
-            return this.sweepInFlight_.then(() => this.flush_(pathString));
-        }
-        const entry = this.latest_.get(pathString);
-        if (!entry || this.disposed_ || !this.authScopeConfigured_) {
-            return Promise.resolve();
-        }
-        if (!this.holdsWriterLease_(pathString)) {
-            // Another tab is this root's writer. latest_ keeps the newest tree in
-            // memory; if the lease ever transfers here, the grant callback
-            // re-enters the ordinary write window for this root.
-            return Promise.resolve();
-        }
-        const { node, revision, authScope } = entry;
-        const prev = this.lastFlush_.get(pathString);
-        const now = Date.now();
-        if (prev &&
-            prev.rootNode === node &&
-            now - prev.storedUpdatedAt < PERSISTENCE_REFRESH_AGE_MS) {
-            return Promise.resolve();
-        }
-        const key = this.key_(pathString);
-        if (node.isEmpty()) {
-            // An empty tree is a GENERATION, and deleting the record is its
-            // commit — so it obeys the exact CAS arms a manifest commit does,
-            // inside one readwrite transaction. The lease check above ran before
-            // async work: Web Locks `steal` can revoke it while this flush is
-            // suspended, and an unconditional delete on resume would erase the
-            // manifest and ranges the NEW holder committed meanwhile. With a
-            // baseline, delete only the baseline's revision (adopted counts —
-            // this is commit CAS, not an ownership guard); with none, only an
-            // absent record or a replaceable-foreign manifest (same live scope
-            // staging over another identity/format — see the commit arms) may be
-            // removed. Anything else is a CAS conflict: adopt the winner
-            // manifest-only and let the write window retry — where the lease
-            // gate runs again, so a stolen holder never retries as a writer.
-            return this.withStore_('readwrite', false, (store, done, progress) => {
-                // Eligibility is re-checked INSIDE the commit transaction: the
-                // gate at flush entry ran before async staging, and the lease can
-                // be released (goOffline) or lost (steal) while this flush was
-                // suspended in between. Losing it reads as a CAS conflict — the
-                // adopt + write-window retry re-runs the entry gate. Re-running
-                // the LIVE gate (not a captured token) deliberately still allows
-                // a suspend→resume→re-granted holder to commit: it is the
-                // eligible writer again, and nothing newer can exist locally.
-                if (!this.holdsWriterLease_(pathString)) {
-                    done(false);
-                    return;
-                }
-                const req = store.get(key);
-                req.onsuccess = () => {
-                    progress();
-                    // A stored literal `null` is garbage no CAS writer produced;
-                    // normalized to ABSENT so the empty commit succeeds instead of
-                    // throwing on the field reads below (an exception here aborts
-                    // the transaction, and every window retry would abort the same
-                    // way — the root could never flush again). Restore-side
-                    // cleanup (deleteRecordIfInvalid_) reclaims the value and its
-                    // sidecars.
-                    const current = (req.result ?? undefined);
-                    if (current === undefined) {
-                        done(true);
-                        return;
-                    }
-                    const replaceableForeign = !prev &&
-                        authScope === this.authScope_ &&
-                        (current.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-                            current.authScope !== authScope);
-                    if ((prev && current.revision === prev.revision) ||
-                        replaceableForeign) {
-                        this.deleteRecordInStore_(store, key);
-                        done(true);
-                        return;
-                    }
-                    done(false);
-                };
-            }).then(ok => {
-                if (this.disposed_) {
-                    return;
-                }
-                if (ok) {
-                    this.lastFlush_.delete(pathString);
-                    return;
-                }
-                return this.adoptCommittedBaseline_(pathString);
-            });
-        }
-        if (prev && prev.rootNode === node) {
-            // Content-identical: refresh only the manifest timestamp. The revision
-            // guard prevents a stale tab from refreshing a superseded generation.
-            // 'ineligible' (the lease was released or lost between the entry gate
-            // and this transaction — see the empty-path comment) is a plain
-            // no-op, NOT a conflict: the stored generation may be perfectly
-            // current, and an ineligible tab must neither extend its perceived
-            // freshness nor discard its own decoded baseline over it.
-            return this.withStore_('readwrite', 'conflict', (store, done, progress) => {
-                if (!this.holdsWriterLease_(pathString)) {
-                    done('ineligible');
-                    return;
-                }
-                const req = store.get(key);
-                req.onsuccess = () => {
-                    progress();
-                    const current = req.result;
-                    if (current && current.revision === prev.revision) {
-                        const put = store.put({ ...current, updatedAt: now }, key);
-                        put.onsuccess = progress;
-                        done('refreshed');
-                    }
-                    else {
-                        done('conflict');
-                    }
-                };
-            }).then(outcome => {
-                if (this.disposed_ || outcome === 'ineligible') {
-                    return;
-                }
-                if (outcome === 'refreshed') {
-                    this.lastFlush_.set(pathString, { ...prev, storedUpdatedAt: now });
-                    return;
-                }
-                // The stored generation is gone (another identity's manifest, a
-                // sweep, or manual storage clearing). lastFlush_ no longer describes
-                // storage; left in place, every future identical-node write-through
-                // would skip against it and the root would stay unpersisted for the
-                // whole session. Resync from the committed manifest — never a full
-                // range read/decode — and rebuild once, through the write window.
-                return this.adoptCommittedBaseline_(pathString);
-            });
-        }
-        // Dirty ranges come from the changed paths the server already named
-        // (accumulateChangedPath_), consumed against the flush baseline; when
-        // the accumulated set is imprecise (null: a range merge, a listen
-        // completion, an unknown-path update, overflow) fall back to the
-        // identity diff of the two trees — the exact pre-accumulator behavior.
-        // Consume-on-read: whatever happens to this flush, the paths below are
-        // relative to the CURRENT baseline only once.
-        const accumulated = this.changedSinceFlush_.get(pathString);
-        this.changedSinceFlush_.set(pathString, []);
-        let previousRanges = [];
-        let dirty = [];
-        let tailDirty = false;
-        // An adopted baseline (rootNode null — another writer's committed
-        // manifest) has UNKNOWN content: neither the identity diff nor paths
-        // accumulated against our own chain describe differences from it, and
-        // carrying any of its ranges over unverified would splice two server
-        // snapshots into one stored tree. Stage a fresh full generation; its
-        // revision still CASes against the adopted manifest.
-        if (prev && prev.ranges.length > 0 && prev.rootNode !== null) {
-            const changed = accumulated !== null && accumulated !== undefined
-                ? accumulated
-                : collectChangedSubtreePaths(prev.rootNode, node);
-            previousRanges = prev.ranges;
-            if (changed.length === 0) {
-                dirty = new Array(prev.ranges.length).fill(false);
-            }
-            else {
-                const marked = markDirtyRanges(prev.ranges, changed);
-                dirty = marked.dirty;
-                tailDirty = marked.tailDirty;
-            }
-        }
-        // First pass: boundaries/sizes only. It never creates canonical strings
-        // or export payloads, so a first generation cannot retain another full
-        // copy of the root merely to decide its ranges. Drained in bounded
-        // main-thread slices: a whole-root plan (first generation after a cold
-        // boot — every range dirty) is a full leaf walk, and running it
-        // synchronously was a multi-second stall exactly on the boots that must
-        // complete their first flush to escape the cold-reload loop.
-        const planner = new CompoundHashBuilder(fixedSizeSplitStrategy(this.rangeTargetBytes_), true);
-        const planSliced = async () => {
-            const rebuilder = new StableRangeRebuilder(node, previousRanges, dirty, tailDirty, planner, this.rangeTargetBytes_);
-            while (!rebuilder.drainUntil(Date.now() + FLUSH_PLAN_SLICE_MS)) {
-                await yieldMacrotask();
-                if (this.disposed_) {
-                    throw new FlushObsoleteError();
-                }
-            }
-            return rebuilder.result();
-        };
-        return planSliced().then(rebuilt => this.finishFlush_(pathString, entry, prev, accumulated, rebuilt), e => {
-            if (e instanceof FlushObsoleteError) {
-                return;
-            }
-            persistenceStats.storageFailures++;
-            recordPersistenceEvent(pathString, 'flush-plan-error');
-            // Protective cleanup of THIS manager's own possibly-implicated
-            // generation — housekeeping, so it follows the ownership rule (see
-            // deleteRecordIfRevision_ / the covered-untrack delete): only a
-            // revision this manager itself verified or wrote. An ADOPTED baseline
-            // (rootNode null) is another writer's generation — a local planning
-            // failure says nothing about it — and with no baseline at all there
-            // is nothing of ours to protect against. A lease lost to a steal
-            // while this flush was suspended is covered the same way: the
-            // revision-named delete cannot touch the new holder's generation.
-            const owned = prev !== undefined && prev.rootNode !== null ? prev.revision : null;
-            this.lastFlush_.delete(pathString);
-            return owned !== null
-                ? this.deleteRecordIfRevision_(pathString, owned)
-                : Promise.resolve();
-        });
-    }
-    /**
-     * Second half of a flush: stages the planned dirty ranges and commits the
-     * generation. Split from flush_ so the sliced planner can yield between
-     * slices without holding the whole body in one closure. `entry` is the
-     * latest_ record the flush entered with (its node/revision/authScope are
-     * the generation being written); `rebuilt` is the planned range list —
-     * clean ranges carried with their recordIds, dirty ranges with empty
-     * hashes to be serialized, digested, and staged here.
-     */
-    finishFlush_(pathString, entry, prev, accumulated, rebuilt) {
-        const { node, revision, authScope } = entry;
-        const now = Date.now();
-        const key = this.key_(pathString);
-        const dirtyPlans = [];
-        let previousPost = null;
-        let dirtyIndex = 0;
-        const ranges = rebuilt.map(range => {
-            const carried = range;
-            if (range.hash !== '' && typeof carried.recordId === 'string') {
-                previousPost = range.post;
-                return carried;
-            }
-            const persisted = {
-                ...range,
-                recordId: revision + '-' + dirtyIndex.toString(36)
-            };
-            dirtyPlans.push({
-                range: persisted,
-                start: previousPost,
-                end: range.post
-            });
-            previousPost = range.post;
-            dirtyIndex++;
-            return persisted;
-        });
-        const stagedIds = [];
-        const stageBatch = async (plans) => {
-            const texts = [];
-            const records = [];
-            for (const plan of plans) {
-                const builder = new CompoundHashBuilder(() => false);
-                let text;
-                let payload = undefined;
-                builder.hashSink = completed => {
-                    text = completed;
-                };
-                builder.payloadSink = completed => {
-                    payload = completed;
-                };
-                const from = plan.start === null
-                    ? null
-                    : plan.start === '/'
-                        ? []
-                        : plan.start.split('/');
-                const to = plan.end === '/' ? [] : plan.end.split('/');
-                if (from !== null) {
-                    builder.seedBoundary(from);
-                }
-                walkLeafInterval(node, from, to, builder);
-                if (text === undefined ||
-                    payload === undefined ||
-                    builder.posts.length !== 1 ||
-                    builder.posts[0] !== plan.end) {
-                    throw new Error('Dirty range did not serialize to its planned boundary');
-                }
-                texts.push(text);
-                records.push({
-                    recordId: plan.range.recordId,
-                    start: plan.start,
-                    end: plan.end,
-                    tree: payload
-                });
-            }
-            const digests = await digestRangeTexts(texts);
-            for (let i = 0; i < plans.length; i++) {
-                plans[i].range.hash = digests[i];
-            }
-            const stored = await this.withStore_('readwrite', false, (store, done, progress) => {
-                for (const record of records) {
-                    const put = store.put(record, key + RANGE_KEY_INFIX + record.recordId);
-                    put.onsuccess = progress;
-                }
-                done(true);
-            });
-            if (!stored) {
-                throw new Error('Failed to stage persisted ranges');
-            }
-            stagedIds.push(...records.map(record => record.recordId));
-            // Async activation records can otherwise retain completed IDB request
-            // inputs until the whole generation settles. Drop every large reference
-            // explicitly and yield a macrotask so WebKit can collect between
-            // batches (yieldMacrotask: MessageChannel, exempt from the nested
-            // setTimeout clamp that stretched many-batch generations by seconds).
-            for (const record of records) {
-                record.tree = undefined;
-            }
-            records.length = 0;
-            texts.length = 0;
-            digests.length = 0;
-            await yieldMacrotask();
-            if (this.disposed_) {
-                throw new FlushObsoleteError();
-            }
-        };
-        const stageAll = async () => {
-            // Batches are cut by planned canonical-text bytes, not range count:
-            // ranges vary from a few bytes to ~2x the split target, and a fixed
-            // count made slice cost swing with them. A single oversized range
-            // still ships alone (the batch admits the first plan unconditionally).
-            let batch = [];
-            let batchBytes = 0;
-            for (const plan of dirtyPlans) {
-                if (batch.length > 0 && batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
-                    await stageBatch(batch);
-                    batch = [];
-                    batchBytes = 0;
-                }
-                batch.push(plan);
-                batchBytes += plan.range.size;
-            }
-            if (batch.length > 0) {
-                await stageBatch(batch);
-            }
-        };
-        return stageAll()
-            .then(() => {
-            if (this.disposed_) {
-                return;
-            }
-            const manifest = {
-                formatVersion: PERSISTENCE_FORMAT_VERSION,
-                revision,
-                updatedAt: now,
-                authScope,
-                // Sum of canonical-text range sizes, already computed by the
-                // planner (the old estimateSerializedNodeSize call here was a
-                // second full-tree walk solely for this field). NOTE: a different
-                // measure than that estimate (canonical text vs JSON-ish size) —
-                // same order of magnitude, and the LRU sweep that consumes
-                // estimatedBytes only needs a consistent-scale byte proxy. Old
-                // manifests keep their estimate until content next changes; the
-                // mixed sum drifts the sweep budget by at most that scale gap.
-                estimatedBytes: ranges.reduce((sum, range) => sum + range.size, 0),
-                hash: '',
-                ranges
-            };
-            const liveIds = new Set(ranges.map(range => range.recordId));
-            const retiredIds = prev
-                ? prev.ranges
-                    .map(range => range.recordId)
-                    .filter(recordId => !liveIds.has(recordId))
-                : [];
-            // The range payloads are immutable staging records. This tiny CAS
-            // transaction is the atomic authority switch: until the manifest put
-            // commits, a crash leaves the previous generation fully live.
-            return this.withStore_('readwrite', false, (store, done, progress) => {
-                // Same in-transaction eligibility re-check as the empty path:
-                // the entry gate ran before staging, and the lease can be
-                // released (goOffline) or lost (steal) while the staging work
-                // was in flight. Failing reads as a CAS conflict — staged ids
-                // are reclaimed and the write window (which re-runs the entry
-                // gate) owns any retry.
-                if (!this.holdsWriterLease_(pathString)) {
-                    done(false);
-                    return;
-                }
-                const currentReq = store.get(key);
-                currentReq.onsuccess = () => {
-                    progress();
-                    // Stored `null` normalizes to ABSENT (see the empty-path
-                    // comment): the first-generation commit then OVERWRITES the
-                    // garbage instead of throwing on the replaceableForeign
-                    // field reads and aborting every commit of this root forever.
-                    const current = (currentReq.result ?? undefined);
-                    // A first generation may REPLACE a manifest this manager can
-                    // never restore (another identity's scope, or an unknown
-                    // format): treating those as CAS winners would strand the
-                    // adopt-and-retry loser forever — its readRecord_ always
-                    // resolves null against a foreign manifest, so every retry
-                    // re-stages the full tree and conflicts again. Same-scope
-                    // manifests keep strict CAS semantics. Replacement is LIVE
-                    // scope only: a generation staged under a superseded identity
-                    // may still publish into an absent key under its own label
-                    // (reads are scope-checked; see the in-flight relabel test)
-                    // but must never replace the new identity's fresh manifest.
-                    const replaceableForeign = !prev &&
-                        current !== undefined &&
-                        authScope === this.authScope_ &&
-                        (current.formatVersion !== PERSISTENCE_FORMAT_VERSION ||
-                            current.authScope !== authScope);
-                    if ((prev && (!current || current.revision !== prev.revision)) ||
-                        (!prev && current !== undefined && !replaceableForeign)) {
-                        done(false);
-                        return;
-                    }
-                    const commit = () => {
-                        for (const recordId of retiredIds) {
-                            const remove = store.delete(key + RANGE_KEY_INFIX + recordId);
-                            remove.onsuccess = progress;
-                        }
-                        const manifestPut = store.put(manifest, key);
-                        manifestPut.onsuccess = progress;
-                        done(true);
-                    };
-                    if (stagedIds.length === 0) {
-                        commit();
-                        return;
-                    }
-                    // Another tab's sweep classifies suffixed records against the
-                    // manifest that is COMMITTED, so records staged for this still
-                    // unpublished generation look like orphans there and can be
-                    // reclaimed between staging and this transaction without
-                    // moving the manifest revision (in-memory guards only cover
-                    // this tab). Publishing would durably reference missing
-                    // payloads. Re-verify every staged id inside the same atomic
-                    // switch — key-only reads — and treat a loss exactly like a
-                    // CAS conflict. Ordering is airtight because readwrite
-                    // transactions on one store serialize: a sweep that ran before
-                    // this transaction is observed here; one that runs after reads
-                    // this manifest and keeps its records.
-                    let missing = false;
-                    let verified = 0;
-                    for (const recordId of stagedIds) {
-                        const stagedKey = key + RANGE_KEY_INFIX + recordId;
-                        // Key-only where the platform (or fake) provides it; the
-                        // fallback get only runs in environments without getKey.
-                        const check = typeof store.getKey === 'function'
-                            ? store.getKey(stagedKey)
-                            : store.get(stagedKey);
-                        check.onsuccess = () => {
-                            progress();
-                            if (missing) {
-                                return;
-                            }
-                            if (check.result === undefined) {
-                                missing = true;
-                                done(false);
-                                return;
-                            }
-                            if (++verified === stagedIds.length) {
-                                commit();
-                            }
-                        };
-                    }
-                };
-            }).then(ok => {
-                if (!ok || this.disposed_) {
-                    if (this.disposed_) {
-                        return;
-                    }
-                    // A different tab committed while we staged, or a concurrent
-                    // sweep reclaimed our still-unreferenced staged records. Remove
-                    // our immutable ids and adopt the winning manifest as the CAS
-                    // baseline (manifest-only — no range read, no decode); the next
-                    // window stages one fresh self-contained generation against it.
-                    return this.withStore_('readwrite', undefined, store => {
-                        for (const recordId of stagedIds) {
-                            store.delete(key + RANGE_KEY_INFIX + recordId);
-                        }
-                    }).then(() => this.adoptCommittedBaseline_(pathString));
-                }
-                persistenceStats.rangesHashed += dirtyPlans.length;
-                persistenceStats.rangesReused += ranges.length - dirtyPlans.length;
-                persistenceStats.writeThroughs++;
-                this.lastFlush_.set(pathString, {
-                    rootNode: node,
-                    revision,
-                    ranges,
-                    storedUpdatedAt: now
-                });
-                stampSeedHashes(node, manifest.hash, wireCompoundHashFromRanges(ranges));
-                recordPersistenceEvent(pathString, 'stored', `${ranges.length} ranges, ${dirtyPlans.length} written`);
-                if (!prev) {
-                    void this.gcRangeRecords_(pathString, revision, liveIds);
-                }
-            });
-        })
-            .catch((e) => {
-            if (e instanceof FlushObsoleteError) {
-                // Disposed mid-stage: staged ids are reclaimed by the next
-                // successful GC/sweep; nothing to merge back — the manager is gone.
-                return;
-            }
-            persistenceStats.storageFailures++;
-            recordPersistenceEvent(pathString, 'flush-range-stage-error');
-            // The flush consumed the accumulated changed-paths at its start, but
-            // nothing was committed: lastFlush_ still describes the stored
-            // baseline, so the paths this flush was covering must flow into the
-            // next diff or its ranges would be carried forward stale. Merge them
-            // back with whatever accrued since (either side already imprecise
-            // stays imprecise).
-            const since = this.changedSinceFlush_.get(pathString);
-            if (accumulated === null || since === null) {
-                this.changedSinceFlush_.set(pathString, null);
-            }
-            else if (accumulated !== undefined && accumulated.length > 0) {
-                const merged = accumulated.concat(since ?? []);
-                this.changedSinceFlush_.set(pathString, merged.length > MAX_ACCUMULATED_CHANGED_PATHS ? null : merged);
-            }
-            // Staged immutable records are non-authoritative and are reclaimed by
-            // the next successful full-generation GC or the deferred sweep.
-            if (stagedIds.length > 0) {
-                void this.withStore_('readwrite', undefined, store => {
-                    for (const recordId of stagedIds) {
-                        store.delete(key + RANGE_KEY_INFIX + recordId);
-                    }
-                });
-            }
-        });
-    }
-    gcRangeRecords_(pathString, revision, liveIds) {
-        const key = this.key_(pathString);
-        const prefix = key + RANGE_KEY_INFIX;
-        return this.withStore_('readwrite', undefined, (store, done) => {
-            const manifestReq = store.get(key);
-            manifestReq.onsuccess = () => {
-                const manifest = manifestReq.result;
-                if (!manifest || manifest.revision !== revision) {
-                    done(undefined);
-                    return;
-                }
-                let range;
-                try {
-                    range =
-                        typeof IDBKeyRange !== 'undefined'
-                            ? IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff))
-                            : undefined;
-                }
-                catch (e) {
-                    range = undefined;
-                }
-                const keyCursorStore = store;
-                // A value cursor structured-clones every range payload; on a 65 MB
-                // root that would recreate the full-read cost solely to discover keys.
-                const req = typeof keyCursorStore.openKeyCursor === 'function'
-                    ? keyCursorStore.openKeyCursor(range)
-                    : store.openCursor(range);
-                req.onsuccess = () => {
-                    const cursor = req.result;
-                    if (!cursor) {
-                        done(undefined);
-                        return;
-                    }
-                    if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
-                        const recordId = cursor.key.slice(prefix.length);
-                        if (!liveIds.has(recordId)) {
-                            cursor.delete();
-                        }
-                    }
-                    cursor.continue();
-                };
-            };
-        });
-    }
-}
 
 /**
  * @license
@@ -8960,6 +2897,284 @@ class OnlineMonitor extends EventEmitter {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/** Maximum key depth. */
+const MAX_PATH_DEPTH = 32;
+/** Maximum number of (UTF8) bytes in a Firebase path. */
+const MAX_PATH_LENGTH_BYTES = 768;
+/**
+ * An immutable object representing a parsed path.  It's immutable so that you
+ * can pass them around to other functions without worrying about them changing
+ * it.
+ */
+class Path {
+    /**
+     * @param pathOrString - Path string to parse, or another path, or the raw
+     * tokens array
+     */
+    constructor(pathOrString, pieceNum) {
+        if (pieceNum === void 0) {
+            this.pieces_ = pathOrString.split('/');
+            // Remove empty pieces.
+            let copyTo = 0;
+            for (let i = 0; i < this.pieces_.length; i++) {
+                if (this.pieces_[i].length > 0) {
+                    this.pieces_[copyTo] = this.pieces_[i];
+                    copyTo++;
+                }
+            }
+            this.pieces_.length = copyTo;
+            this.pieceNum_ = 0;
+        }
+        else {
+            this.pieces_ = pathOrString;
+            this.pieceNum_ = pieceNum;
+        }
+    }
+    toString() {
+        let pathString = '';
+        for (let i = this.pieceNum_; i < this.pieces_.length; i++) {
+            if (this.pieces_[i] !== '') {
+                pathString += '/' + this.pieces_[i];
+            }
+        }
+        return pathString || '/';
+    }
+}
+function newEmptyPath() {
+    return new Path('');
+}
+function pathGetFront(path) {
+    if (path.pieceNum_ >= path.pieces_.length) {
+        return null;
+    }
+    return path.pieces_[path.pieceNum_];
+}
+/**
+ * @returns The number of segments in this path
+ */
+function pathGetLength(path) {
+    return path.pieces_.length - path.pieceNum_;
+}
+function pathPopFront(path) {
+    let pieceNum = path.pieceNum_;
+    if (pieceNum < path.pieces_.length) {
+        pieceNum++;
+    }
+    return new Path(path.pieces_, pieceNum);
+}
+function pathGetBack(path) {
+    if (path.pieceNum_ < path.pieces_.length) {
+        return path.pieces_[path.pieces_.length - 1];
+    }
+    return null;
+}
+function pathToUrlEncodedString(path) {
+    let pathString = '';
+    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
+        if (path.pieces_[i] !== '') {
+            pathString += '/' + encodeURIComponent(String(path.pieces_[i]));
+        }
+    }
+    return pathString || '/';
+}
+/**
+ * Shallow copy of the parts of the path.
+ *
+ */
+function pathSlice(path, begin = 0) {
+    return path.pieces_.slice(path.pieceNum_ + begin);
+}
+function pathParent(path) {
+    if (path.pieceNum_ >= path.pieces_.length) {
+        return null;
+    }
+    const pieces = [];
+    for (let i = path.pieceNum_; i < path.pieces_.length - 1; i++) {
+        pieces.push(path.pieces_[i]);
+    }
+    return new Path(pieces, 0);
+}
+function pathChild(path, childPathObj) {
+    const pieces = [];
+    for (let i = path.pieceNum_; i < path.pieces_.length; i++) {
+        pieces.push(path.pieces_[i]);
+    }
+    if (childPathObj instanceof Path) {
+        for (let i = childPathObj.pieceNum_; i < childPathObj.pieces_.length; i++) {
+            pieces.push(childPathObj.pieces_[i]);
+        }
+    }
+    else {
+        const childPieces = childPathObj.split('/');
+        for (let i = 0; i < childPieces.length; i++) {
+            if (childPieces[i].length > 0) {
+                pieces.push(childPieces[i]);
+            }
+        }
+    }
+    return new Path(pieces, 0);
+}
+/**
+ * @returns True if there are no segments in this path
+ */
+function pathIsEmpty(path) {
+    return path.pieceNum_ >= path.pieces_.length;
+}
+/**
+ * @returns The path from outerPath to innerPath
+ */
+function newRelativePath(outerPath, innerPath) {
+    const outer = pathGetFront(outerPath), inner = pathGetFront(innerPath);
+    if (outer === null) {
+        return innerPath;
+    }
+    else if (outer === inner) {
+        return newRelativePath(pathPopFront(outerPath), pathPopFront(innerPath));
+    }
+    else {
+        throw new Error('INTERNAL ERROR: innerPath (' +
+            innerPath +
+            ') is not within ' +
+            'outerPath (' +
+            outerPath +
+            ')');
+    }
+}
+/**
+ * @returns -1, 0, 1 if left is less, equal, or greater than the right.
+ */
+function pathCompare(left, right) {
+    const leftKeys = pathSlice(left, 0);
+    const rightKeys = pathSlice(right, 0);
+    for (let i = 0; i < leftKeys.length && i < rightKeys.length; i++) {
+        const cmp = nameCompare(leftKeys[i], rightKeys[i]);
+        if (cmp !== 0) {
+            return cmp;
+        }
+    }
+    if (leftKeys.length === rightKeys.length) {
+        return 0;
+    }
+    return leftKeys.length < rightKeys.length ? -1 : 1;
+}
+/**
+ * @returns true if paths are the same.
+ */
+function pathEquals(path, other) {
+    if (pathGetLength(path) !== pathGetLength(other)) {
+        return false;
+    }
+    for (let i = path.pieceNum_, j = other.pieceNum_; i <= path.pieces_.length; i++, j++) {
+        if (path.pieces_[i] !== other.pieces_[j]) {
+            return false;
+        }
+    }
+    return true;
+}
+/**
+ * @returns True if this path is a parent of (or the same as) other
+ */
+function pathContains(path, other) {
+    let i = path.pieceNum_;
+    let j = other.pieceNum_;
+    if (pathGetLength(path) > pathGetLength(other)) {
+        return false;
+    }
+    while (i < path.pieces_.length) {
+        if (path.pieces_[i] !== other.pieces_[j]) {
+            return false;
+        }
+        ++i;
+        ++j;
+    }
+    return true;
+}
+/**
+ * Dynamic (mutable) path used to count path lengths.
+ *
+ * This class is used to efficiently check paths for valid
+ * length (in UTF8 bytes) and depth (used in path validation).
+ *
+ * Throws Error exception if path is ever invalid.
+ *
+ * The definition of a path always begins with '/'.
+ */
+class ValidationPath {
+    /**
+     * @param path - Initial Path.
+     * @param errorPrefix_ - Prefix for any error messages.
+     */
+    constructor(path, errorPrefix_) {
+        this.errorPrefix_ = errorPrefix_;
+        this.parts_ = pathSlice(path, 0);
+        /** Initialize to number of '/' chars needed in path. */
+        this.byteLength_ = Math.max(1, this.parts_.length);
+        for (let i = 0; i < this.parts_.length; i++) {
+            this.byteLength_ += util.stringLength(this.parts_[i]);
+        }
+        validationPathCheckValid(this);
+    }
+}
+function validationPathPush(validationPath, child) {
+    // Count the needed '/'
+    if (validationPath.parts_.length > 0) {
+        validationPath.byteLength_ += 1;
+    }
+    validationPath.parts_.push(child);
+    validationPath.byteLength_ += util.stringLength(child);
+    validationPathCheckValid(validationPath);
+}
+function validationPathPop(validationPath) {
+    const last = validationPath.parts_.pop();
+    validationPath.byteLength_ -= util.stringLength(last);
+    // Un-count the previous '/'
+    if (validationPath.parts_.length > 0) {
+        validationPath.byteLength_ -= 1;
+    }
+}
+function validationPathCheckValid(validationPath) {
+    if (validationPath.byteLength_ > MAX_PATH_LENGTH_BYTES) {
+        throw new Error(validationPath.errorPrefix_ +
+            'has a key path longer than ' +
+            MAX_PATH_LENGTH_BYTES +
+            ' bytes (' +
+            validationPath.byteLength_ +
+            ').');
+    }
+    if (validationPath.parts_.length > MAX_PATH_DEPTH) {
+        throw new Error(validationPath.errorPrefix_ +
+            'path specified exceeds the maximum depth that can be written (' +
+            MAX_PATH_DEPTH +
+            ') or object contains a cycle ' +
+            validationPathToErrorString(validationPath));
+    }
+}
+/**
+ * String for use in error messages - uses '.' notation for path.
+ */
+function validationPathToErrorString(validationPath) {
+    if (validationPath.parts_.length === 0) {
+        return '';
+    }
+    return "in property '" + validationPath.parts_.join('.') + "'";
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 class VisibilityMonitor extends EventEmitter {
     static getInstance() {
         return new VisibilityMonitor();
@@ -9516,7 +3731,7 @@ class PersistentConnection extends ServerActions {
         else if (action === 'rm') {
             // Range merge: the listen carried a compound hash and only some of its
             // ranges differed — the server resends just those ranges.
-            this.onRangeMergeUpdate_?.(body[ /*path*/'p'], body[ /*ranges*/'d'], body['t'], bytes);
+            this.onRangeMergeUpdate_?.(body[ /*path*/'p'], body[ /*ranges*/'d'], body['t']);
         }
         else if (action === 'c') {
             this.onListenRevoked_(body[ /*path*/'p'], body[ /*query*/'q']);
@@ -9880,6 +4095,1909 @@ PersistentConnection.nextPersistentConnectionId_ = 0;
  * Counter for number of connections created. Mainly used for tagging in the logs
  */
 PersistentConnection.nextConnectionId_ = 0;
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class NamedNode {
+    constructor(name, node) {
+        this.name = name;
+        this.node = node;
+    }
+    static Wrap(name, node) {
+        return new NamedNode(name, node);
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class Index {
+    /**
+     * @returns A standalone comparison function for
+     * this index
+     */
+    getCompare() {
+        return this.compare.bind(this);
+    }
+    /**
+     * Given a before and after value for a node, determine if the indexed value has changed. Even if they are different,
+     * it's possible that the changes are isolated to parts of the snapshot that are not indexed.
+     *
+     *
+     * @returns True if the portion of the snapshot being indexed changed between oldNode and newNode
+     */
+    indexedValueChanged(oldNode, newNode) {
+        const oldWrapped = new NamedNode(MIN_NAME, oldNode);
+        const newWrapped = new NamedNode(MIN_NAME, newNode);
+        return this.compare(oldWrapped, newWrapped) !== 0;
+    }
+    /**
+     * @returns a node wrapper that will sort equal to or less than
+     * any other node wrapper, using this index
+     */
+    minPost() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return NamedNode.MIN;
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let __EMPTY_NODE;
+class KeyIndex extends Index {
+    static get __EMPTY_NODE() {
+        return __EMPTY_NODE;
+    }
+    static set __EMPTY_NODE(val) {
+        __EMPTY_NODE = val;
+    }
+    compare(a, b) {
+        return nameCompare(a.name, b.name);
+    }
+    isDefinedOn(node) {
+        // We could probably return true here (since every node has a key), but it's never called
+        // so just leaving unimplemented for now.
+        throw util.assertionError('KeyIndex.isDefinedOn not expected to be called.');
+    }
+    indexedValueChanged(oldNode, newNode) {
+        return false; // The key for a node never changes.
+    }
+    minPost() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return NamedNode.MIN;
+    }
+    maxPost() {
+        // TODO: This should really be created once and cached in a static property, but
+        // NamedNode isn't defined yet, so I can't use it in a static.  Bleh.
+        return new NamedNode(MAX_NAME, __EMPTY_NODE);
+    }
+    makePost(indexValue, name) {
+        util.assert(typeof indexValue === 'string', 'KeyIndex indexValue must always be a string.');
+        // We just use empty node, but it'll never be compared, since our comparator only looks at name.
+        return new NamedNode(indexValue, __EMPTY_NODE);
+    }
+    /**
+     * @returns String representation for inclusion in a query spec
+     */
+    toString() {
+        return '.key';
+    }
+}
+const KEY_INDEX = new KeyIndex();
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * An iterator over an LLRBNode.
+ */
+class SortedMapIterator {
+    /**
+     * @param node - Node to iterate.
+     * @param isReverse_ - Whether or not to iterate in reverse
+     */
+    constructor(node, startKey, comparator, isReverse_, resultGenerator_ = null) {
+        this.isReverse_ = isReverse_;
+        this.resultGenerator_ = resultGenerator_;
+        this.nodeStack_ = [];
+        let cmp = 1;
+        while (!node.isEmpty()) {
+            node = node;
+            cmp = startKey ? comparator(node.key, startKey) : 1;
+            // flip the comparison if we're going in reverse
+            if (isReverse_) {
+                cmp *= -1;
+            }
+            if (cmp < 0) {
+                // This node is less than our start key. ignore it
+                if (this.isReverse_) {
+                    node = node.left;
+                }
+                else {
+                    node = node.right;
+                }
+            }
+            else if (cmp === 0) {
+                // This node is exactly equal to our start key. Push it on the stack, but stop iterating;
+                this.nodeStack_.push(node);
+                break;
+            }
+            else {
+                // This node is greater than our start key, add it to the stack and move to the next one
+                this.nodeStack_.push(node);
+                if (this.isReverse_) {
+                    node = node.right;
+                }
+                else {
+                    node = node.left;
+                }
+            }
+        }
+    }
+    getNext() {
+        if (this.nodeStack_.length === 0) {
+            return null;
+        }
+        let node = this.nodeStack_.pop();
+        let result;
+        if (this.resultGenerator_) {
+            result = this.resultGenerator_(node.key, node.value);
+        }
+        else {
+            result = { key: node.key, value: node.value };
+        }
+        if (this.isReverse_) {
+            node = node.left;
+            while (!node.isEmpty()) {
+                this.nodeStack_.push(node);
+                node = node.right;
+            }
+        }
+        else {
+            node = node.right;
+            while (!node.isEmpty()) {
+                this.nodeStack_.push(node);
+                node = node.left;
+            }
+        }
+        return result;
+    }
+    hasNext() {
+        return this.nodeStack_.length > 0;
+    }
+    peek() {
+        if (this.nodeStack_.length === 0) {
+            return null;
+        }
+        const node = this.nodeStack_[this.nodeStack_.length - 1];
+        if (this.resultGenerator_) {
+            return this.resultGenerator_(node.key, node.value);
+        }
+        else {
+            return { key: node.key, value: node.value };
+        }
+    }
+}
+/**
+ * Represents a node in a Left-leaning Red-Black tree.
+ */
+class LLRBNode {
+    /**
+     * @param key - Key associated with this node.
+     * @param value - Value associated with this node.
+     * @param color - Whether this node is red.
+     * @param left - Left child.
+     * @param right - Right child.
+     */
+    constructor(key, value, color, left, right) {
+        this.key = key;
+        this.value = value;
+        this.color = color != null ? color : LLRBNode.RED;
+        this.left =
+            left != null ? left : SortedMap.EMPTY_NODE;
+        this.right =
+            right != null ? right : SortedMap.EMPTY_NODE;
+    }
+    /**
+     * Returns a copy of the current node, optionally replacing pieces of it.
+     *
+     * @param key - New key for the node, or null.
+     * @param value - New value for the node, or null.
+     * @param color - New color for the node, or null.
+     * @param left - New left child for the node, or null.
+     * @param right - New right child for the node, or null.
+     * @returns The node copy.
+     */
+    copy(key, value, color, left, right) {
+        return new LLRBNode(key != null ? key : this.key, value != null ? value : this.value, color != null ? color : this.color, left != null ? left : this.left, right != null ? right : this.right);
+    }
+    /**
+     * @returns The total number of nodes in the tree.
+     */
+    count() {
+        return this.left.count() + 1 + this.right.count();
+    }
+    /**
+     * @returns True if the tree is empty.
+     */
+    isEmpty() {
+        return false;
+    }
+    /**
+     * Traverses the tree in key order and calls the specified action function
+     * for each node.
+     *
+     * @param action - Callback function to be called for each
+     *   node.  If it returns true, traversal is aborted.
+     * @returns The first truthy value returned by action, or the last falsey
+     *   value returned by action
+     */
+    inorderTraversal(action) {
+        return (this.left.inorderTraversal(action) ||
+            !!action(this.key, this.value) ||
+            this.right.inorderTraversal(action));
+    }
+    /**
+     * Traverses the tree in reverse key order and calls the specified action function
+     * for each node.
+     *
+     * @param action - Callback function to be called for each
+     * node.  If it returns true, traversal is aborted.
+     * @returns True if traversal was aborted.
+     */
+    reverseTraversal(action) {
+        return (this.right.reverseTraversal(action) ||
+            action(this.key, this.value) ||
+            this.left.reverseTraversal(action));
+    }
+    /**
+     * @returns The minimum node in the tree.
+     */
+    min_() {
+        if (this.left.isEmpty()) {
+            return this;
+        }
+        else {
+            return this.left.min_();
+        }
+    }
+    /**
+     * @returns The maximum key in the tree.
+     */
+    minKey() {
+        return this.min_().key;
+    }
+    /**
+     * @returns The maximum key in the tree.
+     */
+    maxKey() {
+        if (this.right.isEmpty()) {
+            return this.key;
+        }
+        else {
+            return this.right.maxKey();
+        }
+    }
+    /**
+     * @param key - Key to insert.
+     * @param value - Value to insert.
+     * @param comparator - Comparator.
+     * @returns New tree, with the key/value added.
+     */
+    insert(key, value, comparator) {
+        let n = this;
+        const cmp = comparator(key, n.key);
+        if (cmp < 0) {
+            n = n.copy(null, null, null, n.left.insert(key, value, comparator), null);
+        }
+        else if (cmp === 0) {
+            n = n.copy(null, value, null, null, null);
+        }
+        else {
+            n = n.copy(null, null, null, null, n.right.insert(key, value, comparator));
+        }
+        return n.fixUp_();
+    }
+    /**
+     * @returns New tree, with the minimum key removed.
+     */
+    removeMin_() {
+        if (this.left.isEmpty()) {
+            return SortedMap.EMPTY_NODE;
+        }
+        let n = this;
+        if (!n.left.isRed_() && !n.left.left.isRed_()) {
+            n = n.moveRedLeft_();
+        }
+        n = n.copy(null, null, null, n.left.removeMin_(), null);
+        return n.fixUp_();
+    }
+    /**
+     * @param key - The key of the item to remove.
+     * @param comparator - Comparator.
+     * @returns New tree, with the specified item removed.
+     */
+    remove(key, comparator) {
+        let n, smallest;
+        n = this;
+        if (comparator(key, n.key) < 0) {
+            if (!n.left.isEmpty() && !n.left.isRed_() && !n.left.left.isRed_()) {
+                n = n.moveRedLeft_();
+            }
+            n = n.copy(null, null, null, n.left.remove(key, comparator), null);
+        }
+        else {
+            if (n.left.isRed_()) {
+                n = n.rotateRight_();
+            }
+            if (!n.right.isEmpty() && !n.right.isRed_() && !n.right.left.isRed_()) {
+                n = n.moveRedRight_();
+            }
+            if (comparator(key, n.key) === 0) {
+                if (n.right.isEmpty()) {
+                    return SortedMap.EMPTY_NODE;
+                }
+                else {
+                    smallest = n.right.min_();
+                    n = n.copy(smallest.key, smallest.value, null, null, n.right.removeMin_());
+                }
+            }
+            n = n.copy(null, null, null, null, n.right.remove(key, comparator));
+        }
+        return n.fixUp_();
+    }
+    /**
+     * @returns Whether this is a RED node.
+     */
+    isRed_() {
+        return this.color;
+    }
+    /**
+     * @returns New tree after performing any needed rotations.
+     */
+    fixUp_() {
+        let n = this;
+        if (n.right.isRed_() && !n.left.isRed_()) {
+            n = n.rotateLeft_();
+        }
+        if (n.left.isRed_() && n.left.left.isRed_()) {
+            n = n.rotateRight_();
+        }
+        if (n.left.isRed_() && n.right.isRed_()) {
+            n = n.colorFlip_();
+        }
+        return n;
+    }
+    /**
+     * @returns New tree, after moveRedLeft.
+     */
+    moveRedLeft_() {
+        let n = this.colorFlip_();
+        if (n.right.left.isRed_()) {
+            n = n.copy(null, null, null, null, n.right.rotateRight_());
+            n = n.rotateLeft_();
+            n = n.colorFlip_();
+        }
+        return n;
+    }
+    /**
+     * @returns New tree, after moveRedRight.
+     */
+    moveRedRight_() {
+        let n = this.colorFlip_();
+        if (n.left.left.isRed_()) {
+            n = n.rotateRight_();
+            n = n.colorFlip_();
+        }
+        return n;
+    }
+    /**
+     * @returns New tree, after rotateLeft.
+     */
+    rotateLeft_() {
+        const nl = this.copy(null, null, LLRBNode.RED, null, this.right.left);
+        return this.right.copy(null, null, this.color, nl, null);
+    }
+    /**
+     * @returns New tree, after rotateRight.
+     */
+    rotateRight_() {
+        const nr = this.copy(null, null, LLRBNode.RED, this.left.right, null);
+        return this.left.copy(null, null, this.color, null, nr);
+    }
+    /**
+     * @returns Newt ree, after colorFlip.
+     */
+    colorFlip_() {
+        const left = this.left.copy(null, null, !this.left.color, null, null);
+        const right = this.right.copy(null, null, !this.right.color, null, null);
+        return this.copy(null, null, !this.color, left, right);
+    }
+    /**
+     * For testing.
+     *
+     * @returns True if all is well.
+     */
+    checkMaxDepth_() {
+        const blackDepth = this.check_();
+        return Math.pow(2.0, blackDepth) <= this.count() + 1;
+    }
+    check_() {
+        if (this.isRed_() && this.left.isRed_()) {
+            throw new Error('Red node has red child(' + this.key + ',' + this.value + ')');
+        }
+        if (this.right.isRed_()) {
+            throw new Error('Right child of (' + this.key + ',' + this.value + ') is red');
+        }
+        const blackDepth = this.left.check_();
+        if (blackDepth !== this.right.check_()) {
+            throw new Error('Black depths differ');
+        }
+        else {
+            return blackDepth + (this.isRed_() ? 0 : 1);
+        }
+    }
+}
+LLRBNode.RED = true;
+LLRBNode.BLACK = false;
+/**
+ * Represents an empty node (a leaf node in the Red-Black Tree).
+ */
+class LLRBEmptyNode {
+    /**
+     * Returns a copy of the current node.
+     *
+     * @returns The node copy.
+     */
+    copy(key, value, color, left, right) {
+        return this;
+    }
+    /**
+     * Returns a copy of the tree, with the specified key/value added.
+     *
+     * @param key - Key to be added.
+     * @param value - Value to be added.
+     * @param comparator - Comparator.
+     * @returns New tree, with item added.
+     */
+    insert(key, value, comparator) {
+        return new LLRBNode(key, value, null);
+    }
+    /**
+     * Returns a copy of the tree, with the specified key removed.
+     *
+     * @param key - The key to remove.
+     * @param comparator - Comparator.
+     * @returns New tree, with item removed.
+     */
+    remove(key, comparator) {
+        return this;
+    }
+    /**
+     * @returns The total number of nodes in the tree.
+     */
+    count() {
+        return 0;
+    }
+    /**
+     * @returns True if the tree is empty.
+     */
+    isEmpty() {
+        return true;
+    }
+    /**
+     * Traverses the tree in key order and calls the specified action function
+     * for each node.
+     *
+     * @param action - Callback function to be called for each
+     * node.  If it returns true, traversal is aborted.
+     * @returns True if traversal was aborted.
+     */
+    inorderTraversal(action) {
+        return false;
+    }
+    /**
+     * Traverses the tree in reverse key order and calls the specified action function
+     * for each node.
+     *
+     * @param action - Callback function to be called for each
+     * node.  If it returns true, traversal is aborted.
+     * @returns True if traversal was aborted.
+     */
+    reverseTraversal(action) {
+        return false;
+    }
+    minKey() {
+        return null;
+    }
+    maxKey() {
+        return null;
+    }
+    check_() {
+        return 0;
+    }
+    /**
+     * @returns Whether this node is red.
+     */
+    isRed_() {
+        return false;
+    }
+}
+/**
+ * An immutable sorted map implementation, based on a Left-leaning Red-Black
+ * tree.
+ */
+class SortedMap {
+    /**
+     * @param comparator_ - Key comparator.
+     * @param root_ - Optional root node for the map.
+     */
+    constructor(comparator_, root_ = SortedMap.EMPTY_NODE) {
+        this.comparator_ = comparator_;
+        this.root_ = root_;
+    }
+    /**
+     * Returns a copy of the map, with the specified key/value added or replaced.
+     * (TODO: We should perhaps rename this method to 'put')
+     *
+     * @param key - Key to be added.
+     * @param value - Value to be added.
+     * @returns New map, with item added.
+     */
+    insert(key, value) {
+        return new SortedMap(this.comparator_, this.root_
+            .insert(key, value, this.comparator_)
+            .copy(null, null, LLRBNode.BLACK, null, null));
+    }
+    /**
+     * Returns a copy of the map, with the specified key removed.
+     *
+     * @param key - The key to remove.
+     * @returns New map, with item removed.
+     */
+    remove(key) {
+        return new SortedMap(this.comparator_, this.root_
+            .remove(key, this.comparator_)
+            .copy(null, null, LLRBNode.BLACK, null, null));
+    }
+    /**
+     * Returns the value of the node with the given key, or null.
+     *
+     * @param key - The key to look up.
+     * @returns The value of the node with the given key, or null if the
+     * key doesn't exist.
+     */
+    get(key) {
+        let cmp;
+        let node = this.root_;
+        while (!node.isEmpty()) {
+            cmp = this.comparator_(key, node.key);
+            if (cmp === 0) {
+                return node.value;
+            }
+            else if (cmp < 0) {
+                node = node.left;
+            }
+            else if (cmp > 0) {
+                node = node.right;
+            }
+        }
+        return null;
+    }
+    /**
+     * Returns the key of the item *before* the specified key, or null if key is the first item.
+     * @param key - The key to find the predecessor of
+     * @returns The predecessor key.
+     */
+    getPredecessorKey(key) {
+        let cmp, node = this.root_, rightParent = null;
+        while (!node.isEmpty()) {
+            cmp = this.comparator_(key, node.key);
+            if (cmp === 0) {
+                if (!node.left.isEmpty()) {
+                    node = node.left;
+                    while (!node.right.isEmpty()) {
+                        node = node.right;
+                    }
+                    return node.key;
+                }
+                else if (rightParent) {
+                    return rightParent.key;
+                }
+                else {
+                    return null; // first item.
+                }
+            }
+            else if (cmp < 0) {
+                node = node.left;
+            }
+            else if (cmp > 0) {
+                rightParent = node;
+                node = node.right;
+            }
+        }
+        throw new Error('Attempted to find predecessor key for a nonexistent key.  What gives?');
+    }
+    /**
+     * @returns True if the map is empty.
+     */
+    isEmpty() {
+        return this.root_.isEmpty();
+    }
+    /**
+     * @returns The total number of nodes in the map.
+     */
+    count() {
+        return this.root_.count();
+    }
+    /**
+     * @returns The minimum key in the map.
+     */
+    minKey() {
+        return this.root_.minKey();
+    }
+    /**
+     * @returns The maximum key in the map.
+     */
+    maxKey() {
+        return this.root_.maxKey();
+    }
+    /**
+     * Traverses the map in key order and calls the specified action function
+     * for each key/value pair.
+     *
+     * @param action - Callback function to be called
+     * for each key/value pair.  If action returns true, traversal is aborted.
+     * @returns The first truthy value returned by action, or the last falsey
+     *   value returned by action
+     */
+    inorderTraversal(action) {
+        return this.root_.inorderTraversal(action);
+    }
+    /**
+     * Traverses the map in reverse key order and calls the specified action function
+     * for each key/value pair.
+     *
+     * @param action - Callback function to be called
+     * for each key/value pair.  If action returns true, traversal is aborted.
+     * @returns True if the traversal was aborted.
+     */
+    reverseTraversal(action) {
+        return this.root_.reverseTraversal(action);
+    }
+    /**
+     * Returns an iterator over the SortedMap.
+     * @returns The iterator.
+     */
+    getIterator(resultGenerator) {
+        return new SortedMapIterator(this.root_, null, this.comparator_, false, resultGenerator);
+    }
+    getIteratorFrom(key, resultGenerator) {
+        return new SortedMapIterator(this.root_, key, this.comparator_, false, resultGenerator);
+    }
+    getReverseIteratorFrom(key, resultGenerator) {
+        return new SortedMapIterator(this.root_, key, this.comparator_, true, resultGenerator);
+    }
+    getReverseIterator(resultGenerator) {
+        return new SortedMapIterator(this.root_, null, this.comparator_, true, resultGenerator);
+    }
+}
+/**
+ * Always use the same empty node, to reduce memory.
+ */
+SortedMap.EMPTY_NODE = new LLRBEmptyNode();
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+function NAME_ONLY_COMPARATOR(left, right) {
+    return nameCompare(left.name, right.name);
+}
+function NAME_COMPARATOR(left, right) {
+    return nameCompare(left, right);
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let MAX_NODE$2;
+function setMaxNode$1(val) {
+    MAX_NODE$2 = val;
+}
+/**
+ * The hash text of a leaf value: `<typeof>:<serialized value>`. Numbers
+ * serialize as IEEE-754 hex; everything else via String(). This is the one
+ * definition of the leaf grammar shared by Node.hash() (v2 = false) and the
+ * compound-hash range serialization (v2 = true, where strings are
+ * JSON-quoted so ranges are unambiguous to reparse — Android calls this the
+ * "V2" hash representation).
+ */
+function leafHashValueText(value, v2) {
+    const type = typeof value;
+    let text = type + ':';
+    if (type === 'number') {
+        text += doubleToIEEE754String(value);
+    }
+    else if (v2 && type === 'string') {
+        text += hashQuotedString(value);
+    }
+    else {
+        text += String(value);
+    }
+    return text;
+}
+/**
+ * JSON-style quoting with only backslash and double quote escaped (the V2
+ * hash grammar's string form).
+ */
+function hashQuotedString(value) {
+    let escaped = value;
+    if (escaped.indexOf('\\') !== -1) {
+        escaped = escaped.replace(/\\/g, '\\\\');
+    }
+    if (escaped.indexOf('"') !== -1) {
+        escaped = escaped.replace(/"/g, '\\"');
+    }
+    return '"' + escaped + '"';
+}
+const priorityHashText = function (priority) {
+    return leafHashValueText(priority, /* v2= */ false);
+};
+/**
+ * Validates that a priority snapshot Node is valid.
+ */
+const validatePriorityNode = function (priorityNode) {
+    if (priorityNode.isLeafNode()) {
+        const val = priorityNode.val();
+        util.assert(typeof val === 'string' ||
+            typeof val === 'number' ||
+            (typeof val === 'object' && util.contains(val, '.sv')), 'Priority must be a string or number.');
+    }
+    else {
+        util.assert(priorityNode === MAX_NODE$2 || priorityNode.isEmpty(), 'priority of unexpected type.');
+    }
+    // Don't call getPriority() on MAX_NODE to avoid hitting assertion.
+    util.assert(priorityNode === MAX_NODE$2 || priorityNode.getPriority().isEmpty(), "Priority nodes can't have a priority of their own.");
+};
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let __childrenNodeConstructor;
+/**
+ * LeafNode is a class for storing leaf nodes in a DataSnapshot.  It
+ * implements Node and stores the value of the node (a string,
+ * number, or boolean) accessible via getValue().
+ */
+class LeafNode {
+    static set __childrenNodeConstructor(val) {
+        __childrenNodeConstructor = val;
+    }
+    static get __childrenNodeConstructor() {
+        return __childrenNodeConstructor;
+    }
+    /**
+     * @param value_ - The value to store in this leaf node. The object type is
+     * possible in the event of a deferred value
+     * @param priorityNode_ - The priority of this node.
+     */
+    constructor(value_, priorityNode_ = LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
+        this.value_ = value_;
+        this.priorityNode_ = priorityNode_;
+        this.lazyHash_ = null;
+        util.assert(this.value_ !== undefined && this.value_ !== null, "LeafNode shouldn't be created with null/undefined value.");
+        validatePriorityNode(this.priorityNode_);
+    }
+    /** @inheritDoc */
+    isLeafNode() {
+        return true;
+    }
+    /** @inheritDoc */
+    getPriority() {
+        return this.priorityNode_;
+    }
+    /** @inheritDoc */
+    updatePriority(newPriorityNode) {
+        return new LeafNode(this.value_, newPriorityNode);
+    }
+    /** @inheritDoc */
+    getImmediateChild(childName) {
+        // Hack to treat priority as a regular child
+        if (childName === '.priority') {
+            return this.priorityNode_;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
+        }
+    }
+    /** @inheritDoc */
+    getChild(path) {
+        if (pathIsEmpty(path)) {
+            return this;
+        }
+        else if (pathGetFront(path) === '.priority') {
+            return this.priorityNode_;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE;
+        }
+    }
+    hasChild() {
+        return false;
+    }
+    /** @inheritDoc */
+    getPredecessorChildName(childName, childNode) {
+        return null;
+    }
+    /** @inheritDoc */
+    updateImmediateChild(childName, newChildNode) {
+        if (childName === '.priority') {
+            return this.updatePriority(newChildNode);
+        }
+        else if (newChildNode.isEmpty() && childName !== '.priority') {
+            return this;
+        }
+        else {
+            return LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateImmediateChild(childName, newChildNode).updatePriority(this.priorityNode_);
+        }
+    }
+    /** @inheritDoc */
+    updateChild(path, newChildNode) {
+        const front = pathGetFront(path);
+        if (front === null) {
+            return newChildNode;
+        }
+        else if (newChildNode.isEmpty() && front !== '.priority') {
+            return this;
+        }
+        else {
+            util.assert(front !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
+            return this.updateImmediateChild(front, LeafNode.__childrenNodeConstructor.EMPTY_NODE.updateChild(pathPopFront(path), newChildNode));
+        }
+    }
+    /** @inheritDoc */
+    isEmpty() {
+        return false;
+    }
+    /** @inheritDoc */
+    numChildren() {
+        return 0;
+    }
+    /** @inheritDoc */
+    forEachChild(index, action) {
+        return false;
+    }
+    val(exportFormat) {
+        if (exportFormat && !this.getPriority().isEmpty()) {
+            return {
+                '.value': this.getValue(),
+                '.priority': this.getPriority().val()
+            };
+        }
+        else {
+            return this.getValue();
+        }
+    }
+    /** @inheritDoc */
+    hash() {
+        if (this.lazyHash_ === null) {
+            let toHash = '';
+            if (!this.priorityNode_.isEmpty()) {
+                toHash +=
+                    'priority:' +
+                        priorityHashText(this.priorityNode_.val()) +
+                        ':';
+            }
+            toHash += leafHashValueText(this.value_, 
+            /* v2= */ false);
+            this.lazyHash_ = sha1(toHash);
+        }
+        return this.lazyHash_;
+    }
+    /** @inheritDoc */
+    stampLazyHash(hash) {
+        if (this.lazyHash_ === null) {
+            this.lazyHash_ = hash;
+        }
+    }
+    /**
+     * Returns the value of the leaf node.
+     * @returns The value of the node.
+     */
+    getValue() {
+        return this.value_;
+    }
+    compareTo(other) {
+        if (other === LeafNode.__childrenNodeConstructor.EMPTY_NODE) {
+            return 1;
+        }
+        else if (other instanceof LeafNode.__childrenNodeConstructor) {
+            return -1;
+        }
+        else {
+            util.assert(other.isLeafNode(), 'Unknown node type');
+            return this.compareToLeafNode_(other);
+        }
+    }
+    /**
+     * Comparison specifically for two leaf nodes
+     */
+    compareToLeafNode_(otherLeaf) {
+        const otherLeafType = typeof otherLeaf.value_;
+        const thisLeafType = typeof this.value_;
+        const otherIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(otherLeafType);
+        const thisIndex = LeafNode.VALUE_TYPE_ORDER.indexOf(thisLeafType);
+        util.assert(otherIndex >= 0, 'Unknown leaf type: ' + otherLeafType);
+        util.assert(thisIndex >= 0, 'Unknown leaf type: ' + thisLeafType);
+        if (otherIndex === thisIndex) {
+            // Same type, compare values
+            if (thisLeafType === 'object') {
+                // Deferred value nodes are all equal, but we should also never get to this point...
+                return 0;
+            }
+            else {
+                // Note that this works because true > false, all others are number or string comparisons
+                if (this.value_ < otherLeaf.value_) {
+                    return -1;
+                }
+                else if (this.value_ === otherLeaf.value_) {
+                    return 0;
+                }
+                else {
+                    return 1;
+                }
+            }
+        }
+        else {
+            return thisIndex - otherIndex;
+        }
+    }
+    withIndex() {
+        return this;
+    }
+    isIndexed() {
+        return true;
+    }
+    equals(other) {
+        if (other === this) {
+            return true;
+        }
+        else if (other.isLeafNode()) {
+            const otherLeaf = other;
+            return (this.value_ === otherLeaf.value_ &&
+                this.priorityNode_.equals(otherLeaf.priorityNode_));
+        }
+        else {
+            return false;
+        }
+    }
+}
+/**
+ * The sort order for comparing leaf nodes of different types. If two leaf nodes have
+ * the same type, the comparison falls back to their value
+ */
+LeafNode.VALUE_TYPE_ORDER = ['object', 'boolean', 'number', 'string'];
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let nodeFromJSON$1;
+let MAX_NODE$1;
+function setNodeFromJSON(val) {
+    nodeFromJSON$1 = val;
+}
+function setMaxNode(val) {
+    MAX_NODE$1 = val;
+}
+class PriorityIndex extends Index {
+    compare(a, b) {
+        const aPriority = a.node.getPriority();
+        const bPriority = b.node.getPriority();
+        const indexCmp = aPriority.compareTo(bPriority);
+        if (indexCmp === 0) {
+            return nameCompare(a.name, b.name);
+        }
+        else {
+            return indexCmp;
+        }
+    }
+    isDefinedOn(node) {
+        return !node.getPriority().isEmpty();
+    }
+    indexedValueChanged(oldNode, newNode) {
+        return !oldNode.getPriority().equals(newNode.getPriority());
+    }
+    minPost() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return NamedNode.MIN;
+    }
+    maxPost() {
+        return new NamedNode(MAX_NAME, new LeafNode('[PRIORITY-POST]', MAX_NODE$1));
+    }
+    makePost(indexValue, name) {
+        const priorityNode = nodeFromJSON$1(indexValue);
+        return new NamedNode(name, new LeafNode('[PRIORITY-POST]', priorityNode));
+    }
+    /**
+     * @returns String representation for inclusion in a query spec
+     */
+    toString() {
+        return '.priority';
+    }
+}
+const PRIORITY_INDEX = new PriorityIndex();
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const LOG_2 = Math.log(2);
+class Base12Num {
+    constructor(length) {
+        const logBase2 = (num) => 
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        parseInt((Math.log(num) / LOG_2), 10);
+        const bitMask = (bits) => parseInt(Array(bits + 1).join('1'), 2);
+        this.count = logBase2(length + 1);
+        this.current_ = this.count - 1;
+        const mask = bitMask(this.count);
+        this.bits_ = (length + 1) & mask;
+    }
+    nextBitIsOne() {
+        //noinspection JSBitwiseOperatorUsage
+        const result = !(this.bits_ & (0x1 << this.current_));
+        this.current_--;
+        return result;
+    }
+}
+/**
+ * Takes a list of child nodes and constructs a SortedSet using the given comparison
+ * function
+ *
+ * Uses the algorithm described in the paper linked here:
+ * http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.46.1458
+ *
+ * @param childList - Unsorted list of children
+ * @param cmp - The comparison method to be used
+ * @param keyFn - An optional function to extract K from a node wrapper, if K's
+ * type is not NamedNode
+ * @param mapSortFn - An optional override for comparator used by the generated sorted map
+ */
+const buildChildSet = function (childList, cmp, keyFn, mapSortFn) {
+    childList.sort(cmp);
+    const buildBalancedTree = function (low, high) {
+        const length = high - low;
+        let namedNode;
+        let key;
+        if (length === 0) {
+            return null;
+        }
+        else if (length === 1) {
+            namedNode = childList[low];
+            key = keyFn ? keyFn(namedNode) : namedNode;
+            return new LLRBNode(key, namedNode.node, LLRBNode.BLACK, null, null);
+        }
+        else {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const middle = parseInt((length / 2), 10) + low;
+            const left = buildBalancedTree(low, middle);
+            const right = buildBalancedTree(middle + 1, high);
+            namedNode = childList[middle];
+            key = keyFn ? keyFn(namedNode) : namedNode;
+            return new LLRBNode(key, namedNode.node, LLRBNode.BLACK, left, right);
+        }
+    };
+    const buildFrom12Array = function (base12) {
+        let node = null;
+        let root = null;
+        let index = childList.length;
+        const buildPennant = function (chunkSize, color) {
+            const low = index - chunkSize;
+            const high = index;
+            index -= chunkSize;
+            const childTree = buildBalancedTree(low + 1, high);
+            const namedNode = childList[low];
+            const key = keyFn ? keyFn(namedNode) : namedNode;
+            attachPennant(new LLRBNode(key, namedNode.node, color, null, childTree));
+        };
+        const attachPennant = function (pennant) {
+            if (node) {
+                node.left = pennant;
+                node = pennant;
+            }
+            else {
+                root = pennant;
+                node = pennant;
+            }
+        };
+        for (let i = 0; i < base12.count; ++i) {
+            const isOne = base12.nextBitIsOne();
+            // The number of nodes taken in each slice is 2^(arr.length - (i + 1))
+            const chunkSize = Math.pow(2, base12.count - (i + 1));
+            if (isOne) {
+                buildPennant(chunkSize, LLRBNode.BLACK);
+            }
+            else {
+                // current == 2
+                buildPennant(chunkSize, LLRBNode.BLACK);
+                buildPennant(chunkSize, LLRBNode.RED);
+            }
+        }
+        return root;
+    };
+    const base12 = new Base12Num(childList.length);
+    const root = buildFrom12Array(base12);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new SortedMap(mapSortFn || cmp, root);
+};
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let _defaultIndexMap;
+const fallbackObject = {};
+class IndexMap {
+    /**
+     * The default IndexMap for nodes without a priority
+     */
+    static get Default() {
+        util.assert(fallbackObject && PRIORITY_INDEX, 'ChildrenNode.ts has not been loaded');
+        _defaultIndexMap =
+            _defaultIndexMap ||
+                new IndexMap({ '.priority': fallbackObject }, { '.priority': PRIORITY_INDEX });
+        return _defaultIndexMap;
+    }
+    constructor(indexes_, indexSet_) {
+        this.indexes_ = indexes_;
+        this.indexSet_ = indexSet_;
+    }
+    get(indexKey) {
+        const sortedMap = util.safeGet(this.indexes_, indexKey);
+        if (!sortedMap) {
+            throw new Error('No index defined for ' + indexKey);
+        }
+        if (sortedMap instanceof SortedMap) {
+            return sortedMap;
+        }
+        else {
+            // The index exists, but it falls back to just name comparison. Return null so that the calling code uses the
+            // regular child map
+            return null;
+        }
+    }
+    hasIndex(indexDefinition) {
+        return util.contains(this.indexSet_, indexDefinition.toString());
+    }
+    addIndex(indexDefinition, existingChildren) {
+        util.assert(indexDefinition !== KEY_INDEX, "KeyIndex always exists and isn't meant to be added to the IndexMap.");
+        const childList = [];
+        let sawIndexedValue = false;
+        const iter = existingChildren.getIterator(NamedNode.Wrap);
+        let next = iter.getNext();
+        while (next) {
+            sawIndexedValue =
+                sawIndexedValue || indexDefinition.isDefinedOn(next.node);
+            childList.push(next);
+            next = iter.getNext();
+        }
+        let newIndex;
+        if (sawIndexedValue) {
+            newIndex = buildChildSet(childList, indexDefinition.getCompare());
+        }
+        else {
+            newIndex = fallbackObject;
+        }
+        const indexName = indexDefinition.toString();
+        const newIndexSet = { ...this.indexSet_ };
+        newIndexSet[indexName] = indexDefinition;
+        const newIndexes = { ...this.indexes_ };
+        newIndexes[indexName] = newIndex;
+        return new IndexMap(newIndexes, newIndexSet);
+    }
+    /**
+     * Ensure that this node is properly tracked in any indexes that we're maintaining
+     */
+    addToIndexes(namedNode, existingChildren) {
+        const newIndexes = util.map(this.indexes_, (indexedChildren, indexName) => {
+            const index = util.safeGet(this.indexSet_, indexName);
+            util.assert(index, 'Missing index implementation for ' + indexName);
+            if (indexedChildren === fallbackObject) {
+                // Check to see if we need to index everything
+                if (index.isDefinedOn(namedNode.node)) {
+                    // We need to build this index
+                    const childList = [];
+                    const iter = existingChildren.getIterator(NamedNode.Wrap);
+                    let next = iter.getNext();
+                    while (next) {
+                        if (next.name !== namedNode.name) {
+                            childList.push(next);
+                        }
+                        next = iter.getNext();
+                    }
+                    childList.push(namedNode);
+                    return buildChildSet(childList, index.getCompare());
+                }
+                else {
+                    // No change, this remains a fallback
+                    return fallbackObject;
+                }
+            }
+            else {
+                const existingSnap = existingChildren.get(namedNode.name);
+                let newChildren = indexedChildren;
+                if (existingSnap) {
+                    newChildren = newChildren.remove(new NamedNode(namedNode.name, existingSnap));
+                }
+                return newChildren.insert(namedNode, namedNode.node);
+            }
+        });
+        return new IndexMap(newIndexes, this.indexSet_);
+    }
+    /**
+     * Create a new IndexMap instance with the given value removed
+     */
+    removeFromIndexes(namedNode, existingChildren) {
+        const newIndexes = util.map(this.indexes_, (indexedChildren) => {
+            if (indexedChildren === fallbackObject) {
+                // This is the fallback. Just return it, nothing to do in this case
+                return indexedChildren;
+            }
+            else {
+                const existingSnap = existingChildren.get(namedNode.name);
+                if (existingSnap) {
+                    return indexedChildren.remove(new NamedNode(namedNode.name, existingSnap));
+                }
+                else {
+                    // No record of this child
+                    return indexedChildren;
+                }
+            }
+        });
+        return new IndexMap(newIndexes, this.indexSet_);
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// TODO: For memory savings, don't store priorityNode_ if it's empty.
+let EMPTY_NODE;
+/**
+ * ChildrenNode is a class for storing internal nodes in a DataSnapshot
+ * (i.e. nodes with children).  It implements Node and stores the
+ * list of children in the children property, sorted by child name.
+ */
+class ChildrenNode {
+    static get EMPTY_NODE() {
+        return (EMPTY_NODE ||
+            (EMPTY_NODE = new ChildrenNode(new SortedMap(NAME_COMPARATOR), null, IndexMap.Default)));
+    }
+    /**
+     * @param children_ - List of children of this node..
+     * @param priorityNode_ - The priority of this node (as a snapshot node).
+     */
+    constructor(children_, priorityNode_, indexMap_) {
+        this.children_ = children_;
+        this.priorityNode_ = priorityNode_;
+        this.indexMap_ = indexMap_;
+        this.lazyHash_ = null;
+        /**
+         * Note: The only reason we allow null priority is for EMPTY_NODE, since we can't use
+         * EMPTY_NODE as the priority of EMPTY_NODE.  We might want to consider making EMPTY_NODE its own
+         * class instead of an empty ChildrenNode.
+         */
+        if (this.priorityNode_) {
+            validatePriorityNode(this.priorityNode_);
+        }
+        if (this.children_.isEmpty()) {
+            util.assert(!this.priorityNode_ || this.priorityNode_.isEmpty(), 'An empty node cannot have a priority');
+        }
+    }
+    /** @inheritDoc */
+    isLeafNode() {
+        return false;
+    }
+    /** @inheritDoc */
+    getPriority() {
+        return this.priorityNode_ || EMPTY_NODE;
+    }
+    /** @inheritDoc */
+    updatePriority(newPriorityNode) {
+        if (this.children_.isEmpty()) {
+            // Don't allow priorities on empty nodes
+            return this;
+        }
+        else {
+            return new ChildrenNode(this.children_, newPriorityNode, this.indexMap_);
+        }
+    }
+    /** @inheritDoc */
+    getImmediateChild(childName) {
+        // Hack to treat priority as a regular child
+        if (childName === '.priority') {
+            return this.getPriority();
+        }
+        else {
+            const child = this.children_.get(childName);
+            return child === null ? EMPTY_NODE : child;
+        }
+    }
+    /** @inheritDoc */
+    getChild(path) {
+        const front = pathGetFront(path);
+        if (front === null) {
+            return this;
+        }
+        return this.getImmediateChild(front).getChild(pathPopFront(path));
+    }
+    /** @inheritDoc */
+    hasChild(childName) {
+        return this.children_.get(childName) !== null;
+    }
+    /** @inheritDoc */
+    updateImmediateChild(childName, newChildNode) {
+        util.assert(newChildNode, 'We should always be passing snapshot nodes');
+        if (childName === '.priority') {
+            return this.updatePriority(newChildNode);
+        }
+        else {
+            const namedNode = new NamedNode(childName, newChildNode);
+            let newChildren, newIndexMap;
+            if (newChildNode.isEmpty()) {
+                newChildren = this.children_.remove(childName);
+                newIndexMap = this.indexMap_.removeFromIndexes(namedNode, this.children_);
+            }
+            else {
+                newChildren = this.children_.insert(childName, newChildNode);
+                newIndexMap = this.indexMap_.addToIndexes(namedNode, this.children_);
+            }
+            const newPriority = newChildren.isEmpty()
+                ? EMPTY_NODE
+                : this.priorityNode_;
+            return new ChildrenNode(newChildren, newPriority, newIndexMap);
+        }
+    }
+    /** @inheritDoc */
+    updateChild(path, newChildNode) {
+        const front = pathGetFront(path);
+        if (front === null) {
+            return newChildNode;
+        }
+        else {
+            util.assert(pathGetFront(path) !== '.priority' || pathGetLength(path) === 1, '.priority must be the last token in a path');
+            const newImmediateChild = this.getImmediateChild(front).updateChild(pathPopFront(path), newChildNode);
+            return this.updateImmediateChild(front, newImmediateChild);
+        }
+    }
+    /** @inheritDoc */
+    isEmpty() {
+        return this.children_.isEmpty();
+    }
+    /** @inheritDoc */
+    numChildren() {
+        return this.children_.count();
+    }
+    /** @inheritDoc */
+    val(exportFormat) {
+        if (this.isEmpty()) {
+            return null;
+        }
+        const obj = {};
+        let numKeys = 0, maxKey = 0, allIntegerKeys = true;
+        this.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+            obj[key] = childNode.val(exportFormat);
+            numKeys++;
+            // charCode fast-reject: named keys can never be integers; skip the
+            // regex for them (val() over a large workspace calls this per key).
+            if (allIntegerKeys &&
+                key.charCodeAt(0) >= 48 /* '0' */ &&
+                key.charCodeAt(0) <= 57 /* '9' */ &&
+                ChildrenNode.INTEGER_REGEXP_.test(key)) {
+                maxKey = Math.max(maxKey, Number(key));
+            }
+            else {
+                allIntegerKeys = false;
+            }
+        });
+        if (!exportFormat && allIntegerKeys && maxKey < 2 * numKeys) {
+            // convert to array.
+            const array = [];
+            // eslint-disable-next-line guard-for-in
+            for (const key in obj) {
+                array[key] = obj[key];
+            }
+            return array;
+        }
+        else {
+            if (exportFormat && !this.getPriority().isEmpty()) {
+                obj['.priority'] = this.getPriority().val();
+            }
+            return obj;
+        }
+    }
+    /** @inheritDoc */
+    hash() {
+        if (this.lazyHash_ === null) {
+            let toHash = '';
+            if (!this.getPriority().isEmpty()) {
+                toHash +=
+                    'priority:' +
+                        priorityHashText(this.getPriority().val()) +
+                        ':';
+            }
+            this.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+                const childHash = childNode.hash();
+                if (childHash !== '') {
+                    toHash += ':' + key + ':' + childHash;
+                }
+            });
+            this.lazyHash_ = toHash === '' ? '' : sha1(toHash);
+        }
+        return this.lazyHash_;
+    }
+    /** @inheritDoc */
+    stampLazyHash(hash) {
+        if (this.lazyHash_ === null) {
+            this.lazyHash_ = hash;
+        }
+    }
+    /** @inheritDoc */
+    getPredecessorChildName(childName, childNode, index) {
+        const idx = this.resolveIndex_(index);
+        if (idx) {
+            const predecessor = idx.getPredecessorKey(new NamedNode(childName, childNode));
+            return predecessor ? predecessor.name : null;
+        }
+        else {
+            return this.children_.getPredecessorKey(childName);
+        }
+    }
+    getFirstChildName(indexDefinition) {
+        const idx = this.resolveIndex_(indexDefinition);
+        if (idx) {
+            const minKey = idx.minKey();
+            return minKey && minKey.name;
+        }
+        else {
+            return this.children_.minKey();
+        }
+    }
+    getFirstChild(indexDefinition) {
+        const minKey = this.getFirstChildName(indexDefinition);
+        if (minKey) {
+            return new NamedNode(minKey, this.children_.get(minKey));
+        }
+        else {
+            return null;
+        }
+    }
+    /**
+     * Given an index, return the key name of the largest value we have, according to that index
+     */
+    getLastChildName(indexDefinition) {
+        const idx = this.resolveIndex_(indexDefinition);
+        if (idx) {
+            const maxKey = idx.maxKey();
+            return maxKey && maxKey.name;
+        }
+        else {
+            return this.children_.maxKey();
+        }
+    }
+    getLastChild(indexDefinition) {
+        const maxKey = this.getLastChildName(indexDefinition);
+        if (maxKey) {
+            return new NamedNode(maxKey, this.children_.get(maxKey));
+        }
+        else {
+            return null;
+        }
+    }
+    forEachChild(index, action) {
+        const idx = this.resolveIndex_(index);
+        if (idx) {
+            return idx.inorderTraversal(wrappedNode => {
+                return action(wrappedNode.name, wrappedNode.node);
+            });
+        }
+        else {
+            return this.children_.inorderTraversal(action);
+        }
+    }
+    getIterator(indexDefinition) {
+        return this.getIteratorFrom(indexDefinition.minPost(), indexDefinition);
+    }
+    getIteratorFrom(startPost, indexDefinition) {
+        const idx = this.resolveIndex_(indexDefinition);
+        if (idx) {
+            return idx.getIteratorFrom(startPost, key => key);
+        }
+        else {
+            const iterator = this.children_.getIteratorFrom(startPost.name, NamedNode.Wrap);
+            let next = iterator.peek();
+            while (next != null && indexDefinition.compare(next, startPost) < 0) {
+                iterator.getNext();
+                next = iterator.peek();
+            }
+            return iterator;
+        }
+    }
+    getReverseIterator(indexDefinition) {
+        return this.getReverseIteratorFrom(indexDefinition.maxPost(), indexDefinition);
+    }
+    getReverseIteratorFrom(endPost, indexDefinition) {
+        const idx = this.resolveIndex_(indexDefinition);
+        if (idx) {
+            return idx.getReverseIteratorFrom(endPost, key => {
+                return key;
+            });
+        }
+        else {
+            const iterator = this.children_.getReverseIteratorFrom(endPost.name, NamedNode.Wrap);
+            let next = iterator.peek();
+            while (next != null && indexDefinition.compare(next, endPost) > 0) {
+                iterator.getNext();
+                next = iterator.peek();
+            }
+            return iterator;
+        }
+    }
+    compareTo(other) {
+        if (this.isEmpty()) {
+            if (other.isEmpty()) {
+                return 0;
+            }
+            else {
+                return -1;
+            }
+        }
+        else if (other.isLeafNode() || other.isEmpty()) {
+            return 1;
+        }
+        else if (other === MAX_NODE) {
+            return -1;
+        }
+        else {
+            // Must be another node with children.
+            return 0;
+        }
+    }
+    withIndex(indexDefinition) {
+        if (indexDefinition === KEY_INDEX ||
+            this.indexMap_.hasIndex(indexDefinition)) {
+            return this;
+        }
+        else {
+            const newIndexMap = this.indexMap_.addIndex(indexDefinition, this.children_);
+            return new ChildrenNode(this.children_, this.priorityNode_, newIndexMap);
+        }
+    }
+    isIndexed(index) {
+        return index === KEY_INDEX || this.indexMap_.hasIndex(index);
+    }
+    equals(other) {
+        if (other === this) {
+            return true;
+        }
+        else if (other.isLeafNode()) {
+            return false;
+        }
+        else {
+            const otherChildrenNode = other;
+            if (!this.getPriority().equals(otherChildrenNode.getPriority())) {
+                return false;
+            }
+            else if (this.children_.count() === otherChildrenNode.children_.count()) {
+                const thisIter = this.getIterator(PRIORITY_INDEX);
+                const otherIter = otherChildrenNode.getIterator(PRIORITY_INDEX);
+                let thisCurrent = thisIter.getNext();
+                let otherCurrent = otherIter.getNext();
+                while (thisCurrent && otherCurrent) {
+                    if (thisCurrent.name !== otherCurrent.name ||
+                        !thisCurrent.node.equals(otherCurrent.node)) {
+                        return false;
+                    }
+                    thisCurrent = thisIter.getNext();
+                    otherCurrent = otherIter.getNext();
+                }
+                return thisCurrent === null && otherCurrent === null;
+            }
+            else {
+                return false;
+            }
+        }
+    }
+    /**
+     * Returns a SortedMap ordered by index, or null if the default (by-key) ordering can be used
+     * instead.
+     *
+     */
+    resolveIndex_(indexDefinition) {
+        if (indexDefinition === KEY_INDEX) {
+            return null;
+        }
+        else {
+            return this.indexMap_.get(indexDefinition.toString());
+        }
+    }
+}
+ChildrenNode.INTEGER_REGEXP_ = /^(0|[1-9]\d*)$/;
+class MaxNode extends ChildrenNode {
+    constructor() {
+        super(new SortedMap(NAME_COMPARATOR), ChildrenNode.EMPTY_NODE, IndexMap.Default);
+    }
+    compareTo(other) {
+        if (other === this) {
+            return 0;
+        }
+        else {
+            return 1;
+        }
+    }
+    equals(other) {
+        // Not that we every compare it, but MAX_NODE is only ever equal to itself
+        return other === this;
+    }
+    getPriority() {
+        return this;
+    }
+    getImmediateChild(childName) {
+        return ChildrenNode.EMPTY_NODE;
+    }
+    isEmpty() {
+        return false;
+    }
+}
+/**
+ * Marker that will sort higher than any other snapshot.
+ */
+const MAX_NODE = new MaxNode();
+Object.defineProperties(NamedNode, {
+    MIN: {
+        value: new NamedNode(MIN_NAME, ChildrenNode.EMPTY_NODE)
+    },
+    MAX: {
+        value: new NamedNode(MAX_NAME, MAX_NODE)
+    }
+});
+/**
+ * Reference Extensions
+ */
+KeyIndex.__EMPTY_NODE = ChildrenNode.EMPTY_NODE;
+LeafNode.__childrenNodeConstructor = ChildrenNode;
+setMaxNode$1(MAX_NODE);
+setMaxNode(MAX_NODE);
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const USE_HINZE = true;
+/**
+ * Constructs a snapshot node representing the passed JSON and returns it.
+ * @param json - JSON to create a node for.
+ * @param priority - Optional priority to use.  This will be ignored if the
+ * passed JSON contains a .priority property.
+ */
+function nodeFromJSON(json, priority = null) {
+    if (json === null) {
+        return ChildrenNode.EMPTY_NODE;
+    }
+    if (typeof json === 'object' && '.priority' in json) {
+        priority = json['.priority'];
+    }
+    util.assert(priority === null ||
+        typeof priority === 'string' ||
+        typeof priority === 'number' ||
+        (typeof priority === 'object' && '.sv' in priority), 'Invalid priority type found: ' + typeof priority);
+    if (typeof json === 'object' && '.value' in json && json['.value'] !== null) {
+        json = json['.value'];
+    }
+    // Valid leaf nodes include non-objects or server-value wrapper objects
+    if (typeof json !== 'object' || '.sv' in json) {
+        const jsonLeaf = json;
+        return new LeafNode(jsonLeaf, nodeFromJSON(priority));
+    }
+    if (!(json instanceof Array) && USE_HINZE) {
+        const children = [];
+        let childrenHavePriority = false;
+        const hinzeJsonObj = json;
+        each(hinzeJsonObj, (key, child) => {
+            if (key.substring(0, 1) !== '.') {
+                // Ignore metadata nodes
+                const childNode = nodeFromJSON(child);
+                if (!childNode.isEmpty()) {
+                    childrenHavePriority =
+                        childrenHavePriority || !childNode.getPriority().isEmpty();
+                    children.push(new NamedNode(key, childNode));
+                }
+            }
+        });
+        if (children.length === 0) {
+            return ChildrenNode.EMPTY_NODE;
+        }
+        const childSet = buildChildSet(children, NAME_ONLY_COMPARATOR, namedNode => namedNode.name, NAME_COMPARATOR);
+        if (childrenHavePriority) {
+            const sortedChildSet = buildChildSet(children, PRIORITY_INDEX.getCompare());
+            return new ChildrenNode(childSet, nodeFromJSON(priority), new IndexMap({ '.priority': sortedChildSet }, { '.priority': PRIORITY_INDEX }));
+        }
+        else {
+            return new ChildrenNode(childSet, nodeFromJSON(priority), IndexMap.Default);
+        }
+    }
+    else {
+        let node = ChildrenNode.EMPTY_NODE;
+        each(json, (key, childData) => {
+            if (util.contains(json, key)) {
+                if (key.substring(0, 1) !== '.') {
+                    // ignore metadata nodes.
+                    const childNode = nodeFromJSON(childData);
+                    if (childNode.isLeafNode() || !childNode.isEmpty()) {
+                        node = node.updateImmediateChild(key, childNode);
+                    }
+                }
+            }
+        });
+        return node.updatePriority(nodeFromJSON(priority));
+    }
+}
+setNodeFromJSON(nodeFromJSON);
 
 /**
  * @license
@@ -10966,6 +7084,2191 @@ class ReadonlyRestClient extends ServerActions {
  * limitations under the License.
  */
 /**
+ * Sizes computed for interior (children) nodes, keyed by node identity.
+ * Nodes are immutable and structurally shared across server updates, so a
+ * subtree's estimate stays valid for as long as the subtree object lives —
+ * repeated estimations of a large mostly-unchanged tree (the persistence
+ * write path re-plans its chunks on every flush) only walk the changed
+ * spine. Leaves are cheap to size and are not cached.
+ */
+const serializedSizeCache = new WeakMap();
+/**
+ * Estimates the serialized size of a node in bytes — a cheap approximation
+ * that only drives the default split threshold and the persistence chunk
+ * planner, never a wire value (port of Android NodeSizeEstimator).
+ */
+function estimateSerializedNodeSize(node) {
+    if (node.isEmpty()) {
+        return 4; // null keyword
+    }
+    else if (node.isLeafNode()) {
+        let valueSize;
+        const value = node.val();
+        if (typeof value === 'number') {
+            valueSize = 8; // estimate each float with 8 bytes
+        }
+        else if (typeof value === 'boolean') {
+            valueSize = 4; // true or false need roughly 4 bytes
+        }
+        else {
+            // string: two quotes plus the payload
+            valueSize = 2 + String(value).length;
+        }
+        if (node.getPriority().isEmpty()) {
+            return valueSize;
+        }
+        // Account for the extra overhead of the ".value" and ".priority" keys.
+        return 24 + valueSize + estimateSerializedNodeSize(node.getPriority());
+    }
+    else {
+        const cached = serializedSizeCache.get(node);
+        if (cached !== undefined) {
+            return cached;
+        }
+        let sum = 1; // opening brace
+        node.forEachChild(KEY_INDEX, (key, child) => {
+            // key, quotes, colon, comma
+            sum += key.length + 4 + estimateSerializedNodeSize(child);
+        });
+        if (!node.getPriority().isEmpty()) {
+            sum += 12 + estimateSerializedNodeSize(node.getPriority());
+        }
+        serializedSizeCache.set(node, sum);
+        return sum;
+    }
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+function createRowHashKernel(sha1Base64, yieldFn) {
+    // ---- name ordering (verbatim port of core/util nameCompare) ----
+    const MIN_NAME = '[MIN_NAME]';
+    const MAX_NAME = '[MAX_NAME]';
+    const INTEGER_32_MIN = -2147483648;
+    const INTEGER_32_MAX = 2147483647;
+    const tryParseInt = (str) => {
+        if (/^-?\d{1,10}$/.test(str)) {
+            const intVal = Number(str);
+            if (intVal >= INTEGER_32_MIN && intVal <= INTEGER_32_MAX) {
+                return intVal;
+            }
+        }
+        return null;
+    };
+    const nameCompare = (a, b) => {
+        if (a === b) {
+            return 0;
+        }
+        else if (a === MIN_NAME || b === MAX_NAME) {
+            return -1;
+        }
+        else if (b === MIN_NAME || a === MAX_NAME) {
+            return 1;
+        }
+        else {
+            const aAsInt = tryParseInt(a), bAsInt = tryParseInt(b);
+            if (aAsInt !== null) {
+                if (bAsInt !== null) {
+                    return aAsInt - bAsInt === 0 ? a.length - b.length : aAsInt - bAsInt;
+                }
+                else {
+                    return -1;
+                }
+            }
+            else if (bAsInt !== null) {
+                return 1;
+            }
+            else {
+                return a < b ? -1 : 1;
+            }
+        }
+    };
+    const comparePaths = (a, b) => {
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+            const cmp = nameCompare(a[i], b[i]);
+            if (cmp !== 0) {
+                return cmp;
+            }
+        }
+        return a.length - b.length;
+    };
+    // ---- leaf text (verbatim ports of doubleToIEEE754String and snap.ts) ----
+    const ieee754Buffer = new DataView(new ArrayBuffer(8));
+    const ieee754HexBytes = [];
+    for (let i = 0; i < 256; i++) {
+        ieee754HexBytes[i] = (i < 16 ? '0' : '') + i.toString(16);
+    }
+    const doubleToIEEE754String = (v) => {
+        ieee754Buffer.setFloat64(0, v);
+        return (ieee754HexBytes[ieee754Buffer.getUint8(0)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(1)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(2)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(3)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(4)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(5)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(6)] +
+            ieee754HexBytes[ieee754Buffer.getUint8(7)]);
+    };
+    const hashQuotedString = (value) => {
+        let escaped = value;
+        if (escaped.indexOf('\\') !== -1) {
+            escaped = escaped.replace(/\\/g, '\\\\');
+        }
+        if (escaped.indexOf('"') !== -1) {
+            escaped = escaped.replace(/"/g, '\\"');
+        }
+        return '"' + escaped + '"';
+    };
+    const leafHashValueText = (value) => {
+        const type = typeof value;
+        let text = type + ':';
+        if (type === 'number') {
+            text += doubleToIEEE754String(value);
+        }
+        else if (type === 'string') {
+            text += hashQuotedString(value);
+        }
+        else {
+            text += String(value);
+        }
+        return text;
+    };
+    const isLeafValue = (v) => v === null || typeof v !== 'object' || '.value' in v;
+    const leafRepresentation = (v) => {
+        if (typeof v === 'object' && v !== null) {
+            const wrapped = v;
+            const priority = wrapped['.priority'];
+            let text = '';
+            if (priority !== undefined) {
+                text +=
+                    'priority:' + leafHashValueText(priority) + ':';
+            }
+            return (text + leafHashValueText(wrapped['.value']));
+        }
+        return leafHashValueText(v);
+    };
+    // ---- range builder (verbatim CompoundHashBuilder text semantics) ----
+    class Builder {
+        constructor(splitThreshold_) {
+            this.splitThreshold_ = splitThreshold_;
+            this.posts = [];
+            this.hashTexts = [];
+            this.currentHash_ = null;
+            this.currentPath_ = [];
+            this.currentDepth_ = 0;
+            this.lastLeafDepth_ = -1;
+            this.needsComma_ = true;
+        }
+        ensureRange_() {
+            if (this.currentHash_ === null) {
+                let hash = '(';
+                for (let i = 0; i < this.currentDepth_; i++) {
+                    hash += hashQuotedString(this.currentPath_[i]) + ':(';
+                }
+                this.currentHash_ = hash;
+                this.needsComma_ = false;
+            }
+        }
+        startChild(key) {
+            this.ensureRange_();
+            if (this.needsComma_) {
+                this.currentHash_ += ',';
+            }
+            this.currentHash_ += hashQuotedString(key) + ':(';
+            if (this.currentDepth_ === this.currentPath_.length) {
+                this.currentPath_.push(key);
+            }
+            else {
+                this.currentPath_[this.currentDepth_] = key;
+            }
+            this.currentDepth_++;
+            this.needsComma_ = false;
+        }
+        endChild() {
+            this.currentDepth_--;
+            if (this.currentHash_ !== null) {
+                this.currentHash_ += ')';
+            }
+            this.needsComma_ = true;
+        }
+        processLeaf(leafText) {
+            this.ensureRange_();
+            this.lastLeafDepth_ = this.currentDepth_;
+            this.currentHash_ += leafText;
+            this.needsComma_ = true;
+            if (this.currentHash_.length > this.splitThreshold_ &&
+                this.currentPath_[this.currentDepth_ - 1] !== '.priority') {
+                this.endRange_();
+            }
+        }
+        finish() {
+            if (this.currentHash_ !== null) {
+                this.endRange_();
+            }
+        }
+        endRange_() {
+            let hash = this.currentHash_;
+            for (let i = 0; i < this.currentDepth_; i++) {
+                hash += ')';
+            }
+            hash += ')';
+            this.hashTexts.push(hash);
+            const post = this.currentPath_.slice(0, this.lastLeafDepth_).join('/');
+            this.posts.push(post === '' ? '/' : post);
+            this.currentHash_ = null;
+            this.needsComma_ = true;
+        }
+    }
+    /**
+     * Walks one export value at the builder's current position. `hasLaterRowSibling`
+     * reports whether, for the CURRENT row's root object, a later row exists
+     * under the same parent whose key sorts after '.priority' — needed for the
+     * trailing-priority drop rule when a split node's priority lives in its own
+     * pseudo-row (handled by the caller); inside one row the rule is local.
+     */
+    const walkValue = (builder, value) => {
+        if (isLeafValue(value)) {
+            builder.processLeaf(leafRepresentation(value));
+            return;
+        }
+        const obj = value;
+        const keys = [];
+        for (const key in obj) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                keys.push(key);
+            }
+        }
+        keys.sort(nameCompare);
+        // Trailing-priority drop (Android grammar): a '.priority' key sorting
+        // after every other child is omitted from the hash.
+        let emitKeys = keys;
+        if (keys.length > 0 && keys[keys.length - 1] === '.priority') {
+            emitKeys = keys.slice(0, keys.length - 1);
+        }
+        for (let i = 0; i < emitKeys.length; i++) {
+            const key = emitKeys[i];
+            builder.startChild(key);
+            if (key === '.priority') {
+                builder.processLeaf(leafHashValueText(obj[key]));
+            }
+            else {
+                walkValue(builder, obj[key]);
+            }
+            builder.endChild();
+        }
+    };
+    const hashRows = async (rows, splitThreshold, sliceBudgetBytes) => {
+        if (rows.length === 0) {
+            return { posts: [], hashes: [''] };
+        }
+        const sliceBudget = sliceBudgetBytes !== undefined ? sliceBudgetBytes : 256 * 1024;
+        let sliceSpent = 0;
+        const sorted = rows.slice().sort((a, b) => comparePaths(a.path, b.path));
+        let threshold;
+        if (splitThreshold !== undefined) {
+            threshold = Math.max(512, Math.floor(splitThreshold));
+        }
+        else {
+            // Android's SimpleSizeSplitStrategy, sized from total row bytes (a
+            // serialized-size estimate of the whole tree).
+            let totalBytes = 0;
+            for (let i = 0; i < sorted.length; i++) {
+                totalBytes += sorted[i].json.length;
+            }
+            threshold = Math.max(512, Math.floor(Math.sqrt(totalBytes * 100)));
+        }
+        const builder = new Builder(threshold);
+        let openDepth = 0;
+        for (let i = 0; i < sorted.length; i++) {
+            const path = sorted[i].path;
+            if (i > 0) {
+                const prev = sorted[i - 1].path;
+                let common = 0;
+                while (common < prev.length &&
+                    common < path.length &&
+                    prev[common] === path[common]) {
+                    common++;
+                }
+                if (common === prev.length) {
+                    // This row's path is inside (or equal to) the previous row's
+                    // subtree — the disjointness invariant is violated and streaming
+                    // would interleave two serializations of one subtree.
+                    throw new Error('overlap');
+                }
+                while (openDepth > common) {
+                    builder.endChild();
+                    openDepth--;
+                }
+            }
+            const isPriorityRow = path.length > 0 && path[path.length - 1] === '.priority';
+            if (isPriorityRow) {
+                // A split node's priority pseudo-row. Trailing-drop rule against ROW
+                // siblings: emit only when a later row still sits under the same
+                // parent (rows are in nameCompare order, so any such row's key
+                // sorts after '.priority').
+                const parentLen = path.length - 1;
+                const next = i + 1 < sorted.length ? sorted[i + 1].path : null;
+                let hasLaterSibling = next !== null && next.length > parentLen;
+                for (let d = 0; hasLaterSibling && d < parentLen; d++) {
+                    if (next[d] !== path[d]) {
+                        hasLaterSibling = false;
+                    }
+                }
+                if (!hasLaterSibling) {
+                    continue;
+                }
+            }
+            while (openDepth < path.length) {
+                builder.startChild(path[openDepth]);
+                openDepth++;
+            }
+            if (isPriorityRow) {
+                builder.processLeaf(leafHashValueText(JSON.parse(sorted[i].json)));
+            }
+            else {
+                walkValue(builder, JSON.parse(sorted[i].json));
+            }
+            if (yieldFn !== undefined) {
+                sliceSpent += sorted[i].json.length;
+                if (sliceSpent >= sliceBudget) {
+                    sliceSpent = 0;
+                    await yieldFn();
+                }
+            }
+        }
+        while (openDepth > 0) {
+            builder.endChild();
+            openDepth--;
+        }
+        builder.finish();
+        const hashes = await Promise.all(builder.hashTexts.map(text => sha1Base64(text)));
+        hashes.push('');
+        return { posts: builder.posts, hashes };
+    };
+    return { hashRows };
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+function workerHashAvailable() {
+    return (typeof Worker !== 'undefined' &&
+        typeof Blob !== 'undefined' &&
+        typeof URL !== 'undefined' &&
+        typeof URL.createObjectURL === 'function');
+}
+/**
+ * The worker body. Runs `createRowHashKernel` (embedded by toString) over
+ * the rows it reads from IndexedDB and posts one result per request.
+ * Kept as a function so it is syntax-checked by the compiler; never called
+ * on this thread.
+ */
+function workerMain() {
+    const factory = (0, eval)('(KERNEL_FACTORY)');
+    const sha1 = async (text) => {
+        const bytes = new TextEncoder().encode(text);
+        const digest = await crypto.subtle.digest('SHA-1', bytes);
+        const arr = new Uint8Array(digest);
+        let bin = '';
+        for (let i = 0; i < arr.length; i++) {
+            bin += String.fromCharCode(arr[i]);
+        }
+        return btoa(bin);
+    };
+    const kernel = factory(sha1);
+    self.onmessage = (event) => {
+        const req = event.data;
+        const fail = (message) => {
+            self.postMessage({ error: message });
+        };
+        try {
+            const open = indexedDB.open(req.dbName);
+            open.onerror = () => fail('idb-open');
+            open.onsuccess = () => {
+                const db = open.result;
+                let txn;
+                try {
+                    txn = db.transaction([req.storeName, req.metaStoreName], 'readonly');
+                }
+                catch (e) {
+                    db.close();
+                    fail('idb-txn');
+                    return;
+                }
+                const store = txn.objectStore(req.storeName);
+                const metaReq = txn.objectStore(req.metaStoreName).get(req.metaKey);
+                const range = IDBKeyRange.bound(req.lowerKey, req.upperKey, false, true);
+                const keysReq = store.getAllKeys(range);
+                const valuesReq = store.getAll(range);
+                let keys = null;
+                let values = null;
+                let metaDone = false;
+                let metaGen = null;
+                const maybeRun = () => {
+                    if (keys === null || values === null || !metaDone) {
+                        return;
+                    }
+                    db.close();
+                    if (metaGen !== req.expectedGen) {
+                        fail('gen-mismatch');
+                        return;
+                    }
+                    const rows = [];
+                    for (let i = 0; i < keys.length; i++) {
+                        const rest = keys[i].slice(req.prefixLength);
+                        let path;
+                        if (rest === '') {
+                            path = [];
+                        }
+                        else {
+                            path = rest.split(req.separator);
+                            path.pop();
+                            // Row keys hold URI-encoded segments (RowStore encodeRowKey);
+                            // the kernel must hash the REAL child names or its posts and
+                            // range text diverge from the server's tree.
+                            for (let j = 0; j < path.length; j++) {
+                                path[j] = decodeURIComponent(path[j]);
+                            }
+                        }
+                        rows.push({ path, json: values[i] });
+                    }
+                    kernel.hashRows(rows).then(result => self.postMessage(result), err => fail(err instanceof Error ? err.message : 'kernel-failure'));
+                };
+                metaReq.onerror = () => {
+                    db.close();
+                    fail('idb-meta');
+                };
+                metaReq.onsuccess = () => {
+                    const meta = metaReq.result;
+                    metaGen = meta && typeof meta.gen === 'string' ? meta.gen : null;
+                    metaDone = true;
+                    maybeRun();
+                };
+                keysReq.onerror = () => {
+                    db.close();
+                    fail('idb-keys');
+                };
+                valuesReq.onerror = () => {
+                    db.close();
+                    fail('idb-values');
+                };
+                keysReq.onsuccess = () => {
+                    keys = keysReq.result;
+                    maybeRun();
+                };
+                valuesReq.onsuccess = () => {
+                    values = valuesReq.result;
+                    maybeRun();
+                };
+            };
+        }
+        catch (e) {
+            fail(e instanceof Error ? e.message : 'worker-failure');
+        }
+    };
+}
+let workerUrl = null;
+function getWorkerUrl() {
+    if (workerUrl === null) {
+        const script = 'const KERNEL_FACTORY = ' +
+            createRowHashKernel.toString() +
+            ';\n(' +
+            workerMain
+                .toString()
+                // The eval indirection exists only to satisfy the module compiler;
+                // in the worker the factory source is in scope directly.
+                .replace("(0, eval)('(KERNEL_FACTORY)')", 'KERNEL_FACTORY') +
+            ')();';
+        workerUrl = URL.createObjectURL(new Blob([script], { type: 'application/javascript' }));
+    }
+    return workerUrl;
+}
+/**
+ * One-shot worker hash over a stored row range. The worker is spawned per
+ * request and terminated on settle — hashing happens at boot and reconnect,
+ * not in a loop, and a fresh worker cannot hold a stale IDB snapshot.
+ * Rejects on any failure or after `timeoutMs`; the generation keeps running
+ * server-side of nothing — a rejected promise simply routes the caller to
+ * the main-thread fallback.
+ */
+function hashRowsInWorker(request, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let worker;
+        try {
+            worker = new Worker(getWorkerUrl());
+        }
+        catch (e) {
+            reject(e instanceof Error ? e : new Error('worker-spawn'));
+            return;
+        }
+        let settled = false;
+        const timer = setTimeout(() => {
+            finish(() => reject(new Error('worker-timeout')));
+        }, timeoutMs);
+        const finish = (complete) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            worker.terminate();
+            complete();
+        };
+        worker.onmessage = event => {
+            const data = event.data;
+            if (data.error !== undefined) {
+                finish(() => reject(new Error(data.error)));
+            }
+            else {
+                finish(() => resolve(data));
+            }
+        };
+        worker.onerror = event => {
+            finish(() => reject(new Error(event.message || 'worker-error')));
+        };
+        worker.postMessage(request);
+    });
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Subtrees estimated above this split into per-child rows (Android's
+ * CHILDREN_NODE_SPLIT_SIZE_THRESHOLD). 16 KiB keeps single rows small enough
+ * that an incremental rewrite of one row is cheap, while a 60 MB workspace
+ * stays around a few thousand rows — one getAll per restore.
+ */
+const ROW_SPLIT_THRESHOLD_BYTES = 16 * 1024;
+/**
+ * Separator for encoded row-key path segments. RTDB rejects control
+ * characters in keys, so \x01 can never appear inside a segment. Every
+ * component (scope, root, each path segment) is terminated by a separator,
+ * so a subtree prefix never matches a sibling that merely shares a string
+ * prefix ('docs' vs 'docs2'). The subtree range is [prefix, prefix+\uffff):
+ * every key continuing the prefix starts with a code unit below \uffff.
+ */
+const ROW_KEY_SEPARATOR = '\x01';
+const ROW_KEY_RANGE_END = '\uffff';
+/**
+ * Encodes a row key: authScope · encodedRoot · encodedRelativePath. The
+ * scope and root are one prefix segment each (roots are full path strings
+ * like '/users/alice', never containing \x01); the relative path contributes
+ * one segment per level. Every component ends with a separator so prefix
+ * ranges never match sibling keys that merely share a string prefix.
+ */
+function encodeRowKey(scope, rootString, relativePath) {
+    let key = encodeURIComponent(scope) +
+        ROW_KEY_SEPARATOR +
+        encodeURIComponent(rootString) +
+        ROW_KEY_SEPARATOR;
+    for (let i = 0; i < relativePath.length; i++) {
+        key += encodeURIComponent(relativePath[i]) + ROW_KEY_SEPARATOR;
+    }
+    return key;
+}
+/** Decodes the relative-path segments out of a row key. */
+function decodeRowKeyRelativePath(key, scope, rootString) {
+    const prefix = encodeURIComponent(scope) +
+        ROW_KEY_SEPARATOR +
+        encodeURIComponent(rootString) +
+        ROW_KEY_SEPARATOR;
+    util.assert(key.startsWith(prefix), 'row key does not match scope/root prefix');
+    const rest = key.slice(prefix.length);
+    if (rest === '') {
+        return [];
+    }
+    // Every key ends with a trailing separator; drop the empty tail segment.
+    const segments = rest.split(ROW_KEY_SEPARATOR);
+    segments.pop();
+    return segments.map(decodeURIComponent);
+}
+/** The IDBKeyRange covering every row of (scope, root) at or under relPath. */
+function rowKeyRange(scope, rootString, relativePath) {
+    const start = encodeRowKey(scope, rootString, relativePath);
+    const end = start + ROW_KEY_RANGE_END;
+    if (typeof IDBKeyRange !== 'undefined') {
+        return IDBKeyRange.bound(start, end, false, true);
+    }
+    // Node (tests): a structurally compatible range for fake stores.
+    return {
+        lower: start,
+        upper: end,
+        lowerOpen: false,
+        upperOpen: true,
+        includes: (key) => key >= start && key < end
+    };
+}
+/**
+ * Splits `node` (the subtree at `relativePath`) into disjoint rows following
+ * Android's saveNested: children nodes above the threshold recurse into
+ * per-child rows; everything else is one row of export-format JSON text.
+ * Returns [relativePathSegments, jsonText] pairs.
+ *
+ * Interior priorities of split nodes are stored as a '.priority' pseudo-row
+ * (Android stores a priority row the same way); assembly reapplies them.
+ * Empty children nodes produce no row — absence of rows under a prefix after
+ * a range delete IS the deletion.
+ */
+function splitNodeIntoRows(relativePath, node, splitThreshold = ROW_SPLIT_THRESHOLD_BYTES) {
+    const rows = [];
+    splitInto_(relativePath, node, splitThreshold, rows);
+    return rows;
+}
+function splitInto_(relativePath, node, splitThreshold, out) {
+    if (node.isEmpty()) {
+        return;
+    }
+    if (!node.isLeafNode() && estimateSerializedNodeSize(node) > splitThreshold) {
+        node.forEachChild(PRIORITY_INDEX, (key, child) => {
+            splitInto_(relativePath.concat(key), child, splitThreshold, out);
+        });
+        const priority = node.getPriority();
+        if (!priority.isEmpty()) {
+            out.push([
+                relativePath.concat('.priority'),
+                JSON.stringify(priority.val())
+            ]);
+        }
+        return;
+    }
+    out.push([relativePath, JSON.stringify(node.val(true))]);
+}
+/**
+ * Partitions rows into data rows (ancestors-first) and '.priority' pseudo-
+ * rows. Ancestors-first application keeps loading correct even under a
+ * violated disjointness invariant — deeper rows graft over their ancestors,
+ * matching Android's loadNested ordering rule. Priorities apply last, and
+ * only onto non-empty subtrees (a priority row whose data rows were deleted
+ * by an interleaved writer must not resurrect an empty node).
+ */
+function partitionRows(rows) {
+    const plain = [];
+    const priorities = [];
+    for (let i = 0; i < rows.length; i++) {
+        const segs = rows[i][0];
+        if (segs.length > 0 && segs[segs.length - 1] === '.priority') {
+            priorities.push(rows[i]);
+        }
+        else {
+            plain.push(rows[i]);
+        }
+    }
+    plain.sort((a, b) => a[0].length - b[0].length);
+    return { plain, priorities };
+}
+function applyPlainRow(node, segs, text) {
+    const sub = nodeFromJSON(JSON.parse(text));
+    return segs.length === 0 ? sub : node.updateChild(segmentsToPath(segs), sub);
+}
+function applyPriorityRows(node, priorities) {
+    for (let i = 0; i < priorities.length; i++) {
+        const [segs, text] = priorities[i];
+        const priority = nodeFromJSON(JSON.parse(text));
+        const parentPath = segmentsToPath(segs.slice(0, segs.length - 1));
+        if (!node.getChild(parentPath).isEmpty()) {
+            node = node.updateChild(segmentsToPath(segs), priority);
+        }
+    }
+    return node;
+}
+/**
+ * assembleRows in bounded slices: awaits `yieldFn` after every
+ * `sliceBudgetBytes` of parsed row text so a large restore never blocks the
+ * main thread in one task. Identical result to assembleRows by
+ * construction (same partition, same application order).
+ */
+async function assembleRowsSliced(rows, yieldFn, sliceBudgetBytes) {
+    if (rows.length === 0) {
+        return ChildrenNode.EMPTY_NODE;
+    }
+    const { plain, priorities } = partitionRows(rows);
+    let node = ChildrenNode.EMPTY_NODE;
+    let spent = 0;
+    for (let i = 0; i < plain.length; i++) {
+        node = applyPlainRow(node, plain[i][0], plain[i][1]);
+        spent += plain[i][1].length;
+        if (spent >= sliceBudgetBytes) {
+            spent = 0;
+            await yieldFn();
+        }
+    }
+    return applyPriorityRows(node, priorities);
+}
+function segmentsToPath(segments) {
+    let path = newEmptyPath();
+    for (let i = 0; i < segments.length; i++) {
+        path = pathChild(path, segments[i]);
+    }
+    return path;
+}
+/**
+ * In-memory index of one root's row paths, kept by the writer so dirty
+ * paths can be normalized to existing row boundaries before a rewrite
+ * (upholding the disjoint-rows invariant without reading IDB on the write
+ * path). Rebuilt from getAllKeys on restore and on lease acquisition.
+ */
+class RowIndex {
+    constructor() {
+        /** Encoded relative paths ('a\x01b\x01') of every row, lexicographic. */
+        this.keys_ = [];
+    }
+    static fromRelativePaths(paths) {
+        const index = new RowIndex();
+        index.keys_ = paths.map(encodeRelative_).sort();
+        return index;
+    }
+    /**
+     * The relative path of the EXISTING row that contains `relativePath`
+     * (i.e. an ancestor-or-self row), or null when no row contains it — a
+     * write below the deepest existing row, or into empty space; the caller
+     * then writes at the dirty path itself, which cannot conflict.
+     */
+    rowBoundaryFor(relativePath) {
+        // Any containing row's encoded key is a prefix of the target's encoded
+        // key. Rows are disjoint, so at most one exists; scan candidate
+        // prefixes from shallowest to deepest (bounded by path depth).
+        let prefix = '';
+        for (let depth = 0; depth <= relativePath.length; depth++) {
+            if (this.has_(prefix)) {
+                return relativePath.slice(0, depth);
+            }
+            if (depth < relativePath.length) {
+                // Must match encodeRelative_'s alphabet exactly — keys_ holds
+                // URI-encoded segments.
+                prefix += encodeURIComponent(relativePath[depth]) + ROW_KEY_SEPARATOR;
+            }
+        }
+        return null;
+    }
+    /** Replaces every row at or under `relativePath` with `newRows`. */
+    replaceSubtree(relativePath, newRows) {
+        const prefix = encodeRelative_(relativePath);
+        const kept = this.keys_.filter(k => !k.startsWith(prefix));
+        for (let i = 0; i < newRows.length; i++) {
+            kept.push(encodeRelative_(newRows[i]));
+        }
+        kept.sort();
+        this.keys_ = kept;
+    }
+    rowCount() {
+        return this.keys_.length;
+    }
+    has_(encodedRelative) {
+        // Binary search for the exact encoded key.
+        let lo = 0;
+        let hi = this.keys_.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const k = this.keys_[mid];
+            if (k === encodedRelative) {
+                return true;
+            }
+            else if (k < encodedRelative) {
+                lo = mid + 1;
+            }
+            else {
+                hi = mid - 1;
+            }
+        }
+        return false;
+    }
+}
+function encodeRelative_(segments) {
+    let key = '';
+    for (let i = 0; i < segments.length; i++) {
+        key += encodeURIComponent(segments[i]) + ROW_KEY_SEPARATOR;
+    }
+    return key;
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+let yieldChannel = null;
+const yieldResolvers = [];
+function setPortsReferenced(referenced) {
+    for (const port of [yieldChannel.port1, yieldChannel.port2]) {
+        const p = port;
+        if (referenced) {
+            p.ref?.();
+        }
+        else {
+            p.unref?.();
+        }
+    }
+}
+function yieldMacrotask() {
+    if (typeof MessageChannel === 'undefined') {
+        return new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (yieldChannel === null) {
+        yieldChannel = new MessageChannel();
+        // Installing onmessage references the port in Node; start idle-unref'd.
+        yieldChannel.port1.onmessage = () => {
+            yieldResolvers.shift()?.();
+            if (yieldResolvers.length === 0) {
+                setPortsReferenced(false);
+            }
+        };
+        setPortsReferenced(false);
+    }
+    return new Promise(resolve => {
+        yieldResolvers.push(resolve);
+        setPortsReferenced(true);
+        yieldChannel.port2.postMessage(null);
+    });
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const DB_NAME = 'firebase-database-persistence';
+/** v10 replaces the v1 range/manifest store with the row stores. */
+const DB_VERSION = 10;
+const ROWS_STORE = 'rows';
+const META_STORE = 'meta';
+const LEGACY_STORE = 'firebase-server-cache';
+const ROW_PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
+const ROW_PERSISTENCE_FIRST_GEN_DELAY_MS = 3000;
+/** Peek retention while the app has confirmed the primed scope. */
+const ROW_PERSISTENCE_PEEK_HANDOFF_MS = 30000;
+/** Peek retention while the scope is primed but unconfirmed (slow auth). */
+const ROW_PERSISTENCE_PEEK_PREAUTH_MS = 5 * 60 * 1000;
+const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
+/** Cached roots older than this are swept (30 days, Android parity). */
+const ROW_PERSISTENCE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Sweep delay after the first restore — far off every boot-critical path. */
+const ROW_PERSISTENCE_SWEEP_DELAY_MS = 60 * 1000;
+/** Byte budget per whole-root staging transaction (and its yield cadence). */
+const ROW_PERSISTENCE_STAGE_TXN_BYTES = 2 * 1024 * 1024;
+/** Parsed-bytes budget per restore assembly slice. */
+const RESTORE_SLICE_BYTES = 256 * 1024;
+/** Worker hash wall-clock ceiling before the main-thread fallback runs. */
+const ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS = 20000;
+const META_FORMAT_VERSION = 2;
+function newMetaGen() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+function defaultWebLocks() {
+    if (typeof navigator !== 'undefined' &&
+        typeof navigator.locks !== 'undefined') {
+        return navigator.locks;
+    }
+    return null;
+}
+class RowPersistenceManager {
+    constructor(prefix_, idbFactory_ = typeof indexedDB !== 'undefined'
+        ? indexedDB
+        : null, webLocks_ = defaultWebLocks(), writeDelayMs_ = ROW_PERSISTENCE_WRITE_DEBOUNCE_MS, firstGenDelayMs_ = ROW_PERSISTENCE_FIRST_GEN_DELAY_MS, splitThresholdBytes_ = ROW_SPLIT_THRESHOLD_BYTES, peekHandoffMs_ = ROW_PERSISTENCE_PEEK_HANDOFF_MS, peekPreAuthMs_ = ROW_PERSISTENCE_PEEK_PREAUTH_MS, restoreTimeoutMs_ = ROW_PERSISTENCE_RESTORE_TIMEOUT_MS, stageTxnBytes_ = ROW_PERSISTENCE_STAGE_TXN_BYTES, workerHashTimeoutMs_ = ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS, maxAgeMs_ = ROW_PERSISTENCE_MAX_AGE_MS) {
+        this.prefix_ = prefix_;
+        this.idbFactory_ = idbFactory_;
+        this.webLocks_ = webLocks_;
+        this.writeDelayMs_ = writeDelayMs_;
+        this.firstGenDelayMs_ = firstGenDelayMs_;
+        this.splitThresholdBytes_ = splitThresholdBytes_;
+        this.peekHandoffMs_ = peekHandoffMs_;
+        this.peekPreAuthMs_ = peekPreAuthMs_;
+        this.restoreTimeoutMs_ = restoreTimeoutMs_;
+        this.stageTxnBytes_ = stageTxnBytes_;
+        this.workerHashTimeoutMs_ = workerHashTimeoutMs_;
+        this.maxAgeMs_ = maxAgeMs_;
+        this.db_ = null;
+        this.persistentRoots_ = new Map();
+        this.tracked_ = new Map();
+        this.peeks_ = new Map();
+        this.authScope_ = null;
+        this.authScopeConfigured_ = false;
+        this.authScopeConfirmed_ = false;
+        this.authGeneration_ = 0;
+        this.networkSuspended_ = false;
+        this.disposed_ = false;
+        this.sweepTimer_ = null;
+    }
+    // ─────────────────────────── auth scope ────────────────────────────────
+    isAuthScopeConfigured() {
+        return this.authScopeConfigured_;
+    }
+    authGeneration() {
+        return this.authGeneration_;
+    }
+    /**
+     * Configures the identity scope. `confirmedByApp=false` is a pre-auth
+     * peek priming a trusted expected identity; `true` is the app's real auth
+     * integration. Returns whether the scope CHANGED (callers cancel pending
+     * seed restores on a confirmed change).
+     */
+    setAuthScope(scope, confirmedByApp = true) {
+        const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
+        this.authScopeConfigured_ = true;
+        if (confirmedByApp) {
+            if (!this.authScopeConfirmed_) {
+                this.authScopeConfirmed_ = true;
+                if (!changed) {
+                    // Real auth confirmed the primed scope: retained peeks drop from
+                    // the pre-auth backstop to the short handoff grace, counted now.
+                    this.rearmRetainedPeeks_(this.peekHandoffMs_);
+                }
+            }
+        }
+        else if (changed) {
+            this.authScopeConfirmed_ = false;
+        }
+        if (!changed) {
+            return false;
+        }
+        this.authGeneration_++;
+        this.authScope_ = scope;
+        // A different identity invalidates every in-memory holding: retained
+        // peeks (another account's tree must never reach a listener), pending
+        // trees, dirty sets, and writer locks (their names embed the scope).
+        this.clearAllPeeks_();
+        for (const [pathString, root] of this.tracked_) {
+            this.resetTrackedRoot_(root);
+            void this.acquireWriterLock_(pathString, root);
+        }
+        return true;
+    }
+    scopeKey_() {
+        // The key's first component carries BOTH isolations, structurally:
+        // - repo instance (prefix_ = the database URL) — two databases on one
+        //   origin, or emulator vs production, must never share cached bytes;
+        // - identity, with distinct 'public'/'auth:' tags so an authenticated
+        //   scope can never collide with the signed-out namespace.
+        // encodeRowKey URI-encodes the whole component, so '|' and separators
+        // inside either part cannot forge a different key.
+        const identity = this.authScope_ === null ? 'public' : 'auth:' + this.authScope_;
+        return this.prefix_ + '|' + identity;
+    }
+    // ───────────────────────── root selection ──────────────────────────────
+    setPersistentPath(pathString, enabled) {
+        const count = this.persistentRoots_.get(pathString) ?? 0;
+        if (enabled) {
+            this.persistentRoots_.set(pathString, count + 1);
+        }
+        else if (count <= 1) {
+            this.persistentRoots_.delete(pathString);
+        }
+        else {
+            this.persistentRoots_.set(pathString, count - 1);
+        }
+    }
+    isPersistentPath(pathString) {
+        return this.persistentRoots_.has(pathString);
+    }
+    /**
+     * The tracked root at or above `pathString`, or null. Roots are the paths
+     * listeners selected with {persistent: true}; a server update anywhere
+     * under one re-persists through that root.
+     */
+    trackedRootFor(pathString) {
+        for (const root of this.tracked_.keys()) {
+            if (pathString === root ||
+                pathString.startsWith(root === '/' ? '/' : root + '/')) {
+                return root;
+            }
+        }
+        return null;
+    }
+    /**
+     * EVERY tracked root a server update at `pathString` touches — roots at
+     * or above the path (the change is inside their subtree) AND roots below
+     * it (an overwrite at an ancestor rewrites their whole tree). Overlapping
+     * persistent registrations are legal (ancestor + descendant listeners),
+     * and each stored root must stay current or its next boot hash would
+     * claim bytes it does not hold.
+     */
+    trackedRootsFor(pathString) {
+        const roots = [];
+        for (const root of this.tracked_.keys()) {
+            const rootPrefix = root === '/' ? '/' : root + '/';
+            const pathPrefix = pathString === '/' ? '/' : pathString + '/';
+            if (pathString === root ||
+                pathString.startsWith(rootPrefix) ||
+                root.startsWith(pathPrefix)) {
+                roots.push(root);
+            }
+        }
+        return roots;
+    }
+    track(pathString) {
+        if (this.disposed_) {
+            return;
+        }
+        const existing = this.tracked_.get(pathString);
+        if (existing !== undefined) {
+            // Cancel an in-flight untrack teardown: the path was re-selected
+            // while its drain ran. The entry, lock, and any rearmed dirt stay.
+            existing.untrackPending = false;
+            return;
+        }
+        const root = {
+            latest: null,
+            latestScope: null,
+            dirty: undefined,
+            rowIndex: null,
+            hasGeneration: false,
+            lastGen: null,
+            windowTimer: null,
+            flushing: false,
+            activeFlush: null,
+            rearm: false,
+            releaseLock: null,
+            untrackPending: false
+        };
+        this.tracked_.set(pathString, root);
+        void this.acquireWriterLock_(pathString, root);
+    }
+    untrack(pathString) {
+        const root = this.tracked_.get(pathString);
+        if (root === undefined) {
+            return;
+        }
+        root.untrackPending = true;
+        // Drain until clean before releasing writership: awaiting one flush is
+        // not enough — dirt that arrived DURING it (rearm) or an already
+        // in-flight flush must also settle, or the final tree of a closed
+        // listener is silently dropped with the lock released mid-write.
+        const drain = async () => {
+            for (let i = 0; i < 10; i++) {
+                if (root.activeFlush !== null) {
+                    await root.activeFlush;
+                }
+                if (root.dirty === undefined ||
+                    root.latest === null ||
+                    this.networkSuspended_ ||
+                    !this.isWriter_(root)) {
+                    return;
+                }
+                await this.flushNow_(pathString, root);
+            }
+        };
+        void drain().then(() => {
+            // Cancelled (re-tracked mid-drain) or superseded by a fresh entry:
+            // the live registration owns the root now — do not tear it down.
+            if (this.tracked_.get(pathString) !== root || !root.untrackPending) {
+                return;
+            }
+            this.releaseRoot_(root);
+            this.tracked_.delete(pathString);
+        });
+    }
+    resetTrackedRoot_(root) {
+        if (root.windowTimer !== null) {
+            clearTimeout(root.windowTimer);
+            root.windowTimer = null;
+        }
+        root.latest = null;
+        root.latestScope = null;
+        root.dirty = undefined;
+        root.rowIndex = null;
+        root.hasGeneration = false;
+        root.rearm = false;
+        if (root.releaseLock !== null) {
+            root.releaseLock();
+            root.releaseLock = null;
+        }
+    }
+    releaseRoot_(root) {
+        this.resetTrackedRoot_(root);
+    }
+    // ─────────────────────────── writer lock ───────────────────────────────
+    /**
+     * Queues a BLOCKING exclusive lock request for (scope, root). The UA
+     * grants it when the current holder releases — an untrack's final flush,
+     * a scope switch, or tab death (release is UA-guaranteed) — so writer
+     * succession is automatic with zero steal/heartbeat machinery. Until the
+     * grant this tab is a follower: it keeps dirty sets in memory and does
+     * not touch storage. On grant it refreshes the row index (rows on disk
+     * may lag its memory) and flushes whatever is pending.
+     */
+    async acquireWriterLock_(pathString, root) {
+        if (this.webLocks_ === null) {
+            // Fail open: no cross-tab exclusion, every tab writes (LWW rows).
+            return;
+        }
+        const name = 'firebase-db-rows|' +
+            this.prefix_ +
+            '|' +
+            this.scopeKey_() +
+            '|' +
+            pathString;
+        const generation = this.authGeneration_;
+        try {
+            await this.webLocks_.request(name, { mode: 'exclusive' }, () => {
+                if (this.disposed_ ||
+                    this.networkSuspended_ ||
+                    this.authGeneration_ !== generation ||
+                    this.tracked_.get(pathString) !== root) {
+                    // Granted after this tracking ended (or while deliberately
+                    // offline): release immediately so the next queued tab takes
+                    // over. Resume queues a fresh request.
+                    return Promise.resolve();
+                }
+                return new Promise(resolve => {
+                    root.releaseLock = resolve;
+                    root.rowIndex = null;
+                    if (root.dirty !== undefined && root.windowTimer === null) {
+                        this.armWindow_(pathString, root);
+                    }
+                });
+            });
+        }
+        catch (e) {
+            // Lock API failure: stay a follower (rows go stale until next boot).
+        }
+    }
+    isWriter_(root) {
+        // No Web Locks (Node, exotic embedders): every tab writes — a duplicate
+        // LWW write is cheaper than having no writer at all.
+        return this.webLocks_ === null || root.releaseLock !== null;
+    }
+    // ──────────────────────────── IDB layer ────────────────────────────────
+    open_() {
+        if (this.db_ !== null) {
+            return this.db_;
+        }
+        this.db_ = new Promise(resolve => {
+            if (this.idbFactory_ === null) {
+                resolve(null);
+                return;
+            }
+            let request;
+            try {
+                request = this.idbFactory_.open(DB_NAME, DB_VERSION);
+            }
+            catch (e) {
+                resolve(null);
+                return;
+            }
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (db.objectStoreNames.contains(LEGACY_STORE)) {
+                    db.deleteObjectStore(LEGACY_STORE);
+                }
+                if (!db.objectStoreNames.contains(ROWS_STORE)) {
+                    db.createObjectStore(ROWS_STORE);
+                }
+                if (!db.objectStoreNames.contains(META_STORE)) {
+                    db.createObjectStore(META_STORE);
+                }
+            };
+            request.onsuccess = () => {
+                const db = request.result;
+                db.onversionchange = () => db.close();
+                resolve(db);
+            };
+            request.onerror = () => resolve(null);
+            request.onblocked = () => {
+                // Another tab holds an old version open; fail open to live RTDB.
+                resolve(null);
+            };
+        });
+        return this.db_;
+    }
+    requestDone_(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error ?? new Error('idb error'));
+        });
+    }
+    txnDone_(txn) {
+        return new Promise((resolve, reject) => {
+            txn.oncomplete = () => resolve();
+            txn.onerror = () => reject(txn.error ?? new Error('idb txn error'));
+            txn.onabort = () => reject(txn.error ?? new Error('idb txn abort'));
+        });
+    }
+    // ─────────────────────────── peek (boot) ───────────────────────────────
+    /**
+     * Reads the cached tree for `pathString` without starting the repo — the
+     * pre-auth boot peek. One physical read per root: an overlapping
+     * authenticated restore consumes the same decode (restoreForListen). The
+     * resolved node is RETAINED under the pre-auth backstop (or the short
+     * grace once the scope is confirmed) so the later listener join reuses
+     * this decode instead of reading twice.
+     */
+    peek(pathString, expectedAuthScope) {
+        if (this.disposed_) {
+            return Promise.resolve(null);
+        }
+        if (expectedAuthScope !== null &&
+            this.authScopeConfigured_ &&
+            this.authScope_ !== expectedAuthScope) {
+            return Promise.resolve(null);
+        }
+        const generation = this.authGeneration_;
+        const entry = this.startRead_(pathString, /* retain= */ true);
+        return entry.promise.then(result => {
+            if (result === null || this.authGeneration_ !== generation) {
+                return null;
+            }
+            return { node: result.node };
+        });
+    }
+    /**
+     * True while THE retained read that decoded `node` is still awaiting its
+     * listener join — the only window in which materialization stamps have a
+     * consumer (identity-bound; see v1 hasRetainedPeek).
+     */
+    hasRetainedPeek(pathString, node) {
+        const entry = this.peeks_.get(pathString);
+        return entry?.retained === true && entry.resolvedNode === node;
+    }
+    startRead_(pathString, retain) {
+        const existing = this.peeks_.get(pathString);
+        if (existing !== undefined) {
+            return existing;
+        }
+        const entry = {
+            promise: this.readRoot_(pathString),
+            resolvedNode: null,
+            retained: retain,
+            timer: null
+        };
+        this.peeks_.set(pathString, entry);
+        void entry.promise.then(result => {
+            if (this.peeks_.get(pathString) !== entry) {
+                return;
+            }
+            if (result === null) {
+                this.peeks_.delete(pathString);
+                return;
+            }
+            entry.resolvedNode = result.node;
+            if (entry.retained) {
+                const budget = this.authScopeConfirmed_
+                    ? this.peekHandoffMs_
+                    : this.peekPreAuthMs_;
+                entry.timer = setTimeout(() => {
+                    this.dropPeek_(pathString, entry);
+                }, budget);
+            }
+        });
+        return entry;
+    }
+    dropPeek_(pathString, entry) {
+        if (this.peeks_.get(pathString) !== entry) {
+            return;
+        }
+        if (entry.timer !== null) {
+            clearTimeout(entry.timer);
+        }
+        this.peeks_.delete(pathString);
+    }
+    rearmRetainedPeeks_(budget) {
+        for (const [pathString, entry] of this.peeks_) {
+            if (entry.retained && entry.resolvedNode !== null) {
+                if (entry.timer !== null) {
+                    clearTimeout(entry.timer);
+                }
+                entry.timer = setTimeout(() => {
+                    this.dropPeek_(pathString, entry);
+                }, budget);
+            }
+        }
+    }
+    clearAllPeeks_() {
+        for (const entry of this.peeks_.values()) {
+            if (entry.timer !== null) {
+                clearTimeout(entry.timer);
+            }
+        }
+        this.peeks_.clear();
+    }
+    /** One physical root read: meta check, row getAll, sliced assemble. */
+    async readRoot_(pathString) {
+        const db = await this.open_();
+        if (db === null) {
+            return null;
+        }
+        const scope = this.scopeKey_();
+        try {
+            const txn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
+            const metaKey = encodeRowKey(scope, this.rootKey_(pathString), []);
+            const metaReq = txn.objectStore(META_STORE).get(metaKey);
+            const range = rowKeyRange(scope, this.rootKey_(pathString), []);
+            const keysReq = txn.objectStore(ROWS_STORE).getAllKeys(range);
+            const valuesReq = txn.objectStore(ROWS_STORE).getAll(range);
+            const [meta, keys, values] = await Promise.all([
+                this.requestDone_(metaReq),
+                this.requestDone_(keysReq),
+                this.requestDone_(valuesReq)
+            ]);
+            if (meta === undefined ||
+                meta.formatVersion !== META_FORMAT_VERSION) {
+                return null;
+            }
+            if (Date.now() - meta.updatedAt > this.maxAgeMs_) {
+                return null;
+            }
+            const rows = [];
+            const rowPaths = [];
+            for (let i = 0; i < keys.length; i++) {
+                const relative = decodeRowKeyRelativePath(keys[i], scope, this.rootKey_(pathString));
+                rows.push([relative, values[i]]);
+                rowPaths.push(relative);
+            }
+            const node = await assembleRowsSliced(rows, yieldMacrotask, RESTORE_SLICE_BYTES);
+            if (node.isEmpty() && rows.length > 0) {
+                return null;
+            }
+            return { node, rowPaths, gen: meta.gen };
+        }
+        catch (e) {
+            warn('persistence read failed: ' + e?.message);
+            return null;
+        }
+    }
+    /** The root path string used inside row keys ('/a/b' canonical form). */
+    rootKey_(pathString) {
+        return pathString;
+    }
+    // ───────────────────────── restore (listen) ────────────────────────────
+    /**
+     * The authenticated listener's restore: consumes the retained peek's
+     * decode when one exists (the one-decode-per-boot handoff), otherwise
+     * performs its own read. Resolves within `restoreTimeoutMs_` or reports
+     * a timeout miss (the listen then goes cold — liveness over cache).
+     */
+    restoreForListen(pathString) {
+        if (this.disposed_ || !this.authScopeConfigured_) {
+            return Promise.resolve({ node: null });
+        }
+        const generation = this.authGeneration_;
+        const entry = this.startRead_(pathString, /* retain= */ false);
+        let timedOut = false;
+        const timeout = new Promise(resolve => {
+            setTimeout(() => {
+                timedOut = true;
+                resolve(null);
+            }, this.restoreTimeoutMs_);
+        });
+        return Promise.race([entry.promise, timeout]).then(result => {
+            // The listener consumed (or abandoned) the read; retention ends.
+            this.dropPeek_(pathString, entry);
+            this.scheduleSweep_();
+            if (this.authGeneration_ !== generation) {
+                return { node: null };
+            }
+            if (result === null) {
+                return timedOut
+                    ? { node: null, reason: 'timeout' }
+                    : { node: null };
+            }
+            const root = this.tracked_.get(pathString);
+            if (root !== null && root !== undefined) {
+                root.rowIndex = RowIndex.fromRelativePaths(result.rowPaths);
+                root.hasGeneration = true;
+                root.lastGen = result.gen;
+            }
+            return { node: result.node };
+        });
+    }
+    // ───────────────────────── listen hashes ───────────────────────────────
+    /**
+     * Computes the wire listen hashes for `pathString` from its stored rows.
+     *
+     * Worker-first: a Blob-URL worker opens its own readonly IDB connection,
+     * streams the rows through the parity-tested kernel, and posts back only
+     * {posts, hashes} — zero main-thread hashing cost (see HashWorker). Any
+     * worker failure (unavailable, spawn error, IDB error, kernel overlap,
+     * timeout) falls back to the main-thread kernel in bounded yielded
+     * slices. Returns null when there are no rows or both paths fail — the
+     * listen then sends a plain full listen.
+     */
+    async computeListenHashes(pathString) {
+        // The claim is only sound for the exact generation THIS manager last
+        // restored or committed (root.lastGen). The hash read is a separate IDB
+        // snapshot — a foreign tab may have committed newer rows in between, and
+        // hashing those would stamp a claim onto a live cache that does not hold
+        // them: the one unhealable corruption class. Reading meta.gen inside the
+        // same snapshot as the rows, and requiring it to equal lastGen, makes
+        // the mismatch a plain downgrade to an uncertified listen.
+        const expectedGen = this.tracked_.get(pathString)?.lastGen ?? null;
+        if (expectedGen === null) {
+            return null;
+        }
+        const scope = this.scopeKey_();
+        const rootKey = this.rootKey_(pathString);
+        if (this.idbFactory_ !== null && workerHashAvailable()) {
+            const prefix = encodeRowKey(scope, rootKey, []);
+            try {
+                const compoundHash = await hashRowsInWorker({
+                    dbName: DB_NAME,
+                    storeName: ROWS_STORE,
+                    metaStoreName: META_STORE,
+                    metaKey: prefix,
+                    expectedGen,
+                    lowerKey: prefix,
+                    upperKey: prefix + '\uffff',
+                    prefixLength: prefix.length,
+                    separator: ROW_KEY_SEPARATOR
+                }, this.workerHashTimeoutMs_);
+                if (compoundHash.posts.length === 0 && compoundHash.hashes[0] === '') {
+                    // Zero rows: no cache to certify.
+                    return null;
+                }
+                // h:'' + ch — the simple hash never matches, so the server always
+                // evaluates the compound hash (range merges), the wire shape the
+                // fork's e2e certification covers.
+                return { hash: '', compoundHash };
+            }
+            catch (e) {
+                // Fall through to the main-thread sliced kernel.
+            }
+        }
+        return this.computeListenHashesOnMainThread_(pathString, expectedGen);
+    }
+    async computeListenHashesOnMainThread_(pathString, expectedGen) {
+        const db = await this.open_();
+        if (db === null) {
+            return null;
+        }
+        const scope = this.scopeKey_();
+        try {
+            const txn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
+            const metaReq = txn
+                .objectStore(META_STORE)
+                .get(encodeRowKey(scope, this.rootKey_(pathString), []));
+            const range = rowKeyRange(scope, this.rootKey_(pathString), []);
+            const keysReq = txn.objectStore(ROWS_STORE).getAllKeys(range);
+            const valuesReq = txn.objectStore(ROWS_STORE).getAll(range);
+            const [meta, keys, values] = await Promise.all([
+                this.requestDone_(metaReq),
+                this.requestDone_(keysReq),
+                this.requestDone_(valuesReq)
+            ]);
+            // Same-snapshot generation check (see computeListenHashes).
+            if (meta === undefined ||
+                meta.gen !== expectedGen ||
+                keys.length === 0) {
+                return null;
+            }
+            const rows = [];
+            for (let i = 0; i < keys.length; i++) {
+                rows.push({
+                    path: decodeRowKeyRelativePath(keys[i], scope, this.rootKey_(pathString)),
+                    json: values[i]
+                });
+            }
+            const kernel = createRowHashKernel(text => Promise.resolve(sha1(text)), yieldMacrotask);
+            const compoundHash = await kernel.hashRows(rows);
+            return { hash: '', compoundHash };
+        }
+        catch (e) {
+            return null;
+        }
+    }
+    // ─────────────────────────── write path ────────────────────────────────
+    /**
+     * Write-through entry: the server updated `path`; `node` is the complete
+     * server cache at the TRACKED ROOT containing it. `changedPaths` names
+     * what changed relative to the root (undefined = unknown = whole root).
+     * Mirrors the v1 serverCacheUpdated signature so Repo call sites carry
+     * over unchanged.
+     */
+    serverCacheUpdated(path, node, changedPaths) {
+        if (this.disposed_ || !this.authScopeConfigured_) {
+            return;
+        }
+        const pathString = path.toString();
+        const root = this.tracked_.get(pathString);
+        if (root === undefined) {
+            return;
+        }
+        root.latest = node;
+        root.latestScope = this.authScope_;
+        if (changedPaths !== undefined && changedPaths.length === 0) {
+            // A listen certification: state already accounted, NOTHING dirty.
+            // It must not set a dirty marker — a marker here reads as pending
+            // dirt at boot-hash time and silently downgrades every listen to an
+            // uncertified full resend (descendant listeners certify while the
+            // root restore is still reading IDB, so this fired on every boot of
+            // a busy app). latest is refreshed; an armed window is untouched.
+            return;
+        }
+        if (changedPaths === undefined ||
+            changedPaths.some(path => path.length === 0)) {
+            // Whole root — including a write-through NAMING the root (a full
+            // push's 'at-path' at the root itself). Routing this through the
+            // incremental flush would serialize the entire tree synchronously
+            // into one giant transaction; the whole-root path stages in
+            // byte-batched transactions instead.
+            root.dirty = null;
+        }
+        else if (root.dirty === undefined) {
+            root.dirty = changedPaths.slice();
+        }
+        else if (root.dirty !== null) {
+            root.dirty = root.dirty.concat(changedPaths);
+        }
+        if (this.networkSuspended_) {
+            return;
+        }
+        this.armWindow_(pathString, root);
+    }
+    /**
+     * Flushes any pending dirt for `pathString` immediately (skipping the
+     * debounce window). Used before boot-hashing a grafted base and before
+     * reconnect hashing, so the rows describe exactly the live cache.
+     * Resolves when the flush (if any) completed.
+     */
+    flushNow(pathString) {
+        const root = this.tracked_.get(pathString);
+        if (root === undefined) {
+            return Promise.resolve();
+        }
+        if (root.windowTimer !== null) {
+            clearTimeout(root.windowTimer);
+            root.windowTimer = null;
+        }
+        return this.flushNow_(pathString, root);
+    }
+    /** The currently tracked persistent root paths. */
+    trackedPaths() {
+        return [...this.tracked_.keys()];
+    }
+    /**
+     * True while the root's rows lag its live server cache: dirt is pending
+     * or a flush is in flight. The listen-hash rule builds on this — a
+     * compound hash is only claimed when the rows equal the live cache, so a
+     * claim can never describe bytes older than what the client holds.
+     */
+    hasPendingDirt(pathString) {
+        const root = this.tracked_.get(pathString);
+        if (root === undefined) {
+            return false;
+        }
+        return root.dirty !== undefined || root.flushing;
+    }
+    armWindow_(pathString, root) {
+        if (root.windowTimer !== null) {
+            return; // non-restarting window
+        }
+        const delay = root.hasGeneration
+            ? this.writeDelayMs_
+            : Math.min(this.writeDelayMs_, this.firstGenDelayMs_);
+        root.windowTimer = setTimeout(() => {
+            root.windowTimer = null;
+            void this.flushNow_(pathString, root);
+        }, delay);
+    }
+    /** Single-flight flush of everything dirty at the root. */
+    flushNow_(pathString, root) {
+        if (root.activeFlush !== null) {
+            root.rearm = true;
+            return root.activeFlush;
+        }
+        const promise = this.flushNowImpl_(pathString, root);
+        root.activeFlush = promise;
+        void promise.finally(() => {
+            if (root.activeFlush === promise) {
+                root.activeFlush = null;
+            }
+        });
+        return promise;
+    }
+    async flushNowImpl_(pathString, root) {
+        if (root.flushing) {
+            root.rearm = true;
+            return;
+        }
+        if (root.latest === null ||
+            root.dirty === undefined ||
+            !this.isWriter_(root) ||
+            this.networkSuspended_ ||
+            root.latestScope !== this.authScope_) {
+            return;
+        }
+        root.flushing = true;
+        const node = root.latest;
+        const dirty = root.dirty;
+        root.dirty = undefined;
+        const generation = this.authGeneration_;
+        try {
+            if (dirty === null || root.rowIndex === null || !root.hasGeneration) {
+                await this.flushWholeRoot_(pathString, root, node, generation);
+            }
+            else {
+                await this.flushIncremental_(pathString, root, node, dirty, generation);
+            }
+        }
+        catch (e) {
+            warn('persistence flush failed: ' + e?.message);
+            // Leave hasGeneration as-is; the next window retries from latest.
+            if (root.dirty === undefined) {
+                root.dirty = null;
+            }
+        }
+        finally {
+            root.flushing = false;
+            if (root.rearm) {
+                root.rearm = false;
+                if (root.dirty === undefined) {
+                    root.dirty = null;
+                }
+                this.armWindow_(pathString, root);
+            }
+        }
+    }
+    /**
+     * First generation / unknown-change rewrite of the whole root. Byte-
+     * budgeted staging with meta LAST: crash mid-stage reads as "no cache"
+     * on the next boot, never a torn generation claiming completeness.
+     */
+    /**
+     * Whole-root rewrite as ITERATIVE, BYTE-BATCHED staging: the tree is
+     * walked with an explicit stack, rows are serialized as they are emitted,
+     * and each ~stageTxnBytes_ of row text commits in its own readwrite
+     * transaction with a macrotask yield after it. Peak memory is one batch
+     * of strings and the main thread is never blocked for more than one
+     * batch's serialization — a multi-MB root previously stringified in one
+     * synchronous pass and committed as one giant buffered transaction, which
+     * is exactly the main-thread stall + memory spike mobile WebKit kills.
+     *
+     * Crash consistency is meta-deleted-FIRST (with the old rows, in the
+     * first batch) / meta-written-LAST (with the new gen, in the final
+     * batch): at every intermediate point the cache reads as ABSENT — "no
+     * cache, never torn". A crash mid-stage costs the cache (cold next boot),
+     * never correctness; orphan rows are reclaimed by the sweep and by the
+     * next staging's range delete. Losing writership or the auth generation
+     * mid-stage simply stops before the next batch.
+     */
+    async flushWholeRoot_(pathString, root, node, generation) {
+        const db = await this.open_();
+        if (db === null || this.authGeneration_ !== generation) {
+            return;
+        }
+        const scope = this.scopeKey_();
+        const rootKey = this.rootKey_(pathString);
+        const metaKey = encodeRowKey(scope, rootKey, []);
+        const range = rowKeyRange(scope, rootKey, []);
+        const live = () => !this.disposed_ &&
+            this.authGeneration_ === generation &&
+            this.isWriter_(root) &&
+            !this.networkSuspended_;
+        const stack = [[[], node]];
+        const rowPaths = [];
+        let batch = [];
+        let batchBytes = 0;
+        let firstBatch = true;
+        const writeBatch = async (final) => {
+            const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+            const rowStore = txn.objectStore(ROWS_STORE);
+            if (firstBatch) {
+                firstBatch = false;
+                // Invalidate with the first rows: from here until the final meta
+                // put, the cache reads as absent — and this manager's own state
+                // must agree, so an abandoned stage retries as a whole root and
+                // never claims a generation it no longer has.
+                root.hasGeneration = false;
+                root.lastGen = null;
+                root.rowIndex = null;
+                txn.objectStore(META_STORE).delete(metaKey);
+                rowStore.delete(range);
+            }
+            for (let i = 0; i < batch.length; i++) {
+                rowStore.put(batch[i][1], encodeRowKey(scope, rootKey, batch[i][0]));
+            }
+            if (final) {
+                const gen = newMetaGen();
+                txn.objectStore(META_STORE).put({
+                    updatedAt: Date.now(),
+                    formatVersion: META_FORMAT_VERSION,
+                    gen
+                }, metaKey);
+                await this.txnDone_(txn);
+                root.rowIndex = RowIndex.fromRelativePaths(rowPaths);
+                root.hasGeneration = true;
+                root.lastGen = gen;
+                return;
+            }
+            await this.txnDone_(txn);
+            batch = [];
+            batchBytes = 0;
+            await yieldMacrotask();
+        };
+        while (stack.length > 0) {
+            if (!live()) {
+                return;
+            }
+            const [segs, current] = stack.pop();
+            if (current.isEmpty()) {
+                continue;
+            }
+            if (!current.isLeafNode() &&
+                estimateSerializedNodeSize(current) > this.splitThresholdBytes_) {
+                const priority = current.getPriority();
+                if (!priority.isEmpty()) {
+                    const priorityJson = JSON.stringify(priority.val());
+                    const prioritySegs = segs.concat('.priority');
+                    batch.push([prioritySegs, priorityJson]);
+                    rowPaths.push(prioritySegs);
+                    batchBytes += priorityJson.length;
+                }
+                current.forEachChild(PRIORITY_INDEX, (key, child) => {
+                    stack.push([segs.concat(key), child]);
+                });
+            }
+            else {
+                const json = JSON.stringify(current.val(true));
+                batch.push([segs, json]);
+                rowPaths.push(segs);
+                batchBytes += json.length;
+            }
+            if (batchBytes >= this.stageTxnBytes_) {
+                await writeBatch(false);
+            }
+        }
+        if (!live()) {
+            return;
+        }
+        await writeBatch(true);
+    }
+    /**
+     * Incremental flush: each dirty path normalizes to its containing row's
+     * boundary (disjoint-rows invariant), covered duplicates drop, and each
+     * boundary's subtree is deleted+rewritten — ONE readwrite transaction,
+     * no hashing, work proportional to the change.
+     */
+    async flushIncremental_(pathString, root, node, dirty, generation) {
+        const db = await this.open_();
+        if (db === null || this.authGeneration_ !== generation) {
+            return;
+        }
+        const rowIndex = root.rowIndex;
+        // Normalize to row boundaries, then drop paths covered by another.
+        const boundaries = [];
+        for (let i = 0; i < dirty.length; i++) {
+            boundaries.push(rowIndex.rowBoundaryFor(dirty[i]) ?? dirty[i]);
+        }
+        boundaries.sort((a, b) => a.length - b.length);
+        const chosen = [];
+        outer: for (let i = 0; i < boundaries.length; i++) {
+            for (let j = 0; j < chosen.length; j++) {
+                const c = chosen[j];
+                if (c.length <= boundaries[i].length &&
+                    c.every((seg, k) => boundaries[i][k] === seg)) {
+                    continue outer;
+                }
+            }
+            chosen.push(boundaries[i]);
+        }
+        // Bound the synchronous work: an incremental flush is for CHANGE-SIZED
+        // dirt. When the dirty subtrees together exceed one staging batch, the
+        // byte-batched whole-root path is both simpler and strictly better than
+        // serializing a huge subtree into one transaction here.
+        let estimated = 0;
+        for (let i = 0; i < chosen.length; i++) {
+            estimated += estimateSerializedNodeSize(node.getChild(new Path(chosen[i].join('/'))));
+            if (estimated > this.stageTxnBytes_) {
+                await this.flushWholeRoot_(pathString, root, node, generation);
+                return;
+            }
+        }
+        const scope = this.scopeKey_();
+        const rootKey = this.rootKey_(pathString);
+        const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+        const store = txn.objectStore(ROWS_STORE);
+        for (let i = 0; i < chosen.length; i++) {
+            const segs = chosen[i];
+            store.delete(rowKeyRange(scope, rootKey, segs));
+            const subtree = node.getChild(new Path(segs.join('/')));
+            const newRows = splitNodeIntoRows(segs, subtree, this.splitThresholdBytes_);
+            for (let j = 0; j < newRows.length; j++) {
+                store.put(newRows[j][1], encodeRowKey(scope, rootKey, newRows[j][0]));
+            }
+            rowIndex.replaceSubtree(segs, newRows.map(r => r[0]));
+        }
+        const gen = newMetaGen();
+        const meta = {
+            updatedAt: Date.now(),
+            formatVersion: META_FORMAT_VERSION,
+            gen
+        };
+        txn.objectStore(META_STORE).put(meta, encodeRowKey(scope, rootKey, []));
+        await this.txnDone_(txn);
+        root.lastGen = gen;
+    }
+    /**
+     * One deferred sweep per manager lifetime: deletes roots whose meta is
+     * older than maxAge (any scope — an account that never logs in again
+     * must not hold storage forever) and orphan rows whose meta is absent
+     * (a torn first generation). Scheduled off the boot path; failures are
+     * ignored (the next session sweeps again).
+     */
+    scheduleSweep_() {
+        if (this.sweepTimer_ !== null || this.disposed_) {
+            return;
+        }
+        this.sweepTimer_ = setTimeout(() => {
+            void this.sweep_();
+        }, ROW_PERSISTENCE_SWEEP_DELAY_MS);
+    }
+    async sweep_() {
+        const db = await this.open_();
+        if (db === null || this.disposed_) {
+            return;
+        }
+        try {
+            const readTxn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
+            const metaKeysReq = readTxn.objectStore(META_STORE).getAllKeys();
+            const metaValuesReq = readTxn.objectStore(META_STORE).getAll();
+            const rowKeysReq = readTxn.objectStore(ROWS_STORE).getAllKeys();
+            const [metaKeys, metaValues, rowKeys] = await Promise.all([
+                this.requestDone_(metaKeysReq),
+                this.requestDone_(metaValuesReq),
+                this.requestDone_(rowKeysReq)
+            ]);
+            const now = Date.now();
+            const liveMeta = new Set();
+            const expired = [];
+            for (let i = 0; i < metaKeys.length; i++) {
+                const meta = metaValues[i];
+                if (meta === null ||
+                    typeof meta !== 'object' ||
+                    meta.formatVersion !== META_FORMAT_VERSION ||
+                    now - meta.updatedAt > this.maxAgeMs_) {
+                    expired.push(metaKeys[i]);
+                }
+                else {
+                    liveMeta.add(metaKeys[i]);
+                }
+            }
+            // A row belongs to the meta whose key is its scope·root prefix; the
+            // meta key is the shortest prefix ending in ROW_KEY_SEPARATOR twice
+            // (scope + root). Orphans (no live meta prefix) are torn/expired.
+            const doomedRows = [];
+            for (let i = 0; i < rowKeys.length; i++) {
+                const key = rowKeys[i];
+                const second = key.indexOf(ROW_KEY_SEPARATOR, key.indexOf(ROW_KEY_SEPARATOR) + 1);
+                const metaKey = key.slice(0, second + 1);
+                if (!liveMeta.has(metaKey)) {
+                    doomedRows.push(key);
+                }
+            }
+            if (expired.length === 0 && doomedRows.length === 0) {
+                return;
+            }
+            const writeTxn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+            const metaStore = writeTxn.objectStore(META_STORE);
+            const rowStore = writeTxn.objectStore(ROWS_STORE);
+            for (let i = 0; i < expired.length; i++) {
+                metaStore.delete(expired[i]);
+            }
+            for (let i = 0; i < doomedRows.length; i++) {
+                rowStore.delete(doomedRows[i]);
+            }
+            await this.txnDone_(writeTxn);
+        }
+        catch (e) {
+            // Best-effort; sweep again next session.
+        }
+    }
+    // ───────────────────── invalidate / evict / sweep ──────────────────────
+    /** Drops the stored cache for the root containing `path` (corrupt). */
+    invalidate(path) {
+        const rootString = this.trackedRootFor(path.toString());
+        void this.deleteRoot_(rootString ?? path.toString());
+        const root = rootString !== null ? this.tracked_.get(rootString) : undefined;
+        if (root !== undefined) {
+            root.rowIndex = null;
+            root.hasGeneration = false;
+        }
+    }
+    /** Removes the stored cache when a persistent listener is torn down. */
+    evict(path) {
+        void this.deleteRoot_(path.toString());
+    }
+    async deleteRoot_(pathString) {
+        const db = await this.open_();
+        if (db === null) {
+            return;
+        }
+        const scope = this.scopeKey_();
+        try {
+            const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+            txn
+                .objectStore(META_STORE)
+                .delete(encodeRowKey(scope, this.rootKey_(pathString), []));
+            txn
+                .objectStore(ROWS_STORE)
+                .delete(rowKeyRange(scope, this.rootKey_(pathString), []));
+            await this.txnDone_(txn);
+        }
+        catch (e) {
+            // Fail open.
+        }
+    }
+    // ───────────────────────────── lifecycle ───────────────────────────────
+    /**
+     * Deliberate offline (goOffline/repoInterrupt). Liveness is not
+     * eligibility: a suspended tab keeps running but its server cache is
+     * frozen, so it RELEASES its writer locks — the UA then grants them to a
+     * queued online tab, which persists the newest server state. Resume
+     * re-queues; writership returns whenever the interim holder unsubscribes
+     * or dies. While suspended the write gate stays closed even without Web
+     * Locks, so a frozen tree never overwrites an online writer's rows.
+     */
+    setNetworkSuspended(suspended) {
+        if (this.networkSuspended_ === suspended) {
+            return;
+        }
+        this.networkSuspended_ = suspended;
+        for (const [pathString, root] of this.tracked_) {
+            if (suspended) {
+                if (root.windowTimer !== null) {
+                    clearTimeout(root.windowTimer);
+                    root.windowTimer = null;
+                }
+                if (root.releaseLock !== null) {
+                    const release = root.releaseLock;
+                    const active = root.activeFlush;
+                    if (active !== null) {
+                        void active.finally(() => {
+                            if (root.releaseLock === release) {
+                                release();
+                                root.releaseLock = null;
+                            }
+                        });
+                    }
+                    else {
+                        release();
+                        root.releaseLock = null;
+                    }
+                }
+            }
+            else {
+                void this.acquireWriterLock_(pathString, root);
+                if (root.dirty !== undefined) {
+                    this.armWindow_(pathString, root);
+                }
+            }
+        }
+    }
+    rebindTo(prefix) {
+        const rebound = new RowPersistenceManager(prefix, this.idbFactory_, this.webLocks_, this.writeDelayMs_, this.firstGenDelayMs_, this.splitThresholdBytes_, this.peekHandoffMs_, this.peekPreAuthMs_, this.restoreTimeoutMs_, this.stageTxnBytes_, this.workerHashTimeoutMs_, this.maxAgeMs_);
+        if (this.authScopeConfigured_) {
+            rebound.setAuthScope(this.authScope_, this.authScopeConfirmed_);
+        }
+        for (const [pathString, count] of this.persistentRoots_) {
+            rebound.persistentRoots_.set(pathString, count);
+        }
+        this.dispose();
+        return rebound;
+    }
+    dispose() {
+        if (this.disposed_) {
+            return;
+        }
+        this.disposed_ = true;
+        this.clearAllPeeks_();
+        for (const root of this.tracked_.values()) {
+            this.releaseRoot_(root);
+        }
+        this.tracked_.clear();
+        if (this.sweepTimer_ !== null) {
+            clearTimeout(this.sweepTimer_);
+            this.sweepTimer_ = null;
+        }
+        void this.db_?.then(db => db?.close());
+        this.db_ = null;
+    }
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Stamps a precomputed canonical hash into the node's lazy-hash slot (so
+ * hash() returns it without an O(tree) walk) and attaches the precomputed
+ * compound hash for the listen to send. Both must describe exactly this
+ * tree — the server certifies whatever the listen carries.
+ *
+ * An empty tree is returned unstamped: an empty node is the shared
+ * ChildrenNode.EMPTY_NODE singleton, and stamping that would poison every
+ * empty node in the app.
+ */
+function stampSeedHashes(node, hash, compoundHash) {
+    if (node.isEmpty()) {
+        return node;
+    }
+    if (typeof hash === 'string') {
+        nodeCanonicalHashes.set(node, hash);
+        if (hash.length > 0) {
+            node.stampLazyHash(hash);
+        }
+    }
+    if (compoundHash &&
+        Array.isArray(compoundHash.hashes) &&
+        Array.isArray(compoundHash.posts) &&
+        compoundHash.hashes.length === compoundHash.posts.length + 1) {
+        setNodeCompoundHash(node, compoundHash);
+    }
+    return node;
+}
+/**
+ * The compound hash rides on the seeded node itself: once a server update
+ * replaces the cached node the stamp is gone, so re-listens after real data
+ * arrived send only the simple hash (which is then correct by construction).
+ */
+const nodeCompoundHashes = new WeakMap();
+const nodeCanonicalHashes = new WeakMap();
+function setNodeCompoundHash(node, compoundHash) {
+    nodeCompoundHashes.set(node, compoundHash);
+}
+function getNodeCompoundHash(node) {
+    return nodeCompoundHashes.get(node);
+}
+/**
+ * The persisted canonical hash associated with a seeded node. This rides in
+ * a WeakMap instead of being stamped into every subtree by node.hash(): a
+ * compound-hash-only seed deliberately stores the empty simple hash, letting
+ * the server validate its ranges without a full-tree hash pass that would
+ * permanently retain one SHA string per node.
+ */
+function getNodeCanonicalHash(node) {
+    return nodeCanonicalHashes.get(node);
+}
+/**
+ * One-boot materialization handoff. The optimistic pre-auth peek
+ * (getPersistedValue) materializes the restored tree to JS objects once;
+ * the authenticated listener that adopts the SAME immutable Node then
+ * replays it as a child_added burst whose per-child `snapshot.val()` calls
+ * would materialize the identical tree a second time — two full JS copies
+ * of a large workspace alive at the peak of boot.
+ *
+ * The peek stamps each materialized value here, keyed by its Node instance;
+ * a consumer that OPTS IN via consumePersistedMaterialization() (api/
+ * Reference_impl) takes a stamp (get + delete) instead of walking the node.
+ * `DataSnapshot.val()` never consumes a stamp — its fresh-objects contract
+ * is untouched. Consume-once means only the single designed peek→listener
+ * handoff ever receives shared objects (which is the point — the optimistic
+ * tree and the live tree then share child identity, so downstream
+ * memoization sees unchanged branches as unchanged).
+ *
+ * Correctness is by construction: a Node is immutable, so a stamp can only
+ * ever be returned for exactly the data it was computed from. Any server
+ * delta between peek and replay produces a NEW child Node instance, which
+ * misses the WeakMap and materializes fresh.
+ *
+ * Only non-null object values are stamped (a leaf's val() is O(1) already),
+ * and never on an empty node — the empty ChildrenNode is a shared singleton
+ * and stamping it would leak one boot's subtree to unrelated paths.
+ */
+const nodeMaterializedValues = new WeakMap();
+function stampMaterializedValue(node, value) {
+    if (value === null || typeof value !== 'object' || node.isEmpty()) {
+        return;
+    }
+    nodeMaterializedValues.set(node, value);
+}
+function consumeMaterializedValue(node) {
+    const value = nodeMaterializedValues.get(node);
+    if (value !== undefined) {
+        nodeMaterializedValues.delete(node);
+    }
+    return value;
+}
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
  * Per-key work units charged per main-thread slice of a sliced server-push
  * decode (one charge per JSON key visited, at every depth, and one per node
  * compared by the graft's budgeted equality). Sized like the peek walk's
@@ -11005,104 +9308,148 @@ function charge(state) {
     });
 }
 /**
- * Public charge for ingest bodies that do per-unit work OUTSIDE the decoder
- * (e.g. folding one decoded range merge over a base tree): shares the same
- * slice budget and yield/liveness contract as the decode itself. @internal
- */
-function chargeSlice(state) {
-    return charge(state);
-}
-/**
  * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
  * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
  * metadata-key skipping, empty-child pruning, and childSet construction —
- * but every JSON key visited charges one unit of the shared slice budget,
- * and the walk yields a macrotask when the budget exhausts so a large
- * server push can never decode as one monolithic main-thread task.
+ * driven by a SYNCHRONOUS explicit-stack walk that awaits only when the
+ * shared slice budget trips (one charge per JSON key at every depth). The
+ * earlier async-recursive form allocated a promise chain per interior node;
+ * on a multi-MB payload that is hundreds of thousands of microtasks —
+ * observed in Safari field traces as a 70k-microtask storm saturating the
+ * main thread. The explicit stack keeps the hot path 100% synchronous
+ * between budget boundaries.
  *
  * Key enumeration is prototype-safe ({@link contains}) exactly like
  * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
  * a legal child key, and JSON.parse makes it an own string property — a
  * direct method call through the object would invoke user data and throw.
  *
- * Primitive children decode synchronously through nodeFromJSON itself (a
- * single bounded leaf) — a promise per leaf would dominate allocation on
- * exactly the wide flat collections this bounds (the peek walk's inline-leaf
- * precedent). Fidelity is enforced by test corpus equality (node.equals +
- * hash) against nodeFromJSON; when editing either function, keep them in
+ * Fidelity is enforced by test corpus equality (node.equals + hash)
+ * against nodeFromJSON; when editing either function, keep them in
  * lockstep.
  * @internal
  */
 async function decodeNodeSliced(json, state, priority = null) {
-    if (json === null) {
-        return ChildrenNode.EMPTY_NODE;
+    let result = null;
+    const finishFrame = (frame) => {
+        let node;
+        if (frame.isArray) {
+            node = frame.arrayNode.updatePriority(nodeFromJSON(frame.priority));
+        }
+        else {
+            node = assembleChildrenNode(frame.children, frame.childrenHavePriority, frame.priority);
+        }
+        if (frame.parent === null) {
+            result = node;
+            return;
+        }
+        attachChild(frame.parent, frame.parentKey, node);
+    };
+    const attachChild = (parent, key, childNode) => {
+        if (parent.isArray) {
+            if (childNode.isLeafNode() || !childNode.isEmpty()) {
+                parent.arrayNode = parent.arrayNode.updateImmediateChild(key, childNode);
+            }
+        }
+        else if (!childNode.isEmpty()) {
+            parent.childrenHavePriority =
+                parent.childrenHavePriority || !childNode.getPriority().isEmpty();
+            parent.children.push(new NamedNode(key, childNode));
+        }
+    };
+    /**
+     * Opens a frame for `raw` (or resolves it immediately when it is a
+     * bounded leaf). Returns the frame to descend into, or null.
+     */
+    const openValue = (raw, parent, parentKey) => {
+        let value = raw;
+        let valuePriority = null;
+        if (value !== null && typeof value === 'object') {
+            const record = value;
+            if ('.priority' in record) {
+                valuePriority = record['.priority'];
+            }
+            util.assert(valuePriority === null ||
+                typeof valuePriority === 'string' ||
+                typeof valuePriority === 'number' ||
+                (typeof valuePriority === 'object' &&
+                    '.sv' in valuePriority), 'Invalid priority type found: ' + typeof valuePriority);
+            if ('.value' in record && record['.value'] !== null) {
+                value = record['.value'];
+            }
+        }
+        if (value === null ||
+            typeof value !== 'object' ||
+            '.sv' in value) {
+            // Bounded leaf (or explicit null): decode synchronously.
+            const leaf = value === null
+                ? ChildrenNode.EMPTY_NODE
+                : new LeafNode(value, nodeFromJSON(valuePriority));
+            if (parent === null) {
+                result = leaf;
+            }
+            else {
+                attachChild(parent, parentKey, leaf);
+            }
+            return null;
+        }
+        const record = value;
+        const isArray = value instanceof Array;
+        const keys = [];
+        for (const key in record) {
+            if (util.contains(record, key) && key.substring(0, 1) !== '.') {
+                keys.push(key);
+            }
+        }
+        return {
+            keys,
+            index: 0,
+            obj: record,
+            isArray,
+            priority: valuePriority,
+            children: [],
+            childrenHavePriority: false,
+            arrayNode: ChildrenNode.EMPTY_NODE,
+            parent,
+            parentKey
+        };
+    };
+    // Root: honor the explicitly passed priority exactly like the recursive
+    // form (the root's own '.priority' key, when present, overrides it).
+    const rootFrame = openValue(json, null, null);
+    if (rootFrame === null) {
+        // Root was a leaf/null; apply the caller's priority when the JSON did
+        // not carry its own.
+        if (result !== null && priority !== null && result.isLeafNode()) {
+            const leaf = result;
+            if (leaf.getPriority().isEmpty()) {
+                result = new LeafNode(leaf.getValue(), nodeFromJSON(priority));
+            }
+        }
+        return result ?? ChildrenNode.EMPTY_NODE;
     }
-    if (typeof json === 'object' && '.priority' in json) {
-        priority = json['.priority'];
+    if (rootFrame.priority === null) {
+        rootFrame.priority = priority;
     }
-    util.assert(priority === null ||
-        typeof priority === 'string' ||
-        typeof priority === 'number' ||
-        (typeof priority === 'object' && '.sv' in priority), 'Invalid priority type found: ' + typeof priority);
-    if (typeof json === 'object' &&
-        '.value' in json &&
-        json['.value'] !== null) {
-        json = json['.value'];
-    }
-    // Valid leaf nodes include non-objects or server-value wrapper objects
-    if (typeof json !== 'object' || '.sv' in json) {
+    const stack = [rootFrame];
+    while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        if (frame.index >= frame.keys.length) {
+            stack.pop();
+            finishFrame(frame);
+            continue;
+        }
+        const key = frame.keys[frame.index++];
         const y = charge(state);
         if (y !== null) {
             await y;
         }
-        const jsonLeaf = json;
-        return new LeafNode(jsonLeaf, nodeFromJSON(priority));
-    }
-    if (!(json instanceof Array)) {
-        const children = [];
-        let childrenHavePriority = false;
-        const obj = json;
-        for (const key in obj) {
-            if (util.contains(obj, key) && key.substring(0, 1) !== '.') {
-                // Ignore metadata nodes
-                const y = charge(state);
-                if (y !== null) {
-                    await y;
-                }
-                const raw = obj[key];
-                const childNode = typeof raw !== 'object' || raw === null
-                    ? nodeFromJSON(raw) // primitive leaf / null — bounded, synchronous
-                    : await decodeNodeSliced(raw, state);
-                if (!childNode.isEmpty()) {
-                    childrenHavePriority =
-                        childrenHavePriority || !childNode.getPriority().isEmpty();
-                    children.push(new NamedNode(key, childNode));
-                }
-            }
+        const child = openValue(frame.obj[key], frame, key);
+        if (child !== null) {
+            stack.push(child);
         }
-        return assembleChildrenNode(children, childrenHavePriority, priority);
     }
-    else {
-        let node = ChildrenNode.EMPTY_NODE;
-        const arr = json;
-        for (const key in arr) {
-            if (util.contains(arr, key) && key.substring(0, 1) !== '.') {
-                // ignore metadata nodes.
-                const y = charge(state);
-                if (y !== null) {
-                    await y;
-                }
-                const raw = arr[key];
-                const childNode = typeof raw !== 'object' || raw === null
-                    ? nodeFromJSON(raw)
-                    : await decodeNodeSliced(raw, state);
-                if (childNode.isLeafNode() || !childNode.isEmpty()) {
-                    node = node.updateImmediateChild(key, childNode);
-                }
-            }
-        }
-        return node.updatePriority(nodeFromJSON(priority));
-    }
+    return result ?? ChildrenNode.EMPTY_NODE;
 }
 /**
  * The childSet-assembly tail of nodeFromJSON's object branch, shared by the
@@ -11124,47 +9471,68 @@ function assembleChildrenNode(children, childrenHavePriority, priority) {
     }
 }
 /**
- * Budgeted structural equality: Node.equals with every compared node
- * charging the shared slice budget, so grafting a large unchanged subtree
- * cannot itself become the monolithic walk the decoder exists to remove.
+ * Budgeted structural equality: Node.equals semantics driven by a
+ * SYNCHRONOUS explicit-stack walk that awaits only when the shared slice
+ * budget trips. The naive async recursion allocated a promise (plus its
+ * continuation microtasks) for EVERY compared node pair — on a large
+ * mostly-equal graft probe that is millions of microtasks, which saturates
+ * the scheduler and spikes GC on exactly the mobile boots the slicing
+ * exists to protect (observed as a Safari microtask storm in field traces).
  * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
  * child count, PRIORITY_INDEX-iterated pairwise children).
  */
 async function nodesEqualSliced(a, b, state) {
-    if (a === b) {
+    const stack = [];
+    // Compares one pair without descending; pushes a frame for children.
+    // Returns false on definite inequality, true to continue.
+    const compare = (x, y) => {
+        if (x === y) {
+            return true;
+        }
+        if (x.isLeafNode() || y.isLeafNode()) {
+            // Leaf equality is bounded — delegate to the node's own equals.
+            return x.equals(y);
+        }
+        const xc = x;
+        const yc = y;
+        if (!xc.getPriority().equals(yc.getPriority())) {
+            return false;
+        }
+        if (xc.numChildren() !== yc.numChildren()) {
+            return false;
+        }
+        stack.push({
+            aIter: xc.getIterator(PRIORITY_INDEX),
+            bIter: yc.getIterator(PRIORITY_INDEX)
+        });
         return true;
-    }
-    const y = charge(state);
-    if (y !== null) {
-        await y;
-    }
-    if (a.isLeafNode() || b.isLeafNode()) {
-        // Leaf equality is bounded — delegate to the node's own equals.
-        return a.equals(b);
-    }
-    const aChildren = a;
-    const bChildren = b;
-    if (!aChildren.getPriority().equals(bChildren.getPriority())) {
+    };
+    if (!compare(a, b)) {
         return false;
     }
-    if (aChildren.numChildren() !== bChildren.numChildren()) {
-        return false;
-    }
-    const aIter = aChildren.getIterator(PRIORITY_INDEX);
-    const bIter = bChildren.getIterator(PRIORITY_INDEX);
-    let aCurrent = aIter.getNext();
-    let bCurrent = bIter.getNext();
-    while (aCurrent !== null && bCurrent !== null) {
+    while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        const aCurrent = frame.aIter.getNext();
+        const bCurrent = frame.bIter.getNext();
+        if (aCurrent === null || bCurrent === null) {
+            if (aCurrent !== bCurrent) {
+                return false;
+            }
+            stack.pop();
+            continue;
+        }
         if (aCurrent.name !== bCurrent.name) {
             return false;
         }
-        if (!(await nodesEqualSliced(aCurrent.node, bCurrent.node, state))) {
+        const y = charge(state);
+        if (y !== null) {
+            await y;
+        }
+        if (!compare(aCurrent.node, bCurrent.node)) {
             return false;
         }
-        aCurrent = aIter.getNext();
-        bCurrent = bIter.getNext();
     }
-    return aCurrent === null && bCurrent === null;
+    return true;
 }
 /**
  * Decodes one full-root plain-children push into a single Node, sliced, with
@@ -14134,25 +12502,6 @@ function syncTreeApplyServerRangeMerges(syncTree, path, merges) {
     return syncTreeApplyServerOverwrite(syncTree, path, applyRangeMergesToView(view, merges));
 }
 /**
- * The base an untagged range merge at `path` folds over — the complete
- * view's current server cache (empty node when the cache is absent), or
- * null when there is no complete view (the merge is ignored for that
- * state, matching syncTreeApplyServerRangeMerges). Lets an asynchronous
- * ingest snapshot the base, fold merges OFF-TREE across yields, and apply
- * the result as one overwrite. @internal
- */
-function syncTreeGetRangeMergeBase(syncTree, path) {
-    const syncPoint = syncTree.syncPointTree_.get(path);
-    if (!syncPoint) {
-        return null;
-    }
-    const view = syncPointGetCompleteView(syncPoint);
-    if (!view) {
-        return null;
-    }
-    return viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-}
-/**
  * Applies tagged-query server range merges against the query's view.
  *
  * @returns Events to raise.
@@ -14497,26 +12846,18 @@ function syncTreeApplyOperationDescendantsHelper_(operation, syncPointTree, serv
 function syncTreeCreateListenerForView_(syncTree, view) {
     const query = view.query;
     const tag = syncTreeTagForQuery(syncTree, query);
-    const pathString = query._path.toString();
     const hashFn = () => {
-        // Manifest-first boot: the persisted hashes are stamped for this path
-        // before the restored tree exists in SyncTree (see stampNextListenHashes).
-        const pending = syncTree.listenProvider_.getPendingListenHashes?.(pathString);
-        if (pending !== undefined) {
-            return pending.hash;
-        }
+        // A restored persistent root carries stamped hashes on the node itself
+        // (stampSeedHashes): '' + a compound hash, so the server evaluates the
+        // ranges instead of the whole tree. Any server update replaces the node
+        // and the stamps with it; ordinary listens hash their live cache.
         const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
         return getNodeCanonicalHash(cache) ?? cache.hash();
     };
     // The compound hash rides as a property on hashFn so it threads through
-    // the existing listen-provider chain untouched. Only a seeded node carries
-    // one; once a server update replaces the cache it is gone, and re-listens
-    // send only the simple hash.
+    // the existing listen-provider chain untouched. Only a seeded node
+    // carries one; once a server update replaces the cache it is gone.
     hashFn.compoundHash = () => {
-        const pending = syncTree.listenProvider_.getPendingListenHashes?.(pathString);
-        if (pending !== undefined) {
-            return pending.compoundHash;
-        }
         const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
         return getNodeCompoundHash(cache);
     };
@@ -15465,6 +13806,19 @@ function repoDeferredStreamActive(repo) {
  * gated root are deferred to the repo's ordered queue until the gate lifts
  * (its cached base / sliced push is in SyncTree).
  */
+function repoPendingRestoreCovering(repo, pathString) {
+    if (repo.pendingSeedRestores_.size === 0) {
+        return null;
+    }
+    for (const root of repo.pendingSeedRestores_.keys()) {
+        if (pathString === root ||
+            root === '/' ||
+            (pathString.length > root.length && pathString.startsWith(root + '/'))) {
+            return root;
+        }
+    }
+    return null;
+}
 function repoIngestGateFor(repo, pathString) {
     if (repo.ingestQueue_.gates.size === 0) {
         return null;
@@ -15510,8 +13864,8 @@ class Repo {
         // TODO: This should be @private but it's used by test_access.js and internal.js
         this.persistentConnection_ = null;
         /**
-         * Server-cache persistence (see core/Persistence.ts); null unless the app
-         * enabled it before this Repo's first listen.
+         * Server-cache persistence (see core/RowPersistence.ts); null unless the
+         * app enabled it before this Repo's first listen.
          */
         this.persistence_ = null;
         /**
@@ -15526,13 +13880,11 @@ class Repo {
          * removed mid-restore is never sent (see repoStartServerListen).
          */
         this.pendingSeedRestores_ = new Map();
-        /** Manifest-first hashes scoped to this Repo, never process-global. */
-        this.pendingListenHashes_ = new PendingListenHashStore();
         /**
          * The repo-level ordered ingest queue (see IngestQueue): wire operations
-         * deferred behind a manifest-first boot window or an in-flight sliced
-         * ingest, in exact arrival order across roots and kinds, plus the gate
-         * set and the continuation generation.
+         * deferred behind an in-flight sliced full-root ingest, in exact arrival
+         * order across roots and kinds, plus the gate set and the continuation
+         * generation.
          */
         this.ingestQueue_ = newIngestQueue();
         /**
@@ -15579,8 +13931,8 @@ function repoStart(repo, appId, authOverride) {
             repoOnConnectStatus(repo, connectStatus);
         }, (updates) => {
             repoOnServerInfoUpdate(repo, updates);
-        }, repo.authTokenProvider_, repo.appCheckProvider_, authOverride, (pathString, ranges, tag, wireBytes) => {
-            repoOnRangeMergeUpdate(repo, pathString, ranges, tag, wireBytes ?? 0);
+        }, repo.authTokenProvider_, repo.appCheckProvider_, authOverride, (pathString, ranges, tag) => {
+            repoOnRangeMergeUpdate(repo, pathString, ranges, tag);
         });
         repo.server_ = repo.persistentConnection_;
     }
@@ -15620,8 +13972,7 @@ function repoStart(repo, appId, authOverride) {
         },
         stopListening: (query, tag) => {
             repoStopServerListen(repo, query, tag);
-        },
-        getPendingListenHashes: pathString => repo.pendingListenHashes_.get(pathString)
+        }
     });
 }
 /**
@@ -15750,20 +14101,6 @@ function repoIngestEligible(repo, pathString, data, isMerge, tag, wireBytes = 0)
     // registration. wireBytes is the message's frame bytes — 0 when the
     // transport didn't report (long-poll), which keeps the synchronous path.
     return wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD;
-}
-/**
- * A range merge takes the sliced pump when it is untagged and its message
- * was giant. Unlike a data push there is no payload-shape gate: the merge
- * applies against the path's existing view, and the sliced body handles
- * every range shape the synchronous path does. Tagged merges (filtered
- * query views) keep the synchronous path — same as tagged data pushes.
- * Size is the ONLY trigger: small merges are the steady-state hot path
- * (certification deltas) where a pump cycle would cost more than it saves.
- */
-function repoRangeMergeIngestEligible(repo, tag, wireBytes) {
-    return (tag == null &&
-        repo.interceptServerDataCallback_ === null &&
-        wireBytes >= _INGEST_WIRE_BYTES_THRESHOLD);
 }
 /**
  * Runs one sliced full-root ingest under a gate on the repo's ordered
@@ -15900,12 +14237,6 @@ function repoDrainIngestQueue(repo) {
                         repoApplyDataUpdate(repo, op.pathString, op.data, op.isMerge, op.tag);
                     }
                     else if (op.kind === 'rm') {
-                        if (repoRangeMergeIngestEligible(repo, op.tag, op.wireBytes)) {
-                            // Re-enter the sliced range-merge ingest for a queued giant
-                            // merge — same consume-then-stand-down as a queued full push.
-                            void repoRunSlicedRangeMergeIngest(repo, op.pathString, op.ranges);
-                            return;
-                        }
                         repoApplyRangeMergeUpdate(repo, op.pathString, op.ranges, op.tag);
                     }
                     else if (op.kind === 'disconnect') {
@@ -15970,106 +14301,6 @@ async function repoIngestFullRootPush(repo, pathString, data, isCurrent) {
     repoPersistAfterServerUpdate(repo, rootPath, 'at-path');
 }
 /**
- * Runs one sliced range-merge ingest under a gate on the repo's ordered
- * queue, then drains the queue — the exact lifecycle of
- * repoRunSlicedIngest (gate ownership, generation/auth supersession,
- * finally lifts + drains), with a range-merge body.
- */
-async function repoRunSlicedRangeMergeIngest(repo, pathString, ranges) {
-    const queue = repo.ingestQueue_;
-    const gate = { pathString };
-    queue.gates.set(pathString, gate);
-    const generation = queue.generation;
-    const authGeneration = repo.persistence_?.authGeneration();
-    const isCurrent = () => queue.generation === generation &&
-        queue.gates.get(pathString) === gate &&
-        repo.persistence_?.authGeneration() === authGeneration;
-    try {
-        await repoIngestOneRangeMerge(repo, pathString, ranges, isCurrent);
-    }
-    finally {
-        if (queue.gates.get(pathString) === gate) {
-            queue.gates.delete(pathString);
-        }
-        repoDrainIngestQueue(repo);
-    }
-}
-/**
- * Applies one giant untagged range merge through the sliced ingest,
- * DEGRADING to the legacy monolithic apply on an unexpected mid-ingest
- * error and dropping the payload on cancellation — the exact containment
- * contract of repoIngestOnePush.
- */
-async function repoIngestOneRangeMerge(repo, pathString, ranges, isCurrent) {
-    try {
-        await repoIngestRangeMerge(repo, pathString, ranges, isCurrent);
-    }
-    catch (e) {
-        if (e instanceof IngestCancelledError) {
-            return;
-        }
-        warn('sliced range-merge ingest failed for ' + pathString, e);
-        try {
-            repoApplyRangeMergeUpdate(repo, pathString, ranges, null);
-        }
-        catch (applyError) {
-            warn('monolithic range-merge apply also failed', applyError);
-        }
-    }
-}
-/**
- * The sliced range-merge body. The synchronous path decodes EVERY range's
- * update tree with nodeFromJSON and folds each merge over the view's
- * server cache in one task — on a stale restored listen the server's
- * resend approaches the whole root and that task ran for ten seconds on
- * mobile Safari. Here each range's update tree decodes through the
- * budgeted decoder (one charge per JSON key, macrotask yield per slice),
- * the merges fold OFF-TREE against a snapshot of the view's server cache
- * with a yield between ranges, and the result lands as ONE
- * syncTreeApplyServerOverwrite — one coherent SyncTree transition, one
- * event batch, exactly the atomicity contract of the data-push pump.
- *
- * Wire coherence: the fold's base is captured before the first yield, and
- * the gate defers every later same-subtree wire operation into the
- * ordered queue behind this ingest — so nothing can mutate the view's
- * server cache between the snapshot and the apply except this ingest's
- * own overwrite (a superseded gate cancels at the next yield instead).
- */
-async function repoIngestRangeMerge(repo, pathString, ranges, isCurrent) {
-    const path = new Path(pathString);
-    const state = { visits: 0, isCurrent };
-    const merges = [];
-    for (const range of ranges) {
-        merges.push(new RangeMerge(typeof range.s === 'string' ? new Path(range.s) : null, typeof range.e === 'string' ? new Path(range.e) : null, await decodeNodeSliced(range.m, state)));
-    }
-    const base = syncTreeGetRangeMergeBase(repo.serverSyncTree_, path);
-    if (base === null) {
-        // Removed / incomplete view: the synchronous path ignores the merge
-        // for exactly this state; converge to the same no-op.
-        return;
-    }
-    let folded = base;
-    for (const merge of merges) {
-        folded = merge.applyTo(folded);
-        const y = chargeSlice(state);
-        if (y !== null) {
-            await y;
-        }
-    }
-    if (!isCurrent()) {
-        throw new IngestCancelledError();
-    }
-    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, folded);
-    let affectedPath = path;
-    if (events.length > 0) {
-        affectedPath = repoRerunTransactions(repo, path);
-    }
-    eventQueueRaiseEventsForChangedPath(repo.eventQueue_, affectedPath, events);
-    // Same baseline semantics as the synchronous path: ranges name leaf
-    // intervals, not subtrees — the flush falls back to the identity diff.
-    repoPersistAfterServerUpdate(repo, path, 'unknown');
-}
-/**
  * Sends a listen for the server sync tree, restoring the persisted server
  * cache first where applicable: a complete default listen on a persisted
  * root is held until the stored tree restores (bounded inside restore()),
@@ -16090,7 +14321,7 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
         exceptionGuard(() => subscriber(outcome));
     }
 }
-function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS, coldReason) {
+function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = ROW_PERSISTENCE_RESTORE_TIMEOUT_MS, coldReason) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
     if (isDefaultComplete) {
@@ -16227,17 +14458,11 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
     }
     persistence.track(pathString);
     const token = { cancelled: false };
-    // A bulk cancel (account switch) lands in one of two shapes: pre-manifest
-    // (no listen sent yet — just start cold), or manifest-first (a seeded wire
-    // listen is out and its boot buffer is about to be dropped — tear the
-    // seeded listen down first, then start cold). Restore resolution observes
-    // the cancelled token and exits without touching the new listen.
+    // A bulk cancel (account switch) reattaches this SUBSCRIPTION as a plain
+    // cold listen. Nothing is on the wire while a v2 restore is pending — the
+    // listen is sent only after restore + hash complete — so reattaching
+    // needs no unlisten and no teardown.
     token.reattachCold = () => {
-        repo.pendingListenHashes_.clear(pathString);
-        if (repo.ingestQueue_.gates.has(pathString)) {
-            repoLiftIngestGate(repo, pathString);
-            repo.server_.unlisten(query, tag);
-        }
         repoStartServerListen(repo, query, tag, currentHashFn, onComplete, true, authScopeTimeoutMs);
     };
     repo.pendingSeedRestores_.set(pathString, token);
@@ -16249,46 +14474,21 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         repo.pendingSeedRestores_.delete(pathString);
         sendListen(mode, reason);
     };
-    // MANIFEST-FIRST LISTEN. The stored manifest alone carries the protocol
-    // hashes, so the listen goes out the moment it is read (milliseconds) —
-    // the server's round-trip overlaps the tree record's read and Node
-    // construction. Server pushes that arrive before the cached base has been
-    // applied are buffered (repoOnDataUpdate/repoOnRangeMergeUpdate) and
-    // replayed against the base, preserving arrival order. If anything about
-    // the restore then fails, the buffered data is authoritative anyway — it
-    // is applied and the listen simply behaves as an unseeded one.
-    let sentFromManifest = false;
-    let restartedCold = false;
-    const restartCold = (reason = 'corrupt') => {
-        if (!sentFromManifest || restartedCold || !isCurrent()) {
-            return;
-        }
-        restartedCold = true;
-        repo.pendingSeedRestores_.delete(pathString);
-        repo.pendingListenHashes_.clear(pathString);
-        repoLiftIngestGate(repo, pathString);
-        // The compound response may omit every matching range, so buffered data
-        // cannot reconstruct a missing base. Tear down the seeded listen and send
-        // exactly one ordinary full listen.
-        repo.server_.unlisten(query, tag);
-        sendListen('fallback', reason);
-    };
     /**
      * Certified complete server caches strictly below the root (shallowest
      * first), or null when any descendant view holds PARTIAL server data — a
-     * filtered query's window, a half-filled cache — which cannot be grafted
-     * and would be replaced by applying a stale stored tree over it.
+     * filtered query's window — which cannot be grafted and would be replaced
+     * by applying a stale stored tree over it.
      *
      * Complete descendant caches are server truth the SDK already certified
-     * (a deeper listen's initial answer landing while the root's restore is
-     * still decoding). The restored base is applied WITH them grafted over
+     * (a deeper listen's initial answer landing while the root's restore was
+     * reading IndexedDB). The restored base is applied WITH them grafted over
      * it, so an early component read never forfeits the whole root's cache to
-     * a cold reload. The set is captured when the seeded listen is sent and
-     * cannot grow mid-window: a descendant registration joining the existing
-     * root view sends no wire listen of its own, and every server operation
-     * for the root is boot-buffered until the base applies.
+     * a cold reload.
      */
-    let grafts = null;
+    // Paths in the returned states are RELATIVE to query._path (SyncTree
+    // reports subtree-relative paths); updateChild and the dirty marking
+    // below both consume them as such.
     const collectGraftableDescendants = () => {
         const states = syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, query._path);
         const collected = [];
@@ -16300,175 +14500,122 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         }
         return collected;
     };
-    /**
-     * Stored range hashes describe exactly the STORED tree; grafting makes
-     * that claim false for every range a graft's leaves intersect — and a
-     * stale stored hash could falsely match a server range that REVERTED to
-     * the stored bytes, silently certifying grafted data the server no longer
-     * holds (the one corruption the range handshake cannot self-heal). Blank
-     * the intersecting ranges' hashes: an empty hash never matches, so the
-     * server always resends those ranges' current data — converging to server
-     * truth in every interleaving. Untouched ranges hold exactly the stored
-     * bytes (markDirtyRanges marks every intersecting range), so their stored
-     * hashes remain truthful. The virtual tail past the last post is already
-     * the empty hash on the wire.
-     */
-    const blankGraftedRangeHashes = (compoundHash, graftPaths) => {
-        const ranges = compoundHash.posts.map((post, index) => ({
-            post,
-            hash: compoundHash.hashes[index],
-            size: 0
-        }));
-        const marked = markDirtyRanges(ranges, graftPaths);
-        const hashes = compoundHash.hashes.slice();
-        for (let index = 0; index < ranges.length; index++) {
-            if (marked.dirty[index]) {
-                hashes[index] = '';
-            }
-        }
-        return { posts: compoundHash.posts, hashes };
-    };
-    const onManifest = () => {
-        if (!isCurrent() || sentFromManifest) {
-            return;
-        }
-        if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
-            // The root itself is already server-certified — nothing a restore
-            // could add; let the restore resolution pick the cold path.
-            return;
-        }
-        grafts = collectGraftableDescendants();
-        if (grafts === null) {
-            // Partial descendant data cannot be grafted; let the restore
-            // resolution pick the cold path.
-            return;
-        }
-        if (grafts.length > 0) {
-            const pending = repo.pendingListenHashes_.get(pathString);
-            if (pending !== undefined) {
-                // The listen must claim the tree we will actually hold: the merged
-                // base-plus-grafts. Blank the graft-intersecting range hashes and
-                // the whole-tree hash (see blankGraftedRangeHashes).
-                repo.pendingListenHashes_.set(pathString, '', blankGraftedRangeHashes(pending.compoundHash, grafts.map(graft => pathSlice(graft.path))));
-            }
-        }
-        sentFromManifest = true;
-        repo.ingestQueue_.gates.set(pathString, { pathString });
-        // Keep the pending token until range assembly finishes. A stop after this
-        // send must cancel replay/restart as well as unlisten the wire request.
-        sendListen('restored');
-    };
-    const drainBootBuffer = () => {
-        // Lift this listen's gate; the shared driver drains the repo-level
-        // ordered queue (which holds anything the wire delivered for this root
-        // while the base was applying — and everything else deferred, in one
-        // global arrival order).
-        repoLiftIngestGate(repo, pathString);
-    };
-    void persistence
-        .restoreForListen(pathString, hashes => {
-        repo.pendingListenHashes_.set(pathString, hashes.hash, hashes.compoundHash);
-        onManifest();
-    })
-        .then(result => {
+    // RESTORE → GRAFT → APPLY → HASH → LISTEN. The wire listen is sent only
+    // after the cached base is applied to the SyncTree, so no server
+    // operation can ever precede the base: there is no boot window, no
+    // buffering, no replay, and no cold restart. The hash is computed from
+    // the stored rows AFTER any grafted paths were flushed, so what the
+    // listen claims is exactly what the client holds. The costs are one
+    // hash walk per boot (worker-first, off the main thread) and server
+    // deltas arriving that much later — never a paint delay: painting rides
+    // the peek, not the listen.
+    void persistence.restoreForListen(pathString).then(async (result) => {
         if (!isCurrent()) {
-            repo.pendingListenHashes_.clear(pathString);
-            repoLiftIngestGate(repo, pathString);
             return;
         }
-        const { record, reason } = result;
-        if (record === null) {
-            // A manifest-first listen may have omitted matching ranges. If
-            // any referenced local payload is missing/corrupt, buffered deltas
-            // are not a complete base: restart exactly once with a cold listen.
-            repo.pendingListenHashes_.clear(pathString);
-            if (sentFromManifest) {
-                restartCold(reason ?? 'corrupt');
-                return;
-            }
-            const fallback = reason === 'corrupt' || reason === 'timeout';
-            finish(fallback ? 'fallback' : 'cold', reason);
+        const { node, reason } = result;
+        if (node === null) {
+            // Miss / corrupt / timeout: one ordinary cold listen. A full push
+            // then arrives and the sliced ingest + first-generation flush
+            // create the next boot's cache.
+            finish(reason !== undefined ? 'fallback' : 'cold', reason);
             return;
         }
-        if (!sentFromManifest) {
-            // Manifest callback never fired usable (pre-existing server cache,
-            // or a race); apply-then-listen, the pre-manifest-first sequence.
-            if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !== null) {
-                repo.pendingListenHashes_.clear(pathString);
-                finish('cold');
-                return;
-            }
-            grafts = collectGraftableDescendants();
-            if (grafts === null) {
-                // Partial descendant server data cannot be grafted (see
-                // collectGraftableDescendants); applying the stored tree over it
-                // would replace live server data with stale bytes.
-                repo.pendingListenHashes_.clear(pathString);
-                finish('cold', 'partial-descendants');
-                return;
-            }
+        if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path) !==
+            null) {
+            // The root itself is already server-certified — nothing a restore
+            // could add.
+            finish('cold');
+            return;
+        }
+        const grafts = collectGraftableDescendants();
+        if (grafts === null) {
+            // Partial descendant server data cannot be grafted; applying the
+            // stored tree over it would replace live server data with stale
+            // bytes.
+            finish('cold', 'partial-descendants');
+            return;
         }
         try {
-            // Graft certified descendant caches over the restored base: the
-            // deeper listens' server truth wins where they nest, and the range
-            // hashes covering them were blanked so the server resends exactly
-            // those intervals' current data (see blankGraftedRangeHashes). The
-            // set captured at listen-send time still holds: descendant wire
-            // listens are shadow-stopped by this root registration, pushes are
-            // boot-buffered, and mid-window get() responses skip the SyncTree.
-            const graftList = grafts ?? [];
-            let base = record.node;
-            for (const graft of graftList) {
+            let base = node;
+            for (const graft of grafts) {
                 base = base.updateChild(graft.path, graft.complete);
             }
-            const restored = graftList.length === 0
-                ? stampSeedHashes(base, record.hash, record.compoundHash)
-                : stampSeedHashes(base, 
-                // A merged tree matches no stored whole-tree hash; claim
-                // none. The blanked compound hash still lets every clean
-                // range validate instead of re-downloading.
-                '', record.compoundHash !== undefined
-                    ? blankGraftedRangeHashes(record.compoundHash, graftList.map(graft => pathSlice(graft.path)))
-                    : undefined);
-            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
+            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, base);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isCurrent()) {
-                repo.pendingListenHashes_.clear(pathString);
-                repoLiftIngestGate(repo, pathString);
                 return;
             }
-            if (sentFromManifest) {
-                repo.pendingSeedRestores_.delete(pathString);
+            // The view may rebuild an equal-but-distinct root during apply;
+            // capture ITS node now — the identity anchor for the stamp below.
+            const appliedAtApply = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path);
+            if (grafts.length > 0) {
+                // The stored rows lag the applied base by the grafted subtrees.
+                // Flush them BEFORE hashing, so the hash describes exactly what
+                // was applied. On failure the dirt stays pending and the hash is
+                // skipped below — a plain listen re-downloads, never certifies
+                // stale bytes.
+                persistence.serverCacheUpdated(query._path, base, 
+                // graft.path is already RELATIVE to the root (SyncTree's
+                // descendant states are subtree-relative).
+                grafts.map(graft => pathSlice(graft.path)));
+                await persistence.flushNow(pathString);
             }
-            // The hashes ride the seeded node from here on; the pending stamp
-            // must not outlive the boot window (a re-listen after real server
-            // updates must send the CURRENT tree's hashes, not the stored ones).
-            repo.pendingListenHashes_.clear(pathString);
-            if (sentFromManifest) {
-                drainBootBuffer();
+            if (!isCurrent()) {
+                return;
             }
-            else {
-                finish('restored');
+            // HASH. Claiming a compound hash is only sound while the rows equal
+            // the live cache (no pending dirt): a hash of older bytes could be
+            // certified by a server that reverted to exactly those bytes while
+            // the client holds newer data — the one corruption the range
+            // handshake cannot heal. Pending dirt (a failed graft flush)
+            // therefore downgrades to a plain full listen.
+            let hashes = persistence.hasPendingDirt(pathString)
+                ? null
+                : await persistence.computeListenHashes(pathString);
+            if (!isCurrent()) {
+                return;
             }
+            // Re-check AFTER the async walk: dirt that arrived while hashing
+            // (a descendant update writing through) means the rows no longer
+            // equal the live cache — drop the claim rather than certify it.
+            if (hashes !== null && persistence.hasPendingDirt(pathString)) {
+                hashes = null;
+            }
+            // The hashes ride the APPLIED NODE itself (WeakMap stamps), not a
+            // side table: PersistentConnection sends listens asynchronously
+            // (socket-ready, and again on every reconnect), and its hashFn
+            // reads the view's cache at SEND time. Stamp the node the VIEW
+            // actually holds — a grafted apply filters through the view
+            // processors, which can rebuild an equal-but-distinct root object —
+            // so the stamps are on exactly the object hashFn will read. Any
+            // server update replaces that node and the stamps die with it.
+            //
+            // The simple hash is ALWAYS stamped '' for a restored persistent
+            // root — with the compound hash when one was computed (range
+            // merges), plain otherwise (one full resend through the sliced
+            // ingest). Either way the view's hashFn must never fall through to
+            // cache.hash(): a synchronous full-tree hash walk of a restored
+            // multi-MB workspace is exactly the main-thread stall v2 exists to
+            // remove.
+            const applied = syncTreeGetCompleteServerCache(repo.serverSyncTree_, query._path);
+            // Identity check: the compound hash describes the tree this restore
+            // applied. If a server op replaced the cache while the hash walked,
+            // stamping the claim onto the NEW node would certify bytes the
+            // client no longer holds. A replaced cache still gets '' (never a
+            // synchronous full-tree walk), just no compound claim.
+            if (applied !== null) {
+                stampSeedHashes(applied, '', applied === appliedAtApply ? hashes?.compoundHash : undefined);
+            }
+            repo.pendingSeedRestores_.delete(pathString);
+            sendListen(hashes !== null ? 'restored' : 'fallback');
         }
-        catch {
-            repo.pendingListenHashes_.clear(pathString);
+        catch (e) {
             persistence.invalidate(query._path);
-            if (sentFromManifest) {
-                restartCold('corrupt');
-            }
-            else {
-                finish('fallback', 'corrupt');
-            }
-        }
-    }, () => {
-        repo.pendingListenHashes_.clear(pathString);
-        if (sentFromManifest) {
-            drainBootBuffer();
-        }
-        else {
             finish('fallback', 'corrupt');
         }
+    }, () => {
+        finish('fallback', 'corrupt');
     });
 }
 /**
@@ -16484,20 +14631,18 @@ function repoStopServerListen(repo, query, tag) {
         return;
     }
     const pending = repo.pendingSeedRestores_.get(pathString);
-    if (pending && !repo.ingestQueue_.gates.has(pathString)) {
-        // Still waiting on the auth scope or manifest: the listen was never sent.
+    if (pending) {
+        // A pending v2 restore has NOTHING on the wire — the listen is sent
+        // only after restore + hash complete — so cancelling the token is the
+        // whole teardown.
         repoCancelPendingSeedRestore(pending);
         repo.pendingSeedRestores_.delete(pathString);
     }
     else {
-        if (pending) {
-            repoCancelPendingSeedRestore(pending);
-            repo.pendingSeedRestores_.delete(pathString);
-        }
         repo.server_.unlisten(query, tag);
     }
+    // A sliced full-root push may still be ingesting under a gate.
     repoLiftIngestGate(repo, pathString);
-    repo.pendingListenHashes_.clear(pathString);
     repo.listenOutcomes_.delete(pathString);
     repo.persistence_?.untrack(pathString);
 }
@@ -16533,13 +14678,21 @@ function repoActivatePersistenceForJoinedListen(repo, path) {
     const pathString = path.toString();
     if (persistence === null ||
         !persistence.isPersistentPath(pathString) ||
-        persistence.trackedRootFor(pathString) === pathString ||
         repo.pendingSeedRestores_?.has(pathString)) {
-        // No manager, not selected, already tracked by its own start path, or the
-        // start path is still in flight (it will track on resolution).
+        // No manager, not selected, or the start path is still in flight (it
+        // will track on resolution).
         return;
     }
+    // track() is idempotent AND cancels a pending untrack teardown — a
+    // persistent registration that rejoins while the previous one's async
+    // drain is still running must revive the root, exactly like the direct
+    // re-track path. Never gate this call on "already tracked": an entry
+    // mid-teardown looks tracked but is about to be deleted.
+    const alreadyTracked = persistence.trackedRootFor(pathString) === pathString;
     persistence.track(pathString);
+    if (alreadyTracked) {
+        return;
+    }
     const serverCache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
     if (serverCache !== null) {
         persistence.serverCacheUpdated(path, serverCache);
@@ -16620,16 +14773,26 @@ function repoPersistAfterServerUpdate(repo, path, preciseChange) {
     if (persistence === null) {
         return;
     }
-    const rootString = persistence.trackedRootFor(path.toString());
-    if (rootString === null) {
-        return;
-    }
-    const rootPath = new Path(rootString);
-    const serverCache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath);
-    if (serverCache !== null) {
+    // Every intersecting tracked root updates — overlapping persistent
+    // registrations (ancestor + descendant) are legal, and a root left
+    // stale with no dirty marker would boot-hash bytes it does not hold.
+    for (const rootString of persistence.trackedRootsFor(path.toString())) {
+        const rootPath = new Path(rootString);
+        const serverCache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath);
+        if (serverCache === null) {
+            continue;
+        }
+        // 'at-path' names the changed subtree so the flush rewrites only its
+        // row; 'confirmed' (listen certification) re-states known state ([] =
+        // nothing dirty, meta touch); 'unknown' (a range merge names leaf
+        // INTERVALS, not subtrees) marks the whole root dirty (undefined).
         let changedPaths;
         if (preciseChange === 'at-path') {
-            changedPaths = [pathSlice(newRelativePath(rootPath, path))];
+            changedPaths = pathContains(rootPath, path)
+                ? [pathSlice(newRelativePath(rootPath, path))]
+                : // The change is at an ANCESTOR of this root: its whole subtree
+                    // may have been replaced.
+                    undefined;
         }
         else if (preciseChange === 'confirmed') {
             changedPaths = [];
@@ -16644,7 +14807,7 @@ function repoPersistAfterServerUpdate(repo, path, preciseChange) {
  * may be missing, meaning open), and the update tree for that range —
  * applied in order against the locally cached server data.
  */
-function repoOnRangeMergeUpdate(repo, pathString, ranges, tag, wireBytes = 0) {
+function repoOnRangeMergeUpdate(repo, pathString, ranges, tag) {
     // For testing.
     repo.dataUpdateCount++;
     // Wire-form path — canonicalize at the boundary (see repoOnDataUpdate).
@@ -16655,19 +14818,11 @@ function repoOnRangeMergeUpdate(repo, pathString, ranges, tag, wireBytes = 0) {
             pathString,
             ranges,
             tag,
-            wireBytes,
             generation: repo.ingestQueue_.generation
         });
         if (repo.ingestQueue_.gates.size === 0) {
             repoDrainIngestQueue(repo);
         }
-        return;
-    }
-    if (repoRangeMergeIngestEligible(repo, tag, wireBytes)) {
-        // Giant merge (a stale restored listen's near-full resend): gate the
-        // subtree, decode + fold the ranges in yielded slices off-tree, apply
-        // ONE overwrite (see repoRunSlicedRangeMergeIngest).
-        void repoRunSlicedRangeMergeIngest(repo, pathString, ranges);
         return;
     }
     repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
@@ -16701,11 +14856,76 @@ function repoApplyRangeMergeUpdate(repo, pathString, ranges, tag) {
         repoPersistAfterServerUpdate(repo, path, 'unknown');
     }
 }
+/**
+ * Prepares reconnect listen hashes at DISCONNECT time. Mobile browsers kill
+ * the socket on every backgrounding, and PersistentConnection re-sends every
+ * listen on reconnect with whatever its hashFn returns at that moment —
+ * which, after server updates replaced the boot-stamped node, would be
+ * cache.hash(): a synchronous full canonical walk of the workspace, exactly
+ * the main-thread stall persistence exists to remove.
+ *
+ * The server cache is FROZEN while disconnected (only server operations
+ * mutate it; local writes ride the pending-writes layer), so this is the one
+ * moment a stored-rows hash can be made to EXACTLY equal the live cache:
+ *
+ *   1. Stamp '' on the current cache node synchronously — from here the
+ *      reconnect hashFn can never fall through to the full walk; worst case
+ *      the listen goes plain (h:'') and the server full-resends through the
+ *      sliced ingest.
+ *   2. Flush pending dirt (rows := live cache), then compute the compound
+ *      hash from the rows off-thread and stamp it — if the node is still
+ *      the cache when the hash resolves (an identity re-check; while offline
+ *      it always is) the reconnect listen claims h:'' + ch and an unchanged
+ *      tree costs a handshake.
+ *
+ * The claim-only-what-you-hold rule (see repoStartServerListen) is enforced
+ * by the hasPendingDirt gate: a follower tab that cannot flush (another tab
+ * holds the writer lock) skips the compound stamp and pays a full resend —
+ * a stale claim could be certified by a server that reverted to exactly the
+ * stored bytes, the one divergence the range handshake cannot heal.
+ */
+function repoPrepareReconnectHashes(repo) {
+    const persistence = repo.persistence_;
+    if (persistence === null) {
+        return;
+    }
+    for (const pathString of persistence.trackedPaths()) {
+        const path = new Path(pathString);
+        const cache = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
+        if (cache === null) {
+            continue;
+        }
+        stampSeedHashes(cache, '');
+        void persistence
+            .flushNow(pathString)
+            .then(() => {
+            if (persistence.hasPendingDirt(pathString)) {
+                return null;
+            }
+            return persistence.computeListenHashes(pathString);
+        })
+            .then(hashes => {
+            if (hashes === null) {
+                return;
+            }
+            const current = syncTreeGetCompleteServerCache(repo.serverSyncTree_, path);
+            if (current === cache) {
+                stampSeedHashes(cache, '', hashes.compoundHash);
+            }
+        })
+            .catch(() => {
+            // Preparation is an optimization; the '' stamp already guarantees
+            // no synchronous walk, and a plain listen self-heals via full
+            // resend.
+        });
+    }
+}
 function repoOnConnectStatus(repo, connectStatus) {
     // The .info/connected flip rides infoSyncTree_ — independent of any data
     // ingest — and must stay immediate either way.
     repoUpdateInfo(repo, 'connected', connectStatus);
     if (connectStatus === false) {
+        repoPrepareReconnectHashes(repo);
         // Freeze THIS disconnect's registrations now: the tree is snapshotted
         // and reset in one motion, so acks landing on the new connection (a
         // cancel, a fresh registration) mutate the NEXT disconnect's tree and
@@ -16782,7 +15002,16 @@ function repoGetValue(repo, query, eventRegistration) {
         // pending base/full push would clobber the fresh value moments later)
         // suppresses the SyncTree side effect. A non-empty queue for other
         // roots must not skip an unrelated get's normal event delivery.
-        if (repoIngestGateFor(repo, query._path.toString()) !== null) {
+        //
+        // The same applies while an ancestor's persisted restore is pending
+        // (base not yet applied, listen unsent): installing this fresh answer
+        // would raise fresh events to listeners at this path moments before
+        // the restored base applies stale bytes over them — the visible
+        // fresh→stale→fresh flip. The caller still gets the fresh value; the
+        // base + the listen's range merges populate the tree consistently.
+        const getPathString = query._path.toString();
+        if (repoIngestGateFor(repo, getPathString) !== null ||
+            repoPendingRestoreCovering(repo, getPathString) !== null) {
             return node;
         }
         /**
@@ -18736,7 +16965,20 @@ function addEventListener(query, eventType, callback, cancelCallbackOrListenOpti
                 return;
             }
             persistenceReleased = true;
-            query._repo.persistence_?.setPersistentPath(query._path.toString(), false);
+            const persistence = query._repo.persistence_;
+            if (persistence === undefined || persistence === null) {
+                return;
+            }
+            const pathString = query._path.toString();
+            persistence.setPersistentPath(pathString, false);
+            // A joined registration (repoActivatePersistenceForJoinedListen)
+            // tracked the root without a wire listen of its own; stop-listen
+            // teardown will never run for it. When the LAST persistent
+            // registration releases, storage ownership must end here — the
+            // shared network listener stays untouched.
+            if (!persistence.isPersistentPath(pathString)) {
+                persistence.untrack(pathString);
+            }
         }
         : undefined;
     if (options?.persistent) {
@@ -19768,7 +18010,12 @@ function setPersistenceEnabled(db, enabled) {
     const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
-            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+            repo.persistence_ = new RowPersistenceManager(repo.repoInfo_.toURLString());
+            // Auth may be configured before persistence is enabled; preserve the
+            // explicit undefined-vs-null distinction.
+            if (repo.persistenceAuthScope_ !== undefined) {
+                repo.persistence_.setAuthScope(repo.persistenceAuthScope_);
+            }
         }
     }
     else {
@@ -20116,7 +18363,6 @@ exports.Database = Database;
 exports.OnDisconnect = OnDisconnect;
 exports.QueryConstraint = QueryConstraint;
 exports.TransactionResult = TransactionResult;
-exports._PERSISTENCE_WRITE_DEBOUNCE_MS = PERSISTENCE_WRITE_DEBOUNCE_MS;
 exports._QueryImpl = QueryImpl;
 exports._QueryParams = QueryParams;
 exports._ReferenceImpl = ReferenceImpl;
