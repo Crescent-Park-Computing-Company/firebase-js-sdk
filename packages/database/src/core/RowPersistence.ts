@@ -867,8 +867,25 @@ export class RowPersistenceManager {
     }
     root.latest = node;
     root.latestScope = this.authScope_;
-    if (changedPaths === undefined) {
-      root.dirty = null; // whole root
+    if (changedPaths !== undefined && changedPaths.length === 0) {
+      // A listen certification: state already accounted, NOTHING dirty.
+      // It must not set a dirty marker — a marker here reads as pending
+      // dirt at boot-hash time and silently downgrades every listen to an
+      // uncertified full resend (descendant listeners certify while the
+      // root restore is still reading IDB, so this fired on every boot of
+      // a busy app). latest is refreshed; an armed window is untouched.
+      return;
+    }
+    if (
+      changedPaths === undefined ||
+      changedPaths.some(path => path.length === 0)
+    ) {
+      // Whole root — including a write-through NAMING the root (a full
+      // push's 'at-path' at the root itself). Routing this through the
+      // incremental flush would serialize the entire tree synchronously
+      // into one giant transaction; the whole-root path stages in
+      // byte-batched transactions instead.
+      root.dirty = null;
     } else if (root.dirty === undefined) {
       root.dirty = changedPaths.slice();
     } else if (root.dirty !== null) {
@@ -1156,6 +1173,20 @@ export class RowPersistenceManager {
         }
       }
       chosen.push(boundaries[i]);
+    }
+    // Bound the synchronous work: an incremental flush is for CHANGE-SIZED
+    // dirt. When the dirty subtrees together exceed one staging batch, the
+    // byte-batched whole-root path is both simpler and strictly better than
+    // serializing a huge subtree into one transaction here.
+    let estimated = 0;
+    for (let i = 0; i < chosen.length; i++) {
+      estimated += estimateSerializedNodeSize(
+        node.getChild(new Path(chosen[i].join('/')))
+      );
+      if (estimated > this.stageTxnBytes_) {
+        await this.flushWholeRoot_(pathString, root, node, generation);
+        return;
+      }
     }
     const scope = this.scopeKey_();
     const rootKey = this.rootKey_(pathString);

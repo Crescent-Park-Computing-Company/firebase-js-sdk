@@ -617,3 +617,38 @@ describe('joined persistent rejoin during untrack drain', () => {
     manager.dispose();
   });
 });
+
+describe('warm boot stays certified under boot-time write-throughs', () => {
+  it('a certification write-through during the restore window does not downgrade the claim', async () => {
+    const idb = makeFakeIdb();
+    {
+      const writer = makeManager(idb);
+      await persistRoot(writer, new Path('users/alice'), {
+        docs: { a: 'x'.repeat(300) }
+      });
+      writer.dispose();
+    }
+    const manager = makeManager(idb);
+    const h = makeListenHarness(manager);
+    registerRootView(h);
+    repoStartServerListen(h.repo, h.query, null, h.hashFn, h.onComplete);
+    // While the restore/hash runs, a listen certification re-states known
+    // state ([] = nothing changed) — the exact write-through every deeper
+    // certified listener produces during a busy boot.
+    manager.serverCacheUpdated(
+      h.path,
+      nodeFromJSON({ docs: { a: 'x'.repeat(300) } }),
+      []
+    );
+    await waitForListen(h.calls);
+    const cache = syncTreeGetCompleteServerCache(
+      h.repo.serverSyncTree_,
+      h.path
+    )!;
+    // The claim survived: '' + compound hash stamped (a 'restored' boot,
+    // range merges — NOT an uncertified full resend).
+    expect(getNodeCanonicalHash(cache)).to.equal('');
+    expect(getNodeCompoundHash(cache)).to.not.equal(undefined);
+    manager.dispose();
+  });
+});

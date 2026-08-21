@@ -854,3 +854,46 @@ describe('iterative whole-root staging', () => {
     reader.dispose();
   });
 });
+
+describe('boot-claim protection (amber regression)', () => {
+  it('a listen certification (changedPaths=[]) marks nothing dirty', async () => {
+    const manager = makeManager(makeFakeIdb());
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    const tree = nodeFromJSON({ a: 1 });
+    manager.serverCacheUpdated(new Path('/ws'), tree);
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    expect(manager.hasPendingDirt('/ws')).to.equal(false);
+    // The certification write-through: nothing dirty, claim stays sound.
+    manager.serverCacheUpdated(new Path('/ws'), tree, []);
+    expect(manager.hasPendingDirt('/ws')).to.equal(false);
+    const hashes = await manager.computeListenHashes('/ws');
+    expect(hashes).to.not.equal(null);
+    manager.dispose();
+  });
+
+  it('a root-covering changed path routes to whole-root staging, not the single-txn incremental', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    manager.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    // A full push write-through names the ROOT ('at-path' at the root):
+    // changedPaths=[[]] must take the batched whole-root path (dirty=null).
+    const v2 = nodeFromJSON({ v: 2, extra: 'x'.repeat(100) });
+    manager.serverCacheUpdated(new Path('/ws'), v2, [[]]);
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const restored = await reader.peek('/ws', 'alice');
+    expect(restored!.node.equals(v2)).to.equal(true);
+    manager.dispose();
+    reader.dispose();
+  });
+});
