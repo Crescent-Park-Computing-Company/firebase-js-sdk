@@ -26,6 +26,10 @@ import {
   markDirtyRanges,
   walkLeafInterval
 } from './CompoundHash';
+import {
+  emitPersistenceTrace,
+  persistenceTraceSinkInstalled
+} from './PersistenceTrace';
 import { SeedCompoundHash, stampSeedHashes } from './ServerCacheSeed';
 import { ChildrenNode } from './snap/ChildrenNode';
 import { KEY_INDEX } from './snap/indexes/KeyIndex';
@@ -367,6 +371,32 @@ function recordPersistenceEvent(
   if (persistenceStats.events.length > 100) {
     persistenceStats.events.splice(0, persistenceStats.events.length - 100);
   }
+}
+
+/**
+ * Identity sharing between the previous flush baseline and the tree being
+ * written — the flush trace's memory signal. `sharedChildren` counts the new
+ * tree's immediate children that ARE the baseline's child objects (===);
+ * zero with a present baseline means a wholesale replace (a fallback resend
+ * or an ungrafted ingest): until this flush commits, the divorced baseline
+ * retains a second complete tree in memory.
+ */
+function baselineSharing(
+  prev: FlushedState | undefined,
+  node: Node
+): { sharedChildren: number; totalChildren: number } {
+  let sharedChildren = 0;
+  let totalChildren = 0;
+  const prevRoot = prev?.rootNode ?? null;
+  if (prevRoot !== null && !node.isLeafNode() && !prevRoot.isLeafNode()) {
+    (node as ChildrenNode).forEachChild(KEY_INDEX, (name, child) => {
+      totalChildren++;
+      if (prevRoot.getImmediateChild(name) === child) {
+        sharedChildren++;
+      }
+    });
+  }
+  return { sharedChildren, totalChildren };
 }
 
 const RANGE_KEY_INFIX = '#range:';
@@ -2955,6 +2985,17 @@ export class PersistenceManager {
         }
         if (ok) {
           this.lastFlush_.delete(pathString);
+          if (persistenceTraceSinkInstalled()) {
+            emitPersistenceTrace({
+              type: 'flush',
+              path: pathString,
+              mode: 'empty',
+              ranges: 0,
+              rangesHashed: 0,
+              rangesReused: 0,
+              ...baselineSharing(prev, node)
+            });
+          }
           return;
         }
         return this.adoptCommittedBaseline_(pathString);
@@ -3413,6 +3454,17 @@ export class PersistenceManager {
             'stored',
             `${ranges.length} ranges, ${dirtyPlans.length} written`
           );
+          if (persistenceTraceSinkInstalled()) {
+            emitPersistenceTrace({
+              type: 'flush',
+              path: pathString,
+              mode: 'commit',
+              ranges: ranges.length,
+              rangesHashed: dirtyPlans.length,
+              rangesReused: ranges.length - dirtyPlans.length,
+              ...baselineSharing(prev, node)
+            });
+          }
           if (!prev) {
             void this.gcRangeRecords_(pathString, revision, liveIds);
           }

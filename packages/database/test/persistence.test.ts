@@ -467,6 +467,93 @@ describe('PersistenceManager', () => {
     expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
   });
 
+  it('emits a flush trace with baseline identity-sharing counters', async () => {
+    const traced: Array<Record<string, unknown>> = [];
+    const traceGlobal = globalThis as typeof globalThis & {
+      __firebaseDatabasePersistenceTrace?: (event: unknown) => void;
+    };
+    traceGlobal.__firebaseDatabasePersistenceTrace = event => {
+      const e = event as Record<string, unknown>;
+      if (e['type'] === 'flush') {
+        traced.push(e);
+      }
+    };
+    try {
+      const { factory } = makeFakeIndexedDB();
+      const manager = scopedManager('test-repo', factory);
+      const path = new Path('some/root');
+      manager.track(path.toString());
+
+      // Generation 1: no prior baseline.
+      const first = nodeFromJSON({ a: 1, b: 2 });
+      manager.serverCacheUpdated(path, first);
+      await manager.flushNow(path.toString());
+      await flushAsync();
+      expect(traced.length).to.equal(1);
+      expect(traced[0]['mode']).to.equal('commit');
+      expect(traced[0]['path']).to.equal(path.toString());
+      // No baseline at all: sharing counters stay zero.
+      expect(traced[0]['sharedChildren']).to.equal(0);
+      expect(traced[0]['totalChildren']).to.equal(0);
+      expect(traced[0]['ranges']).to.be.a('number');
+      expect(traced[0]['rangesHashed']).to.be.a('number');
+
+      // Generation 2: an incremental update SHARING children identity with
+      // the flushed baseline (updateImmediateChild preserves the untouched
+      // child objects) — still a different root object, so the identity diff
+      // runs, but the divorce signal below is about a WHOLESALE replace.
+      const second = first.updateImmediateChild('b', nodeFromJSON(3));
+      manager.serverCacheUpdated(path, second, [['b']]);
+      await manager.flushNow(path.toString());
+      await flushAsync();
+      expect(traced.length).to.equal(2);
+      // 'a' kept the baseline's object; 'b' was replaced: 1 of 2 shared.
+      expect(traced[1]['sharedChildren']).to.equal(1);
+      expect(traced[1]['totalChildren']).to.equal(2);
+      expect((traced[1]['rangesReused'] as number) >= 0).to.equal(true);
+
+      // Generation 3: flushing the SAME tree object after the refresh age
+      // is skipped entirely (no event) — assert no spurious emission.
+      await manager.flushNow(path.toString());
+      await flushAsync();
+      expect(traced.length).to.equal(2);
+    } finally {
+      delete traceGlobal.__firebaseDatabasePersistenceTrace;
+    }
+  });
+
+  it('emits an empty-mode flush trace when the tree empties', async () => {
+    const traced: Array<Record<string, unknown>> = [];
+    const traceGlobal = globalThis as typeof globalThis & {
+      __firebaseDatabasePersistenceTrace?: (event: unknown) => void;
+    };
+    traceGlobal.__firebaseDatabasePersistenceTrace = event => {
+      const e = event as Record<string, unknown>;
+      if (e['type'] === 'flush') {
+        traced.push(e);
+      }
+    };
+    try {
+      const { factory } = makeFakeIndexedDB();
+      const manager = scopedManager('test-repo', factory);
+      const path = new Path('some/root');
+      manager.track(path.toString());
+      manager.serverCacheUpdated(path, nodeFromJSON({ a: 1 }));
+      await manager.flushNow(path.toString());
+      await flushAsync();
+      expect(traced.length).to.equal(1);
+
+      manager.serverCacheUpdated(path, nodeFromJSON(null));
+      await manager.flushNow(path.toString());
+      await flushAsync();
+      expect(traced.length).to.equal(2);
+      expect(traced[1]['mode']).to.equal('empty');
+      expect(traced[1]['ranges']).to.equal(0);
+    } finally {
+      delete traceGlobal.__firebaseDatabasePersistenceTrace;
+    }
+  });
+
   it('stores one manifest + immutable range records and reassembles exactly', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', factory);
