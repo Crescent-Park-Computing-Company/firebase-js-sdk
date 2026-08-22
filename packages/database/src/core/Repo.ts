@@ -34,6 +34,7 @@ import {
   PersistenceManager
 } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
+import { emitPersistenceTrace } from './PersistenceTrace';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ListenWireResult, ServerActions } from './ServerActions';
@@ -370,24 +371,6 @@ interface ListenOutcomeState {
   subscribers: Set<(outcome: ListenOutcome) => void>;
 }
 
-interface PersistenceTraceEvent {
-  type: 'listen-outcome';
-  path: string;
-  outcome: ListenOutcome;
-}
-
-type PersistenceTraceGlobal = typeof globalThis & {
-  __firebaseDatabasePersistenceTrace?: (event: PersistenceTraceEvent) => void;
-};
-
-function emitPersistenceTrace(event: PersistenceTraceEvent): void {
-  const sink = (globalThis as PersistenceTraceGlobal)
-    .__firebaseDatabasePersistenceTrace;
-  if (typeof sink === 'function') {
-    exceptionGuard(() => sink(event));
-  }
-}
-
 function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
   pending.cancelled = true;
   pending.authScopeUnsubscribe?.();
@@ -683,10 +666,20 @@ function repoOnDataUpdate(
   // boundary so repoIngestEligible, gate coverage, and the drain's re-entry
   // all compare within one form. Idempotent for already-canonical callers.
   pathString = new Path(pathString).toString();
+  const traceWire = (decision: 'sync' | 'queued' | 'sliced') =>
+    emitPersistenceTrace({
+      type: 'wire-message',
+      path: pathString,
+      kind: isMerge ? 'merge' : 'data',
+      wireBytes,
+      tagged: tag != null,
+      decision
+    });
   if (repoDeferredStreamActive(repo)) {
     // A gate covers this path, or the ordered queue already holds earlier
     // wire operations: defer. The drain applies it after everything queued
     // before it, across all roots and kinds.
+    traceWire('queued');
     repo.ingestQueue_.ops.push({
       kind: 'data',
       pathString,
@@ -707,9 +700,11 @@ function repoOnDataUpdate(
     // Full-root push at a persistent root: gate the subtree, decode in
     // yielded slices, apply atomically (see repoIngestFullRootPush), then
     // drain whatever the wire delivered meanwhile — in order.
+    traceWire('sliced');
     void repoRunSlicedIngest(repo, pathString, data as Record<string, unknown>);
     return;
   }
+  traceWire('sync');
   repoApplyDataUpdate(repo, pathString, data, isMerge, tag);
 }
 
@@ -1988,7 +1983,17 @@ function repoOnRangeMergeUpdate(
   repo.dataUpdateCount++;
   // Wire-form path — canonicalize at the boundary (see repoOnDataUpdate).
   pathString = new Path(pathString).toString();
+  const traceWire = (decision: 'sync' | 'queued' | 'sliced') =>
+    emitPersistenceTrace({
+      type: 'wire-message',
+      path: pathString,
+      kind: 'rm',
+      wireBytes,
+      tagged: tag != null,
+      decision
+    });
   if (repoDeferredStreamActive(repo)) {
+    traceWire('queued');
     repo.ingestQueue_.ops.push({
       kind: 'rm',
       pathString,
@@ -2006,9 +2011,11 @@ function repoOnRangeMergeUpdate(
     // Giant merge (a stale restored listen's near-full resend): gate the
     // subtree, decode + fold the ranges in yielded slices off-tree, apply
     // ONE overwrite (see repoRunSlicedRangeMergeIngest).
+    traceWire('sliced');
     void repoRunSlicedRangeMergeIngest(repo, pathString, ranges);
     return;
   }
+  traceWire('sync');
   repoApplyRangeMergeUpdate(repo, pathString, ranges, tag);
 }
 

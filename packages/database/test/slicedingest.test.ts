@@ -1550,4 +1550,131 @@ describe('sliced full-root push ingestion', () => {
     // Both applied in order; the second replaced the first entirely.
     expect(cache!.equals(nodeFromJSON(second))).to.equal(true);
   });
+
+  describe('persistence trace: wire-message events', () => {
+    type TraceEvent = Record<string, unknown>;
+    let traced: TraceEvent[];
+    const traceGlobal = globalThis as typeof globalThis & {
+      __firebaseDatabasePersistenceTrace?: (event: unknown) => void;
+    };
+
+    beforeEach(() => {
+      traced = [];
+      traceGlobal.__firebaseDatabasePersistenceTrace = event =>
+        traced.push(event as TraceEvent);
+    });
+
+    afterEach(() => {
+      delete traceGlobal.__firebaseDatabasePersistenceTrace;
+    });
+
+    const wireEvents = () => traced.filter(e => e['type'] === 'wire-message');
+
+    it('a small push reports a sync decision with its path, size and kind', async () => {
+      const { repo } = makeIngestHarness('/users/alice');
+      repoOnDataUpdateForTest(repo, 'users/alice/name', 'x', false, null, 42);
+      await flushAsync();
+      expect(wireEvents()).to.deep.equal([
+        {
+          type: 'wire-message',
+          path: '/users/alice/name',
+          kind: 'data',
+          wireBytes: 42,
+          tagged: false,
+          decision: 'sync'
+        }
+      ]);
+    });
+
+    it('a giant push reports a sliced decision', async () => {
+      const { repo } = makeIngestHarness('/users/alice');
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        wideRoot(4),
+        false,
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      await flushAsync();
+      const events = wireEvents();
+      expect(events.length).to.equal(1);
+      expect(events[0]['decision']).to.equal('sliced');
+      expect(events[0]['wireBytes']).to.equal(_INGEST_WIRE_BYTES_THRESHOLD);
+      expectIngestIdle(repo);
+    });
+
+    it('an operation deferred behind a gate reports queued exactly once', async () => {
+      const { repo } = makeIngestHarness('/users/alice');
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        wideRoot(4),
+        false,
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      // Behind the in-flight sliced ingest's gate: deferred into the queue.
+      repoOnDataUpdateForTest(repo, 'users/alice/name', 'y', false, null, 17);
+      await flushAsync();
+      const deferred = wireEvents().filter(e => e['wireBytes'] === 17);
+      // The drain applies the queued op via the direct apply path, so the
+      // arrival-time 'queued' report is its ONLY event.
+      expect(deferred).to.deep.equal([
+        {
+          type: 'wire-message',
+          path: '/users/alice/name',
+          kind: 'data',
+          wireBytes: 17,
+          tagged: false,
+          decision: 'queued'
+        }
+      ]);
+      expectIngestIdle(repo);
+    });
+
+    it('a giant range merge reports kind rm with a sliced decision', async () => {
+      const { repo } = makeIngestHarness('/users/alice');
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        wideRoot(3),
+        false,
+        null,
+        10
+      );
+      await flushAsync();
+      traced.length = 0;
+      repoOnRangeMergeUpdateForTest(
+        repo,
+        'users/alice',
+        [{ m: { child0: { value: 99, nested: { deep: 'v0' } } } }],
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      await flushAsync();
+      const events = wireEvents();
+      expect(events.length).to.equal(1);
+      expect(events[0]['kind']).to.equal('rm');
+      expect(events[0]['decision']).to.equal('sliced');
+      expectIngestIdle(repo);
+    });
+
+    it('a tagged update reports tagged true and stays sync', async () => {
+      const { repo } = makeIngestHarness('/users/alice');
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        wideRoot(3),
+        false,
+        99,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      await flushAsync();
+      const events = wireEvents();
+      expect(events.length).to.equal(1);
+      expect(events[0]['tagged']).to.equal(true);
+      expect(events[0]['decision']).to.equal('sync');
+    });
+  });
 });
