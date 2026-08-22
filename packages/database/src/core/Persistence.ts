@@ -381,31 +381,6 @@ function recordPersistenceEvent(
  * or an ungrafted ingest): until this flush commits, the divorced baseline
  * retains a second complete tree in memory.
  */
-/**
- * True when the incoming tree keeps NO immediate-child identity with the
- * flush baseline — the wholesale-replace shape. Identity-only and bounded
- * by the root's child count; never compares content (a structurally-equal
- * rebuilt child still reads as divorced, which only costs staging a fresh
- * generation — never correctness).
- */
-function baselineFullyDivorced(prevRoot: Node, node: Node): boolean {
-  if (prevRoot === node) {
-    return false;
-  }
-  if (node.isLeafNode() || prevRoot.isLeafNode() || node.isEmpty()) {
-    return true;
-  }
-  let shared = false;
-  // forEachChild aborts the traversal on a truthy callback return.
-  (node as ChildrenNode).forEachChild(KEY_INDEX, (name, child) => {
-    if (prevRoot.getImmediateChild(name) === child) {
-      shared = true;
-      return true;
-    }
-  });
-  return !shared;
-}
-
 function baselineSharing(
   prev: FlushedState | undefined,
   node: Node
@@ -422,6 +397,38 @@ function baselineSharing(
     });
   }
   return { sharedChildren, totalChildren };
+}
+
+/**
+ * True when the incoming tree keeps NO immediate-child identity with a
+ * MULTI-child flush baseline — the wholesale-replace shape. Identity-only
+ * and bounded by the root's child count; never compares content (a
+ * structurally-equal rebuilt child still reads as divorced, which only
+ * costs staging a fresh generation — never correctness). Roots whose
+ * incoming tree has fewer than two children are never treated as divorced:
+ * a single-child root loses child identity on EVERY ordinary incremental
+ * update (the sole child is rebuilt each time), so the release would fire
+ * per-update and force a full-generation flush each window; retaining one
+ * child's baseline costs little, and the identity diff stays cheap there.
+ */
+function baselineFullyDivorced(prevRoot: Node, node: Node): boolean {
+  if (prevRoot === node || node.isLeafNode() || node.isEmpty()) {
+    return false;
+  }
+  if (prevRoot.isLeafNode()) {
+    return true;
+  }
+  let children = 0;
+  let shared = false;
+  // forEachChild aborts the traversal on a truthy callback return.
+  (node as ChildrenNode).forEachChild(KEY_INDEX, (name, child) => {
+    children++;
+    if (prevRoot.getImmediateChild(name) === child) {
+      shared = true;
+      return true;
+    }
+  });
+  return children > 1 && !shared;
 }
 
 const RANGE_KEY_INFIX = '#range:';
@@ -893,15 +900,35 @@ export class PersistenceManager {
    * the race against teardown simply doesn't commit (the manifest CAS keeps
    * storage consistent), which is exactly today's behavior without the
    * attempt.
+   *
+   * `force` decides what happens while restores are still in flight.
+   * pagehide is terminal — the page is going away, so flushing NOW is
+   * strictly better than losing the generation, even at the cost of
+   * contending with a restore that will die with the page anyway.
+   * visibilitychange:hidden is RECOVERABLE (mobile backgrounding, tab
+   * switch): a forced readwrite there could starve an active restore into
+   * its idle timeout on return, so those roots keep the ordinary
+   * restore-deferral (writesDeferredUntilRestores_ re-arms them when the
+   * restores drain) and only restore-free roots flush.
    */
-  private lifecycleFlush_ = (): void => {
+  private lifecycleFlush_ = (force: boolean): void => {
     if (this.disposed_ || !this.authScopeConfigured_) {
       return;
     }
+    const restoresActive =
+      this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0;
     for (const pathString of [...this.latest_.keys()]) {
+      if (!force && restoresActive) {
+        this.writesDeferredUntilRestores_.add(pathString);
+        continue;
+      }
       // flush_ itself skips a root whose newest tree is already stored.
       void this.flushNow(pathString);
     }
+  };
+
+  private onPageHide_ = (): void => {
+    this.lifecycleFlush_(true);
   };
 
   private onVisibilityChange_ = (): void => {
@@ -909,7 +936,7 @@ export class PersistenceManager {
       typeof document !== 'undefined' &&
       document.visibilityState === 'hidden'
     ) {
-      this.lifecycleFlush_();
+      this.lifecycleFlush_(false);
     }
   };
 
@@ -917,7 +944,7 @@ export class PersistenceManager {
     if (typeof window === 'undefined' || typeof document === 'undefined') {
       return;
     }
-    window.addEventListener('pagehide', this.lifecycleFlush_);
+    window.addEventListener('pagehide', this.onPageHide_);
     document.addEventListener('visibilitychange', this.onVisibilityChange_);
   }
 
@@ -925,7 +952,7 @@ export class PersistenceManager {
     if (typeof window === 'undefined' || typeof document === 'undefined') {
       return;
     }
-    window.removeEventListener('pagehide', this.lifecycleFlush_);
+    window.removeEventListener('pagehide', this.onPageHide_);
     document.removeEventListener('visibilitychange', this.onVisibilityChange_);
   }
 

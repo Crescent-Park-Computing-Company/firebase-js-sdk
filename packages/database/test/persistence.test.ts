@@ -621,6 +621,28 @@ describe('PersistenceManager', () => {
     expect(internals.lastFlush_.get(path.toString())!.rootNode).to.equal(first);
   });
 
+  it('never treats a single-child root as divorced (incremental updates rebuild the sole child)', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('some/root');
+    const internals = manager as unknown as {
+      lastFlush_: Map<string, { rootNode: Node | null }>;
+    };
+    manager.track(path.toString());
+
+    const first = nodeFromJSON({ only: { v: 1 } });
+    manager.serverCacheUpdated(path, first);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+
+    // An ordinary update to a single-child root rebuilds the sole child, so
+    // no child identity survives — the divorce release must NOT fire (it
+    // would force a full-generation flush on every update).
+    const second = first.updateImmediateChild('only', nodeFromJSON({ v: 2 }));
+    manager.serverCacheUpdated(path, second, [['only']]);
+    expect(internals.lastFlush_.get(path.toString())!.rootNode).to.equal(first);
+  });
+
   it('flushes pending roots on pagehide and stops listening after dispose', async () => {
     const g = globalThis as typeof globalThis & {
       window?: unknown;
@@ -687,6 +709,38 @@ describe('PersistenceManager', () => {
         path.toString()
       )) as PersistedRecord;
       expect(restored.node.val(true)).to.deep.equal({ a: 2 });
+
+      // While a restore is active, visibility-hidden DEFERS (the root joins
+      // writesDeferredUntilRestores_) instead of contending with the
+      // restore's transactions; pagehide still forces the flush.
+      const internals = manager as unknown as {
+        activeRestoreCount_: number;
+        writesDeferredUntilRestores_: Set<string>;
+      };
+      manager.serverCacheUpdated(path, nodeFromJSON({ a: 3 }));
+      internals.activeRestoreCount_ = 1;
+      for (const fn of docListeners.get('visibilitychange')!) {
+        fn();
+      }
+      expect(
+        internals.writesDeferredUntilRestores_.has(path.toString())
+      ).to.equal(true);
+      const restoredMid = (await restoreForTest(
+        manager,
+        path.toString()
+      )) as PersistedRecord;
+      // Unflushed: storage still holds the pre-restore-deferral generation.
+      expect(restoredMid.node.val(true)).to.deep.equal({ a: 2 });
+      for (const fn of winListeners.get('pagehide')!) {
+        fn();
+      }
+      await flushAsync();
+      const restoredForced = (await restoreForTest(
+        manager,
+        path.toString()
+      )) as PersistedRecord;
+      expect(restoredForced.node.val(true)).to.deep.equal({ a: 3 });
+      internals.activeRestoreCount_ = 0;
 
       // dispose removes both listeners.
       manager.dispose();
