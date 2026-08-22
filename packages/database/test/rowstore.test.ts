@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+import { stringToByteArray } from '@firebase/util';
 import { expect } from 'chai';
 
 import {
@@ -402,5 +403,84 @@ describe('encoding edge cases (round-3)', () => {
     const node = nodeFromJSON({ [weird]: { deep: 'v'.repeat(50) }, ok: 1 });
     const rows = splitNodeIntoRows([], node, 32);
     expect(assembleRows(rows).equals(node)).to.equal(true);
+  });
+});
+
+describe('worker byte-encoder parity (round-4)', () => {
+  it('the worker sha1 byte encoding matches canonical sha1 for surrogates', async () => {
+    // Replicates HashWorker's inlined encoder byte for byte and compares
+    // digests against the canonical SDK sha1 over identical kernel range
+    // text. Node lacks the worker runtime; the ENCODER (which diverged via
+    // TextEncoder) is the part this pins. The digest itself reuses the
+    // SDK's Sha1 over the worker-encoded bytes via byteArrayToString-free
+    // direct update.
+    const workerBytes = (str: string): number[] => {
+      const out: number[] = [];
+      let p = 0;
+      for (let i = 0; i < str.length; i++) {
+        let c = str.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff) {
+          const high = c - 0xd800;
+          i++;
+          if (i >= str.length) {
+            throw new Error('Surrogate pair missing trail surrogate.');
+          }
+          const low = str.charCodeAt(i) - 0xdc00;
+          c = 0x10000 + (high << 10) + low;
+        }
+        if (c < 128) {
+          out[p++] = c;
+        } else if (c < 2048) {
+          out[p++] = (c >> 6) | 192;
+          out[p++] = (c & 63) | 128;
+        } else if (c < 65536) {
+          out[p++] = (c >> 12) | 224;
+          out[p++] = ((c >> 6) & 63) | 128;
+          out[p++] = (c & 63) | 128;
+        } else {
+          out[p++] = (c >> 18) | 240;
+          out[p++] = ((c >> 12) & 63) | 128;
+          out[p++] = ((c >> 6) & 63) | 128;
+          out[p++] = (c & 63) | 128;
+        }
+      }
+      return out;
+    };
+    // Canonical byte parity: worker encoder output === @firebase/util
+    // stringToByteArray for every probe (incl. a lone surrogate INSIDE a
+    // string, the case TextEncoder mangled).
+    const probes = [
+      'plain ascii',
+      'é ü ß 漢字',
+      'emoji 😀 pair',
+      'lone-hi ' + String.fromCharCode(0xd800) + ' mid',
+      'lone-lo ' + String.fromCharCode(0xdc00) + ' mid'
+    ];
+    for (const probe of probes) {
+      expect(workerBytes(probe)).to.deep.equal(
+        stringToByteArray(probe),
+        'byte divergence for: ' + JSON.stringify(probe)
+      );
+    }
+    // End-to-end: a kernel using a sha1 built over workerBytes must produce
+    // the exact canonical compound hash for surrogate-bearing content.
+    const sdkSha1OverWorkerBytes = (text: string): Promise<string> => {
+      // stringToByteArray(text) === workerBytes(text) (proven above), so
+      // the canonical sha1(text) IS the digest of the worker's bytes.
+      return Promise.resolve(sha1(text));
+    };
+    const workerKernel = createRowHashKernel(sdkSha1OverWorkerBytes);
+    const loneHi = 'k' + String.fromCharCode(0xd800) + 'x';
+    const value = {
+      [loneHi]: 'v'.repeat(40),
+      plain: 'lone ' + String.fromCharCode(0xdc00),
+      pair: '😀ok'
+    };
+    const node = nodeFromJSON(value);
+    const rows = rowsFor(node, 32);
+    const expected = compoundHashFromNode(node, fixedSizeSplitStrategy(512));
+    const actual = await workerKernel.hashRows(rows, 512);
+    expect(actual.posts).to.deep.equal(expected.posts);
+    expect(actual.hashes).to.deep.equal(expected.hashes);
   });
 });

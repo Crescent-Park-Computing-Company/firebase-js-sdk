@@ -81,7 +81,46 @@ function workerMain(): void {
   type Kernel = ReturnType<typeof createRowHashKernel>;
   const factory = (0, eval)('(KERNEL_FACTORY)') as typeof createRowHashKernel;
   const sha1 = async (text: string): Promise<string> => {
-    const bytes = new TextEncoder().encode(text);
+    // VERBATIM port of @firebase/util stringToByteArray (utf8.ts) — the
+    // byte encoder the canonical SDK sha1() uses. NOT TextEncoder: the
+    // canonical encoder consumes the char after any lead surrogate
+    // unconditionally (deterministic garbage for Firebase-legal lone
+    // surrogates, and a throw when one ends the string), while TextEncoder
+    // substitutes U+FFFD — same range text, different bytes, different
+    // hash, failed certification. Wire compatibility pins these bytes.
+    const str = text;
+    const out: number[] = [];
+    let p = 0;
+    for (let i = 0; i < str.length; i++) {
+      let c = str.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        const high = c - 0xd800;
+        i++;
+        if (i >= str.length) {
+          // Canonical encoder asserts here; failing the hash (caught by the
+          // caller → uncertified listen) matches the main-thread outcome.
+          throw new Error('Surrogate pair missing trail surrogate.');
+        }
+        const low = str.charCodeAt(i) - 0xdc00;
+        c = 0x10000 + (high << 10) + low;
+      }
+      if (c < 128) {
+        out[p++] = c;
+      } else if (c < 2048) {
+        out[p++] = (c >> 6) | 192;
+        out[p++] = (c & 63) | 128;
+      } else if (c < 65536) {
+        out[p++] = (c >> 12) | 224;
+        out[p++] = ((c >> 6) & 63) | 128;
+        out[p++] = (c & 63) | 128;
+      } else {
+        out[p++] = (c >> 18) | 240;
+        out[p++] = ((c >> 12) & 63) | 128;
+        out[p++] = ((c >> 6) & 63) | 128;
+        out[p++] = (c & 63) | 128;
+      }
+    }
+    const bytes = new Uint8Array(out);
     const digest = await crypto.subtle.digest('SHA-1', bytes);
     const arr = new Uint8Array(digest);
     let bin = '';
