@@ -25,11 +25,9 @@ import {
 import { createRowHashKernel, KernelRow } from '../src/core/RowHashKernel';
 import {
   assembleRows,
-  splitNodeIntoRows,
-  RowIndex,
-  encodeRowKey,
-  decodeRowKeyRelativePath,
-  sortRelativePathsByName
+  decodeRowSegment,
+  encodeRowSegment,
+  splitNodeIntoRows
 } from '../src/core/RowStore';
 import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
@@ -280,17 +278,6 @@ describe('RowHashKernel parity', () => {
 });
 
 describe('RowStore', () => {
-  it('row keys round-trip and range-scan safely', () => {
-    const key = encodeRowKey('user1', '/users/alice', ['a', 'b']);
-    expect(
-      decodeRowKeyRelativePath(key, 'user1', '/users/alice')
-    ).to.deep.equal(['a', 'b']);
-    const root = encodeRowKey('user1', '/users/alice', []);
-    expect(
-      decodeRowKeyRelativePath(root, 'user1', '/users/alice')
-    ).to.deep.equal([]);
-  });
-
   it('splitNodeIntoRows produces disjoint rows that reassemble exactly', () => {
     const node = nodeFromJSON({
       big: Object.fromEntries(
@@ -318,43 +305,6 @@ describe('RowStore', () => {
       d: 2
     });
   });
-
-  it('RowIndex normalizes dirty paths to row boundaries', () => {
-    const index = RowIndex.fromRelativePaths([['a'], ['b', 'c'], ['d']]);
-    expect(index.rowBoundaryFor(['a', 'x', 'y'])).to.deep.equal(['a']);
-    expect(index.rowBoundaryFor(['b', 'c', 'z'])).to.deep.equal(['b', 'c']);
-    expect(index.rowBoundaryFor(['b'])).to.deep.equal(null);
-    expect(index.rowBoundaryFor(['nowhere'])).to.deep.equal(null);
-    index.replaceSubtree(
-      ['b'],
-      [
-        ['b', 'q'],
-        ['b', 'r']
-      ]
-    );
-    expect(index.rowBoundaryFor(['b', 'q', 'deep'])).to.deep.equal(['b', 'q']);
-    expect(index.rowBoundaryFor(['b', 'c'])).to.deep.equal(null);
-    expect(index.rowCount()).to.equal(4);
-  });
-
-  it('sortRelativePathsByName orders integer keys numerically', () => {
-    const sorted = sortRelativePathsByName([
-      ['10'],
-      ['9'],
-      ['2'],
-      ['abc'],
-      ['2', 'child'],
-      []
-    ]);
-    expect(sorted).to.deep.equal([
-      [],
-      ['2'],
-      ['2', 'child'],
-      ['9'],
-      ['10'],
-      ['abc']
-    ]);
-  });
 });
 
 describe('encoding edge cases (round-3)', () => {
@@ -373,7 +323,7 @@ describe('encoding edge cases (round-3)', () => {
     );
   });
 
-  it('row keys round-trip Firebase-valid lone surrogates', () => {
+  it('segment encoding round-trips Firebase-valid lone surrogates', () => {
     const hi = 'k' + String.fromCharCode(0xd800);
     const lo = String.fromCharCode(0xdc00) + 'x';
     for (const seg of [
@@ -383,18 +333,15 @@ describe('encoding edge cases (round-3)', () => {
       'a%b',
       'pct%0041',
       '\u0001nev',
-      'x\uffff'
+      'x\uffff',
+      'plain'
     ]) {
-      const key = encodeRowKey('auth:u', '/r', [seg, 'plain']);
-      expect(decodeRowKeyRelativePath(key, 'auth:u', '/r')).to.deep.equal([
-        seg,
-        'plain'
-      ]);
-      // Encoded keys never contain a raw separator or sentinel inside a
-      // segment (prefix-range safety).
-      const parts = key.split('\u0001');
-      expect(parts[parts.length - 1]).to.equal('');
-      expect(key.indexOf('\uffff')).to.equal(-1);
+      const enc = encodeRowSegment(seg);
+      expect(decodeRowSegment(enc)).to.equal(seg);
+      // Encoded segments never contain a raw separator or range sentinel,
+      // so chunk/meta key prefix ranges stay exact.
+      expect(enc.indexOf('\u0001')).to.equal(-1);
+      expect(enc.indexOf('\uffff')).to.equal(-1);
     }
   });
 

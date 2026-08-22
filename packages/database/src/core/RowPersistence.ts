@@ -16,55 +16,64 @@
  */
 
 /**
- * Row-model persistence manager (persistence v2).
+ * Generation-swap snapshot persistence (v3).
  *
- * Replaces the stable-range/manifest design with the Android storage model:
- * path-keyed rows of export JSON (RowStore), no stored hashes, compound
- * hashes computed at listen time from the rows (RowHashKernel). A stale or
- * torn cache is plain staleness the server heals through range merges —
- * never a protocol-corruption state — so this manager carries none of the
- * v1 invariant machinery: no manifests, no revision CAS, no staged
- * verification, no lease heartbeat/steal, no boot buffers.
+ * One LOGICAL snapshot per root, stored as immutable ~2MiB chunks under a
+ * generation id, made live by a single-key meta pointer swap:
  *
- * Multi-tab: one Web Locks lock per (scope, root). The holder writes;
- * followers keep their dirty sets in memory and do not touch storage. The
- * lock releases automatically on tab death (UA-guaranteed). Where Web Locks
- * are unavailable every tab writes — rows are last-writer-wins server data,
- * so concurrent writers cost duplicate work, not correctness.
+ *   chunks: scope·root·gen·index  →  JSON of [pathSegments, exportJson][]
+ *   meta:   scope·root            →  { gen, chunkCount, updatedAt, ... }
  *
- * Auth: scope-keyed rows; peek retention preserves the v1 (PR #4)
- * semantics — a pre-auth peek is retained under a long backstop until the
- * app confirms the scope, then drops to the short handoff grace; a scope
- * change invalidates everything immediately.
+ * The design premise: incremental writes against a mutable store
+ * manufacture partial states, and every partial state needs a defense
+ * (v1's manifests/CAS, v2's staging markers/nonces/serializable sweeps —
+ * where every review finding across two audit loops lived). Here there are
+ * no partial states to defend:
+ *
+ * - Chunks are IMMUTABLE once written and INVISIBLE until the meta pointer
+ *   references them. A crash mid-write leaves garbage chunks (aged out by
+ *   the sweep), never a torn generation. Two tabs racing write two
+ *   complete generations; the last pointer swap wins.
+ * - Hash-snapshot binding is free: the worker hashes the chunks of the
+ *   exact generation this manager restored or committed (root.gen).
+ *   Immutability IS the binding — no same-snapshot re-reads, no ownership
+ *   nonces, no claims-require-locks rule. A foreign swap that removed the
+ *   generation → chunks missing → the claim declines → plain listen.
+ * - Every flush is a full snapshot. Mitigations: a one-pointer-compare
+ *   skip when the tree didn't change, a WeakMap chunk-payload cache so
+ *   serialization cost tracks the CHANGED subtrees (Nodes are immutable
+ *   and structurally shared), and a 30s debounce. Web Locks remains a
+ *   pure write-dedup optimization — never a correctness mechanism.
+ *
+ * Auth: rows are namespaced by repo prefix + identity scope exactly like
+ * v2 ('public' | 'auth:<uid>' folded with prefix_ into the key's first
+ * component); peek retention keeps the pre-auth backstop / confirmed
+ * grace semantics.
  */
 
-import { estimateSerializedNodeSize } from './CompoundHash';
 import { hashRowsInWorker, workerHashAvailable } from './HashWorker';
 import { createRowHashKernel, KernelCompoundHash } from './RowHashKernel';
 import {
   ROW_KEY_SEPARATOR,
   ROW_SPLIT_THRESHOLD_BYTES,
-  RowIndex,
   assembleRowsSliced,
-  decodeRowKeyRelativePath,
-  encodeRowKey,
-  rowKeyRange,
+  encodeRowSegment,
   splitNodeIntoRows
 } from './RowStore';
 import { PRIORITY_INDEX } from './snap/indexes/PriorityIndex';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
-import { warn, sha1 } from './util/util';
+import { sha1, warn } from './util/util';
 import { yieldMacrotask } from './util/yieldMacrotask';
 
 const DB_NAME = 'firebase-database-persistence';
-/** v10 replaces the v1 range/manifest store with the row stores. */
-const DB_VERSION = 10;
-const ROWS_STORE = 'rows';
+/** v11 replaces the v2 row/meta stores with the chunk/meta stores. */
+const DB_VERSION = 11;
+const CHUNKS_STORE = 'chunks';
 const META_STORE = 'meta';
-const LEGACY_STORE = 'firebase-server-cache';
+const LEGACY_STORES = ['firebase-server-cache', 'rows'];
 
-export const ROW_PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
+export const ROW_PERSISTENCE_WRITE_DEBOUNCE_MS = 30000;
 export const ROW_PERSISTENCE_FIRST_GEN_DELAY_MS = 3000;
 /** Peek retention while the app has confirmed the primed scope. */
 export const ROW_PERSISTENCE_PEEK_HANDOFF_MS = 30000;
@@ -73,42 +82,24 @@ export const ROW_PERSISTENCE_PEEK_PREAUTH_MS = 5 * 60 * 1000;
 export const ROW_PERSISTENCE_RESTORE_TIMEOUT_MS = 8000;
 /** Cached roots older than this are swept (30 days, Android parity). */
 export const ROW_PERSISTENCE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-/** Sweep delay after the first restore — far off every boot-critical path. */
-export const ROW_PERSISTENCE_SWEEP_DELAY_MS = 60 * 1000;
-/** Byte budget per whole-root staging transaction (and its yield cadence). */
-export const ROW_PERSISTENCE_STAGE_TXN_BYTES = 2 * 1024 * 1024;
+/** Non-live generations older than this are garbage (crashed/raced writes). */
+export const ROW_PERSISTENCE_ORPHAN_GEN_AGE_MS = 10 * 60 * 1000;
+/** Serialized bytes per chunk — the slice unit for parse and write. */
+export const ROW_PERSISTENCE_CHUNK_BYTES = 2 * 1024 * 1024;
+export const ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS = 20000;
 /** Parsed-bytes budget per restore assembly slice. */
 const RESTORE_SLICE_BYTES = 256 * 1024;
-/** Worker hash wall-clock ceiling before the main-thread fallback runs. */
-export const ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS = 20000;
 
 interface RootMeta {
+  /** The LIVE generation id; its chunks are scope·root·gen·0..chunkCount-1. */
+  gen: string;
+  chunkCount: number;
   updatedAt: number;
   formatVersion: number;
-  /**
-   * True while a whole-root staging is IN FLIGHT: rows under this root are
-   * being rewritten batch by batch. Readers treat a staging meta exactly
-   * like no cache; the sweep treats its rows as LIVE (never orphans) until
-   * the marker itself expires (a crashed stage, reclaimed by age). The
-   * marker is what lets multi-transaction staging coexist with an
-   * uncoordinated cross-tab sweep without any lock on the sweep.
-   */
-  staging?: boolean;
-  /**
-   * Random nonce, fresh on every committed generation. The one binding
-   * between "the rows a restore/flush produced" and "the rows a later hash
-   * read": a hash is only claimable when the generation it read equals the
-   * generation this manager last held (lastGen on the tracked root).
-   * Anything else — a foreign tab's commit in between, staged rows with no
-   * meta, an expired cache — reads as a mismatch and downgrades to a plain
-   * listen. Millisecond timestamps alone cannot carry this (same-ms
-   * cross-tab commits), a nonce can.
-   */
-  gen: string;
 }
-const META_FORMAT_VERSION = 2;
+const META_FORMAT_VERSION = 3;
 
-function newMetaGen(): string {
+function newGen(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 }
 
@@ -142,7 +133,7 @@ function defaultWebLocks(): WebLocksLike | null {
 }
 
 interface RetainedPeek {
-  promise: Promise<{ node: Node; rowPaths: string[][]; gen: string } | null>;
+  promise: Promise<{ node: Node; gen: string } | null>;
   /** Set when the read resolves; identity key for the handoff stamps. */
   resolvedNode: Node | null;
   retained: boolean;
@@ -153,36 +144,31 @@ interface TrackedRoot {
   /** Newest complete server-cache tree awaiting flush (null = clean). */
   latest: Node | null;
   latestScope: string | null;
-  /** Dirty subtree paths since the last flush; null = whole root. */
-  dirty: string[][] | null | undefined; // undefined = nothing dirty
-  /** Row-path index for boundary normalization; null until known. */
-  rowIndex: RowIndex | null;
-  /** Whether a committed generation exists (meta present). */
-  hasGeneration: boolean;
-  /** The meta gen of the generation this manager last restored/committed. */
-  lastGen: string | null;
+  /** True when `latest` differs from the last committed snapshot. */
+  dirty: boolean;
+  /** The root Node of the last committed/restored generation. */
+  committedNode: Node | null;
+  /** The generation this manager last restored or committed (the claim). */
+  gen: string | null;
   windowTimer: ReturnType<typeof setTimeout> | null;
-  /** Single-flight: a flush is running; re-arm afterward if set. */
-  flushing: boolean;
   activeFlush: Promise<void> | null;
   rearm: boolean;
   /** Held Web Lock release callback (null = not the writer). */
   releaseLock: (() => void) | null;
-  /**
-   * Resolves once the initial acquisition DECIDED: granted (this tab is
-   * the writer) or queued behind a live holder. flushNow_ awaits it so a
-   * flush issued right after track() — the boot graft flush, a test —
-   * cannot race the in-flight probe and misread "not the writer".
-   */
+  /** Resolves once the initial lock acquisition DECIDED (see acquire). */
   lockDecided: Promise<void> | null;
-  /**
-   * Set while an untrack drain is in flight. track() clears it to CANCEL
-   * the teardown — a remove-then-re-add in one stack (React effect
-   * cleanup + setup) must keep the root tracked, its lock held, and its
-   * rearmed dirt flushable.
-   */
+  /** Set while an untrack drain is in flight; track() clears it to cancel. */
   untrackPending: boolean;
 }
+
+/**
+ * Chunk payloads per top-level child, keyed by the child Node's identity.
+ * Nodes are immutable and structurally shared across server updates, so a
+ * cached serialization stays valid as long as the child object lives — a
+ * snapshot flush re-serializes only the top-level children that actually
+ * changed. Module-level WeakMap: entries die with their nodes.
+ */
+const childPayloadCache = new WeakMap<Node, string>();
 
 export class RowPersistenceManager {
   private db_: Promise<IDBDatabase | null> | null = null;
@@ -196,6 +182,7 @@ export class RowPersistenceManager {
   private networkSuspended_ = false;
   private disposed_ = false;
   private sweepTimer_: ReturnType<typeof setTimeout> | null = null;
+  private sweepDone_ = false;
 
   constructor(
     private prefix_: string,
@@ -209,9 +196,10 @@ export class RowPersistenceManager {
     private peekHandoffMs_: number = ROW_PERSISTENCE_PEEK_HANDOFF_MS,
     private peekPreAuthMs_: number = ROW_PERSISTENCE_PEEK_PREAUTH_MS,
     private restoreTimeoutMs_: number = ROW_PERSISTENCE_RESTORE_TIMEOUT_MS,
-    private stageTxnBytes_: number = ROW_PERSISTENCE_STAGE_TXN_BYTES,
+    private chunkBytes_: number = ROW_PERSISTENCE_CHUNK_BYTES,
     private workerHashTimeoutMs_: number = ROW_PERSISTENCE_WORKER_HASH_TIMEOUT_MS,
-    private maxAgeMs_: number = ROW_PERSISTENCE_MAX_AGE_MS
+    private maxAgeMs_: number = ROW_PERSISTENCE_MAX_AGE_MS,
+    private orphanGenAgeMs_: number = ROW_PERSISTENCE_ORPHAN_GEN_AGE_MS
   ) {}
 
   // ─────────────────────────── auth scope ────────────────────────────────
@@ -226,9 +214,8 @@ export class RowPersistenceManager {
 
   /**
    * Configures the identity scope. `confirmedByApp=false` is a pre-auth
-   * peek priming a trusted expected identity; `true` is the app's real auth
-   * integration. Returns whether the scope CHANGED (callers cancel pending
-   * seed restores on a confirmed change).
+   * peek priming a trusted expected identity; `true` is the app's real
+   * auth integration. Returns whether the scope CHANGED.
    */
   setAuthScope(scope: string | null, confirmedByApp = true): boolean {
     const changed = !this.authScopeConfigured_ || scope !== this.authScope_;
@@ -237,8 +224,6 @@ export class RowPersistenceManager {
       if (!this.authScopeConfirmed_) {
         this.authScopeConfirmed_ = true;
         if (!changed) {
-          // Real auth confirmed the primed scope: retained peeks drop from
-          // the pre-auth backstop to the short handoff grace, counted now.
           this.rearmRetainedPeeks_(this.peekHandoffMs_);
         }
       }
@@ -252,7 +237,7 @@ export class RowPersistenceManager {
     this.authScope_ = scope;
     // A different identity invalidates every in-memory holding: retained
     // peeks (another account's tree must never reach a listener), pending
-    // trees, dirty sets, and writer locks (their names embed the scope).
+    // trees, and writer locks (their names embed the scope).
     this.clearAllPeeks_();
     for (const [pathString, root] of this.tracked_) {
       this.resetTrackedRoot_(root);
@@ -262,13 +247,8 @@ export class RowPersistenceManager {
   }
 
   private scopeKey_(): string {
-    // The key's first component carries BOTH isolations, structurally:
-    // - repo instance (prefix_ = the database URL) — two databases on one
-    //   origin, or emulator vs production, must never share cached bytes;
-    // - identity, with distinct 'public'/'auth:' tags so an authenticated
-    //   scope can never collide with the signed-out namespace.
-    // encodeRowKey URI-encodes the whole component, so '|' and separators
-    // inside either part cannot forge a different key.
+    // Repo instance + identity, structurally tagged, folded into the key's
+    // first component (encodeRowSegment escapes the separators).
     const identity =
       this.authScope_ === null ? 'public' : 'auth:' + this.authScope_;
     return this.prefix_ + '|' + identity;
@@ -296,11 +276,7 @@ export class RowPersistenceManager {
     return [...this.persistentRoots_.keys()];
   }
 
-  /**
-   * The tracked root at or above `pathString`, or null. Roots are the paths
-   * listeners selected with {persistent: true}; a server update anywhere
-   * under one re-persists through that root.
-   */
+  /** The tracked root at or above `pathString`, or null. */
   trackedRootFor(pathString: string): string | null {
     for (const root of this.tracked_.keys()) {
       if (
@@ -315,11 +291,9 @@ export class RowPersistenceManager {
 
   /**
    * EVERY tracked root a server update at `pathString` touches — roots at
-   * or above the path (the change is inside their subtree) AND roots below
-   * it (an overwrite at an ancestor rewrites their whole tree). Overlapping
-   * persistent registrations are legal (ancestor + descendant listeners),
-   * and each stored root must stay current or its next boot hash would
-   * claim bytes it does not hold.
+   * or above the path AND roots below it (an ancestor overwrite rewrites
+   * their subtree). Each stored root must stay current or its next boot
+   * hash would claim bytes it does not hold.
    */
   trackedRootsFor(pathString: string): string[] {
     const roots: string[] = [];
@@ -337,6 +311,10 @@ export class RowPersistenceManager {
     return roots;
   }
 
+  trackedPaths(): string[] {
+    return [...this.tracked_.keys()];
+  }
+
   track(pathString: string): void {
     if (this.disposed_) {
       return;
@@ -344,19 +322,17 @@ export class RowPersistenceManager {
     const existing = this.tracked_.get(pathString);
     if (existing !== undefined) {
       // Cancel an in-flight untrack teardown: the path was re-selected
-      // while its drain ran. The entry, lock, and any rearmed dirt stay.
+      // while its drain ran. The entry, lock, and pending dirt stay.
       existing.untrackPending = false;
       return;
     }
     const root: TrackedRoot = {
       latest: null,
       latestScope: null,
-      dirty: undefined,
-      rowIndex: null,
-      hasGeneration: false,
-      lastGen: null,
+      dirty: false,
+      committedNode: null,
+      gen: null,
       windowTimer: null,
-      flushing: false,
       activeFlush: null,
       rearm: false,
       releaseLock: null,
@@ -373,17 +349,15 @@ export class RowPersistenceManager {
       return;
     }
     root.untrackPending = true;
-    // Drain until clean before releasing writership: awaiting one flush is
-    // not enough — dirt that arrived DURING it (rearm) or an already
-    // in-flight flush must also settle, or the final tree of a closed
-    // listener is silently dropped with the lock released mid-write.
+    // Drain until clean before releasing writership — the final tree of a
+    // closed listener must survive to the next boot.
     const drain = async (): Promise<void> => {
       for (let i = 0; i < 10; i++) {
         if (root.activeFlush !== null) {
           await root.activeFlush;
         }
         if (
-          root.dirty === undefined ||
+          !root.dirty ||
           root.latest === null ||
           this.networkSuspended_ ||
           !this.isWriter_(root)
@@ -394,8 +368,6 @@ export class RowPersistenceManager {
       }
     };
     void drain().then(() => {
-      // Cancelled (re-tracked mid-drain) or superseded by a fresh entry:
-      // the live registration owns the root now — do not tear it down.
       if (this.tracked_.get(pathString) !== root || !root.untrackPending) {
         return;
       }
@@ -411,9 +383,9 @@ export class RowPersistenceManager {
     }
     root.latest = null;
     root.latestScope = null;
-    root.dirty = undefined;
-    root.rowIndex = null;
-    root.hasGeneration = false;
+    root.dirty = false;
+    root.committedNode = null;
+    root.gen = null;
     root.rearm = false;
     if (root.releaseLock !== null) {
       root.releaseLock();
@@ -428,38 +400,23 @@ export class RowPersistenceManager {
   // ─────────────────────────── writer lock ───────────────────────────────
 
   /**
-   * Queues a BLOCKING exclusive lock request for (scope, root). The UA
-   * grants it when the current holder releases — an untrack's final flush,
-   * a scope switch, or tab death (release is UA-guaranteed) — so writer
-   * succession is automatic with zero steal/heartbeat machinery. Until the
-   * grant this tab is a follower: it keeps dirty sets in memory and does
-   * not touch storage. On grant it refreshes the row index (rows on disk
-   * may lag its memory) and flushes whatever is pending.
-   */
-  /**
-   * Two-phase writer acquisition:
-   *
-   * 1. An `ifAvailable` probe decides IMMEDIATELY: either this tab becomes
-   *    the writer now, or a live holder exists elsewhere. `lockDecided`
-   *    resolves at that decision, so a flush issued right after track()
-   *    (the boot graft flush) can await a definitive answer instead of
-   *    misreading an in-flight request as "not the writer".
-   * 2. When the probe lost, a BLOCKING queued request waits behind the
-   *    holder: the UA grants it when the holder releases or its tab dies —
-   *    automatic succession with zero heartbeat/steal machinery.
+   * Two-phase writer acquisition — an OPTIMIZATION ONLY (avoids duplicate
+   * snapshot writes from N tabs); correctness never depends on it, because
+   * generations are complete-or-invisible regardless of who writes.
+   * 1. An `ifAvailable` probe decides immediately (lockDecided resolves).
+   * 2. When the probe lost, a blocking queued request waits for succession
+   *    (the UA grants it when the holder releases or its tab dies).
    */
   private async acquireWriterLock_(
     pathString: string,
     root: TrackedRoot
   ): Promise<void> {
     if (this.webLocks_ === null) {
-      // Fail open: no cross-tab exclusion, every tab writes (LWW rows;
-      // computeListenHashes independently declines claims in this mode).
       root.lockDecided = Promise.resolve();
       return;
     }
     const name =
-      'firebase-db-rows|' +
+      'firebase-db-gen|' +
       this.prefix_ +
       '|' +
       this.scopeKey_() +
@@ -474,8 +431,7 @@ export class RowPersistenceManager {
     const holdLock = (): Promise<void> =>
       new Promise<void>(resolve => {
         root.releaseLock = resolve;
-        root.rowIndex = null;
-        if (root.dirty !== undefined && root.windowTimer === null) {
+        if (root.dirty && root.windowTimer === null) {
           this.armWindow_(pathString, root);
         }
       });
@@ -501,7 +457,6 @@ export class RowPersistenceManager {
       if (probeWon || !usable()) {
         return;
       }
-      // A holder exists elsewhere: queue behind it for succession.
       await this.webLocks_.request(name, { mode: 'exclusive' }, () => {
         if (!usable()) {
           return Promise.resolve();
@@ -510,13 +465,12 @@ export class RowPersistenceManager {
       });
     } catch (e) {
       decided();
-      // Lock API failure: stay a follower (rows go stale until next boot).
     }
   }
 
   private isWriter_(root: TrackedRoot): boolean {
-    // No Web Locks (Node, exotic embedders): every tab writes — a duplicate
-    // LWW write is cheaper than having no writer at all.
+    // Without Web Locks every tab writes — a duplicate complete snapshot
+    // is wasted work, never a correctness problem (last pointer wins).
     return this.webLocks_ === null || root.releaseLock !== null;
   }
 
@@ -540,14 +494,18 @@ export class RowPersistenceManager {
       }
       request.onupgradeneeded = () => {
         const db = request.result;
-        if (db.objectStoreNames.contains(LEGACY_STORE)) {
-          db.deleteObjectStore(LEGACY_STORE);
+        for (const legacy of LEGACY_STORES) {
+          if (db.objectStoreNames.contains(legacy)) {
+            db.deleteObjectStore(legacy);
+          }
         }
-        if (!db.objectStoreNames.contains(ROWS_STORE)) {
-          db.createObjectStore(ROWS_STORE);
+        // The v2 'meta' store carries incompatible records; recreate it.
+        if (db.objectStoreNames.contains(META_STORE)) {
+          db.deleteObjectStore(META_STORE);
         }
-        if (!db.objectStoreNames.contains(META_STORE)) {
-          db.createObjectStore(META_STORE);
+        db.createObjectStore(META_STORE);
+        if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
+          db.createObjectStore(CHUNKS_STORE);
         }
       };
       request.onsuccess = () => {
@@ -556,10 +514,7 @@ export class RowPersistenceManager {
         resolve(db);
       };
       request.onerror = () => resolve(null);
-      request.onblocked = () => {
-        // Another tab holds an old version open; fail open to live RTDB.
-        resolve(null);
-      };
+      request.onblocked = () => resolve(null);
     });
     return this.db_;
   }
@@ -579,15 +534,52 @@ export class RowPersistenceManager {
     });
   }
 
+  /** meta key for a root: scope·root (both escaped) + terminator. */
+  private metaKey_(pathString: string): string {
+    return (
+      encodeRowSegment(this.scopeKey_()) +
+      ROW_KEY_SEPARATOR +
+      encodeRowSegment(pathString) +
+      ROW_KEY_SEPARATOR
+    );
+  }
+
+  /** chunk key: metaKey · gen · index (zero-padded for range order). */
+  private chunkKey_(pathString: string, gen: string, index: number): string {
+    return (
+      this.metaKey_(pathString) +
+      gen +
+      ROW_KEY_SEPARATOR +
+      String(index).padStart(6, '0')
+    );
+  }
+
+  private chunkRange_(pathString: string, gen?: string): IDBKeyRange {
+    const start =
+      gen === undefined
+        ? this.metaKey_(pathString)
+        : this.metaKey_(pathString) + gen + ROW_KEY_SEPARATOR;
+    const end = start + '\uffff';
+    if (typeof IDBKeyRange !== 'undefined') {
+      return IDBKeyRange.bound(start, end, false, true);
+    }
+    // Node (tests): a structurally compatible range for fake stores.
+    return {
+      lower: start,
+      upper: end,
+      lowerOpen: false,
+      upperOpen: true,
+      includes: (key: string) => key >= start && key < end
+    } as unknown as IDBKeyRange;
+  }
+
   // ─────────────────────────── peek (boot) ───────────────────────────────
 
   /**
    * Reads the cached tree for `pathString` without starting the repo — the
-   * pre-auth boot peek. One physical read per root: an overlapping
-   * authenticated restore consumes the same decode (restoreForListen). The
-   * resolved node is RETAINED under the pre-auth backstop (or the short
-   * grace once the scope is confirmed) so the later listener join reuses
-   * this decode instead of reading twice.
+   * pre-auth boot peek. One physical read per root; the resolved node is
+   * RETAINED under the pre-auth backstop (or the short confirmed grace) so
+   * the authenticated listener consumes this same decode.
    */
   peek(
     pathString: string,
@@ -616,7 +608,7 @@ export class RowPersistenceManager {
   /**
    * True while THE retained read that decoded `node` is still awaiting its
    * listener join — the only window in which materialization stamps have a
-   * consumer (identity-bound; see v1 hasRetainedPeek).
+   * consumer (identity-bound).
    */
   hasRetainedPeek(pathString: string, node: Node): boolean {
     const entry = this.peeks_.get(pathString);
@@ -688,47 +680,44 @@ export class RowPersistenceManager {
     this.peeks_.clear();
   }
 
-  /** One physical root read: meta check, row getAll, sliced assemble. */
+  /** One physical root read: meta → live gen's chunks → sliced assemble. */
   private async readRoot_(
     pathString: string
-  ): Promise<{ node: Node; rowPaths: string[][]; gen: string } | null> {
+  ): Promise<{ node: Node; gen: string } | null> {
     const db = await this.open_();
     if (db === null) {
       return null;
     }
-    const scope = this.scopeKey_();
     try {
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
-      const metaKey = encodeRowKey(scope, this.rootKey_(pathString), []);
-      const metaReq = txn.objectStore(META_STORE).get(metaKey);
-      const range = rowKeyRange(scope, this.rootKey_(pathString), []);
-      const keysReq = txn.objectStore(ROWS_STORE).getAllKeys(range);
-      const valuesReq = txn.objectStore(ROWS_STORE).getAll(range);
-      const [meta, keys, values] = await Promise.all([
-        this.requestDone_(metaReq),
-        this.requestDone_(keysReq),
-        this.requestDone_(valuesReq)
-      ]);
+      const txn = db.transaction([CHUNKS_STORE, META_STORE], 'readonly');
+      const metaReq = txn
+        .objectStore(META_STORE)
+        .get(this.metaKey_(pathString));
+      const meta = (await this.requestDone_(metaReq)) as RootMeta | undefined;
       if (
         meta === undefined ||
-        (meta as RootMeta).formatVersion !== META_FORMAT_VERSION ||
-        (meta as RootMeta).staging === true
+        meta.formatVersion !== META_FORMAT_VERSION ||
+        Date.now() - meta.updatedAt > this.maxAgeMs_
       ) {
         return null;
       }
-      if (Date.now() - (meta as RootMeta).updatedAt > this.maxAgeMs_) {
+      const chunksReq = txn
+        .objectStore(CHUNKS_STORE)
+        .getAll(this.chunkRange_(pathString, meta.gen));
+      const chunkTexts = (await this.requestDone_(chunksReq)) as string[];
+      if (chunkTexts.length !== meta.chunkCount) {
+        // A foreign swap GC'd this generation mid-read, or a corrupt store.
         return null;
       }
       const rows: Array<[string[], string]> = [];
-      const rowPaths: string[][] = [];
-      for (let i = 0; i < keys.length; i++) {
-        const relative = decodeRowKeyRelativePath(
-          keys[i] as string,
-          scope,
-          this.rootKey_(pathString)
-        );
-        rows.push([relative, values[i] as string]);
-        rowPaths.push(relative);
+      for (let i = 0; i < chunkTexts.length; i++) {
+        const parsed = JSON.parse(chunkTexts[i]) as Array<[string[], string]>;
+        for (let j = 0; j < parsed.length; j++) {
+          rows.push(parsed[j]);
+        }
+        if (i + 1 < chunkTexts.length) {
+          await yieldMacrotask();
+        }
       }
       const node = await assembleRowsSliced(
         rows,
@@ -738,25 +727,19 @@ export class RowPersistenceManager {
       if (node.isEmpty() && rows.length > 0) {
         return null;
       }
-      return { node, rowPaths, gen: (meta as RootMeta).gen };
+      return { node, gen: meta.gen };
     } catch (e) {
       warn('persistence read failed: ' + (e as Error | null)?.message);
       return null;
     }
   }
 
-  /** The root path string used inside row keys ('/a/b' canonical form). */
-  private rootKey_(pathString: string): string {
-    return pathString;
-  }
-
   // ───────────────────────── restore (listen) ────────────────────────────
 
   /**
    * The authenticated listener's restore: consumes the retained peek's
-   * decode when one exists (the one-decode-per-boot handoff), otherwise
-   * performs its own read. Resolves within `restoreTimeoutMs_` or reports
-   * a timeout miss (the listen then goes cold — liveness over cache).
+   * decode when one exists, otherwise performs its own read. Resolves
+   * within `restoreTimeoutMs_` or reports a timeout miss.
    */
   restoreForListen(pathString: string): Promise<RowRestoreResult> {
     if (this.disposed_ || !this.authScopeConfigured_) {
@@ -772,7 +755,6 @@ export class RowPersistenceManager {
       }, this.restoreTimeoutMs_);
     });
     return Promise.race([entry.promise, timeout]).then(result => {
-      // The listener consumed (or abandoned) the read; retention ends.
       this.dropPeek_(pathString, entry);
       this.scheduleSweep_();
       if (this.authGeneration_ !== generation) {
@@ -784,10 +766,9 @@ export class RowPersistenceManager {
           : { node: null };
       }
       const root = this.tracked_.get(pathString);
-      if (root !== null && root !== undefined) {
-        root.rowIndex = RowIndex.fromRelativePaths(result.rowPaths);
-        root.hasGeneration = true;
-        root.lastGen = result.gen;
+      if (root !== undefined) {
+        root.committedNode = result.node;
+        root.gen = result.gen;
       }
       return { node: result.node };
     });
@@ -796,116 +777,87 @@ export class RowPersistenceManager {
   // ───────────────────────── listen hashes ───────────────────────────────
 
   /**
-   * Computes the wire listen hashes for `pathString` from its stored rows.
-   *
-   * Worker-first: a Blob-URL worker opens its own readonly IDB connection,
-   * streams the rows through the parity-tested kernel, and posts back only
-   * {posts, hashes} — zero main-thread hashing cost (see HashWorker). Any
-   * worker failure (unavailable, spawn error, IDB error, kernel overlap,
-   * timeout) falls back to the main-thread kernel in bounded yielded
-   * slices. Returns null when there are no rows or both paths fail — the
-   * listen then sends a plain full listen.
+   * Computes the wire listen hashes from the stored chunks of the exact
+   * generation this manager last restored or committed. Immutability makes
+   * the snapshot binding structural: the chunks either ARE that generation
+   * byte for byte, or some are missing (foreign swap GC'd it — chunkCount
+   * mismatch) and the claim declines. Worker-first; sliced main-thread
+   * fallback. Null ⇒ the listen goes out plain (full resend, uncertified).
    */
   async computeListenHashes(
     pathString: string
   ): Promise<RowListenHashes | null> {
-    // The claim is only sound for the exact generation THIS manager last
-    // restored or committed (root.lastGen). The hash read is a separate IDB
-    // snapshot — a foreign tab may have committed newer rows in between, and
-    // hashing those would stamp a claim onto a live cache that does not hold
-    // them: the one unhealable corruption class. Reading meta.gen inside the
-    // same snapshot as the rows, and requiring it to equal lastGen, makes
-    // the mismatch a plain downgrade to an uncertified listen.
-    // Claims additionally require REAL cross-tab exclusion. The gen check
-    // binds the hash to one committed generation, but a generation is only
-    // guaranteed internally consistent (one writer's tree, never a mix of
-    // two tabs' increments) because exactly one tab can write at a time.
-    // Where Web Locks does not exist that premise is gone — tabs interleave
-    // incremental flushes and the LAST writer's gen can describe mixed
-    // rows. Cache writes stay (they still paint the next boot); the listen
-    // simply goes uncertified, which is the pre-persistence behavior.
-    if (this.webLocks_ === null) {
+    const root = this.tracked_.get(pathString);
+    const gen = root?.gen ?? null;
+    if (gen === null || root === undefined) {
       return null;
     }
-    const expectedGen = this.tracked_.get(pathString)?.lastGen ?? null;
-    if (expectedGen === null) {
+    if (root.dirty || root.activeFlush !== null) {
+      // The live cache moved past the committed snapshot; a claim would
+      // describe bytes the client no longer holds.
       return null;
     }
-    const scope = this.scopeKey_();
-    const rootKey = this.rootKey_(pathString);
+    const chunkPrefix = this.metaKey_(pathString) + gen + ROW_KEY_SEPARATOR;
     if (this.idbFactory_ !== null && workerHashAvailable()) {
-      const prefix = encodeRowKey(scope, rootKey, []);
       try {
         const compoundHash = await hashRowsInWorker(
           {
             dbName: DB_NAME,
-            storeName: ROWS_STORE,
+            storeName: CHUNKS_STORE,
             metaStoreName: META_STORE,
-            metaKey: prefix,
-            expectedGen,
-            lowerKey: prefix,
-            upperKey: prefix + '\uffff',
-            prefixLength: prefix.length,
-            separator: ROW_KEY_SEPARATOR
+            metaKey: this.metaKey_(pathString),
+            expectedGen: gen,
+            lowerKey: chunkPrefix,
+            upperKey: chunkPrefix + '\uffff',
+            chunked: true
           },
           this.workerHashTimeoutMs_
         );
         if (compoundHash.posts.length === 0 && compoundHash.hashes[0] === '') {
-          // Zero rows: no cache to certify.
           return null;
         }
-        // h:'' + ch — the simple hash never matches, so the server always
-        // evaluates the compound hash (range merges), the wire shape the
-        // fork's e2e certification covers.
         return { hash: '', compoundHash };
       } catch (e) {
         // Fall through to the main-thread sliced kernel.
       }
     }
-    return this.computeListenHashesOnMainThread_(pathString, expectedGen);
+    return this.computeListenHashesOnMainThread_(pathString, gen);
   }
 
   private async computeListenHashesOnMainThread_(
     pathString: string,
-    expectedGen: string
+    gen: string
   ): Promise<RowListenHashes | null> {
     const db = await this.open_();
     if (db === null) {
       return null;
     }
-    const scope = this.scopeKey_();
     try {
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
+      const txn = db.transaction([CHUNKS_STORE, META_STORE], 'readonly');
       const metaReq = txn
         .objectStore(META_STORE)
-        .get(encodeRowKey(scope, this.rootKey_(pathString), []));
-      const range = rowKeyRange(scope, this.rootKey_(pathString), []);
-      const keysReq = txn.objectStore(ROWS_STORE).getAllKeys(range);
-      const valuesReq = txn.objectStore(ROWS_STORE).getAll(range);
-      const [meta, keys, values] = await Promise.all([
+        .get(this.metaKey_(pathString));
+      const chunksReq = txn
+        .objectStore(CHUNKS_STORE)
+        .getAll(this.chunkRange_(pathString, gen));
+      const [meta, chunkTexts] = await Promise.all([
         this.requestDone_(metaReq),
-        this.requestDone_(keysReq),
-        this.requestDone_(valuesReq)
+        this.requestDone_(chunksReq)
       ]);
-      // Same-snapshot generation check (see computeListenHashes).
       if (
         meta === undefined ||
-        (meta as RootMeta).staging === true ||
-        (meta as RootMeta).gen !== expectedGen ||
-        keys.length === 0
+        (meta as RootMeta).gen !== gen ||
+        (chunkTexts as string[]).length !== (meta as RootMeta).chunkCount ||
+        (chunkTexts as string[]).length === 0
       ) {
         return null;
       }
-      const rows = [];
-      for (let i = 0; i < keys.length; i++) {
-        rows.push({
-          path: decodeRowKeyRelativePath(
-            keys[i] as string,
-            scope,
-            this.rootKey_(pathString)
-          ),
-          json: values[i] as string
-        });
+      const rows: Array<{ path: string[]; json: string }> = [];
+      for (const text of chunkTexts as string[]) {
+        const parsed = JSON.parse(text) as Array<[string[], string]>;
+        for (const [path, json] of parsed) {
+          rows.push({ path, json });
+        }
       }
       const kernel = createRowHashKernel(
         text => Promise.resolve(sha1(text)),
@@ -922,10 +874,10 @@ export class RowPersistenceManager {
 
   /**
    * Write-through entry: the server updated `path`; `node` is the complete
-   * server cache at the TRACKED ROOT containing it. `changedPaths` names
-   * what changed relative to the root (undefined = unknown = whole root).
-   * Mirrors the v1 serverCacheUpdated signature so Repo call sites carry
-   * over unchanged.
+   * server cache at the tracked root. `changedPaths` is accepted for call
+   * compatibility; the snapshot model only needs "did anything change",
+   * which the node identity answers exactly ([] = a certification restating
+   * known state = nothing new).
    */
   serverCacheUpdated(path: Path, node: Node, changedPaths?: string[][]): void {
     if (this.disposed_ || !this.authScopeConfigured_) {
@@ -939,29 +891,14 @@ export class RowPersistenceManager {
     root.latest = node;
     root.latestScope = this.authScope_;
     if (changedPaths !== undefined && changedPaths.length === 0) {
-      // A listen certification: state already accounted, NOTHING dirty.
-      // It must not set a dirty marker — a marker here reads as pending
-      // dirt at boot-hash time and silently downgrades every listen to an
-      // uncertified full resend (descendant listeners certify while the
-      // root restore is still reading IDB, so this fired on every boot of
-      // a busy app). latest is refreshed; an armed window is untouched.
+      // A listen certification: state already accounted, nothing dirty.
       return;
     }
-    if (
-      changedPaths === undefined ||
-      changedPaths.some(path => path.length === 0)
-    ) {
-      // Whole root — including a write-through NAMING the root (a full
-      // push's 'at-path' at the root itself). Routing this through the
-      // incremental flush would serialize the entire tree synchronously
-      // into one giant transaction; the whole-root path stages in
-      // byte-batched transactions instead.
-      root.dirty = null;
-    } else if (root.dirty === undefined) {
-      root.dirty = changedPaths.slice();
-    } else if (root.dirty !== null) {
-      root.dirty = root.dirty.concat(changedPaths);
+    if (node === root.committedNode) {
+      // Identity-equal to the committed snapshot: nothing to write.
+      return;
     }
+    root.dirty = true;
     if (this.networkSuspended_) {
       return;
     }
@@ -969,9 +906,7 @@ export class RowPersistenceManager {
   }
 
   /**
-   * Flushes any pending dirt for `pathString` immediately (skipping the
-   * debounce window). Used before boot-hashing a grafted base and before
-   * reconnect hashing, so the rows describe exactly the live cache.
+   * Flushes pending dirt immediately (skipping the debounce window).
    * Resolves when the flush (if any) completed.
    */
   flushNow(pathString: string): Promise<void> {
@@ -986,437 +921,175 @@ export class RowPersistenceManager {
     return this.flushNow_(pathString, root);
   }
 
-  /** The currently tracked persistent root paths. */
-  trackedPaths(): string[] {
-    return [...this.tracked_.keys()];
-  }
-
-  /**
-   * True while the root's rows lag its live server cache: dirt is pending
-   * or a flush is in flight. The listen-hash rule builds on this — a
-   * compound hash is only claimed when the rows equal the live cache, so a
-   * claim can never describe bytes older than what the client holds.
-   */
+  /** True while the committed snapshot lags the live cache. */
   hasPendingDirt(pathString: string): boolean {
     const root = this.tracked_.get(pathString);
     if (root === undefined) {
       return false;
     }
-    return root.dirty !== undefined || root.flushing;
+    return root.dirty || root.activeFlush !== null;
   }
 
   private armWindow_(pathString: string, root: TrackedRoot): void {
     if (root.windowTimer !== null) {
       return; // non-restarting window
     }
-    const delay = root.hasGeneration
-      ? this.writeDelayMs_
-      : Math.min(this.writeDelayMs_, this.firstGenDelayMs_);
+    const delay =
+      root.gen !== null
+        ? this.writeDelayMs_
+        : Math.min(this.writeDelayMs_, this.firstGenDelayMs_);
     root.windowTimer = setTimeout(() => {
       root.windowTimer = null;
       void this.flushNow_(pathString, root);
     }, delay);
   }
 
-  /** Single-flight flush of everything dirty at the root. */
   private flushNow_(pathString: string, root: TrackedRoot): Promise<void> {
     if (root.activeFlush !== null) {
       root.rearm = true;
       return root.activeFlush;
     }
-    const promise = this.flushNowImpl_(pathString, root);
+    const promise = this.flushImpl_(pathString, root);
     root.activeFlush = promise;
     void promise.finally(() => {
       if (root.activeFlush === promise) {
         root.activeFlush = null;
       }
+      if (root.rearm) {
+        root.rearm = false;
+        if (root.dirty) {
+          this.armWindow_(pathString, root);
+        }
+      }
     });
     return promise;
   }
 
-  private async flushNowImpl_(
+  /**
+   * One snapshot flush: serialize → write chunks under a fresh gen (any
+   * number of transactions; unreferenced chunks are invisible) → swap the
+   * meta pointer and delete the previous generation's chunks in ONE final
+   * transaction. Everything before the swap is free to fail or race.
+   */
+  private async flushImpl_(
     pathString: string,
     root: TrackedRoot
   ): Promise<void> {
-    if (root.flushing) {
-      root.rearm = true;
-      return;
-    }
-    // The initial acquisition decides quickly (ifAvailable probe); waiting
-    // for it means a flush issued right after track() cannot misread an
-    // in-flight request as "not the writer".
     if (root.lockDecided !== null) {
       await root.lockDecided;
     }
+    const node = root.latest;
     if (
-      root.latest === null ||
-      root.dirty === undefined ||
+      node === null ||
+      !root.dirty ||
       !this.isWriter_(root) ||
       this.networkSuspended_ ||
       root.latestScope !== this.authScope_
     ) {
       return;
     }
-    root.flushing = true;
-    const node = root.latest;
-    const dirty = root.dirty;
-    root.dirty = undefined;
     const generation = this.authGeneration_;
-    try {
-      if (dirty === null || root.rowIndex === null || !root.hasGeneration) {
-        await this.flushWholeRoot_(pathString, root, node, generation);
-      } else {
-        await this.flushIncremental_(pathString, root, node, dirty, generation);
-      }
-    } catch (e) {
-      warn('persistence flush failed: ' + (e as Error | null)?.message);
-      // Leave hasGeneration as-is; the next window retries from latest.
-      if (root.dirty === undefined) {
-        root.dirty = null;
-      }
-    } finally {
-      root.flushing = false;
-      if (root.rearm) {
-        root.rearm = false;
-        if (root.dirty === undefined) {
-          root.dirty = null;
-        }
-        this.armWindow_(pathString, root);
-      }
-    }
-  }
-
-  /**
-   * First generation / unknown-change rewrite of the whole root. Byte-
-   * budgeted staging with meta LAST: crash mid-stage reads as "no cache"
-   * on the next boot, never a torn generation claiming completeness.
-   */
-  /**
-   * Whole-root rewrite as ITERATIVE, BYTE-BATCHED staging: the tree is
-   * walked with an explicit stack, rows are serialized as they are emitted,
-   * and each ~stageTxnBytes_ of row text commits in its own readwrite
-   * transaction with a macrotask yield after it. Peak memory is one batch
-   * of strings and the main thread is never blocked for more than one
-   * batch's serialization — a multi-MB root previously stringified in one
-   * synchronous pass and committed as one giant buffered transaction, which
-   * is exactly the main-thread stall + memory spike mobile WebKit kills.
-   *
-   * Crash consistency is meta-deleted-FIRST (with the old rows, in the
-   * first batch) / meta-written-LAST (with the new gen, in the final
-   * batch): at every intermediate point the cache reads as ABSENT — "no
-   * cache, never torn". A crash mid-stage costs the cache (cold next boot),
-   * never correctness; orphan rows are reclaimed by the sweep and by the
-   * next staging's range delete. Losing writership or the auth generation
-   * mid-stage simply stops before the next batch.
-   */
-  private async flushWholeRoot_(
-    pathString: string,
-    root: TrackedRoot,
-    node: Node,
-    generation: number
-  ): Promise<void> {
     const db = await this.open_();
     if (db === null || this.authGeneration_ !== generation) {
       return;
     }
-    const scope = this.scopeKey_();
-    const rootKey = this.rootKey_(pathString);
-    const metaKey = encodeRowKey(scope, rootKey, []);
-    const range = rowKeyRange(scope, rootKey, []);
-    const live = (): boolean =>
-      !this.disposed_ &&
-      this.authGeneration_ === generation &&
-      this.isWriter_(root) &&
-      !this.networkSuspended_;
-
-    const stack: Array<[string[], Node]> = [[[], node]];
-    const rowPaths: string[][] = [];
-    let batch: Array<[string[], string]> = [];
-    let batchBytes = 0;
-    let firstBatch = true;
-    // Ownership nonce for THIS stage: every later batch re-reads meta in
-    // its own transaction and proceeds only while the staging marker still
-    // carries this nonce. A concurrent deleteRoot_ (evict from another
-    // tab), a foreign stage, or a foreign complete generation all replace
-    // the marker — this stage then stops instead of committing rows over
-    // someone else's store. One read per ~2MiB batch; no locks, no CAS
-    // machinery beyond the marker the stage already writes.
-    const stageNonce = newMetaGen();
-    /** Resolves false when the marker no longer belongs to this stage. */
-    const ownsMarker = (txn: IDBTransaction): Promise<boolean> =>
-      this.requestDone_(txn.objectStore(META_STORE).get(metaKey)).then(
-        meta =>
-          meta !== undefined &&
-          (meta as RootMeta).staging === true &&
-          (meta as RootMeta).gen === stageNonce
-      );
-
-    const writeBatch = async (final: boolean): Promise<boolean> => {
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-      const rowStore = txn.objectStore(ROWS_STORE);
-      if (firstBatch) {
-        firstBatch = false;
-        // Invalidate with the first rows: from here until the final meta
-        // put, the cache reads as absent — and this manager's own state
-        // must agree, so an abandoned stage retries as a whole root and
-        // never claims a generation it no longer has. The STAGING MARKER
-        // (not a bare delete) protects the in-flight rows from the
-        // cross-tab sweep (rows under a staging meta are live, not
-        // orphans) and carries this stage's ownership nonce. A crashed
-        // stage leaves the marker; readers treat it as no-cache and the
-        // sweep reclaims it by age.
-        root.hasGeneration = false;
-        root.lastGen = null;
-        root.rowIndex = null;
-        txn.objectStore(META_STORE).put(
-          {
-            updatedAt: Date.now(),
-            formatVersion: META_FORMAT_VERSION,
-            staging: true,
-            gen: stageNonce
-          } as RootMeta,
-          metaKey
-        );
-        rowStore.delete(range);
-      } else if (!(await ownsMarker(txn))) {
-        txn.abort();
-        return false;
-      }
-      for (let i = 0; i < batch.length; i++) {
-        rowStore.put(batch[i][1], encodeRowKey(scope, rootKey, batch[i][0]));
-      }
-      if (final) {
-        const gen = newMetaGen();
-        txn.objectStore(META_STORE).put(
-          {
-            updatedAt: Date.now(),
-            formatVersion: META_FORMAT_VERSION,
-            gen
-          } as RootMeta,
-          metaKey
-        );
-        await this.txnDone_(txn);
-        root.rowIndex = RowIndex.fromRelativePaths(rowPaths);
-        root.hasGeneration = true;
-        root.lastGen = gen;
-        return true;
-      }
-      await this.txnDone_(txn);
-      batch = [];
-      batchBytes = 0;
-      await yieldMacrotask();
-      return true;
-    };
-
-    while (stack.length > 0) {
-      if (!live()) {
-        return;
-      }
-      const [segs, current] = stack.pop()!;
-      if (current.isEmpty()) {
-        continue;
-      }
-      if (
-        !current.isLeafNode() &&
-        estimateSerializedNodeSize(current) > this.splitThresholdBytes_
-      ) {
-        const priority = current.getPriority();
-        if (!priority.isEmpty()) {
-          const priorityJson = JSON.stringify(priority.val());
-          const prioritySegs = segs.concat('.priority');
-          batch.push([prioritySegs, priorityJson]);
-          rowPaths.push(prioritySegs);
-          batchBytes += priorityJson.length;
+    root.dirty = false;
+    const previousGen = root.gen;
+    const gen = newGen();
+    try {
+      // 1) Serialize into chunk texts, sliced. Per-top-level-child payloads
+      //    are cached by node identity, so unchanged children reuse their
+      //    serialized text (cost ∝ changed subtrees).
+      const chunkTexts: string[] = [];
+      let current: string[] = [];
+      let currentBytes = 0;
+      const pushRows = (rows: Array<[string[], string]>): void => {
+        for (const row of rows) {
+          const text = JSON.stringify(row);
+          current.push(text);
+          currentBytes += text.length;
+          if (currentBytes >= this.chunkBytes_) {
+            chunkTexts.push('[' + current.join(',') + ']');
+            current = [];
+            currentBytes = 0;
+          }
         }
-        current.forEachChild(PRIORITY_INDEX, (key: string, child: Node) => {
-          stack.push([segs.concat(key), child]);
-        });
+      };
+      if (node.isLeafNode() || node.isEmpty()) {
+        pushRows(splitNodeIntoRows([], node, this.splitThresholdBytes_));
       } else {
-        const json = JSON.stringify(current.val(true));
-        batch.push([segs, json]);
-        rowPaths.push(segs);
-        batchBytes += json.length;
+        const priority = node.getPriority();
+        if (!priority.isEmpty()) {
+          pushRows([[['.priority'], JSON.stringify(priority.val())]]);
+        }
+        const children: Array<[string, Node]> = [];
+        node.forEachChild(PRIORITY_INDEX, (key: string, child: Node) => {
+          children.push([key, child]);
+        });
+        for (const [key, child] of children) {
+          if (this.disposed_ || this.authGeneration_ !== generation) {
+            root.dirty = true;
+            return;
+          }
+          let payload = childPayloadCache.get(child);
+          if (payload === undefined) {
+            payload = JSON.stringify(
+              splitNodeIntoRows([key], child, this.splitThresholdBytes_)
+            );
+            childPayloadCache.set(child, payload);
+            await yieldMacrotask();
+          }
+          pushRows(JSON.parse(payload) as Array<[string[], string]>);
+        }
       }
-      if (batchBytes >= this.stageTxnBytes_) {
-        if (!(await writeBatch(false))) {
+      if (current.length > 0 || chunkTexts.length === 0) {
+        chunkTexts.push('[' + current.join(',') + ']');
+      }
+
+      // 2) Write the chunks under the fresh gen (invisible until the swap).
+      for (let i = 0; i < chunkTexts.length; i++) {
+        if (this.disposed_ || this.authGeneration_ !== generation) {
+          root.dirty = true;
           return;
         }
-      }
-    }
-    if (!live()) {
-      return;
-    }
-    await writeBatch(true);
-  }
-
-  /**
-   * Incremental flush: each dirty path normalizes to its containing row's
-   * boundary (disjoint-rows invariant), covered duplicates drop, and each
-   * boundary's subtree is deleted+rewritten — ONE readwrite transaction,
-   * no hashing, work proportional to the change.
-   */
-  private async flushIncremental_(
-    pathString: string,
-    root: TrackedRoot,
-    node: Node,
-    dirty: string[][],
-    generation: number
-  ): Promise<void> {
-    const db = await this.open_();
-    if (db === null || this.authGeneration_ !== generation) {
-      return;
-    }
-    const rowIndex = root.rowIndex!;
-    // Normalize to row boundaries, then drop paths covered by another.
-    const boundaries: string[][] = [];
-    for (let i = 0; i < dirty.length; i++) {
-      boundaries.push(rowIndex.rowBoundaryFor(dirty[i]) ?? dirty[i]);
-    }
-    boundaries.sort((a, b) => a.length - b.length);
-    const chosen: string[][] = [];
-    outer: for (let i = 0; i < boundaries.length; i++) {
-      for (let j = 0; j < chosen.length; j++) {
-        const c = chosen[j];
-        if (
-          c.length <= boundaries[i].length &&
-          c.every((seg, k) => boundaries[i][k] === seg)
-        ) {
-          continue outer;
+        const txn = db.transaction(CHUNKS_STORE, 'readwrite');
+        txn
+          .objectStore(CHUNKS_STORE)
+          .put(chunkTexts[i], this.chunkKey_(pathString, gen, i));
+        await this.txnDone_(txn);
+        if (i + 1 < chunkTexts.length) {
+          await yieldMacrotask();
         }
       }
-      chosen.push(boundaries[i]);
-    }
-    // Bound the synchronous work: an incremental flush is for CHANGE-SIZED
-    // dirt. When the dirty subtrees together exceed one staging batch, the
-    // byte-batched whole-root path is both simpler and strictly better than
-    // serializing a huge subtree into one transaction here.
-    let estimated = 0;
-    for (let i = 0; i < chosen.length; i++) {
-      estimated += estimateSerializedNodeSize(
-        node.getChild(new Path(chosen[i].join('/')))
-      );
-      if (estimated > this.stageTxnBytes_) {
-        await this.flushWholeRoot_(pathString, root, node, generation);
+
+      // 3) The swap: point meta at the new gen and drop the old gen's
+      //    chunks, atomically. Readers see the old complete generation
+      //    right up to this commit, the new one after it.
+      if (this.disposed_ || this.authGeneration_ !== generation) {
+        root.dirty = true;
         return;
       }
-    }
-    const scope = this.scopeKey_();
-    const rootKey = this.rootKey_(pathString);
-    const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-    const store = txn.objectStore(ROWS_STORE);
-    for (let i = 0; i < chosen.length; i++) {
-      const segs = chosen[i];
-      store.delete(rowKeyRange(scope, rootKey, segs));
-      const subtree = node.getChild(new Path(segs.join('/')));
-      const newRows = splitNodeIntoRows(
-        segs,
-        subtree,
-        this.splitThresholdBytes_
+      const txn = db.transaction([CHUNKS_STORE, META_STORE], 'readwrite');
+      txn.objectStore(META_STORE).put(
+        {
+          gen,
+          chunkCount: chunkTexts.length,
+          updatedAt: Date.now(),
+          formatVersion: META_FORMAT_VERSION
+        } as RootMeta,
+        this.metaKey_(pathString)
       );
-      for (let j = 0; j < newRows.length; j++) {
-        store.put(newRows[j][1], encodeRowKey(scope, rootKey, newRows[j][0]));
-      }
-      rowIndex.replaceSubtree(
-        segs,
-        newRows.map(r => r[0])
-      );
-    }
-    const gen = newMetaGen();
-    const meta: RootMeta = {
-      updatedAt: Date.now(),
-      formatVersion: META_FORMAT_VERSION,
-      gen
-    };
-    txn.objectStore(META_STORE).put(meta, encodeRowKey(scope, rootKey, []));
-    await this.txnDone_(txn);
-    root.lastGen = gen;
-  }
-
-  /**
-   * One deferred sweep per manager lifetime: deletes roots whose meta is
-   * older than maxAge (any scope — an account that never logs in again
-   * must not hold storage forever) and orphan rows whose meta is absent
-   * (a torn first generation). Scheduled off the boot path; failures are
-   * ignored (the next session sweeps again).
-   */
-  private scheduleSweep_(): void {
-    if (this.sweepTimer_ !== null || this.disposed_) {
-      return;
-    }
-    this.sweepTimer_ = setTimeout(() => {
-      void this.sweep_();
-    }, ROW_PERSISTENCE_SWEEP_DELAY_MS);
-  }
-
-  private async sweep_(): Promise<void> {
-    const db = await this.open_();
-    if (db === null || this.disposed_) {
-      return;
-    }
-    try {
-      // Classification AND deletion in ONE readwrite transaction: a
-      // separate readonly snapshot goes stale the moment another tab
-      // commits between the two transactions — the sweep then deletes rows
-      // belonging to a FRESH generation while its complete meta survives
-      // (fresh meta + missing rows: a torn store whose own writer still
-      // holds the gen in lastGen and could certify it). IndexedDB
-      // transactions are serializable against each other, so reading and
-      // deleting under one txn makes the classification exact by
-      // construction — simpler than any re-validation protocol.
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-      const metaStore = txn.objectStore(META_STORE);
-      const rowStore = txn.objectStore(ROWS_STORE);
-      const [metaKeys, metaValues, rowKeys] = await Promise.all([
-        this.requestDone_(metaStore.getAllKeys()),
-        this.requestDone_(metaStore.getAll()),
-        this.requestDone_(rowStore.getAllKeys())
-      ]);
-      const now = Date.now();
-      const liveMeta = new Set<string>();
-      const expired: string[] = [];
-      for (let i = 0; i < metaKeys.length; i++) {
-        const meta = metaValues[i] as RootMeta | null;
-        if (
-          meta === null ||
-          typeof meta !== 'object' ||
-          meta.formatVersion !== META_FORMAT_VERSION ||
-          now - meta.updatedAt > this.maxAgeMs_
-        ) {
-          expired.push(metaKeys[i] as string);
-        } else {
-          // Complete AND staging metas both protect their rows: a staging
-          // marker means another tab is mid-rewrite — its rows are live,
-          // not orphans. A crashed stage's marker ages out above and its
-          // rows are reclaimed with it.
-          liveMeta.add(metaKeys[i] as string);
-        }
-      }
-      // A row belongs to the meta whose key is its scope·root prefix; the
-      // meta key is the shortest prefix ending in ROW_KEY_SEPARATOR twice
-      // (scope + root). Orphans (no live meta prefix) are torn/expired.
-      let deletions = 0;
-      for (let i = 0; i < rowKeys.length; i++) {
-        const key = rowKeys[i] as string;
-        const second = key.indexOf(
-          ROW_KEY_SEPARATOR,
-          key.indexOf(ROW_KEY_SEPARATOR) + 1
-        );
-        const metaKey = key.slice(0, second + 1);
-        if (!liveMeta.has(metaKey)) {
-          rowStore.delete(key);
-          deletions++;
-        }
-      }
-      for (let i = 0; i < expired.length; i++) {
-        metaStore.delete(expired[i]);
-        deletions++;
-      }
-      if (deletions === 0) {
-        return;
+      if (previousGen !== null && previousGen !== gen) {
+        txn
+          .objectStore(CHUNKS_STORE)
+          .delete(this.chunkRange_(pathString, previousGen));
       }
       await this.txnDone_(txn);
+      root.committedNode = node;
+      root.gen = gen;
     } catch (e) {
-      // Best-effort; sweep again next session.
+      warn('persistence flush failed: ' + (e as Error | null)?.message);
+      root.dirty = true;
     }
   }
 
@@ -1434,23 +1107,16 @@ export class RowPersistenceManager {
   }
 
   /**
-   * Deletes a root's stored cache THROUGH the writer discipline. For a
-   * tracked root: first invalidate this manager's own state (drop pending
-   * dirt and the window so no queued flush resurrects the cache), then
-   * await the in-flight flush — deleting BETWEEN a staged flush's batches
-   * would otherwise leave its later batches committing rows over the
-   * deletion, a torn store. An untracked root (plain teardown evict)
-   * deletes directly; ANOTHER tab's in-flight stage is protected by its
-   * staging marker — the interleaved delete removes marker+rows, and the
-   * stage's remaining batches rewrite their rows with the final meta
-   * commit restoring a complete self-consistent generation.
+   * Deletes a root's stored cache. The namespace is captured synchronously
+   * (an auth switch during the awaits must not redirect the delete), and
+   * local state is invalidated first so no queued flush resurrects it.
+   * The one delete transaction removes meta + every chunk of every gen —
+   * a concurrent writer's in-flight gen simply becomes orphan chunks that
+   * its own swap either re-references (it wins) or the sweep ages out.
    */
   private async deleteRoot_(pathString: string): Promise<void> {
-    // Capture the namespace SYNCHRONOUSLY: the deletion belongs to the
-    // scope whose cache was invalidated. An auth switch during the awaits
-    // below must not redirect the delete into the NEXT account's namespace
-    // (erasing an unrelated valid cache while leaving the doomed one).
-    const scope = this.scopeKey_();
+    const metaKey = this.metaKey_(pathString);
+    const range = this.chunkRange_(pathString);
     const generation = this.authGeneration_;
     const root = this.tracked_.get(pathString);
     if (root !== undefined) {
@@ -1458,50 +1124,119 @@ export class RowPersistenceManager {
         clearTimeout(root.windowTimer);
         root.windowTimer = null;
       }
-      root.dirty = undefined;
+      root.dirty = false;
       root.rearm = false;
-      root.hasGeneration = false;
-      root.lastGen = null;
-      root.rowIndex = null;
+      root.committedNode = null;
+      root.gen = null;
       if (root.activeFlush !== null) {
         await root.activeFlush.catch(() => {});
       }
     }
     const db = await this.open_();
-    if (db === null) {
-      return;
-    }
-    if (this.authGeneration_ !== generation) {
-      // Scope switched while waiting. The captured namespace's rows are
-      // already invisible to the new session (different key prefix) and
-      // the sweep reclaims them by age — deleting now would race whatever
-      // the previous scope's writer was still settling. Stand down.
+    if (db === null || this.authGeneration_ !== generation) {
       return;
     }
     try {
-      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-      txn
-        .objectStore(META_STORE)
-        .delete(encodeRowKey(scope, this.rootKey_(pathString), []));
-      txn
-        .objectStore(ROWS_STORE)
-        .delete(rowKeyRange(scope, this.rootKey_(pathString), []));
+      const txn = db.transaction([CHUNKS_STORE, META_STORE], 'readwrite');
+      txn.objectStore(META_STORE).delete(metaKey);
+      txn.objectStore(CHUNKS_STORE).delete(range);
       await this.txnDone_(txn);
     } catch (e) {
       // Fail open.
     }
   }
 
+  /**
+   * One deferred sweep per manager lifetime, off the boot path. In ONE
+   * readwrite transaction (serializable against writers): delete metas
+   * older than maxAge, chunks of non-live generations older than the
+   * orphan age (crashed/raced writes — their key embeds no timestamp, so
+   * age rides the gen id's time prefix), and chunks with no meta at all.
+   */
+  private scheduleSweep_(): void {
+    if (this.sweepTimer_ !== null || this.sweepDone_ || this.disposed_) {
+      return;
+    }
+    this.sweepTimer_ = setTimeout(() => {
+      this.sweepTimer_ = null;
+      this.sweepDone_ = true;
+      void this.sweep_();
+    }, 60 * 1000);
+  }
+
+  private async sweep_(): Promise<void> {
+    const db = await this.open_();
+    if (db === null || this.disposed_) {
+      return;
+    }
+    try {
+      const txn = db.transaction([CHUNKS_STORE, META_STORE], 'readwrite');
+      const metaStore = txn.objectStore(META_STORE);
+      const chunkStore = txn.objectStore(CHUNKS_STORE);
+      const [metaKeys, metaValues, chunkKeys] = await Promise.all([
+        this.requestDone_(metaStore.getAllKeys()),
+        this.requestDone_(metaStore.getAll()),
+        this.requestDone_(chunkStore.getAllKeys())
+      ]);
+      const now = Date.now();
+      /** live meta prefix → its live gen. */
+      const live = new Map<string, string>();
+      let deletions = 0;
+      for (let i = 0; i < metaKeys.length; i++) {
+        const meta = metaValues[i] as RootMeta | null;
+        if (
+          meta === null ||
+          typeof meta !== 'object' ||
+          meta.formatVersion !== META_FORMAT_VERSION ||
+          now - meta.updatedAt > this.maxAgeMs_
+        ) {
+          metaStore.delete(metaKeys[i] as string);
+          deletions++;
+        } else {
+          live.set(metaKeys[i] as string, meta.gen);
+        }
+      }
+      for (let i = 0; i < chunkKeys.length; i++) {
+        const key = chunkKeys[i] as string;
+        // key = scopeSeg·SEP·rootSeg·SEP·gen·SEP·index — meta prefix is
+        // everything through the second separator.
+        const second = key.indexOf(
+          ROW_KEY_SEPARATOR,
+          key.indexOf(ROW_KEY_SEPARATOR) + 1
+        );
+        const metaPrefix = key.slice(0, second + 1);
+        const rest = key.slice(second + 1);
+        const gen = rest.slice(0, rest.indexOf(ROW_KEY_SEPARATOR));
+        const liveGen = live.get(metaPrefix);
+        if (liveGen === gen) {
+          continue;
+        }
+        // Non-live gen: age from the gen id's time prefix (base36 ms).
+        const genTime = parseInt(gen.slice(0, 8), 36);
+        if (
+          liveGen === undefined ||
+          !isFinite(genTime) ||
+          now - genTime > this.orphanGenAgeMs_
+        ) {
+          chunkStore.delete(key);
+          deletions++;
+        }
+      }
+      if (deletions === 0) {
+        return;
+      }
+      await this.txnDone_(txn);
+    } catch (e) {
+      // Best-effort; sweep again next session.
+    }
+  }
+
   // ───────────────────────────── lifecycle ───────────────────────────────
 
   /**
-   * Deliberate offline (goOffline/repoInterrupt). Liveness is not
-   * eligibility: a suspended tab keeps running but its server cache is
-   * frozen, so it RELEASES its writer locks — the UA then grants them to a
-   * queued online tab, which persists the newest server state. Resume
-   * re-queues; writership returns whenever the interim holder unsubscribes
-   * or dies. While suspended the write gate stays closed even without Web
-   * Locks, so a frozen tree never overwrites an online writer's rows.
+   * Deliberate offline (goOffline/repoInterrupt): a suspended tab's server
+   * cache is frozen, so it releases writership (the UA grants the lock to
+   * an online tab) and stops flushing. Resume re-queues.
    */
   setNetworkSuspended(suspended: boolean): void {
     if (this.networkSuspended_ === suspended) {
@@ -1531,7 +1266,7 @@ export class RowPersistenceManager {
         }
       } else {
         void this.acquireWriterLock_(pathString, root);
-        if (root.dirty !== undefined) {
+        if (root.dirty) {
           this.armWindow_(pathString, root);
         }
       }
@@ -1549,9 +1284,10 @@ export class RowPersistenceManager {
       this.peekHandoffMs_,
       this.peekPreAuthMs_,
       this.restoreTimeoutMs_,
-      this.stageTxnBytes_,
+      this.chunkBytes_,
       this.workerHashTimeoutMs_,
-      this.maxAgeMs_
+      this.maxAgeMs_,
+      this.orphanGenAgeMs_
     );
     if (this.authScopeConfigured_) {
       rebound.setAuthScope(this.authScope_, this.authScopeConfirmed_);

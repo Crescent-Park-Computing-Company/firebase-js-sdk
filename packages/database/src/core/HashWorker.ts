@@ -41,23 +41,24 @@ export interface WorkerHashRequest {
   dbName: string;
   storeName: string;
   metaStoreName: string;
-  /** The meta key of the root (= the row-key prefix with no segments). */
+  /** The root's meta key. */
   metaKey: string;
   /**
-   * Generation nonce the caller last restored/committed. Read from meta in
-   * the SAME readonly transaction as the rows; a mismatch (foreign tab's
-   * newer commit, staged rows without meta) rejects with 'gen-mismatch' and
-   * the listen goes uncertified — never a hash of rows the live cache does
-   * not hold.
+   * The generation the caller restored/committed. Chunks are immutable and
+   * keyed under their gen, so reading [lowerKey, upperKey) either returns
+   * exactly that generation's chunks or misses some (a foreign swap GC'd
+   * it) — verified against meta.chunkCount read in the SAME transaction.
+   * Any mismatch rejects and the listen goes uncertified.
    */
   expectedGen: string;
-  /** Row-key range bounds for the root (lower inclusive, upper exclusive). */
+  /** Chunk-key range bounds for the generation (lower incl., upper excl.). */
   lowerKey: string;
   upperKey: string;
-  /** Length of the scope·root prefix to strip from row keys. */
-  prefixLength: number;
-  /** \x01 — passed in so the worker script stays literal-free. */
-  separator: string;
+  /**
+   * True: values are chunk texts — JSON arrays of [pathSegments, exportJson]
+   * row pairs, concatenated in key order to form the snapshot's rows.
+   */
+  chunked: boolean;
 }
 
 export function workerHashAvailable(): boolean {
@@ -156,43 +157,30 @@ function workerMain(): void {
           false,
           true
         );
-        const keysReq = store.getAllKeys(range);
         const valuesReq = store.getAll(range);
-        let keys: string[] | null = null;
         let values: string[] | null = null;
         let metaDone = false;
         let metaGen: string | null = null;
+        let metaChunkCount = -1;
         const maybeRun = (): void => {
-          if (keys === null || values === null || !metaDone) {
+          if (values === null || !metaDone) {
             return;
           }
           db.close();
-          if (metaGen !== req.expectedGen) {
+          // Chunks are immutable under their gen key: the range read
+          // either returned the complete generation (count matches the
+          // meta read in this same transaction) or the generation was
+          // GC'd/replaced — decline, never hash a partial snapshot.
+          if (metaGen !== req.expectedGen || values.length !== metaChunkCount) {
             fail('gen-mismatch');
             return;
           }
           const rows = [];
-          for (let i = 0; i < keys.length; i++) {
-            const rest = keys[i].slice(req.prefixLength);
-            let path: string[];
-            if (rest === '') {
-              path = [];
-            } else {
-              path = rest.split(req.separator);
-              path.pop();
-              // Row keys hold escape-encoded segments (RowStore
-              // encodeRowSegment: '%xxxx' hex for %, \x01, \uffff); the
-              // kernel must hash the REAL child names or its posts and
-              // range text diverge from the server's tree.
-              for (let j = 0; j < path.length; j++) {
-                path[j] = path[j].replace(
-                  /%([0-9a-f]{4})/g,
-                  (_m: string, hex: string) =>
-                    String.fromCharCode(parseInt(hex, 16))
-                );
-              }
+          for (let i = 0; i < values.length; i++) {
+            const parsed = JSON.parse(values[i]) as Array<[string[], string]>;
+            for (let j = 0; j < parsed.length; j++) {
+              rows.push({ path: parsed[j][0], json: parsed[j][1] });
             }
-            rows.push({ path, json: values[i] });
           }
           kernel.hashRows(rows).then(
             result => (self as unknown as Worker).postMessage(result),
@@ -204,22 +192,18 @@ function workerMain(): void {
           fail('idb-meta');
         };
         metaReq.onsuccess = () => {
-          const meta = metaReq.result as { gen?: string } | undefined;
+          const meta = metaReq.result as
+            | { gen?: string; chunkCount?: number }
+            | undefined;
           metaGen = meta && typeof meta.gen === 'string' ? meta.gen : null;
+          metaChunkCount =
+            meta && typeof meta.chunkCount === 'number' ? meta.chunkCount : -1;
           metaDone = true;
           maybeRun();
-        };
-        keysReq.onerror = () => {
-          db.close();
-          fail('idb-keys');
         };
         valuesReq.onerror = () => {
           db.close();
           fail('idb-values');
-        };
-        keysReq.onsuccess = () => {
-          keys = keysReq.result as string[];
-          maybeRun();
         };
         valuesReq.onsuccess = () => {
           values = valuesReq.result as string[];

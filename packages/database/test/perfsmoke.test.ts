@@ -22,12 +22,19 @@ import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import { Path } from '../src/core/util/Path';
 import { sha1 } from '../src/core/util/util';
 
-import { flushMicrotasks, makeFakeIdb } from './helpers/fakeIdb';
+import { makeFakeIdb } from './helpers/fakeIdb';
 
-describe('perf smoke (node, fake IDB)', function () {
+const locks = {
+  request: (
+    _n: string,
+    _o: { mode: 'exclusive' },
+    cb: (l: unknown) => Promise<unknown>
+  ): Promise<unknown> => Promise.resolve().then(() => cb({}))
+};
+
+describe('perf smoke v3 (node, fake IDB)', function () {
   this.timeout(120000);
-  it('measures split / restore / incremental flush / kernel hash on a ~50MB tree', async () => {
-    // Build a Mana-shaped workspace: many mid-size documents.
+  it('measures snapshot flush / identity skip / delta flush / restore / hash on a ~43MB tree', async () => {
     const workspace: Record<string, unknown> = {};
     for (let s = 0; s < 40; s++) {
       const section: Record<string, unknown> = {};
@@ -40,88 +47,96 @@ describe('perf smoke (node, fake IDB)', function () {
       }
       workspace['section' + s] = section;
     }
-    const t0 = Date.now();
     const node = nodeFromJSON(workspace);
-    const tBuild = Date.now() - t0;
-
-    const t1 = Date.now();
-    const rows = splitNodeIntoRows([], node, 16 * 1024);
-    let totalBytes = 0;
-    for (const [, json] of rows) {
-      totalBytes += json.length;
-    }
-    const tSplit = Date.now() - t1;
-    // eslint-disable-next-line no-console
-    console.log(
-      `      tree=${(totalBytes / 1e6).toFixed(1)}MB rows=${
-        rows.length
-      } build=${tBuild}ms split=${tSplit}ms`
-    );
-
     const shared = new Map<string, Map<string, unknown>>();
     const manager = new RowPersistenceManager(
       'perf',
       makeFakeIdb(shared),
-      null,
+      locks as never,
       1,
       1,
       16 * 1024,
       30000,
       300000,
       60000,
-      4 << 20
+      2 * 1024 * 1024
     );
     manager.setAuthScope('u');
     manager.setPersistentPath('/ws', true);
     manager.track('/ws');
-    const t2 = Date.now();
+
+    let maxGap = 0;
+    let last = Date.now();
+    let watching = true;
+    const tick = (): void => {
+      const now = Date.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+      if (watching) {
+        setTimeout(tick, 0);
+      }
+    };
+    setTimeout(tick, 0);
+
+    const t0 = Date.now();
     manager.serverCacheUpdated(new Path('/ws'), node);
     await manager.flushNow('/ws');
-    await flushMicrotasks();
-    const tFirstGen = Date.now() - t2;
+    const tFirst = Date.now() - t0;
 
-    // Incremental: one leaf change.
+    // Identity-equal update: must be free (no writes, no serialization).
+    const t1 = Date.now();
+    manager.serverCacheUpdated(new Path('/ws'), node);
+    await manager.flushNow('/ws');
+    const tSkip = Date.now() - t1;
+
+    // One changed leaf: the WeakMap cache reuses every unchanged top-level
+    // child's serialized payload — cost tracks the CHANGED subtree.
     const node2 = node.updateChild(
       new Path('section3/doc7/title'),
       nodeFromJSON('CHANGED')
     );
-    const t3 = Date.now();
+    const t2 = Date.now();
     manager.serverCacheUpdated(new Path('/ws'), node2, [
       ['section3', 'doc7', 'title']
     ]);
     await manager.flushNow('/ws');
-    await flushMicrotasks();
-    const tIncr = Date.now() - t3;
+    const tDelta = Date.now() - t2;
+    watching = false;
 
-    // Restore.
     const reader = new RowPersistenceManager(
       'perf',
       makeFakeIdb(shared),
-      null,
+      locks as never,
       1,
       1,
       16 * 1024,
       30000,
       300000,
       60000,
-      4 << 20
+      2 * 1024 * 1024
     );
     reader.setAuthScope('u');
     reader.setPersistentPath('/ws', true);
     reader.track('/ws');
-    const t4 = Date.now();
+    const t3 = Date.now();
     const restored = await reader.restoreForListen('/ws');
-    const tRestore = Date.now() - t4;
+    const tRestore = Date.now() - t3;
 
-    // Kernel hash (main-thread run; the worker does the identical walk).
-    const kernelRows = rows.map(([path, json]) => ({ path, json }));
-    const t5 = Date.now();
+    const rows = splitNodeIntoRows([], node2, 16 * 1024).map(
+      ([path, json]) => ({
+        path,
+        json
+      })
+    );
+    const t4 = Date.now();
     const kernel = createRowHashKernel(text => Promise.resolve(sha1(text)));
-    const hash = await kernel.hashRows(kernelRows);
-    const tHash = Date.now() - t5;
+    const hash = await kernel.hashRows(rows);
+    const tHash = Date.now() - t4;
     // eslint-disable-next-line no-console
     console.log(
-      `      firstGen=${tFirstGen}ms incrementalFlush=${tIncr}ms restore=${tRestore}ms kernelHash=${tHash}ms ranges=${hash.posts.length}`
+      `      firstFlush=${tFirst}ms identitySkip=${tSkip}ms deltaFlush=${tDelta}ms restore=${tRestore}ms kernelHash=${tHash}ms ranges=${
+        hash.posts.length
+      } maxStall=${maxGap}ms chunks=${shared.get('chunks')!.size}`
     );
     // eslint-disable-next-line no-console
     console.log(

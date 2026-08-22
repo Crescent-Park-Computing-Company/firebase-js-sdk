@@ -163,7 +163,7 @@ describe('RowPersistenceManager', () => {
     manager.dispose();
   });
 
-  it('incremental flush rewrites only the dirty row', async () => {
+  it('an identity-equal update skips the flush; a change swaps one fresh generation', async () => {
     const shared = new Map<string, Map<string, unknown>>();
     const log = { puts: [] as string[], deletes: [] as string[] };
     const idb = makeFakeIdb(shared, log);
@@ -171,44 +171,39 @@ describe('RowPersistenceManager', () => {
     manager.setAuthScope('alice');
     manager.setPersistentPath('/ws', true);
     manager.track('/ws');
-    // Two branches large enough to split into separate rows.
     const v1 = nodeFromJSON({
-      left: { a: 'x'.repeat(600), b: 'x'.repeat(600) },
-      right: { c: 'y'.repeat(600), d: 'y'.repeat(600) }
+      left: { a: 'x'.repeat(600) },
+      right: { c: 'y'.repeat(600) }
     });
     manager.serverCacheUpdated(new Path('/ws'), v1);
-    await wait(30);
+    await manager.flushNow('/ws');
     await flushMicrotasks();
-    // Restore to load the row index (as a booted client would).
-    const restored = await manager.restoreForListen('/ws');
-    expect(restored.node).to.not.equal(null);
+    const putsAfterFirst = log.puts.length;
 
-    // Change one leaf under 'left'; only left-subtree rows may rewrite.
-    log.puts.length = 0;
-    log.deletes.length = 0;
+    // Same node identity (a certification, a no-op update): NO writes.
+    manager.serverCacheUpdated(new Path('/ws'), v1);
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+    expect(log.puts.length).to.equal(putsAfterFirst);
+
+    // A real change: one fresh generation replaces the old one (old gen's
+    // chunks deleted in the swap transaction).
     const v2 = nodeFromJSON({
-      left: { a: 'CHANGED', b: 'x'.repeat(600) },
-      right: { c: 'y'.repeat(600), d: 'y'.repeat(600) }
+      left: { a: 'CHANGED' },
+      right: { c: 'y'.repeat(600) }
     });
     manager.serverCacheUpdated(new Path('/ws'), v2, [['left', 'a']]);
-    await wait(30);
+    await manager.flushNow('/ws');
     await flushMicrotasks();
-
-    // Write economics: only rows under the dirty path's row boundary were
-    // touched (plus the meta stamp) — never the clean 'right' subtree.
-    const rowPuts = log.puts.filter(p => p.startsWith('rows:'));
-    expect(rowPuts.length).to.be.greaterThan(0);
-    for (const put of rowPuts) {
-      expect(put).to.include('\u0001left\u0001');
-    }
-    for (const del of log.deletes.filter(d => d.startsWith('rows:'))) {
-      expect(del).to.include('\u0001left\u0001');
-    }
-
-    const reader = makeManager(idb);
+    const reader = makeManager(makeFakeIdb(shared));
     reader.setAuthScope('alice');
     const after = await reader.peek('/ws', 'alice');
     expect(after!.node.equals(v2)).to.equal(true);
+    // Exactly one live generation remains in the chunk store.
+    const gens = new Set(
+      [...shared.get('chunks')!.keys()].map(k => k.split('\u0001')[2])
+    );
+    expect(gens.size).to.equal(1);
     manager.dispose();
     reader.dispose();
   });
@@ -444,56 +439,61 @@ describe('RowPersistenceManager property: generational round-trips', () => {
 });
 
 describe('RowPersistenceManager sweep', () => {
-  it('removes expired roots and orphan rows, keeps live roots', async () => {
+  it('removes expired roots and aged orphan generations, keeps live ones', async () => {
     const shared = new Map<string, Map<string, unknown>>();
-    // Live root written normally.
     const writer = makeManager(makeFakeIdb(shared));
     writer.setAuthScope('alice');
     writer.setPersistentPath('/live', true);
     writer.track('/live');
     writer.serverCacheUpdated(new Path('/live'), nodeFromJSON({ ok: 1 }));
-    await wait(30);
+    await writer.flushNow('/live');
     await flushMicrotasks();
     writer.dispose();
 
-    // An expired root (meta 40 days old) and an orphan row (no meta).
     const sep = '\u0001';
-    shared.get('meta')!.set('bob' + sep + '/old' + sep, {
+    // An expired root: meta 40 days old + its chunk.
+    shared.get('meta')!.set('S' + sep + '/old' + sep, {
+      gen: 'g1',
+      chunkCount: 1,
       updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
-      formatVersion: 1
+      formatVersion: 3
     });
-    shared.get('rows')!.set('bob' + sep + '/old' + sep, '{"stale":1}');
-    shared.get('rows')!.set('carol' + sep + '/orphan' + sep, '{"torn":1}');
+    shared
+      .get('chunks')!
+      .set('S' + sep + '/old' + sep + 'g1' + sep + '000000', '[]');
+    // An AGED orphan generation of the live root (crashed write from long
+    // ago — gen id's base36 time prefix far in the past).
+    const oldGen = (Date.now() - 60 * 60 * 1000).toString(36) + 'zzzz';
+    const liveMetaKey = [...shared.get('meta')!.keys()].find(
+      k => k.indexOf('/live') >= 0
+    )!;
+    shared.get('chunks')!.set(liveMetaKey + oldGen + sep + '000000', '[]');
+    // A FRESH orphan generation (an in-flight write): must survive.
+    const freshGen = Date.now().toString(36) + 'ffff';
+    shared.get('chunks')!.set(liveMetaKey + freshGen + sep + '000000', '[]');
 
-    // A manager with an instant sweep delay: restore triggers the sweep.
-    const manager = new RowPersistenceManager(
-      'test-repo',
-      makeFakeIdb(shared),
-      null,
-      1,
-      1,
-      512,
-      30000,
-      300000,
-      1000,
-      1 << 20,
-      20000,
-      30 * 24 * 60 * 60 * 1000
-    );
-    // Shrink the sweep delay via the timer being real: patch is overkill —
-    // call the private path through restore then wait past the delay is too
-    // slow for tests, so invoke the sweep directly.
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (manager as any).sweep_();
-    manager.setAuthScope('alice');
-    expect(shared.get('rows')!.has('carol' + sep + '/orphan' + sep)).to.equal(
-      false
-    );
-    expect(shared.get('meta')!.has('bob' + sep + '/old' + sep)).to.equal(false);
-    expect(shared.get('rows')!.has('bob' + sep + '/old' + sep)).to.equal(false);
-    const kept = await manager.peek('/live', 'alice');
-    expect(kept!.node.val()).to.deep.equal({ ok: 1 });
+    expect(shared.get('meta')!.has('S' + sep + '/old' + sep)).to.equal(false);
+    expect(
+      shared
+        .get('chunks')!
+        .has('S' + sep + '/old' + sep + 'g1' + sep + '000000')
+    ).to.equal(false);
+    expect(
+      shared.get('chunks')!.has(liveMetaKey + oldGen + sep + '000000')
+    ).to.equal(false);
+    expect(
+      shared.get('chunks')!.has(liveMetaKey + freshGen + sep + '000000')
+    ).to.equal(true);
+    const kept = makeManager(makeFakeIdb(shared));
+    kept.setAuthScope('alice');
+    const peeked = await kept.peek('/live', 'alice');
+    expect(peeked!.node.val()).to.deep.equal({ ok: 1 });
     manager.dispose();
+    kept.dispose();
   });
 });
 
@@ -836,13 +836,13 @@ describe('untrack/re-track race', () => {
 });
 
 describe('iterative whole-root staging', () => {
-  it('produces exactly the same rows as splitNodeIntoRows, across multiple batches', async () => {
+  it('the chunked snapshot stores exactly the splitNodeIntoRows rows, across chunks', async () => {
     const shared = new Map<string, Map<string, unknown>>();
-    // ~1KB stage budget forces many batches at a 96B split threshold.
+    // ~1KB chunk budget forces multiple chunks at a 96B split threshold.
     const manager = new RowPersistenceManager(
       'test-repo',
       makeFakeIdb(shared),
-      null,
+      makeAlwaysGrantedLocks(),
       1,
       1,
       96,
@@ -855,26 +855,38 @@ describe('iterative whole-root staging', () => {
     manager.setPersistentPath('/ws', true);
     manager.track('/ws');
     const tree = nodeFromJSON({
-      a: { x: 'q'.repeat(120), y: 'r'.repeat(120) },
-      b: 's'.repeat(200),
-      c: { d: { e: 't'.repeat(150) }, f: 1 },
-      g: 'plain'
+      a: { x: 'q'.repeat(300), y: 'r'.repeat(300) },
+      b: 's'.repeat(400),
+      c: { d: { e: 't'.repeat(350) }, f: 1 },
+      g: 'plain',
+      h: { i: 'u'.repeat(300), j: 'v'.repeat(300) }
     });
     manager.serverCacheUpdated(new Path('/ws'), tree);
     await manager.flushNow('/ws');
     await flushMicrotasks();
 
-    // Reference rows from the synchronous splitter.
-    const expected = new Map(
-      splitNodeIntoRows([], tree, 96).map(([segs, json]) => [
-        segs.join('/'),
-        json
-      ])
-    );
+    expect(shared.get('chunks')!.size).to.be.greaterThan(1);
+    // Concatenated chunk rows === the direct splitter's rows.
+    const meta = [...shared.get('meta')!.values()][0] as { gen: string };
+    const chunkKeys = [...shared.get('chunks')!.keys()]
+      .filter(k => k.indexOf(meta.gen) >= 0)
+      .sort();
+    const rows: Array<[string[], string]> = [];
+    for (const k of chunkKeys) {
+      const parsed = JSON.parse(
+        shared.get('chunks')!.get(k) as string
+      ) as Array<[string[], string]>;
+      for (const r of parsed) {
+        rows.push(r);
+      }
+    }
+    const expected = splitNodeIntoRows([], tree, 96);
+    expect(rows).to.deep.equal(expected);
+
     const reader = new RowPersistenceManager(
       'test-repo',
       makeFakeIdb(shared),
-      null,
+      makeAlwaysGrantedLocks(),
       1,
       1,
       96,
@@ -885,11 +897,7 @@ describe('iterative whole-root staging', () => {
     );
     reader.setAuthScope('alice');
     const restored = await reader.restoreForListen('/ws');
-    expect(restored.node).to.not.equal(null);
     expect(restored.node!.equals(tree)).to.equal(true);
-    // Same physical row layout (not just the same assembled tree).
-    const rowStore = shared.get('rows')!;
-    expect(rowStore.size).to.equal(expected.size);
     manager.dispose();
     reader.dispose();
   });
@@ -939,7 +947,7 @@ describe('boot-claim protection (amber regression)', () => {
 });
 
 describe('claims require cross-tab exclusion', () => {
-  it('no Web Locks -> cache writes proceed but computeListenHashes declines', async () => {
+  it('no Web Locks -> every tab writes complete generations and claims stay sound', async () => {
     const shared = new Map<string, Map<string, unknown>>();
     const manager = makeManager(makeFakeIdb(shared), { webLocks: null });
     manager.setAuthScope('alice');
@@ -948,17 +956,12 @@ describe('claims require cross-tab exclusion', () => {
     manager.serverCacheUpdated(new Path('/ws'), nodeFromJSON({ v: 1 }));
     await manager.flushNow('/ws');
     await flushMicrotasks();
-    // The cache exists (next boot paints from it)...
-    const reader = makeManager(makeFakeIdb(shared));
-    reader.setAuthScope('alice');
-    expect(await reader.peek('/ws', 'alice')).to.not.equal(null);
-    await manager.restoreForListen('/ws');
-    // ...but no compound-hash claim without real cross-tab exclusion:
-    // interleaved incremental flushes from two lockless writers can leave
-    // a mixed generation whose gen check alone cannot detect.
-    expect(await manager.computeListenHashes('/ws')).to.equal(null);
+    // v3 generations are complete-or-invisible, so a claim is sound even
+    // without cross-tab exclusion: it describes this manager's own
+    // committed generation, which IS its live cache.
+    const hashes = await manager.computeListenHashes('/ws');
+    expect(hashes).to.not.equal(null);
     manager.dispose();
-    reader.dispose();
   });
 });
 
@@ -1053,23 +1056,24 @@ describe('deletion vs in-flight staging', () => {
 });
 
 describe('sweep vs concurrent commits (round-3)', () => {
-  it('a generation committed while the sweep runs keeps all its rows', async () => {
+  it('a generation committed while the sweep runs keeps all its chunks', async () => {
     const shared = new Map<string, Map<string, unknown>>();
-    // Seed an orphan row (torn stage leftover) so the sweep has work.
     const sep = '\u0001';
-    if (!shared.has('rows')) {
-      shared.set('rows', new Map());
-    }
-    if (!shared.has('meta')) {
-      shared.set('meta', new Map());
-    }
-    shared.get('rows')!.set('orphan' + sep + '/dead' + sep, '{"x":1}');
+    // Seed an EXPIRED root so the sweep has work.
+    shared.set('meta', new Map());
+    shared.set('chunks', new Map());
+    shared.get('meta')!.set('S' + sep + '/dead' + sep, {
+      gen: 'g0',
+      chunkCount: 1,
+      updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
+      formatVersion: 3
+    });
+    shared
+      .get('chunks')!
+      .set('S' + sep + '/dead' + sep + 'g0' + sep + '000000', '[]');
 
     const sweeper = makeManager(makeFakeIdb(shared));
     sweeper.setAuthScope('alice');
-    // Run the sweep and, in the same tick, commit a fresh generation from
-    // another manager: single-txn classification must never delete the
-    // fresh generation's rows.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sweeping = (sweeper as any).sweep_();
     const writer = makeManager(makeFakeIdb(shared));
@@ -1085,13 +1089,9 @@ describe('sweep vs concurrent commits (round-3)', () => {
     const reader = makeManager(makeFakeIdb(shared));
     reader.setAuthScope('alice');
     const peeked = await reader.peek('/ws', 'alice');
-    // The fresh generation is intact (meta AND rows, never fresh meta with
-    // deleted rows), and the orphan is gone.
     expect(peeked).to.not.equal(null);
     expect(peeked!.node.equals(tree)).to.equal(true);
-    expect(shared.get('rows')!.has('orphan' + sep + '/dead' + sep)).to.equal(
-      false
-    );
+    expect(shared.get('meta')!.has('S' + sep + '/dead' + sep)).to.equal(false);
     sweeper.dispose();
     writer.dispose();
     reader.dispose();

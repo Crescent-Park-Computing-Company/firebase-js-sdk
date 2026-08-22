@@ -29,11 +29,22 @@
  * read-your-own-writes), while other transactions never observe them —
  * so tests CAN detect torn/partially-visible generations.
  */
+const DB_VERSION_KEY = '__version__';
+
 export function makeFakeIdb(
   shared?: Map<string, Map<string, unknown>>,
   log?: { puts: string[]; deletes: string[] }
 ): IDBFactory {
   const stores = shared ?? new Map<string, Map<string, unknown>>();
+  // Version bookkeeping lives IN the shared map so managers sharing a
+  // substrate see one database: like real IndexedDB, onupgradeneeded fires
+  // only when the requested version exceeds the stored one — not on every
+  // open (which would rerun upgrade handlers that drop/recreate stores and
+  // silently wipe the shared data between managers).
+  if (!stores.has(DB_VERSION_KEY)) {
+    stores.set(DB_VERSION_KEY, new Map([['v', 0]]));
+  }
+  const versionBox = stores.get(DB_VERSION_KEY)! as Map<string, number>;
   const async = (fn: () => void): void => {
     void Promise.resolve().then(fn);
   };
@@ -212,7 +223,7 @@ export function makeFakeIdb(
   };
 
   return {
-    open: () => {
+    open: (_name: string, version?: number) => {
       const req: {
         result: unknown;
         onupgradeneeded: null | (() => void);
@@ -242,7 +253,11 @@ export function makeFakeIdb(
       };
       req.result = db;
       async(() => {
-        req.onupgradeneeded?.();
+        const current = versionBox.get('v') ?? 0;
+        if (version !== undefined && version > current) {
+          versionBox.set('v', version);
+          req.onupgradeneeded?.();
+        }
         req.onsuccess?.();
       });
       return req as unknown as IDBOpenDBRequest;
