@@ -141,11 +141,16 @@ function workerMain(): void {
             } else {
               path = rest.split(req.separator);
               path.pop();
-              // Row keys hold URI-encoded segments (RowStore encodeRowKey);
-              // the kernel must hash the REAL child names or its posts and
+              // Row keys hold escape-encoded segments (RowStore
+              // encodeRowSegment: '%xxxx' hex for %, \x01, \uffff); the
+              // kernel must hash the REAL child names or its posts and
               // range text diverge from the server's tree.
               for (let j = 0; j < path.length; j++) {
-                path[j] = decodeURIComponent(path[j]);
+                path[j] = path[j].replace(
+                  /%([0-9a-f]{4})/g,
+                  (_m: string, hex: string) =>
+                    String.fromCharCode(parseInt(hex, 16))
+                );
               }
             }
             rows.push({ path, json: values[i] });

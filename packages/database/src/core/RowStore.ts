@@ -70,18 +70,40 @@ const ROW_KEY_RANGE_END = '\uffff';
  * one segment per level. Every component ends with a separator so prefix
  * ranges never match sibling keys that merely share a string prefix.
  */
+/**
+ * Total, reversible per-segment encoding over raw UTF-16 code units. Only
+ * three code units are escaped — '%' (the escape lead), the separator
+ * \x01, and the range sentinel \uffff — as '%xxxx' hex. Everything else
+ * passes through verbatim, INCLUDING lone surrogates: Firebase key
+ * validation accepts them, and encodeURIComponent (the previous encoding)
+ * throws URIError on them, which wedged every flush of such a key into a
+ * retry loop. IndexedDB compares string keys by code unit, so pass-through
+ * segments keep prefix-range semantics exactly.
+ */
+export function encodeRowSegment(segment: string): string {
+  return segment.replace(/[%\x01\uffff]/g, c => {
+    return '%' + c.charCodeAt(0).toString(16).padStart(4, '0');
+  });
+}
+
+export function decodeRowSegment(encoded: string): string {
+  return encoded.replace(/%([0-9a-f]{4})/g, (_m, hex) => {
+    return String.fromCharCode(parseInt(hex, 16));
+  });
+}
+
 export function encodeRowKey(
   scope: string,
   rootString: string,
   relativePath: string[]
 ): string {
   let key =
-    encodeURIComponent(scope) +
+    encodeRowSegment(scope) +
     ROW_KEY_SEPARATOR +
-    encodeURIComponent(rootString) +
+    encodeRowSegment(rootString) +
     ROW_KEY_SEPARATOR;
   for (let i = 0; i < relativePath.length; i++) {
-    key += encodeURIComponent(relativePath[i]) + ROW_KEY_SEPARATOR;
+    key += encodeRowSegment(relativePath[i]) + ROW_KEY_SEPARATOR;
   }
   return key;
 }
@@ -93,9 +115,9 @@ export function decodeRowKeyRelativePath(
   rootString: string
 ): string[] {
   const prefix =
-    encodeURIComponent(scope) +
+    encodeRowSegment(scope) +
     ROW_KEY_SEPARATOR +
-    encodeURIComponent(rootString) +
+    encodeRowSegment(rootString) +
     ROW_KEY_SEPARATOR;
   assert(key.startsWith(prefix), 'row key does not match scope/root prefix');
   const rest = key.slice(prefix.length);
@@ -105,7 +127,7 @@ export function decodeRowKeyRelativePath(
   // Every key ends with a trailing separator; drop the empty tail segment.
   const segments = rest.split(ROW_KEY_SEPARATOR);
   segments.pop();
-  return segments.map(decodeURIComponent);
+  return segments.map(decodeRowSegment);
 }
 
 /** The IDBKeyRange covering every row of (scope, root) at or under relPath. */
@@ -307,7 +329,7 @@ export class RowIndex {
       if (depth < relativePath.length) {
         // Must match encodeRelative_'s alphabet exactly — keys_ holds
         // URI-encoded segments.
-        prefix += encodeURIComponent(relativePath[depth]) + ROW_KEY_SEPARATOR;
+        prefix += encodeRowSegment(relativePath[depth]) + ROW_KEY_SEPARATOR;
       }
     }
     return null;
@@ -350,7 +372,7 @@ export class RowIndex {
 function encodeRelative_(segments: string[]): string {
   let key = '';
   for (let i = 0; i < segments.length; i++) {
-    key += encodeURIComponent(segments[i]) + ROW_KEY_SEPARATOR;
+    key += encodeRowSegment(segments[i]) + ROW_KEY_SEPARATOR;
   }
   return key;
 }

@@ -355,3 +355,52 @@ describe('RowStore', () => {
     ]);
   });
 });
+
+describe('encoding edge cases (round-3)', () => {
+  it('kernel orders long zero-prefixed integer keys canonically', async () => {
+    // '00000000001' is integer key 1 (INTEGER_REGEXP_ allows leading
+    // zeros); it must sort BEFORE '2', matching nameCompare.
+    await expectParity(
+      { '00000000001': 'a'.repeat(40), '2': 'b'.repeat(40) },
+      32,
+      512
+    );
+    await expectParity(
+      { '-0000000005': 'neg', '00000000001': 'one', '10': 'ten', abc: 's' },
+      1 << 30,
+      512
+    );
+  });
+
+  it('row keys round-trip Firebase-valid lone surrogates', () => {
+    const hi = 'k' + String.fromCharCode(0xd800);
+    const lo = String.fromCharCode(0xdc00) + 'x';
+    for (const seg of [
+      hi,
+      lo,
+      '%',
+      'a%b',
+      'pct%0041',
+      '\u0001nev',
+      'x\uffff'
+    ]) {
+      const key = encodeRowKey('auth:u', '/r', [seg, 'plain']);
+      expect(decodeRowKeyRelativePath(key, 'auth:u', '/r')).to.deep.equal([
+        seg,
+        'plain'
+      ]);
+      // Encoded keys never contain a raw separator or sentinel inside a
+      // segment (prefix-range safety).
+      const parts = key.split('\u0001');
+      expect(parts[parts.length - 1]).to.equal('');
+      expect(key.indexOf('\uffff')).to.equal(-1);
+    }
+  });
+
+  it('splitNodeIntoRows + assembleRows round-trips surrogate keys end to end', () => {
+    const weird = 'k' + String.fromCharCode(0xd800);
+    const node = nodeFromJSON({ [weird]: { deep: 'v'.repeat(50) }, ok: 1 });
+    const rows = splitNodeIntoRows([], node, 32);
+    expect(assembleRows(rows).equals(node)).to.equal(true);
+  });
+});

@@ -1051,3 +1051,106 @@ describe('deletion vs in-flight staging', () => {
     reader.dispose();
   });
 });
+
+describe('sweep vs concurrent commits (round-3)', () => {
+  it('a generation committed while the sweep runs keeps all its rows', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    // Seed an orphan row (torn stage leftover) so the sweep has work.
+    const sep = '\u0001';
+    if (!shared.has('rows')) {
+      shared.set('rows', new Map());
+    }
+    if (!shared.has('meta')) {
+      shared.set('meta', new Map());
+    }
+    shared.get('rows')!.set('orphan' + sep + '/dead' + sep, '{"x":1}');
+
+    const sweeper = makeManager(makeFakeIdb(shared));
+    sweeper.setAuthScope('alice');
+    // Run the sweep and, in the same tick, commit a fresh generation from
+    // another manager: single-txn classification must never delete the
+    // fresh generation's rows.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sweeping = (sweeper as any).sweep_();
+    const writer = makeManager(makeFakeIdb(shared));
+    writer.setAuthScope('alice');
+    writer.setPersistentPath('/ws', true);
+    writer.track('/ws');
+    const tree = nodeFromJSON({ fresh: 'data' });
+    writer.serverCacheUpdated(new Path('/ws'), tree);
+    const flushing = writer.flushNow('/ws');
+    await Promise.all([sweeping, flushing]);
+    await flushMicrotasks();
+
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const peeked = await reader.peek('/ws', 'alice');
+    // The fresh generation is intact (meta AND rows, never fresh meta with
+    // deleted rows), and the orphan is gone.
+    expect(peeked).to.not.equal(null);
+    expect(peeked!.node.equals(tree)).to.equal(true);
+    expect(shared.get('rows')!.has('orphan' + sep + '/dead' + sep)).to.equal(
+      false
+    );
+    sweeper.dispose();
+    writer.dispose();
+    reader.dispose();
+  });
+});
+
+describe('deletion vs auth switch (round-3)', () => {
+  it('an evict awaited across a scope switch never deletes the new scope cache', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    // Bob has a valid cache.
+    const bobWriter = makeManager(makeFakeIdb(shared));
+    bobWriter.setAuthScope('bob');
+    bobWriter.setPersistentPath('/ws', true);
+    bobWriter.track('/ws');
+    const bobTree = nodeFromJSON({ owner: 'bob' });
+    bobWriter.serverCacheUpdated(new Path('/ws'), bobTree);
+    await bobWriter.flushNow('/ws');
+    await flushMicrotasks();
+    bobWriter.dispose();
+
+    // Alice: start a multi-batch stage, evict mid-flight, then switch to
+    // Bob before the awaited deletion runs.
+    const manager = new RowPersistenceManager(
+      'test-repo',
+      makeFakeIdb(shared),
+      makeAlwaysGrantedLocks(),
+      1,
+      1,
+      96,
+      30000,
+      300000,
+      1000,
+      512
+    );
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    manager.serverCacheUpdated(
+      new Path('/ws'),
+      nodeFromJSON(
+        Object.fromEntries(
+          Array.from({ length: 30 }, (_, i) => ['k' + i, 'x'.repeat(120) + i])
+        )
+      )
+    );
+    const staging = manager.flushNow('/ws');
+    manager.evict(new Path('/ws'));
+    manager.setAuthScope('bob');
+    await staging.catch(() => {});
+    await wait(30);
+    await flushMicrotasks();
+
+    // Bob's cache survived: the deletion belonged to Alice's namespace.
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('bob');
+    const peeked = await reader.peek('/ws', 'bob');
+    expect(peeked).to.not.equal(null);
+    expect(peeked!.node.equals(bobTree)).to.equal(true);
+    manager.dispose();
+    reader.dispose();
+  });
+});

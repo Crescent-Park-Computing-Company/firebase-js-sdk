@@ -1,5 +1,6 @@
 ---
 '@firebase/database': minor
+'firebase': minor
 ---
 
 Client-side server-cache persistence (v2) for web: path-keyed row storage in

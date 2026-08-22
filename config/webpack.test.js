@@ -134,7 +134,14 @@ if (
     exclude: [
       /node_modules/,
       /\.test\.tsx?$/, // Don't instrument the tests themselves
-      /test\//
+      /test\//,
+      // These two files are serialized with Function.toString() into a Blob
+      // worker (database HashWorker): instrumented bodies reference
+      // module-scope istanbul counters that do not exist inside the worker
+      // (ReferenceError: cov_… is not defined). Their behavior is covered
+      // by the kernel-parity and persistence suites on the main thread.
+      /database\/src\/core\/RowHashKernel\.ts$/,
+      /database\/src\/core\/HashWorker\.ts$/
     ]
   });
 }

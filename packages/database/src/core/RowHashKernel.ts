@@ -88,8 +88,13 @@ export function createRowHashKernel(
   const MAX_NAME = '[MAX_NAME]';
   const INTEGER_32_MIN = -2147483648;
   const INTEGER_32_MAX = 2147483647;
+  // EXACT port of core/util INTEGER_REGEXP_: leading zeros are allowed
+  // before up to ten significant digits ('00000000001' IS integer key 1).
+  // A narrower pattern here diverges the kernel's child ordering from the
+  // canonical nameCompare and breaks range-merge certification.
+  const INTEGER_REGEXP = new RegExp('^-?(0*)\\d{1,10}$');
   const tryParseInt = (str: string): number | null => {
-    if (/^-?\d{1,10}$/.test(str)) {
+    if (INTEGER_REGEXP.test(str)) {
       const intVal = Number(str);
       if (intVal >= INTEGER_32_MIN && intVal <= INTEGER_32_MAX) {
         return intVal;

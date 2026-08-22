@@ -1354,14 +1354,22 @@ export class RowPersistenceManager {
       return;
     }
     try {
-      const readTxn = db.transaction([ROWS_STORE, META_STORE], 'readonly');
-      const metaKeysReq = readTxn.objectStore(META_STORE).getAllKeys();
-      const metaValuesReq = readTxn.objectStore(META_STORE).getAll();
-      const rowKeysReq = readTxn.objectStore(ROWS_STORE).getAllKeys();
+      // Classification AND deletion in ONE readwrite transaction: a
+      // separate readonly snapshot goes stale the moment another tab
+      // commits between the two transactions — the sweep then deletes rows
+      // belonging to a FRESH generation while its complete meta survives
+      // (fresh meta + missing rows: a torn store whose own writer still
+      // holds the gen in lastGen and could certify it). IndexedDB
+      // transactions are serializable against each other, so reading and
+      // deleting under one txn makes the classification exact by
+      // construction — simpler than any re-validation protocol.
+      const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
+      const metaStore = txn.objectStore(META_STORE);
+      const rowStore = txn.objectStore(ROWS_STORE);
       const [metaKeys, metaValues, rowKeys] = await Promise.all([
-        this.requestDone_(metaKeysReq),
-        this.requestDone_(metaValuesReq),
-        this.requestDone_(rowKeysReq)
+        this.requestDone_(metaStore.getAllKeys()),
+        this.requestDone_(metaStore.getAll()),
+        this.requestDone_(rowStore.getAllKeys())
       ]);
       const now = Date.now();
       const liveMeta = new Set<string>();
@@ -1386,7 +1394,7 @@ export class RowPersistenceManager {
       // A row belongs to the meta whose key is its scope·root prefix; the
       // meta key is the shortest prefix ending in ROW_KEY_SEPARATOR twice
       // (scope + root). Orphans (no live meta prefix) are torn/expired.
-      const doomedRows: string[] = [];
+      let deletions = 0;
       for (let i = 0; i < rowKeys.length; i++) {
         const key = rowKeys[i] as string;
         const second = key.indexOf(
@@ -1395,22 +1403,18 @@ export class RowPersistenceManager {
         );
         const metaKey = key.slice(0, second + 1);
         if (!liveMeta.has(metaKey)) {
-          doomedRows.push(key);
+          rowStore.delete(key);
+          deletions++;
         }
       }
-      if (expired.length === 0 && doomedRows.length === 0) {
-        return;
-      }
-      const writeTxn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
-      const metaStore = writeTxn.objectStore(META_STORE);
-      const rowStore = writeTxn.objectStore(ROWS_STORE);
       for (let i = 0; i < expired.length; i++) {
         metaStore.delete(expired[i]);
+        deletions++;
       }
-      for (let i = 0; i < doomedRows.length; i++) {
-        rowStore.delete(doomedRows[i]);
+      if (deletions === 0) {
+        return;
       }
-      await this.txnDone_(writeTxn);
+      await this.txnDone_(txn);
     } catch (e) {
       // Best-effort; sweep again next session.
     }
@@ -1442,6 +1446,12 @@ export class RowPersistenceManager {
    * commit restoring a complete self-consistent generation.
    */
   private async deleteRoot_(pathString: string): Promise<void> {
+    // Capture the namespace SYNCHRONOUSLY: the deletion belongs to the
+    // scope whose cache was invalidated. An auth switch during the awaits
+    // below must not redirect the delete into the NEXT account's namespace
+    // (erasing an unrelated valid cache while leaving the doomed one).
+    const scope = this.scopeKey_();
+    const generation = this.authGeneration_;
     const root = this.tracked_.get(pathString);
     if (root !== undefined) {
       if (root.windowTimer !== null) {
@@ -1461,7 +1471,13 @@ export class RowPersistenceManager {
     if (db === null) {
       return;
     }
-    const scope = this.scopeKey_();
+    if (this.authGeneration_ !== generation) {
+      // Scope switched while waiting. The captured namespace's rows are
+      // already invisible to the new session (different key prefix) and
+      // the sweep reclaims them by age — deleting now would race whatever
+      // the previous scope's writer was still settling. Stand down.
+      return;
+    }
     try {
       const txn = db.transaction([ROWS_STORE, META_STORE], 'readwrite');
       txn
