@@ -33,8 +33,8 @@ import {
   PERSISTENCE_RESTORE_TIMEOUT_MS,
   PersistenceManager
 } from './Persistence';
-import { PersistentConnection } from './PersistentConnection';
 import { emitPersistenceTrace } from './PersistenceTrace';
+import { PersistentConnection } from './PersistentConnection';
 import { ReadonlyRestClient } from './ReadonlyRestClient';
 import { RepoInfo } from './RepoInfo';
 import { ListenWireResult, ServerActions } from './ServerActions';
