@@ -451,6 +451,8 @@ toc:
     path: /docs/reference/js/database.iterateddatasnapshot.md
   - title: ListenOptions
     path: /docs/reference/js/database.listenoptions.md
+  - title: ListenOutcome
+    path: /docs/reference/js/database.listenoutcome.md
   - title: OnDisconnect
     path: /docs/reference/js/database.ondisconnect.md
   - title: Query

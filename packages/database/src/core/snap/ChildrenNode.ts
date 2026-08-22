@@ -207,7 +207,14 @@ export class ChildrenNode implements Node {
       obj[key] = childNode.val(exportFormat);
 
       numKeys++;
-      if (allIntegerKeys && ChildrenNode.INTEGER_REGEXP_.test(key)) {
+      // charCode fast-reject: named keys can never be integers; skip the
+      // regex for them (val() over a large workspace calls this per key).
+      if (
+        allIntegerKeys &&
+        key.charCodeAt(0) >= 48 /* '0' */ &&
+        key.charCodeAt(0) <= 57 /* '9' */ &&
+        ChildrenNode.INTEGER_REGEXP_.test(key)
+      ) {
         maxKey = Math.max(maxKey, Number(key));
       } else {
         allIntegerKeys = false;
@@ -252,6 +259,13 @@ export class ChildrenNode implements Node {
       this.lazyHash_ = toHash === '' ? '' : sha1(toHash);
     }
     return this.lazyHash_;
+  }
+
+  /** @inheritDoc */
+  stampLazyHash(hash: string): void {
+    if (this.lazyHash_ === null) {
+      this.lazyHash_ = hash;
+    }
   }
 
   /** @inheritDoc */

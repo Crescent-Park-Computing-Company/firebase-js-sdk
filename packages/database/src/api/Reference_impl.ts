@@ -19,6 +19,7 @@ import { assert, getModularInstance, Deferred } from '@firebase/util';
 
 import {
   Repo,
+  repoActivatePersistenceForJoinedListen,
   repoAddEventCallbackForQuery,
   repoGetValue,
   repoRemoveEventCallbackForQuery,
@@ -26,6 +27,7 @@ import {
   repoSetWithPriority,
   repoUpdate
 } from '../core/Repo';
+import { consumeMaterializedValue } from '../core/ServerCacheSeed';
 import { ChildrenNode } from '../core/snap/ChildrenNode';
 import { Index } from '../core/snap/indexes/Index';
 import { KEY_INDEX } from '../core/snap/indexes/KeyIndex';
@@ -464,6 +466,34 @@ export class DataSnapshot {
 }
 
 /**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+export function consumePersistedMaterialization(
+  snapshot: DataSnapshot
+): unknown | undefined {
+  return consumeMaterializedValue(snapshot._node);
+}
+
+/**
  * Represents a child snapshot of a `Reference` that is being iterated over. The key will never be undefined.
  */
 export interface IteratedDataSnapshot extends DataSnapshot {
@@ -832,7 +862,10 @@ export function get(query: Query): Promise<DataSnapshot> {
  * Represents registration for 'value' events.
  */
 export class ValueEventRegistration implements EventRegistration {
-  constructor(private callbackContext: CallbackContext) {}
+  constructor(
+    private callbackContext: CallbackContext,
+    readonly onRemove?: () => void
+  ) {}
 
   respondsTo(eventType: string): boolean {
     return eventType === 'value';
@@ -891,7 +924,8 @@ export class ValueEventRegistration implements EventRegistration {
 export class ChildEventRegistration implements EventRegistration {
   constructor(
     private eventType: string,
-    private callbackContext: CallbackContext | null
+    private callbackContext: CallbackContext | null,
+    readonly onRemove?: () => void
   ) {}
 
   respondsTo(eventType: string): boolean {
@@ -972,6 +1006,12 @@ function addEventListener(
     cancelCallback = cancelCallbackOrListenOptions;
   }
 
+  if (options?.persistent && query._queryIdentifier !== 'default') {
+    throw new Error(
+      'persistent listener option is only supported for complete, unfiltered references.'
+    );
+  }
+
   if (options && options.onlyOnce) {
     const userCallback = callback;
     const onceCallback: UserCallback = (dataSnapshot, previousChildName) => {
@@ -983,15 +1023,64 @@ function addEventListener(
     callback = onceCallback;
   }
 
+  let persistenceReleased = false;
+  const releasePersistence = options?.persistent
+    ? () => {
+        if (persistenceReleased) {
+          return;
+        }
+        persistenceReleased = true;
+        const persistence = query._repo.persistence_;
+        if (persistence === undefined || persistence === null) {
+          return;
+        }
+        const pathString = query._path.toString();
+        persistence.setPersistentPath(pathString, false);
+        // A joined registration (repoActivatePersistenceForJoinedListen)
+        // tracked the root without a wire listen of its own; stop-listen
+        // teardown will never run for it. When the LAST persistent
+        // registration releases, storage ownership must end here — the
+        // shared network listener stays untouched.
+        if (!persistence.isPersistentPath(pathString)) {
+          persistence.untrack(pathString);
+        }
+      }
+    : undefined;
+  if (options?.persistent) {
+    // Select before adding the registration: the first registration starts
+    // the wire listen synchronously, and persistence must already own it.
+    query._repo.persistence_?.setPersistentPath(query._path.toString(), true);
+  }
+
   const callbackContext = new CallbackContext(
     callback,
     cancelCallback || undefined
   );
   const container =
     eventType === 'value'
-      ? new ValueEventRegistration(callbackContext)
-      : new ChildEventRegistration(eventType, callbackContext);
-  repoAddEventCallbackForQuery(query._repo, query, container);
+      ? new ValueEventRegistration(callbackContext, releasePersistence)
+      : new ChildEventRegistration(
+          eventType,
+          callbackContext,
+          releasePersistence
+        );
+  try {
+    repoAddEventCallbackForQuery(query._repo, query, container);
+  } catch (error) {
+    releasePersistence?.();
+    throw error;
+  }
+  if (options?.persistent) {
+    // Selecting before registration covers the registration that CREATES the
+    // wire listen (repoStartServerListen tracks the root). When this
+    // registration JOINED an already-listening default query instead, that
+    // start path never re-runs — activate persistence against the live
+    // listen: track the root and seed write-through from the complete server
+    // cache the listen already certified (nothing to do while it is still
+    // loading; the listen-complete certification write-through covers that
+    // ordering once tracked).
+    repoActivatePersistenceForJoinedListen(query._repo, query._path);
+  }
   return () => repoRemoveEventCallbackForQuery(query._repo, query, container);
 }
 
@@ -1087,7 +1176,7 @@ export function onValue(
 export function onValue(
   query: Query,
   callback: (snapshot: DataSnapshot) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1210,7 +1299,7 @@ export function onChildAdded(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1339,7 +1428,7 @@ export function onChildChanged(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1462,7 +1551,7 @@ export function onChildMoved(
     snapshot: DataSnapshot,
     previousChildName: string | null
   ) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 
@@ -1588,7 +1677,7 @@ export function onChildRemoved(
 export function onChildRemoved(
   query: Query,
   callback: (snapshot: DataSnapshot) => unknown,
-  cancelCallback: (error: Error) => unknown,
+  cancelCallback: ((error: Error) => unknown) | undefined,
   options: ListenOptions
 ): Unsubscribe;
 

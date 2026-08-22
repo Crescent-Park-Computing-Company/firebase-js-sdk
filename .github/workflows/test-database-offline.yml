@@ -1,0 +1,57 @@
+name: Test Database (offline)
+
+# Runs the @firebase/database offline unit suites — including the
+# row-store persistence-v2 / server-cache-seeding / compound-hash / range-merge tests — on pushes and
+# PRs to the database feature branches. Network-dependent integration
+# suites (which dial a real database) are excluded.
+
+on:
+  push:
+    branches:
+      - 'database-*'
+  pull_request:
+
+jobs:
+  test:
+    name: packages/database offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build @firebase/database and its workspace dependencies
+        run: npx lerna run --scope @firebase/'{app,database}' --include-dependencies build
+
+      - name: Run offline unit tests
+        working-directory: packages/database
+        run: |
+          TS_NODE_FILES=true TS_NODE_CACHE=NO TS_NODE_COMPILER_OPTIONS='{"module":"commonjs"}' \
+          npx mocha \
+            'test/compoundhash.test.ts' \
+            'test/persistence-v2.test.ts' \
+            'test/rowpersistence.test.ts' \
+            'test/rowstore.test.ts' \
+            'test/slicedingest.test.ts' \
+            'test/persistentconnection-compoundhash.test.ts' \
+            'test/rangemerge.test.ts' \
+            'test/websocketconnection.test.ts' \
+            'test/compound_write.test.ts' \
+            'test/path.test.ts' \
+            'test/pushid.test.ts' \
+            'test/sparsesnapshottree.test.ts' \
+            'test/syncpoint.test.ts' \
+            --file src/index.node.ts --config ../../config/mocharc.node.js
+
+      - name: Lint database package
+        working-directory: packages/database
+        run: yarn lint

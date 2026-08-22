@@ -40,17 +40,33 @@ import {
   EmulatorTokenProvider,
   FirebaseAuthTokenProvider
 } from '../core/AuthTokenProvider';
-import { Repo, repoInterrupt, repoResume, repoStart } from '../core/Repo';
+import {
+  Repo,
+  repoCancelPendingSeedRestores,
+  repoDispose,
+  repoInterrupt,
+  ListenOutcome,
+  repoOnListenOutcome,
+  repoNotifyPersistenceAuthScope,
+  repoResume,
+  repoStart
+} from '../core/Repo';
 import { RepoInfo, RepoInfoEmulatorOptions } from '../core/RepoInfo';
+import { RowPersistenceManager } from '../core/RowPersistence';
+import { stampMaterializedValue } from '../core/ServerCacheSeed';
+import { ChildrenNode } from '../core/snap/ChildrenNode';
+import { PRIORITY_INDEX } from '../core/snap/indexes/PriorityIndex';
+import { Node } from '../core/snap/Node';
 import { parseRepoInfo } from '../core/util/libs/parser';
-import { newEmptyPath, pathIsEmpty } from '../core/util/Path';
+import { newEmptyPath, Path, pathIsEmpty } from '../core/util/Path';
 import {
   warn,
   fatal,
   log,
   enableLogging as enableLoggingImpl
 } from '../core/util/util';
-import { validateUrl } from '../core/util/validation';
+import { validateRootPathString, validateUrl } from '../core/util/validation';
+import { yieldMacrotask } from '../core/util/yieldMacrotask';
 import { BrowserPollConnection } from '../realtime/BrowserPollConnection';
 import { TransportManager } from '../realtime/TransportManager';
 import { WebSocketConnection } from '../realtime/WebSocketConnection';
@@ -186,7 +202,7 @@ function repoManagerDeleteRepo(repo: Repo, appName: string): void {
   if (!appRepos || appRepos[repo.key] !== repo) {
     fatal(`Database ${appName}(${repo.repoInfo_}) has already been deleted.`);
   }
-  repoInterrupt(repo);
+  repoDispose(repo);
   delete appRepos[repo.key];
 }
 
@@ -397,6 +413,17 @@ export function connectDatabaseEmulator(
 
   // Modify the repo to apply emulator settings
   repoManagerApplyEmulatorSettings(repo, hostAndPort, options, tokenProvider);
+
+  // Persistence enabled before this call captured the production URL as its
+  // storage prefix; rebind it to the emulator's so emulator sessions never
+  // restore production records or write emulator data under the production
+  // namespace. (Emulator config only happens pre-start, so no listens or
+  // tracked roots exist yet.)
+  if (repo.persistence_ !== null) {
+    repo.persistence_ = repo.persistence_.rebindTo(
+      repo.repoInfo_.toURLString()
+    );
+  }
 }
 
 /**
@@ -424,6 +451,285 @@ export function goOffline(db: Database): void {
   db = getModularInstance(db);
   db._checkNotDeleted('goOffline');
   repoInterrupt(db._repo);
+}
+
+/**
+ * Per-child work units charged per main-thread slice of the peek walk (one
+ * charge per child pulled from a node's iterator and per array-coercion
+ * copy). Sized so one slice stays well inside a frame budget on mobile
+ * hardware while keeping the total slice count (and its scheduling overhead)
+ * low on large workspaces.
+ * @internal
+ */
+export const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
+
+// ChildrenNode.val()'s integer-key grammar (private there; replicated for the
+// sliced walk's array coercion, which must match val() exactly).
+const PEEK_INTEGER_REGEXP = /^(0|[1-9]\d*)$/;
+
+/**
+ * Materializes `node` to the exact JS value `node.val()` returns — same child
+ * ordering (PRIORITY_INDEX), same array coercion, same leaf semantics — in
+ * yielded slices under one budget invariant: EVERY per-child unit of work
+ * (a child pulled from a node's lazy iterator, an array-coercion copy)
+ * charges the shared slice budget, and no uncharged loop is unbounded. After
+ * _PEEK_MATERIALIZE_SLICE_VISITS charges the walk yields a macrotask so the
+ * main thread can paint and GC.
+ *
+ * Children are pulled from ChildrenNode.getIterator(PRIORITY_INDEX) — the
+ * identical resolveIndex_ order forEachChild/val() traverse — one at a time,
+ * so a wide flat node never enumerates (or buffers) its whole child set
+ * between two yields. An eager per-node child copy would itself be the
+ * unbounded synchronous walk this function exists to prevent.
+ *
+ * Why not node.val(): the pre-auth peek materializes the ENTIRE persisted
+ * workspace at boot, and one synchronous walk over a large root is a
+ * multi-second main-thread block plus an allocation spike at exactly the
+ * moment mobile WebKit is quickest to kill the page. The IndexedDB decode
+ * before this point is already sliced (decodeFragmentsSliced_); this closes
+ * the remaining monolithic walk on the boot path.
+ */
+async function materializeNodeSliced(node: Node): Promise<unknown> {
+  let visitsSinceYield = 0;
+  const walk = async (current: Node): Promise<unknown> => {
+    if (current.isLeafNode()) {
+      return current.val();
+    }
+    if (current.isEmpty()) {
+      return null;
+    }
+    // Lazy child iteration: same PRIORITY_INDEX order as forEachChild (both
+    // resolve the identical index), pulled one child per budget charge.
+    const iterator = (current as ChildrenNode).getIterator(PRIORITY_INDEX);
+    const obj: Record<string, unknown> = {};
+    let numKeys = 0;
+    let maxKey = 0;
+    let allIntegerKeys = true;
+    let child = iterator.getNext();
+    while (child !== null) {
+      if (++visitsSinceYield >= _PEEK_MATERIALIZE_SLICE_VISITS) {
+        visitsSinceYield = 0;
+        await yieldMacrotask();
+      }
+      const key = child.name;
+      // Inline leaves: a promise per leaf (via recursion) would dominate
+      // allocation on exactly the wide flat collections this bounds.
+      obj[key] = child.node.isLeafNode()
+        ? child.node.val()
+        : await walk(child.node);
+      numKeys++;
+      // charCode fast-reject mirrors ChildrenNode.val().
+      if (
+        allIntegerKeys &&
+        key.charCodeAt(0) >= 48 /* '0' */ &&
+        key.charCodeAt(0) <= 57 /* '9' */ &&
+        PEEK_INTEGER_REGEXP.test(key)
+      ) {
+        maxKey = Math.max(maxKey, Number(key));
+      } else {
+        allIntegerKeys = false;
+      }
+      child = iterator.getNext();
+    }
+    if (allIntegerKeys && maxKey < 2 * numKeys) {
+      const array: unknown[] = [];
+      // eslint-disable-next-line guard-for-in
+      for (const key in obj) {
+        // Charged like any other per-child unit: a huge dense array must not
+        // replay its whole length in one uncharged task after the last yield.
+        if (++visitsSinceYield >= _PEEK_MATERIALIZE_SLICE_VISITS) {
+          visitsSinceYield = 0;
+          await yieldMacrotask();
+        }
+        array[key as unknown as number] = obj[key];
+      }
+      return array;
+    }
+    return obj;
+  };
+  return walk(node);
+}
+
+/**
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @public
+ */
+export function getPersistedValue(
+  db: Database,
+  pathString: string,
+  expectedAuthScope: string | null = null
+): Promise<unknown | null> {
+  db = getModularInstance(db);
+  db._checkNotDeleted('getPersistedValue');
+  validateRootPathString('getPersistedValue', 'path', pathString, false);
+  // _repoInternal, not the _repo getter: the boot peek runs before sign-in,
+  // and reading a stored record must not start the instance (which would
+  // lock out later transport/emulator configuration).
+  const repo = db._repoInternal;
+  const persistence = repo.persistence_;
+  if (persistence === null) {
+    return Promise.resolve(null);
+  }
+  // Prime the manager with the trusted expected identity so the later auth
+  // callback for that same user can reuse this physical decode. A different
+  // real auth uid changes scope and cancels it before any listener consumes
+  // it. Priming is NOT app confirmation (confirmedByApp=false): until real
+  // auth confirms this scope via setPersistenceAuthScope, the peek's decoded
+  // tree is retained under the long pre-auth backstop instead of the short
+  // handoff grace — auth hydration can be arbitrarily slow, and expiring the
+  // handoff before it completes forces a full second restore alongside the
+  // first (the double-tree boot-memory spike).
+  if (expectedAuthScope !== null) {
+    persistence.setAuthScope(expectedAuthScope, false);
+  }
+  // Exact-root by design: callers peek the same path they are about to
+  // listen to. This lets the authenticated listener consume the same decoded
+  // Node and prevents a fresher ancestor record from being mistaken for the
+  // exact listener's initial replay.
+  const normalizedPath = new Path(pathString).toString();
+  // peek() revalidates the identity scope when its record promise resolves,
+  // but the sliced walk below opens a multi-macrotask window AFTER that
+  // check. Capture the generation here and re-check once the walk is done,
+  // so a scope switch or sign-out mid-walk invalidates this peek exactly
+  // like one that lands before resolution — a public-API caller must never
+  // receive the previous account's cached tree.
+  const authGeneration = persistence.authGeneration();
+  return persistence
+    .peek(normalizedPath, expectedAuthScope)
+    .then(async (record): Promise<unknown | null> => {
+      if (record === null) {
+        return null;
+      }
+      // Sliced val(): identical result, but the walk yields macrotasks so a
+      // large workspace cannot block boot in one multi-second task.
+      const value = await materializeNodeSliced(record.node);
+      if (persistence.authGeneration() !== authGeneration) {
+        return null;
+      }
+      // One-boot materialization handoff (see ServerCacheSeed), installed
+      // ATOMICALLY after the walk and only while THE read that decoded this
+      // exact node is still retained for a future listener join — the only
+      // window with a consumer. Identity-bound (record.node, not just the
+      // path): a listener consuming the read mid-walk, or a replacement
+      // peek retained since, must leave zero stamps behind — a stamp
+      // without a taker pins a full JS copy of its subtree for the session.
+      // When the check fails, the joined/next listener simply
+      // re-materializes via val(), the ordinary cold path.
+      //
+      // This pass is deliberately synchronous (not budget-charged): it
+      // allocates nothing — the values already live in `value` — and its
+      // per-child cost is a WeakMap set for object children only
+      // (stampMaterializedValue ignores primitives itself), strictly
+      // cheaper than the listener replay burst over the same children.
+      // Charging it would reopen the mid-pass interleaving the atomicity
+      // exists to prevent.
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        persistence.hasRetainedPeek(normalizedPath, record.node)
+      ) {
+        const byKey = value as Record<string, unknown>;
+        record.node.forEachChild(PRIORITY_INDEX, (key, childNode) => {
+          stampMaterializedValue(childNode, byKey[key]);
+        });
+        stampMaterializedValue(record.node, value);
+      }
+      return value;
+    });
+}
+
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @public
+ */
+export function setPersistenceEnabled(db: Database, enabled: boolean): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceEnabled');
+  if (db._instanceStarted) {
+    fatal(
+      'setPersistenceEnabled() must be called before the first Database operation.'
+    );
+  }
+  // _repoInternal, not the _repo getter: configuration must not start the
+  // instance, or a later connectDatabaseEmulator() would refuse to run.
+  const repo = db._repoInternal;
+  if (enabled) {
+    if (repo.persistence_ === null) {
+      repo.persistence_ = new RowPersistenceManager(
+        repo.repoInfo_.toURLString()
+      );
+      // Auth may be configured before persistence is enabled; preserve the
+      // explicit undefined-vs-null distinction.
+      if (repo.persistenceAuthScope_ !== undefined) {
+        repo.persistence_.setAuthScope(repo.persistenceAuthScope_);
+      }
+    }
+  } else {
+    if (repo.persistence_ !== null) {
+      repoCancelPendingSeedRestores(repo);
+      repo.persistence_.dispose();
+      repo.persistence_ = null;
+    }
+  }
+}
+
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export function setPersistenceAuthScope(
+  db: Database,
+  scope: string | null
+): void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('setPersistenceAuthScope');
+  const repo = db._repoInternal;
+  const persistenceWasScoped =
+    repo.persistence_?.isAuthScopeConfigured() ?? false;
+  if (repo.persistence_?.setAuthScope(scope) && persistenceWasScoped) {
+    repoCancelPendingSeedRestores(repo);
+  }
+  const scopeChanged = repo.persistenceAuthScope_ !== scope;
+  repo.persistenceAuthScope_ = scope;
+  if (scopeChanged || (!persistenceWasScoped && repo.persistence_ !== null)) {
+    repoNotifyPersistenceAuthScope(repo);
+  }
+}
+
+/**
+ * Observes the restore/cold/fallback state and final server certification for
+ * one exact default listen. The callback is invoked first when the local path
+ * choice is known (`certified: false`), then once the server responds.
+ *
+ * @public
+ */
+export function onListenOutcome(
+  db: Database,
+  pathString: string,
+  callback: (outcome: ListenOutcome) => void
+): () => void {
+  db = getModularInstance(db);
+  db._checkNotDeleted('onListenOutcome');
+  validateRootPathString('onListenOutcome', 'path', pathString, false);
+  return repoOnListenOutcome(
+    db._repoInternal,
+    new Path(pathString).toString(),
+    callback
+  );
 }
 
 /**

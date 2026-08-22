@@ -28,12 +28,47 @@ export function setMaxNode(val: Node) {
   MAX_NODE = val;
 }
 
-export const priorityHashText = function (priority: string | number): string {
-  if (typeof priority === 'number') {
-    return 'number:' + doubleToIEEE754String(priority);
+/**
+ * The hash text of a leaf value: `<typeof>:<serialized value>`. Numbers
+ * serialize as IEEE-754 hex; everything else via String(). This is the one
+ * definition of the leaf grammar shared by Node.hash() (v2 = false) and the
+ * compound-hash range serialization (v2 = true, where strings are
+ * JSON-quoted so ranges are unambiguous to reparse — Android calls this the
+ * "V2" hash representation).
+ */
+export function leafHashValueText(
+  value: string | number | boolean,
+  v2: boolean
+): string {
+  const type = typeof value;
+  let text = type + ':';
+  if (type === 'number') {
+    text += doubleToIEEE754String(value as number);
+  } else if (v2 && type === 'string') {
+    text += hashQuotedString(value as string);
   } else {
-    return 'string:' + priority;
+    text += String(value);
   }
+  return text;
+}
+
+/**
+ * JSON-style quoting with only backslash and double quote escaped (the V2
+ * hash grammar's string form).
+ */
+export function hashQuotedString(value: string): string {
+  let escaped = value;
+  if (escaped.indexOf('\\') !== -1) {
+    escaped = escaped.replace(/\\/g, '\\\\');
+  }
+  if (escaped.indexOf('"') !== -1) {
+    escaped = escaped.replace(/"/g, '\\"');
+  }
+  return '"' + escaped + '"';
+}
+
+export const priorityHashText = function (priority: string | number): string {
+  return leafHashValueText(priority, /* v2= */ false);
 };
 
 /**

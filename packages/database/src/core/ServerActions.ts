@@ -15,7 +15,16 @@
  * limitations under the License.
  */
 
+import { ListenHashFn } from './ServerCacheSeed';
 import { QueryContext } from './view/EventRegistration';
+
+export interface ListenWireResult {
+  bytes: number;
+  hadHash: boolean;
+  hadCompoundHash: boolean;
+  dataReceived: boolean;
+  rangeMerged: boolean;
+}
 
 /**
  * Interface defining the set of actions that can be performed against the Firebase server
@@ -26,9 +35,11 @@ import { QueryContext } from './view/EventRegistration';
 export abstract class ServerActions {
   abstract listen(
     query: QueryContext,
-    currentHashFn: () => string,
+    currentHashFn: ListenHashFn,
     tag: number | null,
-    onComplete: (a: string, b: unknown) => void
+    onComplete: (a: string, b: unknown, result: ListenWireResult) => void,
+    onProgress?: (result: ListenWireResult) => void,
+    onResend?: () => void
   ): void;
 
   /**
