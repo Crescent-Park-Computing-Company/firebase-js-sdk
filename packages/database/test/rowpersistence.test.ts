@@ -456,7 +456,7 @@ describe('RowPersistenceManager sweep', () => {
       gen: 'g1',
       chunkCount: 1,
       updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
-      formatVersion: 3
+      formatVersion: 4
     });
     shared
       .get('chunks')!
@@ -1066,7 +1066,7 @@ describe('sweep vs concurrent commits (round-3)', () => {
       gen: 'g0',
       chunkCount: 1,
       updatedAt: Date.now() - 40 * 24 * 60 * 60 * 1000,
-      formatVersion: 3
+      formatVersion: 4
     });
     shared
       .get('chunks')!

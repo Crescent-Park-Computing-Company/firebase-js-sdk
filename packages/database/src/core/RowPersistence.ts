@@ -97,7 +97,13 @@ interface RootMeta {
   updatedAt: number;
   formatVersion: number;
 }
-const META_FORMAT_VERSION = 3;
+/**
+ * v4 invalidates caches written by the v3.1 build, whose child-payload
+ * cache could serialize a shared subtree under the wrong key (fixed by
+ * binding the cache to key+threshold) — those stores may hold silently
+ * wrong trees, and a version bump is the one-line way to retire them.
+ */
+const META_FORMAT_VERSION = 4;
 
 function newGen(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
