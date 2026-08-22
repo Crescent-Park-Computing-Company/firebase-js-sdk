@@ -70,13 +70,6 @@ export type PersistenceTraceEvent =
       rangesHashed: number;
       rangesReused: number;
       /**
-       * Whether the previous flush baseline was the SAME object as the tree
-       * being written. False after a wholesale replace (fallback resend,
-       * sliced ingest of a giant push/range-merge): until this flush, the
-       * old baseline retained a second complete tree in memory.
-       */
-      baselineShared: boolean;
-      /**
        * Of the new tree's immediate children, how many ARE the baseline's
        * child objects (identity). 0-of-N with a baseline present = a full
        * divorce — the memory-doubling shape; N≈total = a cheap incremental
@@ -96,4 +89,17 @@ export function emitPersistenceTrace(event: PersistenceTraceEvent): void {
   if (typeof sink === 'function') {
     exceptionGuard(() => sink(event));
   }
+}
+
+/**
+ * Whether a trace sink is currently installed. Callers whose event
+ * CONSTRUCTION is itself non-trivial (e.g. the flush event's baseline
+ * identity scan) check this first so an uninstrumented session pays
+ * nothing on the hot path.
+ */
+export function persistenceTraceSinkInstalled(): boolean {
+  return (
+    typeof (globalThis as PersistenceTraceGlobal)
+      .__firebaseDatabasePersistenceTrace === 'function'
+  );
 }

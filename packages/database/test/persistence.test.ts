@@ -467,7 +467,7 @@ describe('PersistenceManager', () => {
     expect(restored.compoundHash).to.deep.equal(computeCompoundHash(json));
   });
 
-  it('emits a flush trace: shared baseline on an in-place update, divorced after a wholesale replace', async () => {
+  it('emits a flush trace with baseline identity-sharing counters', async () => {
     const traced: Array<Record<string, unknown>> = [];
     const traceGlobal = globalThis as typeof globalThis & {
       __firebaseDatabasePersistenceTrace?: (event: unknown) => void;
@@ -484,7 +484,7 @@ describe('PersistenceManager', () => {
       const path = new Path('some/root');
       manager.track(path.toString());
 
-      // Generation 1: no prior baseline — baselineShared is false.
+      // Generation 1: no prior baseline.
       const first = nodeFromJSON({ a: 1, b: 2 });
       manager.serverCacheUpdated(path, first);
       await manager.flushNow(path.toString());
@@ -492,7 +492,6 @@ describe('PersistenceManager', () => {
       expect(traced.length).to.equal(1);
       expect(traced[0]['mode']).to.equal('commit');
       expect(traced[0]['path']).to.equal(path.toString());
-      expect(traced[0]['baselineShared']).to.equal(false);
       // No baseline at all: sharing counters stay zero.
       expect(traced[0]['sharedChildren']).to.equal(0);
       expect(traced[0]['totalChildren']).to.equal(0);
@@ -508,7 +507,6 @@ describe('PersistenceManager', () => {
       await manager.flushNow(path.toString());
       await flushAsync();
       expect(traced.length).to.equal(2);
-      expect(traced[1]['baselineShared']).to.equal(false);
       // 'a' kept the baseline's object; 'b' was replaced: 1 of 2 shared.
       expect(traced[1]['sharedChildren']).to.equal(1);
       expect(traced[1]['totalChildren']).to.equal(2);
