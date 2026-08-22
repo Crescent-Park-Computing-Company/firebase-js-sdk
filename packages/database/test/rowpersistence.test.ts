@@ -1154,3 +1154,31 @@ describe('deletion vs auth switch (round-3)', () => {
     reader.dispose();
   });
 });
+
+describe('child payload cache (v3)', () => {
+  it('the same child node under two different keys serializes under each key correctly', async () => {
+    const shared = new Map<string, Map<string, unknown>>();
+    const manager = makeManager(makeFakeIdb(shared));
+    manager.setAuthScope('alice');
+    manager.setPersistentPath('/ws', true);
+    manager.track('/ws');
+    // One subtree, then a copy under a second key: Firebase trees are
+    // structurally shared, so both keys point at the SAME node object.
+    const sub = nodeFromJSON({ deep: 'x'.repeat(50) });
+    let tree = nodeFromJSON({}).updateImmediateChild('first', sub);
+    tree = tree.updateImmediateChild('second', sub);
+    manager.serverCacheUpdated(new Path('/ws'), tree);
+    await manager.flushNow('/ws');
+    await flushMicrotasks();
+
+    const reader = makeManager(makeFakeIdb(shared));
+    reader.setAuthScope('alice');
+    const restored = await reader.peek('/ws', 'alice');
+    expect(restored).to.not.equal(null);
+    // Both keys restore with their OWN names (a naive node-keyed payload
+    // cache would replay the first key's rows under the second key).
+    expect(restored!.node.equals(tree)).to.equal(true);
+    manager.dispose();
+    reader.dispose();
+  });
+});

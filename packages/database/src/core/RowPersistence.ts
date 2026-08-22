@@ -162,13 +162,23 @@ interface TrackedRoot {
 }
 
 /**
- * Chunk payloads per top-level child, keyed by the child Node's identity.
- * Nodes are immutable and structurally shared across server updates, so a
- * cached serialization stays valid as long as the child object lives — a
- * snapshot flush re-serializes only the top-level children that actually
- * changed. Module-level WeakMap: entries die with their nodes.
+ * Chunk payloads per top-level child, keyed by the child Node's identity,
+ * holding the serialized rows FOR ONE (key, splitThreshold) pair. Nodes
+ * are immutable and structurally shared across server updates, so a cached
+ * serialization stays valid as long as the child object lives — a snapshot
+ * flush re-serializes only the top-level children that actually changed.
+ *
+ * The payload embeds the child's KEY in every row path, and the same node
+ * object can legitimately appear under DIFFERENT keys (a copied subtree
+ * keeps its identity) or be flushed by managers with different split
+ * thresholds — so the entry stores key+threshold and misses on mismatch
+ * rather than replaying rows under the wrong name (which would restore a
+ * silently wrong tree). Module-level WeakMap: entries die with their nodes.
  */
-const childPayloadCache = new WeakMap<Node, string>();
+const childPayloadCache = new WeakMap<
+  Node,
+  { key: string; threshold: number; payload: string }
+>();
 
 export class RowPersistenceManager {
   private db_: Promise<IDBDatabase | null> | null = null;
@@ -1031,12 +1041,23 @@ export class RowPersistenceManager {
             root.dirty = true;
             return;
           }
-          let payload = childPayloadCache.get(child);
-          if (payload === undefined) {
+          const cached = childPayloadCache.get(child);
+          let payload: string;
+          if (
+            cached !== undefined &&
+            cached.key === key &&
+            cached.threshold === this.splitThresholdBytes_
+          ) {
+            payload = cached.payload;
+          } else {
             payload = JSON.stringify(
               splitNodeIntoRows([key], child, this.splitThresholdBytes_)
             );
-            childPayloadCache.set(child, payload);
+            childPayloadCache.set(child, {
+              key,
+              threshold: this.splitThresholdBytes_,
+              payload
+            });
             await yieldMacrotask();
           }
           pushRows(JSON.parse(payload) as Array<[string[], string]>);
