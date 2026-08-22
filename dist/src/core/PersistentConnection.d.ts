@@ -77,10 +77,10 @@ export declare class PersistentConnection extends ServerActions {
         s?: string;
         e?: string;
         m: unknown;
-    }>, tag: number | null, wireBytes?: number) => void);
+    }>, tag: number | null) => void);
     protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown, bytes?: number) => void): void;
     get(query: QueryContext): Promise<string>;
-    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
+    listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void, onResend?: () => void): void;
     private sendGet_;
     private sendListen_;
     private static warnOnListenWarnings_;
