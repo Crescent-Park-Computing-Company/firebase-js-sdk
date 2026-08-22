@@ -399,6 +399,38 @@ function baselineSharing(
   return { sharedChildren, totalChildren };
 }
 
+/**
+ * True when the incoming tree keeps NO immediate-child identity with a
+ * MULTI-child flush baseline — the wholesale-replace shape. Identity-only
+ * and bounded by the root's child count; never compares content (a
+ * structurally-equal rebuilt child still reads as divorced, which only
+ * costs staging a fresh generation — never correctness). Roots whose
+ * incoming tree has fewer than two children are never treated as divorced:
+ * a single-child root loses child identity on EVERY ordinary incremental
+ * update (the sole child is rebuilt each time), so the release would fire
+ * per-update and force a full-generation flush each window; retaining one
+ * child's baseline costs little, and the identity diff stays cheap there.
+ */
+function baselineFullyDivorced(prevRoot: Node, node: Node): boolean {
+  if (prevRoot === node || node.isLeafNode() || node.isEmpty()) {
+    return false;
+  }
+  if (prevRoot.isLeafNode()) {
+    return true;
+  }
+  let children = 0;
+  let shared = false;
+  // forEachChild aborts the traversal on a truthy callback return.
+  (node as ChildrenNode).forEachChild(KEY_INDEX, (name, child) => {
+    children++;
+    if (prevRoot.getImmediateChild(name) === child) {
+      shared = true;
+      return true;
+    }
+  });
+  return children > 1 && !shared;
+}
+
 const RANGE_KEY_INFIX = '#range:';
 
 function wireCompoundHashFromRanges(ranges: StableRange[]): SeedCompoundHash {
@@ -857,6 +889,73 @@ export class PersistenceManager {
     return true;
   }
 
+  /**
+   * Lifecycle flush (F11): fire every root's pending write NOW when the page
+   * hides. The write window is a debounce for foreground UX; a hiding page
+   * has no UX to protect and may never come back — iOS Safari kills
+   * background tabs under memory pressure with no beforeunload. An
+   * unflushed generation makes the NEXT boot restore a staler tree, whose
+   * listen then resends a bigger server delta, which is the giant-message
+   * crash amplifier. Best-effort by design: an IndexedDB commit that loses
+   * the race against teardown simply doesn't commit (the manifest CAS keeps
+   * storage consistent), which is exactly today's behavior without the
+   * attempt.
+   *
+   * `force` decides what happens while restores are still in flight.
+   * pagehide is terminal — the page is going away, so flushing NOW is
+   * strictly better than losing the generation, even at the cost of
+   * contending with a restore that will die with the page anyway.
+   * visibilitychange:hidden is RECOVERABLE (mobile backgrounding, tab
+   * switch): a forced readwrite there could starve an active restore into
+   * its idle timeout on return, so those roots keep the ordinary
+   * restore-deferral (writesDeferredUntilRestores_ re-arms them when the
+   * restores drain) and only restore-free roots flush.
+   */
+  private lifecycleFlush_ = (force: boolean): void => {
+    if (this.disposed_ || !this.authScopeConfigured_) {
+      return;
+    }
+    const restoresActive =
+      this.activeRestoreCount_ > 0 || this.restoreQueue_.length > 0;
+    for (const pathString of [...this.latest_.keys()]) {
+      if (!force && restoresActive) {
+        this.writesDeferredUntilRestores_.add(pathString);
+        continue;
+      }
+      // flush_ itself skips a root whose newest tree is already stored.
+      void this.flushNow(pathString);
+    }
+  };
+
+  private onPageHide_ = (): void => {
+    this.lifecycleFlush_(true);
+  };
+
+  private onVisibilityChange_ = (): void => {
+    if (
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'hidden'
+    ) {
+      this.lifecycleFlush_(false);
+    }
+  };
+
+  private installLifecycleFlush_(): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return;
+    }
+    window.addEventListener('pagehide', this.onPageHide_);
+    document.addEventListener('visibilitychange', this.onVisibilityChange_);
+  }
+
+  private removeLifecycleFlush_(): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return;
+    }
+    window.removeEventListener('pagehide', this.onPageHide_);
+    document.removeEventListener('visibilitychange', this.onVisibilityChange_);
+  }
+
   constructor(
     private prefix_: string,
     private idbFactory_: IDBFactory | null = isIndexedDBAvailable()
@@ -874,6 +973,7 @@ export class PersistenceManager {
     heartbeatStore: HeartbeatStore | null = defaultHeartbeatStore()
   ) {
     this.heartbeatStore_ = heartbeatStore;
+    this.installLifecycleFlush_();
     if (!this.schemaKnownCurrent_) {
       // Do not put the cold server listen behind a potentially slow Safari
       // version-change transaction. Migration runs in the background; restore
@@ -2580,6 +2680,33 @@ export class PersistenceManager {
       return;
     }
     this.accumulateChangedPaths_(pathString, changedPaths);
+    // Divorce release: after a wholesale replace (a fallback resend, a giant
+    // sliced overwrite, a range merge folding the whole root — regardless of
+    // reported precision, since a sliced root push reports the precise
+    // root path) the incoming tree shares NO immediate-child identity with
+    // the flush baseline. Keeping `prev.rootNode` then retains a second
+    // complete tree in memory for a diff that would collapse to all-dirty
+    // anyway (visit-budget bail) — and a tab that never wins the writer
+    // lease NEVER flushes, so without this release the divorced baseline
+    // stays pinned for the tab's whole lifetime. Drop the tree but keep the
+    // revision/ranges (rootNode: null — the adopted-baseline shape): the
+    // CAS still works, and the next flush stages a fresh self-contained
+    // generation exactly as it does after a manifest-only adoption. The
+    // scan aborts on the first shared child, so an ordinary incremental
+    // update (siblings keep identity by construction) costs a few lookups.
+    if (
+      prev !== undefined &&
+      prev.rootNode !== null &&
+      baselineFullyDivorced(prev.rootNode, node)
+    ) {
+      this.lastFlush_.set(pathString, {
+        rootNode: null,
+        revision: prev.revision,
+        ranges: prev.ranges,
+        storedUpdatedAt: prev.storedUpdatedAt
+      });
+      this.changedSinceFlush_.set(pathString, null);
+    }
     this.latest_.set(pathString, {
       node,
       revision: this.instanceId_ + '-' + (++this.writeCounter_).toString(36),
@@ -2746,6 +2873,7 @@ export class PersistenceManager {
 
   dispose(): void {
     this.disposed_ = true;
+    this.removeLifecycleFlush_();
     this.releaseAllWriterLeases_();
     for (const timer of this.writeTimers_.values()) {
       clearTimeout(timer);

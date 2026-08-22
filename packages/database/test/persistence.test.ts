@@ -554,6 +554,212 @@ describe('PersistenceManager', () => {
     }
   });
 
+  it('releases the flush baseline tree on a wholesale (divorced) replace', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('some/root');
+    const internals = manager as unknown as {
+      lastFlush_: Map<string, { rootNode: Node | null; revision: string }>;
+      changedSinceFlush_: Map<string, string[][] | null>;
+    };
+    manager.track(path.toString());
+
+    const first = nodeFromJSON({ a: 1, b: 2 });
+    manager.serverCacheUpdated(path, first);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const flushed = internals.lastFlush_.get(path.toString());
+    expect(flushed!.rootNode).to.equal(first);
+    const flushedRevision = flushed!.revision;
+
+    // A rebuilt tree with the same CONTENT but no shared child identity —
+    // the fallback-resend / giant-overwrite shape.
+    const replaced = nodeFromJSON({ a: 1, b: 2 });
+    manager.serverCacheUpdated(path, replaced);
+
+    // The baseline TREE is released immediately (rootNode null), while the
+    // revision/ranges stay for the commit CAS — the adopted-baseline shape.
+    const after = internals.lastFlush_.get(path.toString());
+    expect(after!.rootNode).to.equal(null);
+    expect(after!.revision).to.equal(flushedRevision);
+    expect(internals.changedSinceFlush_.get(path.toString())).to.equal(null);
+
+    // The next flush stages a fresh self-contained generation and adopts
+    // the live tree as the new baseline…
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    expect(internals.lastFlush_.get(path.toString())!.rootNode).to.equal(
+      replaced
+    );
+    // …and the stored generation restores intact. (restoreForTest re-seeds
+    // lastFlush_ with the restored record's own node — assert it last.)
+    const restored = (await restoreForTest(
+      manager,
+      path.toString()
+    )) as PersistedRecord;
+    expect(restored.node.val(true)).to.deep.equal({ a: 1, b: 2 });
+  });
+
+  it('keeps the flush baseline on an incremental update that shares child identity', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('some/root');
+    const internals = manager as unknown as {
+      lastFlush_: Map<string, { rootNode: Node | null }>;
+    };
+    manager.track(path.toString());
+
+    const first = nodeFromJSON({ a: 1, b: 2 });
+    manager.serverCacheUpdated(path, first);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+
+    // updateImmediateChild preserves the sibling child objects — the normal
+    // incremental shape. The baseline must survive for the identity diff.
+    const second = first.updateImmediateChild('b', nodeFromJSON(3));
+    manager.serverCacheUpdated(path, second, [['b']]);
+    expect(internals.lastFlush_.get(path.toString())!.rootNode).to.equal(first);
+  });
+
+  it('never treats a single-child root as divorced (incremental updates rebuild the sole child)', async () => {
+    const { factory } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('some/root');
+    const internals = manager as unknown as {
+      lastFlush_: Map<string, { rootNode: Node | null }>;
+    };
+    manager.track(path.toString());
+
+    const first = nodeFromJSON({ only: { v: 1 } });
+    manager.serverCacheUpdated(path, first);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+
+    // An ordinary update to a single-child root rebuilds the sole child, so
+    // no child identity survives — the divorce release must NOT fire (it
+    // would force a full-generation flush on every update).
+    const second = first.updateImmediateChild('only', nodeFromJSON({ v: 2 }));
+    manager.serverCacheUpdated(path, second, [['only']]);
+    expect(internals.lastFlush_.get(path.toString())!.rootNode).to.equal(first);
+  });
+
+  it('flushes pending roots on pagehide and stops listening after dispose', async () => {
+    const g = globalThis as typeof globalThis & {
+      window?: unknown;
+      document?: unknown;
+    };
+    const hadWindow = 'window' in g;
+    const prevWindow = g.window;
+    const hadDocument = 'document' in g;
+    const prevDocument = g.document;
+    type Listener = () => void;
+    const winListeners = new Map<string, Set<Listener>>();
+    const docListeners = new Map<string, Set<Listener>>();
+    const listen =
+      (reg: Map<string, Set<Listener>>) =>
+      (type: string, fn: Listener): void => {
+        if (!reg.has(type)) {
+          reg.set(type, new Set());
+        }
+        reg.get(type)!.add(fn);
+      };
+    const unlisten =
+      (reg: Map<string, Set<Listener>>) =>
+      (type: string, fn: Listener): void => {
+        reg.get(type)?.delete(fn);
+      };
+    g.window = {
+      addEventListener: listen(winListeners),
+      removeEventListener: unlisten(winListeners)
+    } as unknown as Window & typeof globalThis;
+    const fakeDocument = {
+      visibilityState: 'visible',
+      addEventListener: listen(docListeners),
+      removeEventListener: unlisten(docListeners)
+    } as unknown as Document & { visibilityState: string };
+    g.document = fakeDocument;
+    try {
+      const { factory, data } = makeFakeIndexedDB();
+      const manager = scopedManager('test-repo', factory);
+      const path = new Path('some/root');
+      manager.track(path.toString());
+      expect(winListeners.get('pagehide')!.size).to.equal(1);
+      expect(docListeners.get('visibilitychange')!.size).to.equal(1);
+
+      // A pending write sits in its debounce window: nothing stored yet.
+      manager.serverCacheUpdated(path, nodeFromJSON({ a: 1 }));
+      expect(data.get('test-repo|/some/root')).to.equal(undefined);
+
+      // pagehide fires the flush immediately.
+      for (const fn of winListeners.get('pagehide')!) {
+        fn();
+      }
+      await flushAsync();
+      expect(data.get('test-repo|/some/root')).to.not.equal(undefined);
+
+      // visibilitychange to hidden flushes a later pending write too.
+      manager.serverCacheUpdated(path, nodeFromJSON({ a: 2 }));
+      (fakeDocument as { visibilityState: string }).visibilityState = 'hidden';
+      for (const fn of docListeners.get('visibilitychange')!) {
+        fn();
+      }
+      await flushAsync();
+      const restored = (await restoreForTest(
+        manager,
+        path.toString()
+      )) as PersistedRecord;
+      expect(restored.node.val(true)).to.deep.equal({ a: 2 });
+
+      // While a restore is active, visibility-hidden DEFERS (the root joins
+      // writesDeferredUntilRestores_) instead of contending with the
+      // restore's transactions; pagehide still forces the flush.
+      const internals = manager as unknown as {
+        activeRestoreCount_: number;
+        writesDeferredUntilRestores_: Set<string>;
+      };
+      manager.serverCacheUpdated(path, nodeFromJSON({ a: 3 }));
+      internals.activeRestoreCount_ = 1;
+      for (const fn of docListeners.get('visibilitychange')!) {
+        fn();
+      }
+      expect(
+        internals.writesDeferredUntilRestores_.has(path.toString())
+      ).to.equal(true);
+      const restoredMid = (await restoreForTest(
+        manager,
+        path.toString()
+      )) as PersistedRecord;
+      // Unflushed: storage still holds the pre-restore-deferral generation.
+      expect(restoredMid.node.val(true)).to.deep.equal({ a: 2 });
+      for (const fn of winListeners.get('pagehide')!) {
+        fn();
+      }
+      await flushAsync();
+      const restoredForced = (await restoreForTest(
+        manager,
+        path.toString()
+      )) as PersistedRecord;
+      expect(restoredForced.node.val(true)).to.deep.equal({ a: 3 });
+      internals.activeRestoreCount_ = 0;
+
+      // dispose removes both listeners.
+      manager.dispose();
+      expect(winListeners.get('pagehide')!.size).to.equal(0);
+      expect(docListeners.get('visibilitychange')!.size).to.equal(0);
+    } finally {
+      if (hadWindow) {
+        g.window = prevWindow;
+      } else {
+        delete g.window;
+      }
+      if (hadDocument) {
+        g.document = prevDocument;
+      } else {
+        delete g.document;
+      }
+    }
+  });
+
   it('stores one manifest + immutable range records and reassembles exactly', async () => {
     const { factory, data } = makeFakeIndexedDB();
     const manager = scopedManager('test-repo', factory);
@@ -4484,9 +4690,9 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     // The sliced write is byte-identical to what a restore expects.
     const restored = await manager.restoreForListen(path.toString());
     expect(restored.record).to.not.equal(null);
-    expect(restored.record!.node.equals(nodeFromJSON(wideRoot(120, 60)))).to.equal(
-      true
-    );
+    expect(
+      restored.record!.node.equals(nodeFromJSON(wideRoot(120, 60)))
+    ).to.equal(true);
   });
 
   it('sliced planning produces the same generation a synchronous rebuild does', async () => {
@@ -4495,7 +4701,14 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
       fixedSizeSplitStrategy(4096),
       true
     );
-    const syncRanges = rebuildStableRanges(node, [], [], false, syncBuilder, 4096);
+    const syncRanges = rebuildStableRanges(
+      node,
+      [],
+      [],
+      false,
+      syncBuilder,
+      4096
+    );
 
     const slicedBuilder = new CompoundHashBuilder(
       fixedSizeSplitStrategy(4096),
@@ -4733,8 +4946,6 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     manager.dispose();
     await flushing;
     await flushAsync();
-    expect(data.get('test-repo|/dispose/root')).to.equal(
-      undefined
-    );
+    expect(data.get('test-repo|/dispose/root')).to.equal(undefined);
   });
 });
