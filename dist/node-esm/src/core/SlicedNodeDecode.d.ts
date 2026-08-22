@@ -40,24 +40,29 @@ export interface DecodeSliceState {
     isCurrent: () => boolean;
 }
 /**
+ * Public charge for ingest bodies that do per-unit work OUTSIDE the decoder
+ * (e.g. folding one decoded range merge over a base tree): shares the same
+ * slice budget and yield/liveness contract as the decode itself. @internal
+ */
+export declare function chargeSlice(state: DecodeSliceState): Promise<void> | null;
+/**
  * Budgeted replica of {@link nodeFromJSON}: the same Node for the same JSON —
  * identical priority handling, '.value' unwrapping, '.sv' leaf semantics,
  * metadata-key skipping, empty-child pruning, and childSet construction —
- * driven by a SYNCHRONOUS explicit-stack walk that awaits only when the
- * shared slice budget trips (one charge per JSON key at every depth). The
- * earlier async-recursive form allocated a promise chain per interior node;
- * on a multi-MB payload that is hundreds of thousands of microtasks —
- * observed in Safari field traces as a 70k-microtask storm saturating the
- * main thread. The explicit stack keeps the hot path 100% synchronous
- * between budget boundaries.
+ * but every JSON key visited charges one unit of the shared slice budget,
+ * and the walk yields a macrotask when the budget exhausts so a large
+ * server push can never decode as one monolithic main-thread task.
  *
  * Key enumeration is prototype-safe ({@link contains}) exactly like
  * nodeFromJSON's each(): "hasOwnProperty" (or any Object.prototype name) is
  * a legal child key, and JSON.parse makes it an own string property — a
  * direct method call through the object would invoke user data and throw.
  *
- * Fidelity is enforced by test corpus equality (node.equals + hash)
- * against nodeFromJSON; when editing either function, keep them in
+ * Primitive children decode synchronously through nodeFromJSON itself (a
+ * single bounded leaf) — a promise per leaf would dominate allocation on
+ * exactly the wide flat collections this bounds (the peek walk's inline-leaf
+ * precedent). Fidelity is enforced by test corpus equality (node.equals +
+ * hash) against nodeFromJSON; when editing either function, keep them in
  * lockstep.
  * @internal
  */
@@ -69,6 +74,14 @@ export declare function decodeNodeSliced(json: unknown | null, state: DecodeSlic
  * @internal
  */
 export declare function assembleChildrenNode(children: NamedNode[], childrenHavePriority: boolean, priority: unknown): Node;
+/**
+ * Budgeted structural equality: Node.equals with every compared node
+ * charging the shared slice budget, so grafting a large unchanged subtree
+ * cannot itself become the monolithic walk the decoder exists to remove.
+ * Same comparison semantics as ChildrenNode/LeafNode.equals (priority,
+ * child count, PRIORITY_INDEX-iterated pairwise children).
+ */
+export declare function nodesEqualSliced(a: Node, b: Node, state: DecodeSliceState): Promise<boolean>;
 /**
  * Decodes one full-root plain-children push into a single Node, sliced, with
  * IDENTITY GRAFTING against the live base: each decoded top-level child that

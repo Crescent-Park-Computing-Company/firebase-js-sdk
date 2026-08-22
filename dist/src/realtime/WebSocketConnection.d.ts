@@ -26,11 +26,9 @@ export declare class WebSocketConnection implements Transport {
     private appCheckToken?;
     private authToken?;
     keepaliveTimer: number | null;
-    /**
-     * Timestamp (ms) of the last websocket activity; the keepalive tick
+    /** Timestamp (ms) of the last websocket activity; the keepalive tick
      * compares against this instead of the timer being torn down and
-     * recreated on every frame.
-     */
+     * recreated on every frame. */
     private lastActivity_;
     frames: string[] | null;
     totalFrames: number;
