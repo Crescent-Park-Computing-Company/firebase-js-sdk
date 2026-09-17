@@ -3819,6 +3819,119 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     unsubscribe();
   });
 
+  it('a get() under a restored-but-uncertified root goes to the server, then back to the cache once certified', async () => {
+    const {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      calls,
+      serverCallbacks,
+      getResponders
+    } = makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale' });
+    // A live registration at the root, so the SyncTree retains the root's
+    // complete server cache (the restored base) the way a real onValue does.
+    const rootQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    // Phase 2: the restored base is the SyncTree's complete value for the
+    // root and the listen is out but unanswered.
+    expect(calls).to.deep.equal(['listen']);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'stale' });
+    expect(repo.listenOutcomes_.get(path.toString())?.outcome).to.deep.equal({
+      mode: 'restored',
+      certified: false,
+      bytes: 0,
+      reason: undefined
+    });
+
+    // A get() for a descendant must not be answered from that base: it is a
+    // request-response read whose caller treats the answer as server truth.
+    const childPath = new Path('users/alice/cached');
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    const uncertifiedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    getResponders[0]('fresh');
+    expect((await uncertifiedGet).val()).to.equal('fresh');
+
+    // Certification: the SyncTree is server truth again and get() is
+    // answered locally, exactly as before.
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    expect(
+      repo.listenOutcomes_.get(path.toString())?.outcome?.certified
+    ).to.equal(true);
+    const certifiedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    expect((await certifiedGet).val()).to.equal('fresh');
+  });
+
+  it('a get() under a root that was never persisted keeps its cached answer', async () => {
+    const { repo, hashFn, onComplete, calls } = makeListenHarness();
+    // A cold listen on a non-persistent root: the SyncTree value is live
+    // server data, so get() stays local (the pre-existing contract).
+    const bobPath = new Path('users/bob');
+    const bobQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      bobPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      bobQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, bobQuery as never, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(
+      repo.listenOutcomes_.get(bobPath.toString())?.outcome?.mode
+    ).to.equal('cold');
+    syncTreeApplyServerOverwrite(
+      repo.serverSyncTree_,
+      bobPath,
+      nodeFromJSON({ profile: 'bob' })
+    );
+    const got = await repoGetValue(
+      repo,
+      bobQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen']);
+    expect(got.val()).to.deep.equal({ profile: 'bob' });
+  });
+
   it('switches restored cyan to fallback amber on a full server replacement', async () => {
     const {
       repo,

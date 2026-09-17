@@ -2126,6 +2126,37 @@ function repoGetNextWriteId(repo: Repo): number {
 }
 
 /**
+ * Whether a persistent default listen at or above `pathString` has applied
+ * its RESTORED tree and the server has not certified it yet (the window
+ * between `sendListen('restored')` and the listen response in
+ * repoStartServerListen). The SyncTree then holds a COMPLETE value that is
+ * exactly as old as the cache's last flush. `onValue` serves it on purpose
+ * (cached-then-live: the certification corrects it in place), but a `get()`
+ * is request-response and its caller treats the answer as server truth, so
+ * it must not be answered from that tree. Cold and fallback listens hold
+ * live server data or nothing; certified listens are server truth.
+ */
+function repoHasUncertifiedRestoreCovering(
+  repo: Repo,
+  pathString: string
+): boolean {
+  for (const [root, state] of repo.listenOutcomes_) {
+    const outcome = state.outcome;
+    if (outcome === null || outcome.certified || outcome.mode !== 'restored') {
+      continue;
+    }
+    if (
+      root === '/' ||
+      pathString === root ||
+      pathString.startsWith(root + '/')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The purpose of `getValue` is to return the latest known value
  * satisfying `query`.
  *
@@ -2145,9 +2176,13 @@ export function repoGetValue(
   query: QueryContext,
   eventRegistration: ValueEventRegistration
 ): Promise<Node> {
-  // Only active queries are cached. There is no persisted cache.
+  // Only active queries are cached; a restored-but-uncertified root is the
+  // one active cache a get() must not trust (repoHasUncertifiedRestoreCovering).
   const cached = syncTreeGetServerValue(repo.serverSyncTree_, query);
-  if (cached != null) {
+  if (
+    cached != null &&
+    !repoHasUncertifiedRestoreCovering(repo, query._path.toString())
+  ) {
     return Promise.resolve(cached);
   }
   return repo.server_.get(query).then(
