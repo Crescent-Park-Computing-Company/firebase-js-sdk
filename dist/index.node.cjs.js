@@ -15729,6 +15729,16 @@ class Repo {
          * to publish its certification outcome (see onListenOutcome in api/Database.ts).
          */
         this.listenOutcomes_ = new Map();
+        /**
+         * Persistent roots whose SyncTree value is RESTORED data the server has not
+         * yet replaced or certified (see repoHasUncertifiedRestoreCovering). Added
+         * when a restored base is applied; removed when the listen completes, when
+         * a full untagged overwrite at or above the root is APPLIED, or when the
+         * listen stops. Deliberately not derived from listenOutcomes_: that mode is
+         * a wire-progress label ('fallback' flips on receipt of a replacement push,
+         * before the push is applied), not a statement about SyncTree contents.
+         */
+        this.restoredUncertifiedRoots_ = new Set();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
         this.key = this.repoInfo_.toURLString();
     }
@@ -15907,6 +15917,7 @@ function repoApplyDataUpdate(repo, pathString, data, isMerge, tag) {
     else {
         const snap = nodeFromJSON(data);
         events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, snap);
+        repoRestoredRootsReplaced(repo, pathString);
     }
     let affectedPath = path;
     if (events.length > 0) {
@@ -16156,6 +16167,7 @@ async function repoIngestFullRootPush(repo, pathString, data, isCurrent) {
         throw new IngestCancelledError();
     }
     const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, rootPath, assembled);
+    repoRestoredRootsReplaced(repo, pathString);
     let affectedPath = rootPath;
     if (events.length > 0) {
         affectedPath = repoRerunTransactions(repo, rootPath);
@@ -16342,6 +16354,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
         if (!isDefaultComplete) {
             return;
         }
+        // Certified ('ok'), or cancelled (the registration is gone with its
+        // cache): either way the SyncTree no longer holds unverified restored data.
+        repo.restoredUncertifiedRoots_.delete(pathString);
         repoPublishListenOutcome(repo, pathString, {
             mode: activeMode,
             certified: status === 'ok',
@@ -16665,6 +16680,9 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
                     ? blankGraftedRangeHashes(record.compoundHash, graftList.map(graft => pathSlice(graft.path)))
                     : undefined);
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
+            // From here until the listen completes or a full push replaces the
+            // root, the SyncTree holds restored data (see repoGetValue).
+            repo.restoredUncertifiedRoots_.add(pathString);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isCurrent()) {
                 repo.pendingListenHashes_.clear(pathString);
@@ -16733,6 +16751,7 @@ function repoStopServerListen(repo, query, tag) {
     repoLiftIngestGate(repo, pathString);
     repo.pendingListenHashes_.clear(pathString);
     repo.listenOutcomes_.delete(pathString);
+    repo.restoredUncertifiedRoots_.delete(pathString);
     repo.persistence_?.untrack(pathString);
 }
 /** Observe the outcome of one exact default listen. @internal */
@@ -16831,6 +16850,7 @@ function repoDispose(repo) {
         }
     }
     repoClearListenOutcomes(repo);
+    repo.restoredUncertifiedRoots_.clear();
     repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
 }
@@ -16991,22 +17011,35 @@ function repoGetNextWriteId(repo) {
     return repo.nextWriteId_++;
 }
 /**
- * Whether a persistent default listen at or above `pathString` has applied
- * its RESTORED tree and the server has not certified it yet (the window
- * between `sendListen('restored')` and the listen response in
- * repoStartServerListen). The SyncTree then holds a COMPLETE value that is
- * exactly as old as the cache's last flush. `onValue` serves it on purpose
- * (cached-then-live: the certification corrects it in place), but a `get()`
- * is request-response and its caller treats the answer as server truth, so
- * it must not be answered from that tree. Cold and fallback listens hold
- * live server data or nothing; certified listens are server truth.
+ * A full untagged server overwrite was APPLIED at `pathString`: every restored
+ * root at or under it now holds server truth, so its restored provenance ends.
+ * Range merges and tagged/partial updates never call this — they correct or
+ * extend the restored base without replacing it.
+ */
+function repoRestoredRootsReplaced(repo, pathString) {
+    if (repo.restoredUncertifiedRoots_.size === 0) {
+        return;
+    }
+    for (const root of [...repo.restoredUncertifiedRoots_]) {
+        if (pathString === '/' ||
+            root === pathString ||
+            root.startsWith(pathString + '/')) {
+            repo.restoredUncertifiedRoots_.delete(root);
+        }
+    }
+}
+/**
+ * Whether the SyncTree value covering `pathString` is a persistent root's
+ * RESTORED tree that the server has neither replaced nor certified yet. That
+ * value is complete and exactly as old as the cache's last flush. `onValue`
+ * serves it on purpose (cached-then-live: the certification or a replacement
+ * push corrects it in place), but a `get()` is request-response and its
+ * caller treats the answer as server truth, so it must not be answered from
+ * that tree. Tracked as applied-data provenance (restoredUncertifiedRoots_),
+ * never inferred from the listen's wire-progress mode.
  */
 function repoHasUncertifiedRestoreCovering(repo, pathString) {
-    for (const [root, state] of repo.listenOutcomes_) {
-        const outcome = state.outcome;
-        if (outcome === null || outcome.certified || outcome.mode !== 'restored') {
-            continue;
-        }
+    for (const root of repo.restoredUncertifiedRoots_) {
         if (root === '/' ||
             pathString === root ||
             pathString.startsWith(root + '/')) {

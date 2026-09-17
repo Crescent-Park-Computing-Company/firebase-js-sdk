@@ -236,6 +236,16 @@ export declare class Repo {
      * to publish its certification outcome (see onListenOutcome in api/Database.ts).
      */
     listenOutcomes_: Map<string, ListenOutcomeState>;
+    /**
+     * Persistent roots whose SyncTree value is RESTORED data the server has not
+     * yet replaced or certified (see repoHasUncertifiedRestoreCovering). Added
+     * when a restored base is applied; removed when the listen completes, when
+     * a full untagged overwrite at or above the root is APPLIED, or when the
+     * listen stops. Deliberately not derived from listenOutcomes_: that mode is
+     * a wire-progress label ('fallback' flips on receipt of a replacement push,
+     * before the push is applied), not a statement about SyncTree contents.
+     */
+    restoredUncertifiedRoots_: Set<string>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
