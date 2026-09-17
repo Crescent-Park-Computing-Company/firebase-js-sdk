@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
-import { ListenHashFn } from './ServerCacheSeed';
+import { ListenHashFn, PendingListenHashes } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
 import { SyncPoint } from './SyncPoint';
@@ -28,6 +28,8 @@ export declare function syncTreeSetReferenceConstructor(val: ReferenceConstructo
 export interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event[]): Event[];
     stopListening(a: QueryContext, b: number | null): void;
+    /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
+    getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
 }
 export declare function resetSyncTreeTag(): void;
 /**
@@ -148,6 +150,15 @@ export declare function syncTreeGetDescendantServerCacheStates(syncTree: SyncTre
  * @returns Events to raise.
  */
 export declare function syncTreeApplyServerRangeMerges(syncTree: SyncTree, path: Path, merges: RangeMerge[]): Event[];
+/**
+ * The base an untagged range merge at `path` folds over — the complete
+ * view's current server cache (empty node when the cache is absent), or
+ * null when there is no complete view (the merge is ignored for that
+ * state, matching syncTreeApplyServerRangeMerges). Lets an asynchronous
+ * ingest snapshot the base, fold merges OFF-TREE across yields, and apply
+ * the result as one overwrite. @internal
+ */
+export declare function syncTreeGetRangeMergeBase(syncTree: SyncTree, path: Path): Node | null;
 /**
  * Applies tagged-query server range merges against the query's view.
  *

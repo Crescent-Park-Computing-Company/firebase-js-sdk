@@ -1231,6 +1231,7 @@ export declare function refFromURL(db: Database, url: string): DatabaseReference
  * @returns Resolves when remove on server is complete.
  */
 export declare function remove(ref: DatabaseReference): Promise<void>;
+/* Excluded from this release type: _repoManagerDatabaseFromApp */
 /**
  * Atomically modifies the data at this location.
  *
