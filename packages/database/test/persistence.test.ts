@@ -2631,6 +2631,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       pendingListenHashes_: pendingHashes,
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      restoredUncertifiedRoots_: new Set<string>(),
       // The boot-window drain reruns transactions after each replayed push;
       // the real Repo always carries this tree. (The legacy synchronous
       // drain crashed here too, but inside a void'd promise chain — the
@@ -3895,6 +3896,168 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect((await certifiedGet).val()).to.equal('fresh');
   });
 
+  it('a get() keeps reading the server after a fallback push is RECEIVED, until that push is APPLIED', async () => {
+    const {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      calls,
+      serverProgress,
+      getResponders
+    } = makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale' });
+    const rootQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'stale' });
+
+    // The wire reports a full (non-range-merge) data push: the outcome label
+    // flips to 'fallback' on RECEIPT, before anything reaches the SyncTree.
+    serverProgress[0]({
+      bytes: 500,
+      hadHash: true,
+      hadCompoundHash: true,
+      dataReceived: true,
+      rangeMerged: false
+    });
+    expect(repo.listenOutcomes_.get(path.toString())?.outcome?.mode).to.equal(
+      'fallback'
+    );
+    // The push itself lands at a persistent root, so it takes the sliced
+    // pump: a gate is installed synchronously and the overwrite applies on a
+    // later macrotask. The SyncTree still holds the restored tree. (The
+    // harness double omits interceptServerDataCallback_; the real Repo
+    // initializes it to null, which is what makes the push eligible.)
+    (
+      repo as unknown as { interceptServerDataCallback_: null }
+    ).interceptServerDataCallback_ = null;
+    repoOnDataUpdateForTest(
+      repo,
+      path.toString(),
+      { cached: 'pushed' },
+      false,
+      null
+    );
+    expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'stale' });
+
+    // Trust must follow the APPLIED data, not the label: still the server.
+    const childPath = new Path('users/alice/cached');
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    const midWindowGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    getResponders[0]('pushed');
+    expect((await midWindowGet).val()).to.equal('pushed');
+
+    // The replacement applies: the SyncTree is server truth for this root
+    // even though the listen has not completed, so get() is local again.
+    await flushAsync();
+    expectIngestIdle(repo);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'pushed' });
+    const appliedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    expect((await appliedGet).val()).to.equal('pushed');
+  });
+
+  it('a range merge before certification corrects the restored base but does not make get() trust it', async () => {
+    const {
+      repo,
+      query,
+      path,
+      hashFn,
+      onComplete,
+      calls,
+      serverCallbacks,
+      getResponders
+    } = makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale', other: 1 });
+    const rootQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    repoStartServerListen(repo, query, null, hashFn, onComplete);
+    await flushAsync();
+    // An incremental correction (merge) of one child: the rest of the tree
+    // is still the unverified restored base.
+    repoOnDataUpdateForTest(
+      repo,
+      path.toString(),
+      { cached: 'merged' },
+      true,
+      null
+    );
+    await flushAsync();
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'merged', other: 1 });
+    const otherQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      new Path('users/alice/other'),
+      new QueryParams(),
+      false
+    );
+    const beforeCert = repoGetValue(
+      repo,
+      otherQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    getResponders[0](2);
+    expect((await beforeCert).val()).to.equal(2);
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    const afterCert = repoGetValue(
+      repo,
+      otherQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'get']);
+    await afterCert;
+  });
+
   it('a get() under a root that was never persisted keeps its cached answer', async () => {
     const { repo, hashFn, onComplete, calls } = makeListenHarness();
     // A cold listen on a non-persistent root: the SyncTree value is live
@@ -4143,6 +4306,7 @@ describe('stale restore vs live server data', () => {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      restoredUncertifiedRoots_: new Set<string>(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,
