@@ -26,11 +26,21 @@ export declare class CacheNode {
     private node_;
     private fullyInitialized_;
     private filtered_;
-    constructor(node_: Node, fullyInitialized_: boolean, filtered_: boolean);
+    private verified_;
+    constructor(node_: Node, fullyInitialized_: boolean, filtered_: boolean, verified_?: boolean);
     /**
      * Returns whether this node was fully initialized with either server data or a complete overwrite by the client
      */
     isFullyInitialized(): boolean;
+    /**
+     * Whether the data came from (or was confirmed by) the server. False only
+     * while a view holds a persisted tree installed ahead of the server's
+     * answer (OperationVerification 'restore'); a full server overwrite or the
+     * listen's completion flips it back. Travels with the cache: a view seeded
+     * from another view's complete cache inherits the bit. get() serves a
+     * cached value only from a verified server cache.
+     */
+    isVerified(): boolean;
     /**
      * Returns whether this node is potentially missing children due to a filter applied to the node
      */

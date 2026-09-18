@@ -237,20 +237,14 @@ export declare class Repo {
      */
     listenOutcomes_: Map<string, ListenOutcomeState>;
     /**
-     * Wire listens (path + tag, see repoListenKey) whose current subscription
-     * the server has answered 'ok'. Read by repoGetValue: a cached answer is
-     * trusted only when the listen owning the SyncTree view that serves it is
-     * in this set. Restored data can only enter the SyncTree at a persistent
-     * listen's own root, before that listen certifies; so a view whose listen
-     * has certified holds only hash-verified or server-replaced data, and a
-     * view whose listen has not (unanswered, shadow-stopped, taken over by a
-     * surviving descendant's or a filtered view's own new listen) may still be
-     * serving the restored tree. Membership follows the wire subscription:
-     * added on 'ok', dropped when a listen (re)starts or stops, cleared on
-     * dispose. No shadow model of SyncTree coverage lives here; the SyncTree
-     * itself names the serving view (syncTreeServingListen).
+     * Identity of each live wire listen, by repoListenKey. A listen completion
+     * that was queued behind an ingest gate can drain after its subscription
+     * was stopped and the same path re-subscribed (PersistentConnection's
+     * listenSpec check runs before the callback is queued, so it does not
+     * cover that); the completion is applied only while the token it captured
+     * is still this map's entry for its key.
      */
-    certifiedListens_: Set<string>;
+    liveListens_: Map<string, object>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.

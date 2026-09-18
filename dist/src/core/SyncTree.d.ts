@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
+import { OperationVerification } from './operation/Operation';
 import { ListenHashFn, PendingListenHashes } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
@@ -97,7 +98,7 @@ export declare function syncTreeAckUserWrite(syncTree: SyncTree, writeId: number
  *
  * @returns Events to raise.
  */
-export declare function syncTreeApplyServerOverwrite(syncTree: SyncTree, path: Path, newData: Node): Event[];
+export declare function syncTreeApplyServerOverwrite(syncTree: SyncTree, path: Path, newData: Node, verification?: OperationVerification): Event[];
 /**
  * Apply new server data to be merged in at the specified path.
  *
@@ -183,7 +184,7 @@ export declare function syncTreeRemoveEventRegistration(syncTree: SyncTree, quer
  *
  * @returns Events to raise.
  */
-export declare function syncTreeApplyTaggedQueryOverwrite(syncTree: SyncTree, path: Path, snap: Node, tag: number): Event[];
+export declare function syncTreeApplyTaggedQueryOverwrite(syncTree: SyncTree, path: Path, snap: Node, tag: number, verification?: OperationVerification): Event[];
 /**
  * Apply server data to be merged in for the specified tagged query.
  *
@@ -210,19 +211,17 @@ export declare function syncTreeAddEventRegistration(syncTree: SyncTree, query: 
  * @param writeIdsToExclude - A specific set to be excluded
  */
 export declare function syncTreeCalcCompleteEventCache(syncTree: SyncTree, path: Path, writeIdsToExclude?: number[]): Node;
-/**
- * The wire listen (path + tag, as handed to the ListenProvider) that owns the
- * view a cached read for `query` would be served from, or null when nothing
- * complete covers it. A default view maps to the default listen at its path;
- * a filtered view to its tagged listen. Whether that listen is currently
- * subscribed on the wire is the provider's business: a shadowed or removed
- * listen's view can outlive it, and this still names it.
- */
-export declare function syncTreeServingListen(syncTree: SyncTree, query: QueryContext): {
-    path: string;
-    tag: number | null;
-} | null;
 export declare function syncTreeGetServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
+/**
+ * Like syncTreeGetServerValue, but null unless the view the value comes from
+ * holds a VERIFIED server cache (CacheNode.isVerified): a persisted tree
+ * installed ahead of the server's answer is not served. Trust is read off
+ * the same view that produces the value (the retained exact-query view when
+ * one exists, else a view seeded from the covering complete cache, which
+ * inherits that cache's bit), so it cannot name a different owner than the
+ * data.
+ */
+export declare function syncTreeGetVerifiedServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
 /**
  * Return the tag associated with the given query.
  */

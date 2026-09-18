@@ -18,6 +18,7 @@ import { Operation } from '../operation/Operation';
 import { Node } from '../snap/Node';
 import { Path } from '../util/Path';
 import { WriteTreeRef } from '../WriteTree';
+import { CacheNode } from './CacheNode';
 import { Event } from './Event';
 import { EventGenerator } from './EventGenerator';
 import { EventRegistration, QueryContext } from './EventRegistration';
@@ -44,6 +45,14 @@ export declare class View {
 export declare function viewGetServerCache(view: View): Node | null;
 export declare function viewGetCompleteNode(view: View): Node | null;
 export declare function viewGetCompleteServerCache(view: View, path: Path): Node | null;
+/**
+ * The complete server cache this view holds for `path`, as a CacheNode that
+ * carries the view's `verified` bit, so a view seeded from it inherits the
+ * provenance along with the data.
+ */
+export declare function viewGetCompleteServerCacheNode(view: View, path: Path): CacheNode | null;
+/** Whether this view's server cache is verified (see CacheNode.isVerified). */
+export declare function viewIsServerCacheVerified(view: View): boolean;
 export declare function viewIsEmpty(view: View): boolean;
 export declare function viewAddEventRegistration(view: View, eventRegistration: EventRegistration): void;
 /**

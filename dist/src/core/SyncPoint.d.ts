@@ -18,6 +18,7 @@ import { ReferenceConstructor } from '../api/Reference';
 import { Operation } from './operation/Operation';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
+import { CacheNode } from './view/CacheNode';
 import { Event } from './view/Event';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
 import { View } from './view/View';
@@ -53,7 +54,7 @@ export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation:
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryContext, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean): View;
+export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryContext, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean, serverCacheVerified?: boolean): View;
 /**
  * Add an event callback for the specified query.
  *
@@ -64,7 +65,7 @@ export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryConte
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-export declare function syncPointAddEventRegistration(syncPoint: SyncPoint, query: QueryContext, eventRegistration: EventRegistration, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean): Event[];
+export declare function syncPointAddEventRegistration(syncPoint: SyncPoint, query: QueryContext, eventRegistration: EventRegistration, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean, serverCacheVerified?: boolean): Event[];
 /**
  * Remove event callback(s).  Return cancelEvents if a cancelError is specified.
  *
@@ -86,11 +87,10 @@ export declare function syncPointGetQueryViews(syncPoint: SyncPoint): View[];
  */
 export declare function syncPointGetCompleteServerCache(syncPoint: SyncPoint, path: Path): Node | null;
 /**
- * The view at this SyncPoint whose complete server cache answers `path`, if
- * any: the first view (in insertion order) with a complete cache that covers
- * the path, i.e. the one syncPointGetCompleteServerCache reads from.
+ * Same as syncPointGetCompleteServerCache, as a CacheNode carrying the
+ * owning view's `verified` bit (see viewGetCompleteServerCacheNode).
  */
-export declare function syncPointServingView(syncPoint: SyncPoint, path: Path): View | null;
+export declare function syncPointGetCompleteServerCacheNode(syncPoint: SyncPoint, path: Path): CacheNode | null;
 export declare function syncPointViewForQuery(syncPoint: SyncPoint, query: QueryContext): View | null;
 export declare function syncPointViewExistsForQuery(syncPoint: SyncPoint, query: QueryContext): boolean;
 export declare function syncPointHasCompleteView(syncPoint: SyncPoint): boolean;
