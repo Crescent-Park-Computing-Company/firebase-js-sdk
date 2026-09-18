@@ -54,13 +54,16 @@ import {
   _setWebLocksForTesting
 } from '../src/core/Persistence';
 import {
+  _INGEST_WIRE_BYTES_THRESHOLD,
   newIngestQueue,
   repoCancelPendingSeedRestores,
   repoClearListenOutcomes,
   repoDispose,
   repoGetValue,
+  repoLiftIngestGateForTest,
   repoOnDataUpdateForTest,
   repoOnListenOutcome,
+  repoOnRangeMergeUpdateForTest,
   repoStartServerListen,
   repoStopServerListen,
   ListenOutcome,
@@ -78,6 +81,7 @@ import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
 import {
   SyncTree,
   syncTreeAddEventRegistration,
+  syncTreeApplyListenComplete,
   syncTreeApplyServerOverwrite,
   syncTreeGetCompleteServerCache,
   syncTreeRemoveEventRegistration
@@ -2631,6 +2635,8 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       pendingListenHashes_: pendingHashes,
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      unconfirmedRestores_: new Map(),
+      interceptServerDataCallback_: null,
       // The boot-window drain reruns transactions after each replayed push;
       // the real Repo always carries this tree. (The legacy synchronous
       // drain crashed here too, but inside a void'd promise chain — the
@@ -3336,6 +3342,855 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expectIngestIdle(repo);
   });
 
+  describe('get() against a restored root the server has not spoken for', () => {
+    type Harness = ReturnType<typeof makeListenHarness>;
+
+    /**
+     * Restores `json` at the harness root, registers a value listener there
+     * (as the app's onValue does) and sends the seeded listen. On return the
+     * restored tree is the root's complete server cache and its listen is out.
+     */
+    async function restoredRoot(harness: Harness, json: unknown) {
+      const { repo, query, path, hashFn, onComplete, calls } = harness;
+      await persistHarnessRoot(repo, path, json);
+      const rootQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        path,
+        new QueryParams(),
+        false
+      );
+      const registration = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        rootQuery,
+        registration
+      );
+      repoStartServerListen(repo, query, null, hashFn, onComplete);
+      await flushAsync();
+      expect(calls).to.deep.equal(['listen']);
+      expectIngestIdle(repo);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal(json);
+      /** The app unsubscribes: SyncTree drops the view, then stops the listen. */
+      const unsubscribe = () => {
+        syncTreeRemoveEventRegistration(
+          repo.serverSyncTree_,
+          rootQuery,
+          registration,
+          null,
+          true
+        );
+        repoStopServerListen(repo, query, null);
+      };
+      return { rootQuery, registration, unsubscribe };
+    }
+
+    /**
+     * Issues a get() and reports where it was answered from: 'cache' when it
+     * resolved without a server round trip, 'server' when the harness server
+     * received a get request (answered with `answer`). The registration
+     * matches itself so repoGetValue's cleanup removes the temporary view.
+     */
+    async function getFrom(
+      harness: Harness,
+      pathString: string,
+      answer: unknown,
+      params: QueryParams = new QueryParams()
+    ): Promise<{ from: 'cache' | 'server'; value: unknown }> {
+      const { repo, calls, getResponders } = harness;
+      const gets = calls.filter(call => call === 'get').length;
+      const getQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path(pathString),
+        params,
+        false
+      );
+      const promise = repoGetValue(
+        repo,
+        getQuery as never,
+        stubRegistration(undefined, true) as unknown as ValueEventRegistration
+      );
+      const fromServer =
+        calls.filter(call => call === 'get').length === gets + 1;
+      if (fromServer) {
+        getResponders[getResponders.length - 1](answer);
+      }
+      const node = await promise;
+      return { from: fromServer ? 'server' : 'cache', value: node.val() };
+    }
+
+    it('reads the server until the listen carrying the restored hashes completes ok', async () => {
+      const harness = makeListenHarness();
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })
+      ).to.deep.equal({ from: 'server', value: { msg: 'fresh' } });
+      harness.serverCallbacks[0]('ok');
+      // The server matched the restored hashes: the cache is the server's.
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'fresh' } });
+    });
+
+    it('an ok queued behind an ingest gate confirms only once it drains', async () => {
+      const harness = makeListenHarness();
+      const { repo, path, serverCallbacks } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      // A sliced ingest holds the stream: the ok is queued, not applied.
+      repo.ingestQueue_.gates.set(path.toString(), {
+        pathString: path.toString()
+      });
+      serverCallbacks[0]('ok');
+      expect(repo.ingestQueue_.ops.map(op => op.kind)).to.deep.equal([
+        'complete'
+      ]);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      repoLiftIngestGateForTest(repo, path.toString());
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
+    });
+
+    it('a fallback push confirms when APPLIED, not when its receipt flips the listen outcome', async () => {
+      const harness = makeListenHarness();
+      const { repo, serverProgress } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      // Receipt: the wire has the replacement, the SyncTree still has the
+      // restored bytes.
+      serverProgress[0]({
+        bytes: 10,
+        hadHash: true,
+        hadCompoundHash: false,
+        dataReceived: true,
+        rangeMerged: false
+      });
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      // Application: the server replaced the root — confirmed before any ok.
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        { inbox: { msg: 'pushed' } },
+        false,
+        null
+      );
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+    });
+
+    it('a giant fallback push confirms through the sliced ingest door', async () => {
+      const harness = makeListenHarness();
+      const { repo, path } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        { inbox: { msg: 'pushed' } },
+        false,
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      // Mid-ingest (gated): the replacement has not applied yet.
+      expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+    });
+
+    it('a range merge folds server ranges over the restored base without confirming it', async () => {
+      const harness = makeListenHarness();
+      const { repo, path, serverCallbacks } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' }, other: 1 });
+      repoOnRangeMergeUpdateForTest(
+        repo,
+        'users/alice',
+        [{ e: 'inbox/msg', m: { inbox: { msg: 'merged' } } }],
+        null
+      );
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { msg: 'merged' }, other: 1 });
+      // The unmerged ranges are still the restored bytes: only the ok that
+      // follows the merge vouches for the whole tree.
+      expect((await getFrom(harness, 'users/alice/other', 2)).from).to.equal(
+        'server'
+      );
+      serverCallbacks[0]('ok');
+      expect((await getFrom(harness, 'users/alice/other', 3)).from).to.equal(
+        'cache'
+      );
+    });
+
+    it('a descendant push does not confirm the root', async () => {
+      const harness = makeListenHarness();
+      const { repo } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' }, other: 1 });
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { msg: 'pushed' },
+        false,
+        null
+      );
+      expect((await getFrom(harness, 'users/alice/other', 2)).from).to.equal(
+        'server'
+      );
+    });
+
+    it('an untagged overwrite at an ancestor confirms the root', async () => {
+      const harness = makeListenHarness();
+      const { repo } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      repoOnDataUpdateForTest(
+        repo,
+        'users',
+        { alice: { inbox: { msg: 'from-ancestor' } } },
+        false,
+        null
+      );
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'from-ancestor' } });
+    });
+
+    it('a filtered query under the root reads the server until the root is confirmed', async () => {
+      const harness = makeListenHarness();
+      const { serverCallbacks } = harness;
+      await restoredRoot(harness, { inbox: { a: 1, b: 2 } });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 9 }, firstOnly)
+      ).to.deep.equal({ from: 'server', value: { a: 9 } });
+      serverCallbacks[0]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)).from
+      ).to.equal('cache');
+    });
+
+    it('a sibling branch keeps its cached answer while the restored root is unconfirmed', async () => {
+      const harness = makeListenHarness();
+      const { repo } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      const bobQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path('users/bob'),
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        bobQuery,
+        stubRegistration()
+      );
+      // Bob's data is a plain server push (never persisted, never restored).
+      repoOnDataUpdateForTest(
+        repo,
+        'users/bob',
+        { profile: 'bob' },
+        false,
+        null
+      );
+      expect(
+        await getFrom(harness, 'users/bob/profile', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 'bob' });
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+    });
+
+    it('an ancestor view completed around the restored bytes reads the server too', async () => {
+      const harness = makeListenHarness();
+      const { repo, path } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      // A default listener above the root assembles its cache from the
+      // restored descendant; an ok for it (its hash was of an incomplete
+      // cache, so the server saw nothing to replace) marks that cache
+      // complete — restored bytes now answer from above the root as well.
+      const usersQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path('users'),
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        usersQuery,
+        stubRegistration()
+      );
+      syncTreeApplyListenComplete(repo.serverSyncTree_, new Path('users'));
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, new Path('users'))
+      ).to.not.equal(null);
+      expect(
+        (await getFrom(harness, 'users', { alice: { inbox: { msg: 'x' } } }))
+          .from
+      ).to.equal('server');
+      // The root's own line is what is unconfirmed; the bytes never left it.
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.not.equal(null);
+    });
+
+    it("a stop leaves the entry where it is; a queued ok for the stopped listen confirms nothing; the survivor's own ok then takes the entry with it", async () => {
+      const harness = makeListenHarness();
+      const { repo, path, hashFn, onComplete, serverCallbacks } = harness;
+      const root = await restoredRoot(harness, {
+        inbox: { msg: 'stale' },
+        other: 1
+      });
+      // A descendant listener outlives the root registration; its view was
+      // seeded from the restored root and keeps those bytes after the stop.
+      const inboxPath = new Path('users/alice/inbox');
+      const inboxQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        inboxPath,
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        inboxQuery,
+        stubRegistration()
+      );
+      // Hold the stream so the root's ok is still queued when it stops: the
+      // push meant to replace the root is discarded with its ingest, and the
+      // ok drains inside the stop against a listen that no longer exists.
+      repo.ingestQueue_.gates.set(path.toString(), {
+        pathString: path.toString()
+      });
+      serverCallbacks[0]('ok');
+      root.unsubscribe();
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, inboxPath)?.val()
+      ).to.deep.equal({ msg: 'stale' });
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // The survivor's own listen (SyncTree sends it before stopping the
+      // root): its ok is the first server word under the root, whose cache
+      // is gone — the entry passes to the survivors this word does not cover
+      // (none) and is retired.
+      repoStartServerListen(
+        repo,
+        inboxQuery as never,
+        null,
+        hashFn,
+        onComplete
+      );
+      serverCallbacks[1]('ok');
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+    });
+
+    it("a get()'s own server answer confirms the path it lands on", async () => {
+      const harness = makeListenHarness();
+      const { repo } = harness;
+      const root = await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      const inboxPath = new Path('users/alice/inbox');
+      const inboxQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        inboxPath,
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        inboxQuery,
+        stubRegistration()
+      );
+      root.unsubscribe();
+      // The get's answer is an untagged overwrite at the survivor's path:
+      // the restored bytes there are gone, and so is the entry.
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })
+      ).to.deep.equal({ from: 'server', value: { msg: 'fresh' } });
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'fresh' } });
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+    });
+
+    it("an old listen's ok draining after a restart at the same path does not confirm the new install", async () => {
+      const harness = makeListenHarness();
+      const { repo, query, hashFn, onComplete, serverCallbacks } = harness;
+      const first = await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      // Another root's ingest holds the stream: the ok stays queued across
+      // the stop and the restart.
+      repo.ingestQueue_.gates.set('/users/bob', { pathString: '/users/bob' });
+      serverCallbacks[0]('ok');
+      first.unsubscribe();
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        first.rootQuery,
+        first.registration
+      );
+      repoStartServerListen(repo, query, null, hashFn, onComplete);
+      await flushAsync();
+      expect(repo.unconfirmedRestores_.size).to.equal(1);
+      repoLiftIngestGateForTest(repo, '/users/bob');
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
+    });
+
+    it('a giant range merge through the sliced ingest does not confirm the restored base either', async () => {
+      const harness = makeListenHarness();
+      const { repo, path, serverCallbacks } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' }, other: 1 });
+      repoOnRangeMergeUpdateForTest(
+        repo,
+        'users/alice',
+        [{ e: 'inbox/msg', m: { inbox: { msg: 'merged' } } }],
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { msg: 'merged' }, other: 1 });
+      expect((await getFrom(harness, 'users/alice/other', 2)).from).to.equal(
+        'server'
+      );
+      serverCallbacks[0]('ok');
+      expect((await getFrom(harness, 'users/alice/other', 3)).from).to.equal(
+        'cache'
+      );
+    });
+
+    /**
+     * SyncTree wired to Repo exactly as repoStart (core/Repo.ts): listens start
+     * and stop as SyncTree decides — shadowing, frontier restarts, coverage —
+     * instead of being driven by hand.
+     */
+    function wireProvider(harness: Harness): void {
+      const { repo } = harness;
+      repo.serverSyncTree_ = new SyncTree({
+        startListening: (query, tag, hashFn, onComplete) => {
+          repoStartServerListen(repo, query, tag, hashFn, onComplete);
+          return [];
+        },
+        stopListening: (query, tag) => {
+          repoStopServerListen(repo, query, tag);
+        },
+        getPendingListenHashes: pathString =>
+          repo.pendingListenHashes_.get(pathString)
+      });
+    }
+
+    /** restoredRoot for a wired harness: the registration itself sends the listen. */
+    async function restoredRootWired(harness: Harness, json: unknown) {
+      const { repo, path, calls } = harness;
+      await persistHarnessRoot(repo, path, json);
+      const rootQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        path,
+        new QueryParams(),
+        false
+      );
+      const registration = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        rootQuery,
+        registration
+      );
+      await flushAsync();
+      expect(calls).to.deep.equal(['listen']);
+      expectIngestIdle(repo);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      return { rootQuery, registration };
+    }
+
+    function defaultQuery(pathString: string) {
+      return new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path(pathString),
+        new QueryParams(),
+        false
+      );
+    }
+
+    it('an ancestor listen shadowing the root stops its wire listen but not its cache: the entry stays until the ancestor answers', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' } });
+      // A default listener above the root: SyncTree starts /users and stops
+      // /users/alice on the wire; alice's view and complete cache remain.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users'),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { msg: 'stale' } });
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // The server agrees with the cache (its answer is installed either way).
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'stale' })).from
+      ).to.equal('server');
+      // The ancestor's listen hashed its raw cache, assembled from alice's
+      // restored bytes: its `ok` is the server matching them.
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it('an ancestor listen shadowing the root: the ancestor overwrite confirms too', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' } });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users'),
+        stubRegistration(undefined, true)
+      );
+      repoOnDataUpdateForTest(
+        repo,
+        'users',
+        { alice: { inbox: { msg: 'pushed' } } },
+        false,
+        null
+      );
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+    });
+
+    it("a shadow stop that cancels an in-flight replacement push: the root's queued ok confirms nothing, the entry survives until the ancestor answers", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' } });
+      // The replacement push takes the sliced ingest (gate at alice); the
+      // root's `ok` arrives behind it and queues.
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice',
+        { inbox: { msg: 'pushed' } },
+        false,
+        null,
+        _INGEST_WIRE_BYTES_THRESHOLD
+      );
+      expect(repo.ingestQueue_.gates.has(path.toString())).to.equal(true);
+      serverCallbacks[0]('ok');
+      expect(repo.ingestQueue_.ops.map(op => op.kind)).to.deep.equal([
+        'complete'
+      ]);
+      // An ancestor listener shadows alice: the stop lifts alice's gate,
+      // cancelling the decode, and drains the queued `ok` synchronously.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users'),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      await flushAsync();
+      expectIngestIdle(repo);
+      // The push was discarded with its ingest: the cache is still the
+      // restored bytes, and the stopped listen's `ok` did not vouch for them.
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { msg: 'stale' } });
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
+    });
+
+    it('a restored ancestor root confirmed by range merges then ok confirms the restored root grafted under it', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' } });
+      // The ancestor is a persistent root too, with its own stored tree.
+      const usersPath = new Path('users');
+      repo.persistence_!.setPersistentPath(usersPath.toString(), true);
+      await persistHarnessRoot(repo, usersPath, {
+        alice: { inbox: { msg: 'older' } },
+        bob: { profile: 'stale' }
+      });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users'),
+        stubRegistration(undefined, true)
+      );
+      await flushAsync();
+      expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
+      // Alice's (restored) complete cache is grafted over users' stored tree.
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, usersPath)?.val()
+      ).to.deep.equal({
+        alice: { inbox: { msg: 'stale' } },
+        bob: { profile: 'stale' }
+      });
+      expect([...repo.unconfirmedRestores_.keys()].sort()).to.deep.equal([
+        '/users',
+        '/users/alice'
+      ]);
+      // The server resends the grafted range, then matches the rest.
+      repoOnRangeMergeUpdateForTest(
+        repo,
+        'users',
+        [{ e: 'alice/inbox/msg', m: { alice: { inbox: { msg: 'merged' } } } }],
+        null
+      );
+      expect(
+        (await getFrom(harness, 'users/bob/profile', 'fresh')).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'merged' } });
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.not.equal(null);
+    });
+
+    it('root removal hands the entry to the frontier SyncTree restarts, not to every nested default view', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        a: { b: { value: 1 }, other: 2 }
+      });
+      // Nested default listeners under the root: covered, no wire listens.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/a'),
+        stubRegistration(undefined, true)
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/a/b'),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen']);
+      // Remove the root: SyncTree restarts only the shallowest survivor
+      // (/users/alice/a covers /users/alice/a/b), then stops the root.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // The server agrees with the cache (its answer is installed either
+      // way). This first word under the root passes the entry to the
+      // frontier: /users/alice/a alone, since it covers /users/alice/a/b.
+      expect(
+        (await getFrom(harness, 'users/alice/a/b/value', 1)).from
+      ).to.equal('server');
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        '/users/alice/a'
+      ]);
+      // The survivor's hashes match: an `ok` with no data certifies its
+      // whole cache, b included.
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/a/b/value', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 1 });
+    });
+
+    it("a shadowed root removed while covered (no wire stop), then the ancestor removed: the survivor's ok retires the entry", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        inbox: { msg: 'stale' }
+      });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/inbox'),
+        stubRegistration(undefined, true)
+      );
+      const usersQuery = defaultQuery('users');
+      const usersReg = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(repo.serverSyncTree_, usersQuery, usersReg);
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      // Alice's registration goes while /users covers her: SyncTree drops
+      // her view without a wire stop. Then /users goes: inbox restarts.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        usersQuery,
+        usersReg
+      );
+      expect(calls).to.deep.equal([
+        'listen',
+        'listen',
+        'unlisten',
+        'listen',
+        'unlisten'
+      ]);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // inbox's own listen answers: the first word under the root, whose
+      // cache is gone; inbox is the only survivor and this word covers it.
+      serverCallbacks[2]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it("a root the server cancels (no wire stop) with a surviving descendant: the survivor's ok retires the entry", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' }, other: 1 });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/inbox'),
+        stubRegistration(undefined, true)
+      );
+      // permission_denied: SyncTree removes the root's view and restarts the
+      // survivor's listen with the cancel error, stopping nothing on the wire.
+      serverCallbacks[0]('permission_denied');
+      expect(calls).to.deep.equal(['listen', 'listen']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'stale' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
+      const harness = makeListenHarness();
+      const { repo, path } = harness;
+      const root = await restoredRoot(harness, { inbox: { a: 1, b: 2 } });
+      // A filtered survivor is not tracked: its answer is tagged.
+      const filtered = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path('users/alice/inbox'),
+        queryParamsLimitToFirst(new QueryParams(), 1),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        filtered,
+        stubRegistration()
+      );
+      root.unsubscribe();
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // No cache under the root answers a get() anyway; the first answer
+      // that lands under it finds no default survivor and retires the entry.
+      expect((await getFrom(harness, 'users/alice/other', 7)).from).to.equal(
+        'server'
+      );
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+    });
+
+    it('a restart of the same root confirms with its own ok', async () => {
+      const harness = makeListenHarness();
+      const { repo, query, path, hashFn, onComplete, serverCallbacks, calls } =
+        harness;
+      const first = await restoredRoot(harness, { inbox: { msg: 'stale' } });
+      first.unsubscribe();
+      expect(repo.unconfirmedRestores_.size).to.equal(1);
+      // The app resubscribes: the root restores again and the new listen's
+      // ok confirms the new install.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        first.rootQuery,
+        first.registration
+      );
+      repoStartServerListen(repo, query, null, hashFn, onComplete);
+      await flushAsync();
+      expect(calls.filter(call => call === 'listen').length).to.equal(2);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.not.equal(null);
+    });
+  });
+
   it('without a manifest callback the listen waits for the restore', async () => {
     // A restore that resolves without ever surfacing a manifest (stub
     // managers, legacy paths) keeps the pre-manifest-first sequencing:
@@ -4030,6 +4885,7 @@ describe('stale restore vs live server data', () => {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      unconfirmedRestores_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,
