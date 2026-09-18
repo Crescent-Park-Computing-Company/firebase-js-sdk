@@ -50,7 +50,8 @@ import {
   syncPointIsEmpty,
   syncPointRemoveEventRegistration,
   syncPointViewExistsForQuery,
-  syncPointViewForQuery
+  syncPointViewForQuery,
+  syncPointServingView
 } from './SyncPoint';
 import { ImmutableTree } from './util/ImmutableTree';
 import {
@@ -813,26 +814,81 @@ export function syncTreeCalcCompleteEventCache(
   );
 }
 
+/**
+ * The view whose complete server cache answers a read at `path`: walking the
+ * SyncPoints from the root down, the first complete cache covering the path
+ * wins (an ancestor's default view before a view at the path itself). This
+ * is the exact selection syncTreeGetServerValue makes; exposed so a caller
+ * can ask WHICH listen's data a cached answer would come from.
+ */
+function syncTreeServingView_(
+  syncTree: SyncTree,
+  path: Path
+): { view: View; relativePath: Path } | null {
+  let found: { view: View; relativePath: Path } | null = null;
+  syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
+    if (found !== null) {
+      return;
+    }
+    const relativePath = newRelativePath(pathToSyncPoint, path);
+    const view = syncPointServingView(sp, relativePath);
+    if (view !== null) {
+      found = { view, relativePath };
+    }
+  });
+  if (found === null) {
+    const syncPoint = syncTree.syncPointTree_.get(path);
+    if (syncPoint) {
+      const view = syncPointServingView(syncPoint, newEmptyPath());
+      if (view !== null) {
+        found = { view, relativePath: newEmptyPath() };
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * The wire listen (path + tag, as handed to the ListenProvider) that owns the
+ * view a cached read for `query` would be served from, or null when nothing
+ * complete covers it. A default view maps to the default listen at its path;
+ * a filtered view to its tagged listen. Whether that listen is currently
+ * subscribed on the wire is the provider's business: a shadowed or removed
+ * listen's view can outlive it, and this still names it.
+ */
+export function syncTreeServingListen(
+  syncTree: SyncTree,
+  query: QueryContext
+): { path: string; tag: number | null } | null {
+  const serving = syncTreeServingView_(syncTree, query._path);
+  if (serving === null) {
+    return null;
+  }
+  const owner = serving.view.query;
+  return {
+    path: owner._path.toString(),
+    tag: owner._queryParams.loadsAllData()
+      ? null
+      : syncTreeTagForQuery(syncTree, owner) ?? null
+  };
+}
+
 export function syncTreeGetServerValue(
   syncTree: SyncTree,
   query: QueryContext
 ): Node | null {
   const path = query._path;
-  let serverCache: Node | null = null;
   // Any covering writes will necessarily be at the root, so really all we need to find is the server cache.
   // Consider optimizing this once there's a better understanding of what actual behavior will be.
-  syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
-    const relativePath = newRelativePath(pathToSyncPoint, path);
-    serverCache =
-      serverCache || syncPointGetCompleteServerCache(sp, relativePath);
-  });
+  const serving = syncTreeServingView_(syncTree, path);
+  const serverCache: Node | null =
+    serving === null
+      ? null
+      : viewGetCompleteServerCache(serving.view, serving.relativePath);
   let syncPoint = syncTree.syncPointTree_.get(path);
   if (!syncPoint) {
     syncPoint = new SyncPoint();
     syncTree.syncPointTree_ = syncTree.syncPointTree_.set(path, syncPoint);
-  } else {
-    serverCache =
-      serverCache || syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
   }
   const serverCacheComplete = serverCache != null;
   const serverCacheNode: CacheNode | null = serverCacheComplete

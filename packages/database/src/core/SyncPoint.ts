@@ -272,11 +272,25 @@ export function syncPointGetCompleteServerCache(
   syncPoint: SyncPoint,
   path: Path
 ): Node | null {
-  let serverCache: Node | null = null;
+  const view = syncPointServingView(syncPoint, path);
+  return view === null ? null : viewGetCompleteServerCache(view, path);
+}
+
+/**
+ * The view at this SyncPoint whose complete server cache answers `path`, if
+ * any: the first view (in insertion order) with a complete cache that covers
+ * the path, i.e. the one syncPointGetCompleteServerCache reads from.
+ */
+export function syncPointServingView(
+  syncPoint: SyncPoint,
+  path: Path
+): View | null {
   for (const view of syncPoint.views.values()) {
-    serverCache = serverCache || viewGetCompleteServerCache(view, path);
+    if (viewGetCompleteServerCache(view, path) !== null) {
+      return view;
+    }
   }
-  return serverCache;
+  return null;
 }
 
 export function syncPointViewForQuery(
