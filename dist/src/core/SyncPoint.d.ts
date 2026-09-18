@@ -85,6 +85,12 @@ export declare function syncPointGetQueryViews(syncPoint: SyncPoint): View[];
  * @returns A complete cache, if it exists
  */
 export declare function syncPointGetCompleteServerCache(syncPoint: SyncPoint, path: Path): Node | null;
+/**
+ * The view at this SyncPoint whose complete server cache answers `path`, if
+ * any: the first view (in insertion order) with a complete cache that covers
+ * the path, i.e. the one syncPointGetCompleteServerCache reads from.
+ */
+export declare function syncPointServingView(syncPoint: SyncPoint, path: Path): View | null;
 export declare function syncPointViewForQuery(syncPoint: SyncPoint, query: QueryContext): View | null;
 export declare function syncPointViewExistsForQuery(syncPoint: SyncPoint, query: QueryContext): boolean;
 export declare function syncPointHasCompleteView(syncPoint: SyncPoint): boolean;

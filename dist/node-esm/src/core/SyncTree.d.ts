@@ -210,6 +210,18 @@ export declare function syncTreeAddEventRegistration(syncTree: SyncTree, query: 
  * @param writeIdsToExclude - A specific set to be excluded
  */
 export declare function syncTreeCalcCompleteEventCache(syncTree: SyncTree, path: Path, writeIdsToExclude?: number[]): Node;
+/**
+ * The wire listen (path + tag, as handed to the ListenProvider) that owns the
+ * view a cached read for `query` would be served from, or null when nothing
+ * complete covers it. A default view maps to the default listen at its path;
+ * a filtered view to its tagged listen. Whether that listen is currently
+ * subscribed on the wire is the provider's business: a shadowed or removed
+ * listen's view can outlive it, and this still names it.
+ */
+export declare function syncTreeServingListen(syncTree: SyncTree, query: QueryContext): {
+    path: string;
+    tag: number | null;
+} | null;
 export declare function syncTreeGetServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
 /**
  * Return the tag associated with the given query.

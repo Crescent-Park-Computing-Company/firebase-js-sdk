@@ -3053,28 +3053,20 @@ declare class Repo {
      */
     listenOutcomes_: Map<string, ListenOutcomeState>;
     /**
-     * Untrusted cache coverage: paths at or under which the SyncTree may hold a
-     * complete server cache that is RESTORED data the server has neither
-     * replaced nor certified (see repoHasUncertifiedRestoreCovering). The set
-     * follows the SyncTree's coverage, not any wire subscription's lifetime,
-     * and not listenOutcomes_ (a wire-progress label; 'fallback' flips on
-     * receipt of a replacement push, before it is applied):
-     *
-     * - added when a restored base is APPLIED to the SyncTree
-     *   (repoStartServerListen restore resolution);
-     * - inherited by every default listen the SyncTree starts whose coverage
-     *   intersects an entry (repoRestoredCoverageListenStarted): the SyncTree
-     *   seeds a new view from the covering cache and starts the takeover
-     *   listen BEFORE stopping the one it replaces, so a root removal with
-     *   surviving descendants and an ancestor shadowing a restored root both
-     *   hand their untrusted data to the new listen here;
-     * - retired when the listen at that exact path completes (certified, or
-     *   cancelled with its registrations), when a full untagged overwrite at
-     *   or above it is APPLIED (repoRestoredRootsReplaced), when the listen at
-     *   that exact path stops (its coverage is gone or was inherited above),
-     *   or on dispose.
+     * Wire listens (path + tag, see repoListenKey) whose current subscription
+     * the server has answered 'ok'. Read by repoGetValue: a cached answer is
+     * trusted only when the listen owning the SyncTree view that serves it is
+     * in this set. Restored data can only enter the SyncTree at a persistent
+     * listen's own root, before that listen certifies; so a view whose listen
+     * has certified holds only hash-verified or server-replaced data, and a
+     * view whose listen has not (unanswered, shadow-stopped, taken over by a
+     * surviving descendant's or a filtered view's own new listen) may still be
+     * serving the restored tree. Membership follows the wire subscription:
+     * added on 'ok', dropped when a listen (re)starts or stops, cleared on
+     * dispose. No shadow model of SyncTree coverage lives here; the SyncTree
+     * itself names the serving view (syncTreeServingListen).
      */
-    restoredUncertifiedRoots_: Set<string>;
+    certifiedListens_: Set<string>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.

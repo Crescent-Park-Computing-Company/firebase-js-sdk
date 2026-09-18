@@ -14047,11 +14047,21 @@ function syncPointGetQueryViews(syncPoint) {
  * @returns A complete cache, if it exists
  */
 function syncPointGetCompleteServerCache(syncPoint, path) {
-    let serverCache = null;
+    const view = syncPointServingView(syncPoint, path);
+    return view === null ? null : viewGetCompleteServerCache(view, path);
+}
+/**
+ * The view at this SyncPoint whose complete server cache answers `path`, if
+ * any: the first view (in insertion order) with a complete cache that covers
+ * the path, i.e. the one syncPointGetCompleteServerCache reads from.
+ */
+function syncPointServingView(syncPoint, path) {
     for (const view of syncPoint.views.values()) {
-        serverCache = serverCache || viewGetCompleteServerCache(view, path);
+        if (viewGetCompleteServerCache(view, path) !== null) {
+            return view;
+        }
     }
-    return serverCache;
+    return null;
 }
 function syncPointViewForQuery(syncPoint, query) {
     const params = query._queryParams;
@@ -14587,24 +14597,69 @@ function syncTreeCalcCompleteEventCache(syncTree, path, writeIdsToExclude) {
     });
     return writeTreeCalcCompleteEventCache(writeTree, path, serverCache, writeIdsToExclude, includeHiddenSets);
 }
+/**
+ * The view whose complete server cache answers a read at `path`: walking the
+ * SyncPoints from the root down, the first complete cache covering the path
+ * wins (an ancestor's default view before a view at the path itself). This
+ * is the exact selection syncTreeGetServerValue makes; exposed so a caller
+ * can ask WHICH listen's data a cached answer would come from.
+ */
+function syncTreeServingView_(syncTree, path) {
+    let found = null;
+    syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
+        if (found !== null) {
+            return;
+        }
+        const relativePath = newRelativePath(pathToSyncPoint, path);
+        const view = syncPointServingView(sp, relativePath);
+        if (view !== null) {
+            found = { view, relativePath };
+        }
+    });
+    if (found === null) {
+        const syncPoint = syncTree.syncPointTree_.get(path);
+        if (syncPoint) {
+            const view = syncPointServingView(syncPoint, newEmptyPath());
+            if (view !== null) {
+                found = { view, relativePath: newEmptyPath() };
+            }
+        }
+    }
+    return found;
+}
+/**
+ * The wire listen (path + tag, as handed to the ListenProvider) that owns the
+ * view a cached read for `query` would be served from, or null when nothing
+ * complete covers it. A default view maps to the default listen at its path;
+ * a filtered view to its tagged listen. Whether that listen is currently
+ * subscribed on the wire is the provider's business: a shadowed or removed
+ * listen's view can outlive it, and this still names it.
+ */
+function syncTreeServingListen(syncTree, query) {
+    const serving = syncTreeServingView_(syncTree, query._path);
+    if (serving === null) {
+        return null;
+    }
+    const owner = serving.view.query;
+    return {
+        path: owner._path.toString(),
+        tag: owner._queryParams.loadsAllData()
+            ? null
+            : syncTreeTagForQuery(syncTree, owner) ?? null
+    };
+}
 function syncTreeGetServerValue(syncTree, query) {
     const path = query._path;
-    let serverCache = null;
     // Any covering writes will necessarily be at the root, so really all we need to find is the server cache.
     // Consider optimizing this once there's a better understanding of what actual behavior will be.
-    syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
-        const relativePath = newRelativePath(pathToSyncPoint, path);
-        serverCache =
-            serverCache || syncPointGetCompleteServerCache(sp, relativePath);
-    });
+    const serving = syncTreeServingView_(syncTree, path);
+    const serverCache = serving === null
+        ? null
+        : viewGetCompleteServerCache(serving.view, serving.relativePath);
     let syncPoint = syncTree.syncPointTree_.get(path);
     if (!syncPoint) {
         syncPoint = new SyncPoint();
         syncTree.syncPointTree_ = syncTree.syncPointTree_.set(path, syncPoint);
-    }
-    else {
-        serverCache =
-            serverCache || syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
     }
     const serverCacheComplete = serverCache != null;
     const serverCacheNode = serverCacheComplete
@@ -15727,28 +15782,20 @@ class Repo {
          */
         this.listenOutcomes_ = new Map();
         /**
-         * Untrusted cache coverage: paths at or under which the SyncTree may hold a
-         * complete server cache that is RESTORED data the server has neither
-         * replaced nor certified (see repoHasUncertifiedRestoreCovering). The set
-         * follows the SyncTree's coverage, not any wire subscription's lifetime,
-         * and not listenOutcomes_ (a wire-progress label; 'fallback' flips on
-         * receipt of a replacement push, before it is applied):
-         *
-         * - added when a restored base is APPLIED to the SyncTree
-         *   (repoStartServerListen restore resolution);
-         * - inherited by every default listen the SyncTree starts whose coverage
-         *   intersects an entry (repoRestoredCoverageListenStarted): the SyncTree
-         *   seeds a new view from the covering cache and starts the takeover
-         *   listen BEFORE stopping the one it replaces, so a root removal with
-         *   surviving descendants and an ancestor shadowing a restored root both
-         *   hand their untrusted data to the new listen here;
-         * - retired when the listen at that exact path completes (certified, or
-         *   cancelled with its registrations), when a full untagged overwrite at
-         *   or above it is APPLIED (repoRestoredRootsReplaced), when the listen at
-         *   that exact path stops (its coverage is gone or was inherited above),
-         *   or on dispose.
+         * Wire listens (path + tag, see repoListenKey) whose current subscription
+         * the server has answered 'ok'. Read by repoGetValue: a cached answer is
+         * trusted only when the listen owning the SyncTree view that serves it is
+         * in this set. Restored data can only enter the SyncTree at a persistent
+         * listen's own root, before that listen certifies; so a view whose listen
+         * has certified holds only hash-verified or server-replaced data, and a
+         * view whose listen has not (unanswered, shadow-stopped, taken over by a
+         * surviving descendant's or a filtered view's own new listen) may still be
+         * serving the restored tree. Membership follows the wire subscription:
+         * added on 'ok', dropped when a listen (re)starts or stops, cleared on
+         * dispose. No shadow model of SyncTree coverage lives here; the SyncTree
+         * itself names the serving view (syncTreeServingListen).
          */
-        this.restoredUncertifiedRoots_ = new Set();
+        this.certifiedListens_ = new Set();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
         this.key = this.repoInfo_.toURLString();
     }
@@ -15927,7 +15974,6 @@ function repoApplyDataUpdate(repo, pathString, data, isMerge, tag) {
     else {
         const snap = nodeFromJSON(data);
         events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, snap);
-        repoRestoredRootsReplaced(repo, pathString);
     }
     let affectedPath = path;
     if (events.length > 0) {
@@ -16177,7 +16223,6 @@ async function repoIngestFullRootPush(repo, pathString, data, isCurrent) {
         throw new IngestCancelledError();
     }
     const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, rootPath, assembled);
-    repoRestoredRootsReplaced(repo, pathString);
     let affectedPath = rootPath;
     if (events.length > 0) {
         affectedPath = repoRerunTransactions(repo, rootPath);
@@ -16349,8 +16394,9 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS, coldReason) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
+    // A (re)started listen has not been answered yet.
+    repo.certifiedListens_.delete(repoListenKey(pathString, tag));
     if (isDefaultComplete) {
-        repoRestoredCoverageListenStarted(repo, pathString);
         const prior = repo.listenOutcomes_.get(pathString);
         repo.listenOutcomes_.set(pathString, {
             outcome: null,
@@ -16362,15 +16408,15 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
     const processListenComplete = (status, data, wire) => {
         const events = onComplete(status, data);
         eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
+        if (status === 'ok') {
+            // Applied in wire order (the deferred stream queues this behind any
+            // pending base or full push), so everything this listen's view holds
+            // is now hash-verified or server-replaced.
+            repo.certifiedListens_.add(repoListenKey(pathString, tag));
+        }
         if (!isDefaultComplete) {
             return;
         }
-        // Certified ('ok'), or cancelled: onComplete above already let the
-        // SyncTree remove the cancelled registrations and start takeover listens
-        // for any surviving descendants, which inherited this path's coverage
-        // (repoRestoredCoverageListenStarted). Either way nothing at this exact
-        // path is unverified restored data any more.
-        repo.restoredUncertifiedRoots_.delete(pathString);
         repoPublishListenOutcome(repo, pathString, {
             mode: activeMode,
             certified: status === 'ok',
@@ -16694,9 +16740,6 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
                     ? blankGraftedRangeHashes(record.compoundHash, graftList.map(graft => pathSlice(graft.path)))
                     : undefined);
             const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
-            // From here until the listen completes or a full push replaces the
-            // root, the SyncTree holds restored data (see repoGetValue).
-            repo.restoredUncertifiedRoots_.add(pathString);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isCurrent()) {
                 repo.pendingListenHashes_.clear(pathString);
@@ -16745,6 +16788,7 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
  */
 function repoStopServerListen(repo, query, tag) {
     const pathString = query._path.toString();
+    repo.certifiedListens_.delete(repoListenKey(pathString, tag));
     if (tag != null || !query._queryParams.loadsAllData()) {
         repo.server_.unlisten(query, tag);
         return;
@@ -16765,10 +16809,6 @@ function repoStopServerListen(repo, query, tag) {
     repoLiftIngestGate(repo, pathString);
     repo.pendingListenHashes_.clear(pathString);
     repo.listenOutcomes_.delete(pathString);
-    // The SyncTree stops a default listen only after the listen taking over
-    // its coverage (a surviving descendant's, or a shadowing ancestor's) has
-    // started and inherited any untrusted data (see restoredUncertifiedRoots_).
-    repo.restoredUncertifiedRoots_.delete(pathString);
     repo.persistence_?.untrack(pathString);
 }
 /** Observe the outcome of one exact default listen. @internal */
@@ -16867,7 +16907,7 @@ function repoDispose(repo) {
         }
     }
     repoClearListenOutcomes(repo);
-    repo.restoredUncertifiedRoots_.clear();
+    repo.certifiedListens_.clear();
     repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
 }
@@ -17028,65 +17068,22 @@ function repoGetNextWriteId(repo) {
     return repo.nextWriteId_++;
 }
 /**
- * A default complete listen is starting at `pathString`. If its coverage
- * intersects an untrusted entry in either direction it inherits: a takeover
- * listen for a surviving descendant view was seeded from the restored cache
- * (root removal), and a shadowing ancestor's view will retain the restored
- * descendant view until the ancestor's own response replaces it. Idempotent
- * for a re-listen at an existing entry.
+ * Key of one wire listen as handed to the ListenProvider: default listens by
+ * path, filtered queries by path plus their SyncTree tag.
  */
-function repoRestoredCoverageListenStarted(repo, pathString) {
-    if (repo.restoredUncertifiedRoots_.size === 0) {
-        return;
-    }
-    for (const root of repo.restoredUncertifiedRoots_) {
-        if (root === pathString ||
-            root === '/' ||
-            pathString === '/' ||
-            pathString.startsWith(root + '/') ||
-            root.startsWith(pathString + '/')) {
-            repo.restoredUncertifiedRoots_.add(pathString);
-            return;
-        }
-    }
+function repoListenKey(pathString, tag) {
+    return tag == null ? pathString : pathString + '|' + tag;
 }
 /**
- * A full untagged server overwrite was APPLIED at `pathString`: every restored
- * root at or under it now holds server truth, so its restored provenance ends.
- * Range merges and tagged/partial updates never call this — they correct or
- * extend the restored base without replacing it.
+ * Whether the SyncTree view a cached read for `query` would be served from
+ * belongs to a listen the server has certified. Nothing complete covering
+ * the path counts as not certified (a cached answer should not exist then;
+ * failing toward the server is the safe direction).
  */
-function repoRestoredRootsReplaced(repo, pathString) {
-    if (repo.restoredUncertifiedRoots_.size === 0) {
-        return;
-    }
-    for (const root of [...repo.restoredUncertifiedRoots_]) {
-        if (pathString === '/' ||
-            root === pathString ||
-            root.startsWith(pathString + '/')) {
-            repo.restoredUncertifiedRoots_.delete(root);
-        }
-    }
-}
-/**
- * Whether the SyncTree value covering `pathString` is a persistent root's
- * RESTORED tree that the server has neither replaced nor certified yet. That
- * value is complete and exactly as old as the cache's last flush. `onValue`
- * serves it on purpose (cached-then-live: the certification or a replacement
- * push corrects it in place), but a `get()` is request-response and its
- * caller treats the answer as server truth, so it must not be answered from
- * that tree. Tracked as applied-data provenance (restoredUncertifiedRoots_),
- * never inferred from the listen's wire-progress mode.
- */
-function repoHasUncertifiedRestoreCovering(repo, pathString) {
-    for (const root of repo.restoredUncertifiedRoots_) {
-        if (root === '/' ||
-            pathString === root ||
-            pathString.startsWith(root + '/')) {
-            return true;
-        }
-    }
-    return false;
+function repoServingListenCertified(repo, query) {
+    const serving = syncTreeServingListen(repo.serverSyncTree_, query);
+    return (serving !== null &&
+        repo.certifiedListens_.has(repoListenKey(serving.path, serving.tag)));
 }
 /**
  * The purpose of `getValue` is to return the latest known value
@@ -17104,11 +17101,14 @@ function repoHasUncertifiedRestoreCovering(repo, pathString) {
  * @param query - The query to surface a value for.
  */
 function repoGetValue(repo, query, eventRegistration) {
-    // Only active queries are cached; a restored-but-uncertified root is the
-    // one active cache a get() must not trust (repoHasUncertifiedRestoreCovering).
+    // Only active queries are cached, and only a certified listen's cache is
+    // server truth: a persistent listen's restored base sits in its view until
+    // the server answers (repoStartServerListen), and that view can outlive the
+    // listen (a surviving descendant's or filtered view's takeover, a shadowing
+    // ancestor). Ask the SyncTree which listen serves this read and trust the
+    // cache only if that listen has been answered 'ok'.
     const cached = syncTreeGetServerValue(repo.serverSyncTree_, query);
-    if (cached != null &&
-        !repoHasUncertifiedRestoreCovering(repo, query._path.toString())) {
+    if (cached != null && repoServingListenCertified(repo, query)) {
         return Promise.resolve(cached);
     }
     return repo.server_.get(query).then(payload => {
