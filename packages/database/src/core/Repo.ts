@@ -448,15 +448,15 @@ export class Repo {
    * Restored roots the server has not spoken for yet, keyed by path: the
    * persisted tree is installed as the root's server cache the moment it is
    * read (repoStartServerListen), and stays there as the SyncTree's complete
-   * value until the listen carrying its hashes completes `ok` or an untagged
-   * server overwrite replaces it (repoApplyConfirmedServerOverwrite). Until
-   * then a get() on the root's line reads the server (repoGetValue). The
-   * entry follows the complete cache at the root: nothing else retires it —
-   * not a range merge (server ranges folded over the restored base), not a
-   * descendant push, not a stop that leaves the cache in place — and when
-   * the cache goes it passes to the views that keep the bytes
-   * (repoHandDownUnconfirmedRestore). A stale entry can only send a get() to
-   * the server, never serve one.
+   * value until the server speaks for a subtree containing it — an untagged
+   * overwrite, or the `ok` of a current default listen, at or above the root
+   * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
+   * the server (repoGetValue). The entry follows the complete cache at the
+   * root: nothing else retires it — not a range merge (server ranges folded
+   * over the restored base), not a descendant push, not a stop that leaves
+   * the cache in place — and when the cache goes it passes to the views that
+   * keep the bytes (repoHandDownUnconfirmedRestore). A stale entry can only
+   * send a get() to the server, never serve one.
    */
   unconfirmedRestores_ = new Map<string, Path>();
 
@@ -726,8 +726,23 @@ function repoOnDataUpdate(
 }
 
 /**
- * Applies an untagged server overwrite: the server's complete word on the
- * subtree at `path`, which confirms every restored root at or under it. The
+ * The server spoke for the whole subtree at `path`: every restored root at
+ * or under it is confirmed. Two doors say so — an untagged overwrite (the
+ * server sent the subtree), and the `ok` of the path's current default
+ * listen (the server matched the hash of the subtree the listen carried; a
+ * restore under it can only have landed before that listen existed, since a
+ * default view shadows every descendant listen, so the hash covered it).
+ */
+function repoConfirmRestoresUnder(repo: Repo, path: Path): void {
+  for (const [rootString, rootPath] of repo.unconfirmedRestores_) {
+    if (pathContains(path, rootPath)) {
+      repo.unconfirmedRestores_.delete(rootString);
+    }
+  }
+}
+
+/**
+ * Applies an untagged server overwrite and confirms what it covers. The
  * restore door (repoStartServerListen) and the range-merge fold
  * (repoIngestRangeMerge) also overwrite, but with bytes the server has not
  * confirmed; they call syncTreeApplyServerOverwrite directly.
@@ -738,11 +753,7 @@ function repoApplyConfirmedServerOverwrite(
   node: Node
 ): Event[] {
   const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, node);
-  for (const [rootString, rootPath] of repo.unconfirmedRestores_) {
-    if (pathContains(path, rootPath)) {
-      repo.unconfirmedRestores_.delete(rootString);
-    }
-  }
+  repoConfirmRestoresUnder(repo, path);
   return events;
 }
 
@@ -1330,7 +1341,8 @@ export function repoStartServerListen(
     });
   }
   // This listen is the path's current one exactly while its outcome state
-  // is: repoStopServerListen deletes the entry and a later start replaces it.
+  // is: repoStopServerListen retires the entry on entry, a later start
+  // replaces it.
   const outcomeState = repo.listenOutcomes_.get(pathString);
 
   let activeMode: ListenOutcomeMode = 'cold';
@@ -1348,10 +1360,10 @@ export function repoStartServerListen(
     ) {
       // The server matched the hashes this listen carried, and everything it
       // sent before the `ok` has applied (the ingest queue keeps wire order).
-      // A stopped listen's `ok` may still drain here after a restart at this
-      // path installed a new tree this listen never vouched for — so only
-      // the path's current listen confirms.
-      repo.unconfirmedRestores_.delete(pathString);
+      // A stopped listen's `ok` may still drain here — behind an ingest its
+      // stop cancelled, or after a restart installed a tree it never vouched
+      // for — so only the path's current listen confirms.
+      repoConfirmRestoresUnder(repo, query._path);
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
     if (!isDefaultComplete) {
@@ -1835,8 +1847,11 @@ export function repoStopServerListen(
     repo.server_.unlisten(query, tag);
     return;
   }
-  // Before the gate lifts: an `ok` still queued behind it drains inside the
-  // lift, and it must find the root's entry already settled.
+  // This listen ends here, before anything below can run its queued `ok`:
+  // lifting the gate drains the queue synchronously, and an `ok` queued
+  // behind an ingest this stop cancels must not confirm bytes that ingest
+  // was about to replace (processListenComplete checks the entry identity).
+  repo.listenOutcomes_.delete(pathString);
   repoHandDownUnconfirmedRestore(repo, query._path);
   const pending = repo.pendingSeedRestores_.get(pathString);
   if (pending && !repo.ingestQueue_.gates.has(pathString)) {
@@ -1852,7 +1867,6 @@ export function repoStopServerListen(
   }
   repoLiftIngestGate(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
-  repo.listenOutcomes_.delete(pathString);
   repo.persistence_?.untrack(pathString);
 }
 
@@ -1860,8 +1874,8 @@ export function repoStopServerListen(
  * The entry follows the complete cache at the root, which a stopped listen
  * does not necessarily remove. Shadowed by a new ancestor listen, the root's
  * view and cache stay (SyncTree stops the wire listen only): the entry stays
- * with them, and the ancestor's answer — a full overwrite at or above the
- * root — retires it. Removed, the restored bytes outlive the root only in the
+ * with them, and the ancestor's answer — its overwrite or its `ok` — retires
+ * it. Removed, the restored bytes outlive the root only in the
  * descendant default views SyncTree just restarted (the shallowest complete
  * view on each branch; deeper ones are covered by it and get no listen), so
  * the entry passes to exactly those: each is confirmed by its own answer. A
