@@ -3789,6 +3789,146 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       );
     });
 
+    /**
+     * SyncTree wired to Repo exactly as repoStart (core/Repo.ts): listens start
+     * and stop as SyncTree decides — shadowing, frontier restarts, coverage —
+     * instead of being driven by hand.
+     */
+    function wireProvider(harness: Harness): void {
+      const { repo } = harness;
+      repo.serverSyncTree_ = new SyncTree({
+        startListening: (query, tag, hashFn, onComplete) => {
+          repoStartServerListen(repo, query, tag, hashFn, onComplete);
+          return [];
+        },
+        stopListening: (query, tag) => {
+          repoStopServerListen(repo, query, tag);
+        },
+        getPendingListenHashes: pathString =>
+          repo.pendingListenHashes_.get(pathString)
+      });
+    }
+
+    /** restoredRoot for a wired harness: the registration itself sends the listen. */
+    async function restoredRootWired(harness: Harness, json: unknown) {
+      const { repo, path, calls } = harness;
+      await persistHarnessRoot(repo, path, json);
+      const rootQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        path,
+        new QueryParams(),
+        false
+      );
+      const registration = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        rootQuery,
+        registration
+      );
+      await flushAsync();
+      expect(calls).to.deep.equal(['listen']);
+      expectIngestIdle(repo);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      return { rootQuery, registration };
+    }
+
+    function defaultQuery(pathString: string) {
+      return new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path(pathString),
+        new QueryParams(),
+        false
+      );
+    }
+
+    it('an ancestor listen shadowing the root stops its wire listen but not its cache: the entry stays until the ancestor overwrites it', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' } });
+      // A default listener above the root: SyncTree starts /users and stops
+      // /users/alice on the wire; alice's view and complete cache remain.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users'),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { msg: 'stale' } });
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      // The ancestor's hash was of an incomplete cache, so its `ok` vouches
+      // for nothing at alice (only an overwrite at or above alice does).
+      serverCallbacks[1]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'fresh' })).from
+      ).to.equal('server');
+      repoOnDataUpdateForTest(
+        repo,
+        'users',
+        { alice: { inbox: { msg: 'pushed' } } },
+        false,
+        null
+      );
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+    });
+
+    it('root removal hands the entry to the frontier SyncTree restarts, not to every nested default view', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, calls, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        a: { b: { value: 1 }, other: 2 }
+      });
+      // Nested default listeners under the root: covered, no wire listens.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/a'),
+        stubRegistration(undefined, true)
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/a/b'),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen']);
+      // Remove the root: SyncTree restarts only the shallowest survivor
+      // (/users/alice/a covers /users/alice/a/b), then stops the root.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        '/users/alice/a'
+      ]);
+      // The server agrees with the cache (its answer is installed either way).
+      expect(
+        (await getFrom(harness, 'users/alice/a/b/value', 1)).from
+      ).to.equal('server');
+      // The survivor's hashes match: an `ok` with no data certifies its
+      // whole cache, b included.
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/a/b/value', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 1 });
+    });
+
     it('a stop with no surviving default view leaves nothing tracked', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;

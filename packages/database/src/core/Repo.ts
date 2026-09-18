@@ -450,11 +450,13 @@ export class Repo {
    * read (repoStartServerListen), and stays there as the SyncTree's complete
    * value until the listen carrying its hashes completes `ok` or an untagged
    * server overwrite replaces it (repoApplyConfirmedServerOverwrite). Until
-   * then a get() on the root's line reads the server (repoGetValue). Nothing
-   * else retires an entry — not a range merge (server ranges folded over the
-   * restored base), not a descendant push; stopping the listen only hands it
-   * to the descendant views that keep the bytes (repoHandDownUnconfirmedRestore)
-   * — so a stale entry can only send a get() to the server, never serve one.
+   * then a get() on the root's line reads the server (repoGetValue). The
+   * entry follows the complete cache at the root: nothing else retires it —
+   * not a range merge (server ranges folded over the restored base), not a
+   * descendant push, not a stop that leaves the cache in place — and when
+   * the cache goes it passes to the views that keep the bytes
+   * (repoHandDownUnconfirmedRestore). A stale entry can only send a get() to
+   * the server, never serve one.
    */
   unconfirmedRestores_ = new Map<string, Path>();
 
@@ -1834,7 +1836,7 @@ export function repoStopServerListen(
     return;
   }
   // Before the gate lifts: an `ok` still queued behind it drains inside the
-  // lift, and it must find the root's entry already handed down.
+  // lift, and it must find the root's entry already settled.
   repoHandDownUnconfirmedRestore(repo, query._path);
   const pending = repo.pendingSeedRestores_.get(pathString);
   if (pending && !repo.ingestQueue_.gates.has(pathString)) {
@@ -1855,27 +1857,44 @@ export function repoStopServerListen(
 }
 
 /**
- * A stopped root's restored bytes outlive it in every descendant default
- * view still registered (SyncTree sent each its own listen before stopping
- * the root), so the entry passes to those views: each is confirmed by its
- * own answer. A filtered survivor is not tracked — its answer is tagged,
- * which nothing here observes — so a get() for exactly that query may be
- * served its restored window for the one round trip until its listen answers.
+ * The entry follows the complete cache at the root, which a stopped listen
+ * does not necessarily remove. Shadowed by a new ancestor listen, the root's
+ * view and cache stay (SyncTree stops the wire listen only): the entry stays
+ * with them, and the ancestor's answer — a full overwrite at or above the
+ * root — retires it. Removed, the restored bytes outlive the root only in the
+ * descendant default views SyncTree just restarted (the shallowest complete
+ * view on each branch; deeper ones are covered by it and get no listen), so
+ * the entry passes to exactly those: each is confirmed by its own answer. A
+ * filtered survivor is not tracked — its answer is tagged, which nothing
+ * here observes — so a get() for exactly that query may be served its
+ * restored window for the one round trip until its listen answers.
  */
 function repoHandDownUnconfirmedRestore(repo: Repo, rootPath: Path): void {
-  if (!repo.unconfirmedRestores_.delete(rootPath.toString())) {
+  const rootString = rootPath.toString();
+  if (
+    !repo.unconfirmedRestores_.has(rootString) ||
+    syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) !== null
+  ) {
     return;
   }
+  repo.unconfirmedRestores_.delete(rootString);
+  const frontier: Path[] = [];
+  // Shallowest first; `complete` is non-null only for a default view (see
+  // viewGetCompleteServerCache).
   for (const state of syncTreeGetDescendantServerCacheStates(
     repo.serverSyncTree_,
     rootPath
   )) {
-    // `complete` is non-null only for a default view (see
-    // viewGetCompleteServerCache).
-    if (state.complete !== null) {
-      const path = pathChild(rootPath, state.path);
-      repo.unconfirmedRestores_.set(path.toString(), path);
+    if (
+      state.complete !== null &&
+      !frontier.some(covering => pathContains(covering, state.path))
+    ) {
+      frontier.push(state.path);
     }
+  }
+  for (const relative of frontier) {
+    const path = pathChild(rootPath, relative);
+    repo.unconfirmedRestores_.set(path.toString(), path);
   }
 }
 
