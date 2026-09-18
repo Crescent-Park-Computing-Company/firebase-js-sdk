@@ -4058,6 +4058,189 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await afterCert;
   });
 
+  /**
+   * The real listen-provider wiring (Repo.ts serverSyncTree_): SyncTree
+   * coverage changes reach the Repo as startListening/stopListening, in the
+   * SyncTree's own order. The two regressions below drive registrations
+   * through the SyncTree so those seams fire exactly as in production.
+   */
+  function wireRealProvider(repo: Repo): void {
+    repo.serverSyncTree_ = new SyncTree({
+      startListening: (query, tag, currentHashFn, onComplete) => {
+        repoStartServerListen(repo, query, tag, currentHashFn, onComplete);
+        return [];
+      },
+      stopListening: (query, tag) => {
+        repoStopServerListen(repo, query, tag);
+      },
+      getPendingListenHashes: pathString =>
+        repo.pendingListenHashes_.get(pathString)
+    });
+  }
+
+  it('root removal with a surviving child: the child inherits untrusted coverage until its own listen certifies', async () => {
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale', other: 1 });
+    wireRealProvider(repo);
+    const rootQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    const rootRegistration = stubRegistration(() => {}, true);
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      rootRegistration
+    );
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'stale', other: 1 });
+
+    // A child registration under the live restored root: covered, no wire
+    // listen of its own, its view seeded from the restored cache.
+    const childPath = new Path('users/alice/cached');
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      childQuery,
+      stubRegistration()
+    );
+    expect(calls).to.deep.equal(['listen']);
+
+    // Root unsubscribes before certification. The SyncTree starts the child's
+    // own (cold) listen, THEN stops the root; the child's view keeps the
+    // restored value.
+    syncTreeRemoveEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      rootRegistration
+    );
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, childPath)?.val()
+    ).to.equal('stale');
+
+    // The stopped root's marker is gone; the surviving restored data must
+    // still be untrusted: get() reads the server.
+    const survivingGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
+    getResponders[0]('fresh');
+    expect((await survivingGet).val()).to.equal('fresh');
+
+    // The child's own listen certifies its data: local again.
+    serverCallbacks[1]('ok');
+    await flushAsync();
+    const certifiedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
+    await certifiedGet;
+  });
+
+  it('ancestor shadowing: the restored view under a new ancestor listen stays untrusted until the ancestor replaces it', async () => {
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale' });
+    wireRealProvider(repo);
+    const rootQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+
+    // A non-persistent ancestor listener: the SyncTree starts a cold listen
+    // at /users and shadow-stops /users/alice, whose view (restored data)
+    // is retained.
+    const parentPath = new Path('users');
+    const parentQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      parentPath,
+      new QueryParams(),
+      false
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      parentQuery,
+      stubRegistration()
+    );
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+    ).to.deep.equal({ cached: 'stale' });
+
+    const childPath = new Path('users/alice/cached');
+    const childQuery = new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      childPath,
+      new QueryParams(),
+      false
+    );
+    const shadowedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
+    getResponders[0]('fresh');
+    expect((await shadowedGet).val()).to.equal('fresh');
+
+    // The ancestor's response replaces everything under /users, then
+    // certifies: the whole subtree is server truth, get() is local.
+    (
+      repo as unknown as { interceptServerDataCallback_: null }
+    ).interceptServerDataCallback_ = null;
+    repoOnDataUpdateForTest(
+      repo,
+      parentPath.toString(),
+      { alice: { cached: 'live' } },
+      false,
+      null
+    );
+    serverCallbacks[1]('ok');
+    await flushAsync();
+    expect(
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, childPath)?.val()
+    ).to.equal('live');
+    const replacedGet = repoGetValue(
+      repo,
+      childQuery as never,
+      stubRegistration() as unknown as ValueEventRegistration
+    );
+    expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
+    expect((await replacedGet).val()).to.equal('live');
+  });
+
   it('a get() under a root that was never persisted keeps its cached answer', async () => {
     const { repo, hashFn, onComplete, calls } = makeListenHarness();
     // A cold listen on a non-persistent root: the SyncTree value is live

@@ -443,13 +443,26 @@ export class Repo {
    */
   listenOutcomes_ = new Map<string, ListenOutcomeState>();
   /**
-   * Persistent roots whose SyncTree value is RESTORED data the server has not
-   * yet replaced or certified (see repoHasUncertifiedRestoreCovering). Added
-   * when a restored base is applied; removed when the listen completes, when
-   * a full untagged overwrite at or above the root is APPLIED, or when the
-   * listen stops. Deliberately not derived from listenOutcomes_: that mode is
-   * a wire-progress label ('fallback' flips on receipt of a replacement push,
-   * before the push is applied), not a statement about SyncTree contents.
+   * Untrusted cache coverage: paths at or under which the SyncTree may hold a
+   * complete server cache that is RESTORED data the server has neither
+   * replaced nor certified (see repoHasUncertifiedRestoreCovering). The set
+   * follows the SyncTree's coverage, not any wire subscription's lifetime,
+   * and not listenOutcomes_ (a wire-progress label; 'fallback' flips on
+   * receipt of a replacement push, before it is applied):
+   *
+   * - added when a restored base is APPLIED to the SyncTree
+   *   (repoStartServerListen restore resolution);
+   * - inherited by every default listen the SyncTree starts whose coverage
+   *   intersects an entry (repoRestoredCoverageListenStarted): the SyncTree
+   *   seeds a new view from the covering cache and starts the takeover
+   *   listen BEFORE stopping the one it replaces, so a root removal with
+   *   surviving descendants and an ancestor shadowing a restored root both
+   *   hand their untrusted data to the new listen here;
+   * - retired when the listen at that exact path completes (certified, or
+   *   cancelled with its registrations), when a full untagged overwrite at
+   *   or above it is APPLIED (repoRestoredRootsReplaced), when the listen at
+   *   that exact path stops (its coverage is gone or was inherited above),
+   *   or on dispose.
    */
   restoredUncertifiedRoots_ = new Set<string>();
 
@@ -1301,6 +1314,7 @@ export function repoStartServerListen(
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
   if (isDefaultComplete) {
+    repoRestoredCoverageListenStarted(repo, pathString);
     const prior = repo.listenOutcomes_.get(pathString);
     repo.listenOutcomes_.set(pathString, {
       outcome: null,
@@ -1320,8 +1334,11 @@ export function repoStartServerListen(
     if (!isDefaultComplete) {
       return;
     }
-    // Certified ('ok'), or cancelled (the registration is gone with its
-    // cache): either way the SyncTree no longer holds unverified restored data.
+    // Certified ('ok'), or cancelled: onComplete above already let the
+    // SyncTree remove the cancelled registrations and start takeover listens
+    // for any surviving descendants, which inherited this path's coverage
+    // (repoRestoredCoverageListenStarted). Either way nothing at this exact
+    // path is unverified restored data any more.
     repo.restoredUncertifiedRoots_.delete(pathString);
     repoPublishListenOutcome(repo, pathString, {
       mode: activeMode,
@@ -1816,6 +1833,9 @@ export function repoStopServerListen(
   repoLiftIngestGate(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
   repo.listenOutcomes_.delete(pathString);
+  // The SyncTree stops a default listen only after the listen taking over
+  // its coverage (a surviving descendant's, or a shadowing ancestor's) has
+  // started and inherited any untrusted data (see restoredUncertifiedRoots_).
   repo.restoredUncertifiedRoots_.delete(pathString);
   repo.persistence_?.untrack(pathString);
 }
@@ -2143,6 +2163,35 @@ function repoUpdateInfo(repo: Repo, pathString: string, value: unknown): void {
 
 function repoGetNextWriteId(repo: Repo): number {
   return repo.nextWriteId_++;
+}
+
+/**
+ * A default complete listen is starting at `pathString`. If its coverage
+ * intersects an untrusted entry in either direction it inherits: a takeover
+ * listen for a surviving descendant view was seeded from the restored cache
+ * (root removal), and a shadowing ancestor's view will retain the restored
+ * descendant view until the ancestor's own response replaces it. Idempotent
+ * for a re-listen at an existing entry.
+ */
+function repoRestoredCoverageListenStarted(
+  repo: Repo,
+  pathString: string
+): void {
+  if (repo.restoredUncertifiedRoots_.size === 0) {
+    return;
+  }
+  for (const root of repo.restoredUncertifiedRoots_) {
+    if (
+      root === pathString ||
+      root === '/' ||
+      pathString === '/' ||
+      pathString.startsWith(root + '/') ||
+      root.startsWith(pathString + '/')
+    ) {
+      repo.restoredUncertifiedRoots_.add(pathString);
+      return;
+    }
+  }
 }
 
 /**
