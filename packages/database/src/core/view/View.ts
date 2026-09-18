@@ -87,12 +87,14 @@ export class View {
     const newServerCache = new CacheNode(
       serverSnap,
       initialServerCache.isFullyInitialized(),
-      indexFilter.filtersNodes()
+      indexFilter.filtersNodes(),
+      initialServerCache.isVerified()
     );
     const newEventCache = new CacheNode(
       eventSnap,
       initialEventCache.isFullyInitialized(),
-      filter.filtersNodes()
+      filter.filtersNodes(),
+      initialEventCache.isVerified()
     );
 
     this.viewCache_ = newViewCache(newEventCache, newServerCache);
@@ -129,6 +131,37 @@ export function viewGetCompleteServerCache(
     }
   }
   return null;
+}
+
+/**
+ * The complete server cache this view holds for `path`, as a CacheNode that
+ * carries the view's `verified` bit, so a view seeded from it inherits the
+ * provenance along with the data.
+ */
+export function viewGetCompleteServerCacheNode(
+  view: View,
+  path: Path
+): CacheNode | null {
+  const node = viewGetCompleteServerCache(view, path);
+  return node === null
+    ? null
+    : new CacheNode(
+        node,
+        true,
+        false,
+        view.viewCache_.serverCache.isVerified()
+      );
+}
+
+/**
+ * Whether the value this view returns (its event cache: server data plus
+ * local writes) is built only from verified data. False while the view's
+ * server cache is a restored tree, or while a local write's refill of a
+ * filtered window borrowed from an unverified covering cache
+ * (see viewProcessorApplyOperation).
+ */
+export function viewIsEventCacheVerified(view: View): boolean {
+  return view.viewCache_.eventCache.isVerified();
 }
 
 export function viewIsEmpty(view: View): boolean {
@@ -199,7 +232,7 @@ export function viewApplyOperation(
   view: View,
   operation: Operation,
   writesCache: WriteTreeRef,
-  completeServerCache: Node | null
+  completeServerCache: CacheNode | null
 ): Event[] {
   if (
     operation.type === OperationType.MERGE &&

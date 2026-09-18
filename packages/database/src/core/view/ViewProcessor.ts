@@ -19,7 +19,11 @@ import { assert, assertionError } from '@firebase/util';
 
 import { AckUserWrite } from '../operation/AckUserWrite';
 import { Merge } from '../operation/Merge';
-import { Operation, OperationType } from '../operation/Operation';
+import {
+  Operation,
+  OperationType,
+  OperationVerification
+} from '../operation/Operation';
 import { Overwrite } from '../operation/Overwrite';
 import { ChildrenNode } from '../snap/ChildrenNode';
 import { KEY_INDEX } from '../snap/indexes/KeyIndex';
@@ -45,6 +49,7 @@ import {
   writeTreeRefShadowingWrite
 } from '../WriteTree';
 
+import { CacheNode } from './CacheNode';
 import { Change, changeValue } from './Change';
 import { ChildChangeAccumulator } from './ChildChangeAccumulator';
 import {
@@ -57,6 +62,7 @@ import {
   ViewCache,
   viewCacheGetCompleteEventSnap,
   viewCacheGetCompleteServerSnap,
+  viewCacheSetEventVerified,
   viewCacheUpdateEventSnap,
   viewCacheUpdateServerSnap
 } from './ViewCache';
@@ -93,9 +99,15 @@ export function viewProcessorApplyOperation(
   oldViewCache: ViewCache,
   operation: Operation,
   writesCache: WriteTreeRef,
-  completeCache: Node | null
+  completeServerCache: CacheNode | null
 ): ProcessorResult {
   const accumulator = new ChildChangeAccumulator();
+  const completeCache =
+    completeServerCache === null ? null : completeServerCache.getNode();
+  // Whether data borrowed from the covering cache is server truth. No cover
+  // (tagged operations, or nothing complete above) borrows nothing.
+  const coverVerified =
+    completeServerCache === null || completeServerCache.isVerified();
   let newViewCache, filterServerNode;
   if (operation.type === OperationType.OVERWRITE) {
     const overwrite = operation as Overwrite;
@@ -125,7 +137,9 @@ export function viewProcessorApplyOperation(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        overwrite.source.verification,
+        coverVerified
       );
     }
   } else if (operation.type === OperationType.MERGE) {
@@ -153,7 +167,9 @@ export function viewProcessorApplyOperation(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        merge.source.verification,
+        coverVerified
       );
     }
   } else if (operation.type === OperationType.ACK_USER_WRITE) {
@@ -189,6 +205,20 @@ export function viewProcessorApplyOperation(
   } else {
     throw assertionError('Unknown operation type: ' + operation.type);
   }
+  // Provenance of the returned value. At the view's own path the event cache
+  // is rebuilt from this view's server cache (plus local writes), so it is
+  // as verified as that cache. Below it, an incremental update may have
+  // borrowed complete children from the covering cache (CompleteChildSource)
+  // to refill a filtered window, so it stays verified only if it was, the
+  // server cache is, and the cover is. Conservative: an update under an
+  // unverified cover marks the result unverified whether or not it borrowed;
+  // the next full replacement or completion at this view resets it.
+  const eventVerified = pathIsEmpty(operation.path)
+    ? newViewCache.serverCache.isVerified()
+    : oldViewCache.eventCache.isVerified() &&
+      newViewCache.serverCache.isVerified() &&
+      coverVerified;
+  newViewCache = viewCacheSetEventVerified(newViewCache, eventVerified);
   const changes = accumulator.getChanges();
   viewProcessorMaybeAddValueEvent(oldViewCache, newViewCache, changes);
   return { viewCache: newViewCache, changes };
@@ -352,9 +382,17 @@ function viewProcessorApplyServerOverwrite(
   writesCache: WriteTreeRef,
   completeCache: Node | null,
   filterServerNode: boolean,
-  accumulator: ChildChangeAccumulator
+  accumulator: ChildChangeAccumulator,
+  verification: OperationVerification,
+  coverVerified: boolean
 ): ViewCache {
   const oldServerSnap = oldViewCache.serverCache;
+  if (verification === 'restore' && !pathIsEmpty(changePath)) {
+    // A restored tree only ever covers the views at and below its listen;
+    // an ancestor view keeps its own (server) data rather than absorbing
+    // unverified bytes it could later serve as verified.
+    return oldViewCache;
+  }
   let newServerCache;
   const serverFilter = filterServerNode
     ? viewProcessor.filter
@@ -403,11 +441,23 @@ function viewProcessorApplyServerOverwrite(
       );
     }
   }
+  // A full overwrite carries the operation's provenance; a partial one
+  // cannot verify (or unverify) the parts it does not touch. A 'keep' fold
+  // is as verified as the base it was folded over: this view's own cache
+  // when the fold is at this view, the covering cache when it was folded
+  // above and propagated down (a range merge at a restored root replacing a
+  // descendant view's server-delivered window with restored bytes).
+  const verified = !pathIsEmpty(changePath)
+    ? oldServerSnap.isVerified()
+    : verification === 'keep'
+    ? oldServerSnap.isVerified() && coverVerified
+    : verification === 'verify';
   const newViewCache = viewCacheUpdateServerSnap(
     oldViewCache,
     newServerCache,
     oldServerSnap.isFullyInitialized() || pathIsEmpty(changePath),
-    serverFilter.filtersNodes()
+    serverFilter.filtersNodes(),
+    verified
   );
   const source = new WriteTreeCompleteChildSource(
     writesCache,
@@ -588,7 +638,9 @@ function viewProcessorApplyServerMerge(
   writesCache: WriteTreeRef,
   serverCache: Node | null,
   filterServerNode: boolean,
-  accumulator: ChildChangeAccumulator
+  accumulator: ChildChangeAccumulator,
+  verification: OperationVerification,
+  coverVerified: boolean
 ): ViewCache {
   // If we don't have a cache yet, this merge was intended for a previously listen in the same location. Ignore it and
   // wait for the complete data update coming soon.
@@ -634,7 +686,9 @@ function viewProcessorApplyServerMerge(
         writesCache,
         serverCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        verification,
+        coverVerified
       );
     }
   });
@@ -659,7 +713,9 @@ function viewProcessorApplyServerMerge(
         writesCache,
         serverCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        verification,
+        coverVerified
       );
     }
   });
@@ -700,7 +756,10 @@ function viewProcessorAckUserWrite(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        // Re-applying the view's own cache: its provenance is unchanged.
+        'keep',
+        true
       );
     } else if (pathIsEmpty(ackPath)) {
       // This is a goofy edge case where we are acking data at this location but don't have full data.  We
@@ -717,7 +776,9 @@ function viewProcessorAckUserWrite(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        'keep',
+        true
       );
     } else {
       return viewCache;
@@ -742,7 +803,9 @@ function viewProcessorAckUserWrite(
       writesCache,
       completeCache,
       filterServerNode,
-      accumulator
+      accumulator,
+      'keep',
+      true
     );
   }
 }
@@ -755,11 +818,14 @@ function viewProcessorListenComplete(
   accumulator: ChildChangeAccumulator
 ): ViewCache {
   const oldServerNode = viewCache.serverCache;
+  // The server answered the listen covering this view: whatever the view
+  // holds now is hash-confirmed or was replaced by that listen's pushes.
   const newViewCache = viewCacheUpdateServerSnap(
     viewCache,
     oldServerNode.getNode(),
     oldServerNode.isFullyInitialized() || pathIsEmpty(path),
-    oldServerNode.isFiltered()
+    oldServerNode.isFiltered(),
+    oldServerNode.isVerified() || pathIsEmpty(path)
   );
   return viewProcessorGenerateEventCacheAfterServerEvent(
     viewProcessor,

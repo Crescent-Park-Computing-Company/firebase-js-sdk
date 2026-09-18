@@ -28,7 +28,8 @@ export class CacheNode {
   constructor(
     private node_: Node,
     private fullyInitialized_: boolean,
-    private filtered_: boolean
+    private filtered_: boolean,
+    private verified_: boolean = true
   ) {}
 
   /**
@@ -36,6 +37,18 @@ export class CacheNode {
    */
   isFullyInitialized(): boolean {
     return this.fullyInitialized_;
+  }
+
+  /**
+   * Whether the data came from (or was confirmed by) the server. False only
+   * while a view holds a persisted tree installed ahead of the server's
+   * answer (OperationVerification 'restore'); a full server overwrite or the
+   * listen's completion flips it back. Travels with the cache: a view seeded
+   * from another view's complete cache inherits the bit. get() serves a
+   * cached value only from a verified server cache.
+   */
+  isVerified(): boolean {
+    return this.verified_;
   }
 
   /**

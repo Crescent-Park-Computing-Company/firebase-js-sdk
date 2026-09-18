@@ -30,10 +30,11 @@ import {
   View,
   viewAddEventRegistration,
   viewApplyOperation,
-  viewGetCompleteServerCache,
   viewGetInitialEvents,
   viewIsEmpty,
-  viewRemoveEventRegistration
+  viewRemoveEventRegistration,
+  viewGetCompleteServerCache,
+  viewGetCompleteServerCacheNode
 } from './view/View';
 import { newViewCache } from './view/ViewCache';
 import {
@@ -87,7 +88,7 @@ export function syncPointApplyOperation(
   syncPoint: SyncPoint,
   operation: Operation,
   writesCache: WriteTreeRef,
-  optCompleteServerCache: Node | null
+  optCompleteServerCache: CacheNode | null
 ): Event[] {
   const queryId = operation.source.queryId;
   if (queryId !== null) {
@@ -126,7 +127,8 @@ export function syncPointGetView(
   query: QueryContext,
   writesCache: WriteTreeRef,
   serverCache: Node | null,
-  serverCacheComplete: boolean
+  serverCacheComplete: boolean,
+  serverCacheVerified = true
 ): View {
   const queryId = query._queryIdentifier;
   const view = syncPoint.views.get(queryId);
@@ -150,8 +152,14 @@ export function syncPointGetView(
       eventCacheComplete = false;
     }
     const viewCache = newViewCache(
-      new CacheNode(eventCache, eventCacheComplete, false),
-      new CacheNode(serverCache, serverCacheComplete, false)
+      // The initial event cache is derived from this server cache alone.
+      new CacheNode(eventCache, eventCacheComplete, false, serverCacheVerified),
+      new CacheNode(
+        serverCache,
+        serverCacheComplete,
+        false,
+        serverCacheVerified
+      )
     );
     return new View(query, viewCache);
   }
@@ -174,14 +182,16 @@ export function syncPointAddEventRegistration(
   eventRegistration: EventRegistration,
   writesCache: WriteTreeRef,
   serverCache: Node | null,
-  serverCacheComplete: boolean
+  serverCacheComplete: boolean,
+  serverCacheVerified = true
 ): Event[] {
   const view = syncPointGetView(
     syncPoint,
     query,
     writesCache,
     serverCache,
-    serverCacheComplete
+    serverCacheComplete,
+    serverCacheVerified
   );
   if (!syncPoint.views.has(query._queryIdentifier)) {
     syncPoint.views.set(query._queryIdentifier, view);
@@ -275,6 +285,21 @@ export function syncPointGetCompleteServerCache(
   let serverCache: Node | null = null;
   for (const view of syncPoint.views.values()) {
     serverCache = serverCache || viewGetCompleteServerCache(view, path);
+  }
+  return serverCache;
+}
+
+/**
+ * Same as syncPointGetCompleteServerCache, as a CacheNode carrying the
+ * owning view's `verified` bit (see viewGetCompleteServerCacheNode).
+ */
+export function syncPointGetCompleteServerCacheNode(
+  syncPoint: SyncPoint,
+  path: Path
+): CacheNode | null {
+  let serverCache: CacheNode | null = null;
+  for (const view of syncPoint.views.values()) {
+    serverCache = serverCache || viewGetCompleteServerCacheNode(view, path);
   }
   return serverCache;
 }
