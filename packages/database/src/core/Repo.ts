@@ -89,10 +89,9 @@ import {
   syncTreeGetCompleteServerCache,
   syncTreeGetDescendantServerCacheStates,
   syncTreeGetRangeMergeBase,
-  syncTreeGetServerValue,
   syncTreeRemoveEventRegistration,
   syncTreeTagForQuery,
-  syncTreeServingListen
+  syncTreeGetVerifiedServerValue
 } from './SyncTree';
 import { Indexable } from './util/misc';
 import {
@@ -444,20 +443,14 @@ export class Repo {
    */
   listenOutcomes_ = new Map<string, ListenOutcomeState>();
   /**
-   * Wire listens (path + tag, see repoListenKey) whose current subscription
-   * the server has answered 'ok'. Read by repoGetValue: a cached answer is
-   * trusted only when the listen owning the SyncTree view that serves it is
-   * in this set. Restored data can only enter the SyncTree at a persistent
-   * listen's own root, before that listen certifies; so a view whose listen
-   * has certified holds only hash-verified or server-replaced data, and a
-   * view whose listen has not (unanswered, shadow-stopped, taken over by a
-   * surviving descendant's or a filtered view's own new listen) may still be
-   * serving the restored tree. Membership follows the wire subscription:
-   * added on 'ok', dropped when a listen (re)starts or stops, cleared on
-   * dispose. No shadow model of SyncTree coverage lives here; the SyncTree
-   * itself names the serving view (syncTreeServingListen).
+   * Identity of each live wire listen, by repoListenKey. A listen completion
+   * that was queued behind an ingest gate can drain after its subscription
+   * was stopped and the same path re-subscribed (PersistentConnection's
+   * listenSpec check runs before the callback is queued, so it does not
+   * cover that); the completion is applied only while the token it captured
+   * is still this map's entry for its key.
    */
-  certifiedListens_ = new Set<string>();
+  liveListens_ = new Map<string, object>();
 
   constructor(
     public repoInfo_: RepoInfo,
@@ -1254,7 +1247,8 @@ async function repoIngestRangeMerge(
   const events = syncTreeApplyServerOverwrite(
     repo.serverSyncTree_,
     path,
-    folded
+    folded,
+    'keep'
   );
   let affectedPath = path;
   if (events.length > 0) {
@@ -1304,8 +1298,9 @@ export function repoStartServerListen(
 ): void {
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
-  // A (re)started listen has not been answered yet.
-  repo.certifiedListens_.delete(repoListenKey(pathString, tag));
+  const listenKey = repoListenKey(pathString, tag);
+  const listenToken = {};
+  repo.liveListens_.set(listenKey, listenToken);
   if (isDefaultComplete) {
     const prior = repo.listenOutcomes_.get(pathString);
     repo.listenOutcomes_.set(pathString, {
@@ -1321,14 +1316,13 @@ export function repoStartServerListen(
     data: unknown,
     wire: ListenWireResult
   ) => {
+    if (repo.liveListens_.get(listenKey) !== listenToken) {
+      // Stopped (and possibly re-subscribed) while this answer was queued:
+      // it belongs to a subscription that no longer exists.
+      return;
+    }
     const events = onComplete(status, data);
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-    if (status === 'ok') {
-      // Applied in wire order (the deferred stream queues this behind any
-      // pending base or full push), so everything this listen's view holds
-      // is now hash-verified or server-replaced.
-      repo.certifiedListens_.add(repoListenKey(pathString, tag));
-    }
     if (!isDefaultComplete) {
       return;
     }
@@ -1746,7 +1740,8 @@ export function repoStartServerListen(
           const events = syncTreeApplyServerOverwrite(
             repo.serverSyncTree_,
             query._path,
-            restored
+            restored,
+            'restore'
           );
           eventQueueRaiseEventsForChangedPath(
             repo.eventQueue_,
@@ -1803,7 +1798,7 @@ export function repoStopServerListen(
   tag: number | null
 ): void {
   const pathString = query._path.toString();
-  repo.certifiedListens_.delete(repoListenKey(pathString, tag));
+  repo.liveListens_.delete(repoListenKey(pathString, tag));
   if (tag != null || !query._queryParams.loadsAllData()) {
     repo.server_.unlisten(query, tag);
     return;
@@ -1942,7 +1937,7 @@ export function repoDispose(repo: Repo): void {
     }
   }
   repoClearListenOutcomes(repo);
-  repo.certifiedListens_.clear();
+  repo.liveListens_.clear();
   repo.persistenceAuthScopeListeners_.clear();
   repo.persistence_?.dispose();
 }
@@ -2160,20 +2155,6 @@ function repoListenKey(pathString: string, tag: number | null): string {
 }
 
 /**
- * Whether the SyncTree view a cached read for `query` would be served from
- * belongs to a listen the server has certified. Nothing complete covering
- * the path counts as not certified (a cached answer should not exist then;
- * failing toward the server is the safe direction).
- */
-function repoServingListenCertified(repo: Repo, query: QueryContext): boolean {
-  const serving = syncTreeServingListen(repo.serverSyncTree_, query);
-  return (
-    serving !== null &&
-    repo.certifiedListens_.has(repoListenKey(serving.path, serving.tag))
-  );
-}
-
-/**
  * The purpose of `getValue` is to return the latest known value
  * satisfying `query`.
  *
@@ -2193,14 +2174,12 @@ export function repoGetValue(
   query: QueryContext,
   eventRegistration: ValueEventRegistration
 ): Promise<Node> {
-  // Only active queries are cached, and only a certified listen's cache is
-  // server truth: a persistent listen's restored base sits in its view until
-  // the server answers (repoStartServerListen), and that view can outlive the
-  // listen (a surviving descendant's or filtered view's takeover, a shadowing
-  // ancestor). Ask the SyncTree which listen serves this read and trust the
-  // cache only if that listen has been answered 'ok'.
-  const cached = syncTreeGetServerValue(repo.serverSyncTree_, query);
-  if (cached != null && repoServingListenCertified(repo, query)) {
+  // Only active queries are cached, and only a VERIFIED cache is served: a
+  // persistent listen's restored tree sits in its views (and any view seeded
+  // from them) unverified until the server replaces or confirms it
+  // (CacheNode.isVerified). The bit lives on the view the value comes from.
+  const cached = syncTreeGetVerifiedServerValue(repo.serverSyncTree_, query);
+  if (cached != null) {
     return Promise.resolve(cached);
   }
   return repo.server_.get(query).then(

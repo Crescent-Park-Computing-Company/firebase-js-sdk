@@ -30,10 +30,11 @@ import {
   View,
   viewAddEventRegistration,
   viewApplyOperation,
-  viewGetCompleteServerCache,
   viewGetInitialEvents,
   viewIsEmpty,
-  viewRemoveEventRegistration
+  viewRemoveEventRegistration,
+  viewGetCompleteServerCache,
+  viewGetCompleteServerCacheNode
 } from './view/View';
 import { newViewCache } from './view/ViewCache';
 import {
@@ -126,7 +127,8 @@ export function syncPointGetView(
   query: QueryContext,
   writesCache: WriteTreeRef,
   serverCache: Node | null,
-  serverCacheComplete: boolean
+  serverCacheComplete: boolean,
+  serverCacheVerified = true
 ): View {
   const queryId = query._queryIdentifier;
   const view = syncPoint.views.get(queryId);
@@ -151,7 +153,12 @@ export function syncPointGetView(
     }
     const viewCache = newViewCache(
       new CacheNode(eventCache, eventCacheComplete, false),
-      new CacheNode(serverCache, serverCacheComplete, false)
+      new CacheNode(
+        serverCache,
+        serverCacheComplete,
+        false,
+        serverCacheVerified
+      )
     );
     return new View(query, viewCache);
   }
@@ -174,14 +181,16 @@ export function syncPointAddEventRegistration(
   eventRegistration: EventRegistration,
   writesCache: WriteTreeRef,
   serverCache: Node | null,
-  serverCacheComplete: boolean
+  serverCacheComplete: boolean,
+  serverCacheVerified = true
 ): Event[] {
   const view = syncPointGetView(
     syncPoint,
     query,
     writesCache,
     serverCache,
-    serverCacheComplete
+    serverCacheComplete,
+    serverCacheVerified
   );
   if (!syncPoint.views.has(query._queryIdentifier)) {
     syncPoint.views.set(query._queryIdentifier, view);
@@ -272,25 +281,26 @@ export function syncPointGetCompleteServerCache(
   syncPoint: SyncPoint,
   path: Path
 ): Node | null {
-  const view = syncPointServingView(syncPoint, path);
-  return view === null ? null : viewGetCompleteServerCache(view, path);
+  let serverCache: Node | null = null;
+  for (const view of syncPoint.views.values()) {
+    serverCache = serverCache || viewGetCompleteServerCache(view, path);
+  }
+  return serverCache;
 }
 
 /**
- * The view at this SyncPoint whose complete server cache answers `path`, if
- * any: the first view (in insertion order) with a complete cache that covers
- * the path, i.e. the one syncPointGetCompleteServerCache reads from.
+ * Same as syncPointGetCompleteServerCache, as a CacheNode carrying the
+ * owning view's `verified` bit (see viewGetCompleteServerCacheNode).
  */
-export function syncPointServingView(
+export function syncPointGetCompleteServerCacheNode(
   syncPoint: SyncPoint,
   path: Path
-): View | null {
+): CacheNode | null {
+  let serverCache: CacheNode | null = null;
   for (const view of syncPoint.views.values()) {
-    if (viewGetCompleteServerCache(view, path) !== null) {
-      return view;
-    }
+    serverCache = serverCache || viewGetCompleteServerCacheNode(view, path);
   }
-  return null;
+  return serverCache;
 }
 
 export function syncPointViewForQuery(

@@ -87,7 +87,8 @@ export class View {
     const newServerCache = new CacheNode(
       serverSnap,
       initialServerCache.isFullyInitialized(),
-      indexFilter.filtersNodes()
+      indexFilter.filtersNodes(),
+      initialServerCache.isVerified()
     );
     const newEventCache = new CacheNode(
       eventSnap,
@@ -129,6 +130,31 @@ export function viewGetCompleteServerCache(
     }
   }
   return null;
+}
+
+/**
+ * The complete server cache this view holds for `path`, as a CacheNode that
+ * carries the view's `verified` bit, so a view seeded from it inherits the
+ * provenance along with the data.
+ */
+export function viewGetCompleteServerCacheNode(
+  view: View,
+  path: Path
+): CacheNode | null {
+  const node = viewGetCompleteServerCache(view, path);
+  return node === null
+    ? null
+    : new CacheNode(
+        node,
+        true,
+        false,
+        view.viewCache_.serverCache.isVerified()
+      );
+}
+
+/** Whether this view's server cache is verified (see CacheNode.isVerified). */
+export function viewIsServerCacheVerified(view: View): boolean {
+  return view.viewCache_.serverCache.isVerified();
 }
 
 export function viewIsEmpty(view: View): boolean {

@@ -19,7 +19,11 @@ import { assert, assertionError } from '@firebase/util';
 
 import { AckUserWrite } from '../operation/AckUserWrite';
 import { Merge } from '../operation/Merge';
-import { Operation, OperationType } from '../operation/Operation';
+import {
+  Operation,
+  OperationType,
+  OperationVerification
+} from '../operation/Operation';
 import { Overwrite } from '../operation/Overwrite';
 import { ChildrenNode } from '../snap/ChildrenNode';
 import { KEY_INDEX } from '../snap/indexes/KeyIndex';
@@ -125,7 +129,8 @@ export function viewProcessorApplyOperation(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        overwrite.source.verification
       );
     }
   } else if (operation.type === OperationType.MERGE) {
@@ -153,7 +158,8 @@ export function viewProcessorApplyOperation(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        merge.source.verification
       );
     }
   } else if (operation.type === OperationType.ACK_USER_WRITE) {
@@ -352,9 +358,16 @@ function viewProcessorApplyServerOverwrite(
   writesCache: WriteTreeRef,
   completeCache: Node | null,
   filterServerNode: boolean,
-  accumulator: ChildChangeAccumulator
+  accumulator: ChildChangeAccumulator,
+  verification: OperationVerification
 ): ViewCache {
   const oldServerSnap = oldViewCache.serverCache;
+  if (verification === 'restore' && !pathIsEmpty(changePath)) {
+    // A restored tree only ever covers the views at and below its listen;
+    // an ancestor view keeps its own (server) data rather than absorbing
+    // unverified bytes it could later serve as verified.
+    return oldViewCache;
+  }
   let newServerCache;
   const serverFilter = filterServerNode
     ? viewProcessor.filter
@@ -403,11 +416,19 @@ function viewProcessorApplyServerOverwrite(
       );
     }
   }
+  // A full overwrite carries the operation's provenance; a partial one
+  // cannot verify (or unverify) the parts it does not touch.
+  const verified = !pathIsEmpty(changePath)
+    ? oldServerSnap.isVerified()
+    : verification === 'keep'
+    ? oldServerSnap.isVerified()
+    : verification === 'verify';
   const newViewCache = viewCacheUpdateServerSnap(
     oldViewCache,
     newServerCache,
     oldServerSnap.isFullyInitialized() || pathIsEmpty(changePath),
-    serverFilter.filtersNodes()
+    serverFilter.filtersNodes(),
+    verified
   );
   const source = new WriteTreeCompleteChildSource(
     writesCache,
@@ -588,7 +609,8 @@ function viewProcessorApplyServerMerge(
   writesCache: WriteTreeRef,
   serverCache: Node | null,
   filterServerNode: boolean,
-  accumulator: ChildChangeAccumulator
+  accumulator: ChildChangeAccumulator,
+  verification: OperationVerification
 ): ViewCache {
   // If we don't have a cache yet, this merge was intended for a previously listen in the same location. Ignore it and
   // wait for the complete data update coming soon.
@@ -634,7 +656,8 @@ function viewProcessorApplyServerMerge(
         writesCache,
         serverCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        verification
       );
     }
   });
@@ -659,7 +682,8 @@ function viewProcessorApplyServerMerge(
         writesCache,
         serverCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        verification
       );
     }
   });
@@ -700,7 +724,9 @@ function viewProcessorAckUserWrite(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        // Re-applying the view's own cache: its provenance is unchanged.
+        'keep'
       );
     } else if (pathIsEmpty(ackPath)) {
       // This is a goofy edge case where we are acking data at this location but don't have full data.  We
@@ -717,7 +743,8 @@ function viewProcessorAckUserWrite(
         writesCache,
         completeCache,
         filterServerNode,
-        accumulator
+        accumulator,
+        'keep'
       );
     } else {
       return viewCache;
@@ -742,7 +769,8 @@ function viewProcessorAckUserWrite(
       writesCache,
       completeCache,
       filterServerNode,
-      accumulator
+      accumulator,
+      'keep'
     );
   }
 }
@@ -755,11 +783,14 @@ function viewProcessorListenComplete(
   accumulator: ChildChangeAccumulator
 ): ViewCache {
   const oldServerNode = viewCache.serverCache;
+  // The server answered the listen covering this view: whatever the view
+  // holds now is hash-confirmed or was replaced by that listen's pushes.
   const newViewCache = viewCacheUpdateServerSnap(
     viewCache,
     oldServerNode.getNode(),
     oldServerNode.isFullyInitialized() || pathIsEmpty(path),
-    oldServerNode.isFiltered()
+    oldServerNode.isFiltered(),
+    oldServerNode.isVerified() || pathIsEmpty(path)
   );
   return viewProcessorGenerateEventCacheAfterServerEvent(
     viewProcessor,

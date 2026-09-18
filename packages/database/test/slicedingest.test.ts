@@ -249,7 +249,7 @@ describe('sliced full-root push ingestion', () => {
       pendingSeedRestores_: new Map(),
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
-      certifiedListens_: new Set<string>(),
+      liveListens_: new Map<string, object>(),
       onDisconnect_: newSparseSnapshotTree(),
       infoData_: new SnapshotHolder(),
       infoSyncTree_: new SyncTree({

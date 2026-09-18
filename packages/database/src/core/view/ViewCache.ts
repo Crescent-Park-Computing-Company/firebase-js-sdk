@@ -52,11 +52,12 @@ export function viewCacheUpdateServerSnap(
   viewCache: ViewCache,
   serverSnap: Node,
   complete: boolean,
-  filtered: boolean
+  filtered: boolean,
+  verified: boolean
 ): ViewCache {
   return newViewCache(
     viewCache.eventCache,
-    new CacheNode(serverSnap, complete, filtered)
+    new CacheNode(serverSnap, complete, filtered, verified)
   );
 }
 
