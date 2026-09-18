@@ -2919,13 +2919,26 @@ declare class Repo {
      */
     listenOutcomes_: Map<string, ListenOutcomeState>;
     /**
-     * Persistent roots whose SyncTree value is RESTORED data the server has not
-     * yet replaced or certified (see repoHasUncertifiedRestoreCovering). Added
-     * when a restored base is applied; removed when the listen completes, when
-     * a full untagged overwrite at or above the root is APPLIED, or when the
-     * listen stops. Deliberately not derived from listenOutcomes_: that mode is
-     * a wire-progress label ('fallback' flips on receipt of a replacement push,
-     * before the push is applied), not a statement about SyncTree contents.
+     * Untrusted cache coverage: paths at or under which the SyncTree may hold a
+     * complete server cache that is RESTORED data the server has neither
+     * replaced nor certified (see repoHasUncertifiedRestoreCovering). The set
+     * follows the SyncTree's coverage, not any wire subscription's lifetime,
+     * and not listenOutcomes_ (a wire-progress label; 'fallback' flips on
+     * receipt of a replacement push, before it is applied):
+     *
+     * - added when a restored base is APPLIED to the SyncTree
+     *   (repoStartServerListen restore resolution);
+     * - inherited by every default listen the SyncTree starts whose coverage
+     *   intersects an entry (repoRestoredCoverageListenStarted): the SyncTree
+     *   seeds a new view from the covering cache and starts the takeover
+     *   listen BEFORE stopping the one it replaces, so a root removal with
+     *   surviving descendants and an ancestor shadowing a restored root both
+     *   hand their untrusted data to the new listen here;
+     * - retired when the listen at that exact path completes (certified, or
+     *   cancelled with its registrations), when a full untagged overwrite at
+     *   or above it is APPLIED (repoRestoredRootsReplaced), when the listen at
+     *   that exact path stops (its coverage is gone or was inherited above),
+     *   or on dispose.
      */
     restoredUncertifiedRoots_: Set<string>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
