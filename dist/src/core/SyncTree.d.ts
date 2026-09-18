@@ -213,11 +213,12 @@ export declare function syncTreeAddEventRegistration(syncTree: SyncTree, query: 
 export declare function syncTreeCalcCompleteEventCache(syncTree: SyncTree, path: Path, writeIdsToExclude?: number[]): Node;
 export declare function syncTreeGetServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
 /**
- * Like syncTreeGetServerValue, but null unless the view the value comes from
- * holds a VERIFIED server cache (CacheNode.isVerified): a persisted tree
- * installed ahead of the server's answer is not served. Trust is read off
- * the same view that produces the value (the retained exact-query view when
- * one exists, else a view seeded from the covering complete cache, which
+ * Like syncTreeGetServerValue, but null unless the value the view returns is
+ * VERIFIED (CacheNode.isVerified on its event cache): a persisted tree
+ * installed ahead of the server's answer is not served, nor is a filtered
+ * window a local write refilled from such a tree. Trust is read off the
+ * same view that produces the value (the retained exact-query view when one
+ * exists, else a view seeded from the covering complete cache, which
  * inherits that cache's bit), so it cannot name a different owner than the
  * data.
  */

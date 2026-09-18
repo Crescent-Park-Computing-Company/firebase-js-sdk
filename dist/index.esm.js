@@ -12161,7 +12161,16 @@ function newViewCache(eventCache, serverCache) {
     return { eventCache, serverCache };
 }
 function viewCacheUpdateEventSnap(viewCache, eventSnap, complete, filtered) {
-    return newViewCache(new CacheNode(eventSnap, complete, filtered), viewCache.serverCache);
+    // Provenance of the event result is settled once per operation
+    // (viewProcessorApplyOperation); carry the current bit through here.
+    return newViewCache(new CacheNode(eventSnap, complete, filtered, viewCache.eventCache.isVerified()), viewCache.serverCache);
+}
+function viewCacheSetEventVerified(viewCache, verified) {
+    const eventCache = viewCache.eventCache;
+    if (eventCache.isVerified() === verified) {
+        return viewCache;
+    }
+    return newViewCache(new CacheNode(eventCache.getNode(), eventCache.isFullyInitialized(), eventCache.isFiltered(), verified), viewCache.serverCache);
 }
 function viewCacheUpdateServerSnap(viewCache, serverSnap, complete, filtered, verified) {
     return newViewCache(viewCache.eventCache, new CacheNode(serverSnap, complete, filtered, verified));
@@ -13320,8 +13329,12 @@ function viewProcessorAssertIndexed(viewProcessor, viewCache) {
     assert(viewCache.eventCache.getNode().isIndexed(viewProcessor.filter.getIndex()), 'Event snap not indexed');
     assert(viewCache.serverCache.getNode().isIndexed(viewProcessor.filter.getIndex()), 'Server snap not indexed');
 }
-function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, writesCache, completeCache) {
+function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, writesCache, completeServerCache) {
     const accumulator = new ChildChangeAccumulator();
+    const completeCache = completeServerCache === null ? null : completeServerCache.getNode();
+    // Whether data borrowed from the covering cache is server truth. No cover
+    // (tagged operations, or nothing complete above) borrows nothing.
+    const coverVerified = completeServerCache === null || completeServerCache.isVerified();
     let newViewCache, filterServerNode;
     if (operation.type === OperationType.OVERWRITE) {
         const overwrite = operation;
@@ -13336,7 +13349,7 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
             filterServerNode =
                 overwrite.source.tagged ||
                     (oldViewCache.serverCache.isFiltered() && !pathIsEmpty(overwrite.path));
-            newViewCache = viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, overwrite.path, overwrite.snap, writesCache, completeCache, filterServerNode, accumulator, overwrite.source.verification);
+            newViewCache = viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, overwrite.path, overwrite.snap, writesCache, completeCache, filterServerNode, accumulator, overwrite.source.verification, coverVerified);
         }
     }
     else if (operation.type === OperationType.MERGE) {
@@ -13349,7 +13362,7 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
             // We filter the node if it's a tagged update or the node has been previously filtered
             filterServerNode =
                 merge.source.tagged || oldViewCache.serverCache.isFiltered();
-            newViewCache = viewProcessorApplyServerMerge(viewProcessor, oldViewCache, merge.path, merge.children, writesCache, completeCache, filterServerNode, accumulator, merge.source.verification);
+            newViewCache = viewProcessorApplyServerMerge(viewProcessor, oldViewCache, merge.path, merge.children, writesCache, completeCache, filterServerNode, accumulator, merge.source.verification, coverVerified);
         }
     }
     else if (operation.type === OperationType.ACK_USER_WRITE) {
@@ -13367,6 +13380,20 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
     else {
         throw assertionError('Unknown operation type: ' + operation.type);
     }
+    // Provenance of the returned value. At the view's own path the event cache
+    // is rebuilt from this view's server cache (plus local writes), so it is
+    // as verified as that cache. Below it, an incremental update may have
+    // borrowed complete children from the covering cache (CompleteChildSource)
+    // to refill a filtered window, so it stays verified only if it was, the
+    // server cache is, and the cover is. Conservative: an update under an
+    // unverified cover marks the result unverified whether or not it borrowed;
+    // the next full replacement or completion at this view resets it.
+    const eventVerified = pathIsEmpty(operation.path)
+        ? newViewCache.serverCache.isVerified()
+        : oldViewCache.eventCache.isVerified() &&
+            newViewCache.serverCache.isVerified() &&
+            coverVerified;
+    newViewCache = viewCacheSetEventVerified(newViewCache, eventVerified);
     const changes = accumulator.getChanges();
     viewProcessorMaybeAddValueEvent(oldViewCache, newViewCache, changes);
     return { viewCache: newViewCache, changes };
@@ -13460,7 +13487,7 @@ function viewProcessorGenerateEventCacheAfterServerEvent(viewProcessor, viewCach
         return viewCacheUpdateEventSnap(viewCache, newEventCache, oldEventSnap.isFullyInitialized() || pathIsEmpty(changePath), viewProcessor.filter.filtersNodes());
     }
 }
-function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePath, changedSnap, writesCache, completeCache, filterServerNode, accumulator, verification) {
+function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePath, changedSnap, writesCache, completeCache, filterServerNode, accumulator, verification, coverVerified) {
     const oldServerSnap = oldViewCache.serverCache;
     if (verification === 'restore' && !pathIsEmpty(changePath)) {
         // A restored tree only ever covers the views at and below its listen;
@@ -13500,11 +13527,15 @@ function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePa
         }
     }
     // A full overwrite carries the operation's provenance; a partial one
-    // cannot verify (or unverify) the parts it does not touch.
+    // cannot verify (or unverify) the parts it does not touch. A 'keep' fold
+    // is as verified as the base it was folded over: this view's own cache
+    // when the fold is at this view, the covering cache when it was folded
+    // above and propagated down (a range merge at a restored root replacing a
+    // descendant view's server-delivered window with restored bytes).
     const verified = !pathIsEmpty(changePath)
         ? oldServerSnap.isVerified()
         : verification === 'keep'
-            ? oldServerSnap.isVerified()
+            ? oldServerSnap.isVerified() && coverVerified
             : verification === 'verify';
     const newViewCache = viewCacheUpdateServerSnap(oldViewCache, newServerCache, oldServerSnap.isFullyInitialized() || pathIsEmpty(changePath), serverFilter.filtersNodes(), verified);
     const source = new WriteTreeCompleteChildSource(writesCache, newViewCache, completeCache);
@@ -13592,7 +13623,7 @@ function viewProcessorApplyMerge(viewProcessor, node, merge) {
     });
     return node;
 }
-function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedChildren, writesCache, serverCache, filterServerNode, accumulator, verification) {
+function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedChildren, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified) {
     // If we don't have a cache yet, this merge was intended for a previously listen in the same location. Ignore it and
     // wait for the complete data update coming soon.
     if (viewCache.serverCache.getNode().isEmpty() &&
@@ -13620,7 +13651,7 @@ function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedCh
                 .getNode()
                 .getImmediateChild(childKey);
             const newChild = viewProcessorApplyMerge(viewProcessor, serverChild, childTree);
-            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification);
+            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified);
         }
     });
     viewMergeTree.children.inorderTraversal((childKey, childMergeTree) => {
@@ -13631,7 +13662,7 @@ function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedCh
                 .getNode()
                 .getImmediateChild(childKey);
             const newChild = viewProcessorApplyMerge(viewProcessor, serverChild, childMergeTree);
-            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification);
+            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified);
         }
     });
     return curViewCache;
@@ -13651,7 +13682,7 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
             serverCache.isCompleteForPath(ackPath)) {
             return viewProcessorApplyServerOverwrite(viewProcessor, viewCache, ackPath, serverCache.getNode().getChild(ackPath), writesCache, completeCache, filterServerNode, accumulator, 
             // Re-applying the view's own cache: its provenance is unchanged.
-            'keep');
+            'keep', true);
         }
         else if (pathIsEmpty(ackPath)) {
             // This is a goofy edge case where we are acking data at this location but don't have full data.  We
@@ -13660,7 +13691,7 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
             serverCache.getNode().forEachChild(KEY_INDEX, (name, node) => {
                 changedChildren = changedChildren.set(new Path(name), node);
             });
-            return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep');
+            return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep', true);
         }
         else {
             return viewCache;
@@ -13675,7 +13706,7 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
                 changedChildren = changedChildren.set(mergePath, serverCache.getNode().getChild(serverCachePath));
             }
         });
-        return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep');
+        return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep', true);
     }
 }
 function viewProcessorListenComplete(viewProcessor, viewCache, path, writesCache, accumulator) {
@@ -13779,7 +13810,7 @@ class View {
         const serverSnap = indexFilter.updateFullNode(ChildrenNode.EMPTY_NODE, initialServerCache.getNode(), null);
         const eventSnap = filter.updateFullNode(ChildrenNode.EMPTY_NODE, initialEventCache.getNode(), null);
         const newServerCache = new CacheNode(serverSnap, initialServerCache.isFullyInitialized(), indexFilter.filtersNodes(), initialServerCache.isVerified());
-        const newEventCache = new CacheNode(eventSnap, initialEventCache.isFullyInitialized(), filter.filtersNodes());
+        const newEventCache = new CacheNode(eventSnap, initialEventCache.isFullyInitialized(), filter.filtersNodes(), initialEventCache.isVerified());
         this.viewCache_ = newViewCache(newEventCache, newServerCache);
         this.eventGenerator_ = new EventGenerator(this.query_);
     }
@@ -13817,9 +13848,15 @@ function viewGetCompleteServerCacheNode(view, path) {
         ? null
         : new CacheNode(node, true, false, view.viewCache_.serverCache.isVerified());
 }
-/** Whether this view's server cache is verified (see CacheNode.isVerified). */
-function viewIsServerCacheVerified(view) {
-    return view.viewCache_.serverCache.isVerified();
+/**
+ * Whether the value this view returns (its event cache: server data plus
+ * local writes) is built only from verified data. False while the view's
+ * server cache is a restored tree, or while a local write's refill of a
+ * filtered window borrowed from an unverified covering cache
+ * (see viewProcessorApplyOperation).
+ */
+function viewIsEventCacheVerified(view) {
+    return view.viewCache_.eventCache.isVerified();
 }
 function viewIsEmpty(view) {
     return view.eventRegistrations_.length === 0;
@@ -13999,7 +14036,9 @@ function syncPointGetView(syncPoint, query, writesCache, serverCache, serverCach
             eventCache = ChildrenNode.EMPTY_NODE;
             eventCacheComplete = false;
         }
-        const viewCache = newViewCache(new CacheNode(eventCache, eventCacheComplete, false), new CacheNode(serverCache, serverCacheComplete, false, serverCacheVerified));
+        const viewCache = newViewCache(
+        // The initial event cache is derived from this server cache alone.
+        new CacheNode(eventCache, eventCacheComplete, false, serverCacheVerified), new CacheNode(serverCache, serverCacheComplete, false, serverCacheVerified));
         return new View(query, viewCache);
     }
     return view;
@@ -14645,17 +14684,18 @@ function syncTreeCalcCompleteEventCache(syncTree, path, writeIdsToExclude) {
     return writeTreeCalcCompleteEventCache(writeTree, path, serverCache, writeIdsToExclude, includeHiddenSets);
 }
 /**
- * Like syncTreeGetServerValue, but null unless the view the value comes from
- * holds a VERIFIED server cache (CacheNode.isVerified): a persisted tree
- * installed ahead of the server's answer is not served. Trust is read off
- * the same view that produces the value (the retained exact-query view when
- * one exists, else a view seeded from the covering complete cache, which
+ * Like syncTreeGetServerValue, but null unless the value the view returns is
+ * VERIFIED (CacheNode.isVerified on its event cache): a persisted tree
+ * installed ahead of the server's answer is not served, nor is a filtered
+ * window a local write refilled from such a tree. Trust is read off the
+ * same view that produces the value (the retained exact-query view when one
+ * exists, else a view seeded from the covering complete cache, which
  * inherits that cache's bit), so it cannot name a different owner than the
  * data.
  */
 function syncTreeGetVerifiedServerValue(syncTree, query) {
     const view = syncTreeGetServerView_(syncTree, query);
-    return viewIsServerCacheVerified(view) ? viewGetCompleteNode(view) : null;
+    return viewIsEventCacheVerified(view) ? viewGetCompleteNode(view) : null;
 }
 function syncTreeGetServerView_(syncTree, query) {
     const path = query._path;
@@ -14699,7 +14739,11 @@ function syncTreeApplyOperationToSyncPoints_(syncTree, operation) {
     /*serverCache=*/ null, writeTreeChildWrites(syncTree.pendingWriteTree_, newEmptyPath()));
 }
 /**
- * Recursive helper for applyOperationToSyncPoints_
+ * Recursive helper for applyOperationToSyncPoints_. The `serverCache`
+ * threaded down is the first complete server cache found on the way from
+ * the root: the covering cache a view may borrow complete children from
+ * (CompleteChildSource). It travels as a CacheNode so its provenance
+ * reaches the view that borrows from it.
  */
 function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, writesCache) {
     if (pathIsEmpty(operation.path)) {
@@ -14709,16 +14753,14 @@ function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, wr
         const syncPoint = syncPointTree.get(newEmptyPath());
         // If we don't have cached server data, see if we can get it from this SyncPoint.
         if (serverCache == null && syncPoint != null) {
-            serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
+            serverCache = syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
         }
         let events = [];
         const childName = pathGetFront(operation.path);
         const childOperation = operation.operationForChild(childName);
         const childTree = syncPointTree.children.get(childName);
         if (childTree && childOperation) {
-            const childServerCache = serverCache
-                ? serverCache.getImmediateChild(childName)
-                : null;
+            const childServerCache = cacheNodeChild(serverCache, childName);
             const childWritesCache = writeTreeRefChild(writesCache, childName);
             events = events.concat(syncTreeApplyOperationHelper_(childOperation, childTree, childServerCache, childWritesCache));
         }
@@ -14728,6 +14770,11 @@ function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, wr
         return events;
     }
 }
+function cacheNodeChild(cache, childName) {
+    return cache
+        ? new CacheNode(cache.getNode().getImmediateChild(childName), true, false, cache.isVerified())
+        : null;
+}
 /**
  * Recursive helper for applyOperationToSyncPoints_
  */
@@ -14735,13 +14782,11 @@ function syncTreeApplyOperationDescendantsHelper_(operation, syncPointTree, serv
     const syncPoint = syncPointTree.get(newEmptyPath());
     // If we don't have cached server data, see if we can get it from this SyncPoint.
     if (serverCache == null && syncPoint != null) {
-        serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
+        serverCache = syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
     }
     let events = [];
     syncPointTree.children.inorderTraversal((childName, childTree) => {
-        const childServerCache = serverCache
-            ? serverCache.getImmediateChild(childName)
-            : null;
+        const childServerCache = cacheNodeChild(serverCache, childName);
         const childWritesCache = writeTreeRefChild(writesCache, childName);
         const childOperation = operation.operationForChild(childName);
         if (childOperation) {

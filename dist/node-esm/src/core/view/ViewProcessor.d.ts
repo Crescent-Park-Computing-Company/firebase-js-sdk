@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 import { Operation } from '../operation/Operation';
-import { Node } from '../snap/Node';
 import { WriteTreeRef } from '../WriteTree';
+import { CacheNode } from './CacheNode';
 import { Change } from './Change';
 import { NodeFilter } from './filter/NodeFilter';
 import { ViewCache } from './ViewCache';
@@ -29,4 +29,4 @@ export interface ViewProcessor {
 }
 export declare function newViewProcessor(filter: NodeFilter): ViewProcessor;
 export declare function viewProcessorAssertIndexed(viewProcessor: ViewProcessor, viewCache: ViewCache): void;
-export declare function viewProcessorApplyOperation(viewProcessor: ViewProcessor, oldViewCache: ViewCache, operation: Operation, writesCache: WriteTreeRef, completeCache: Node | null): ProcessorResult;
+export declare function viewProcessorApplyOperation(viewProcessor: ViewProcessor, oldViewCache: ViewCache, operation: Operation, writesCache: WriteTreeRef, completeServerCache: CacheNode | null): ProcessorResult;

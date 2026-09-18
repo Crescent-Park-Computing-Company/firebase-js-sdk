@@ -44,7 +44,7 @@ export declare class SyncPoint {
 }
 export declare function syncPointSetReferenceConstructor(val: ReferenceConstructor): void;
 export declare function syncPointIsEmpty(syncPoint: SyncPoint): boolean;
-export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation: Operation, writesCache: WriteTreeRef, optCompleteServerCache: Node | null): Event[];
+export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation: Operation, writesCache: WriteTreeRef, optCompleteServerCache: CacheNode | null): Event[];
 /**
  * Get a view for the specified query.
  *

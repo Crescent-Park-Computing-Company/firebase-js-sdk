@@ -51,8 +51,14 @@ export declare function viewGetCompleteServerCache(view: View, path: Path): Node
  * provenance along with the data.
  */
 export declare function viewGetCompleteServerCacheNode(view: View, path: Path): CacheNode | null;
-/** Whether this view's server cache is verified (see CacheNode.isVerified). */
-export declare function viewIsServerCacheVerified(view: View): boolean;
+/**
+ * Whether the value this view returns (its event cache: server data plus
+ * local writes) is built only from verified data. False while the view's
+ * server cache is a restored tree, or while a local write's refill of a
+ * filtered window borrowed from an unverified covering cache
+ * (see viewProcessorApplyOperation).
+ */
+export declare function viewIsEventCacheVerified(view: View): boolean;
 export declare function viewIsEmpty(view: View): boolean;
 export declare function viewAddEventRegistration(view: View, eventRegistration: EventRegistration): void;
 /**
@@ -64,5 +70,5 @@ export declare function viewRemoveEventRegistration(view: View, eventRegistratio
 /**
  * Applies the given Operation, updates our cache, and returns the appropriate events.
  */
-export declare function viewApplyOperation(view: View, operation: Operation, writesCache: WriteTreeRef, completeServerCache: Node | null): Event[];
+export declare function viewApplyOperation(view: View, operation: Operation, writesCache: WriteTreeRef, completeServerCache: CacheNode | null): Event[];
 export declare function viewGetInitialEvents(view: View, registration: EventRegistration): Event[];
