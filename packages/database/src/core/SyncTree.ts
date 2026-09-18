@@ -72,7 +72,7 @@ import {
   viewGetCompleteNode,
   viewGetCompleteServerCache,
   viewGetServerCache,
-  viewIsServerCacheVerified
+  viewIsEventCacheVerified
 } from './view/View';
 import {
   newWriteTree,
@@ -837,11 +837,12 @@ export function syncTreeGetServerValue(
 }
 
 /**
- * Like syncTreeGetServerValue, but null unless the view the value comes from
- * holds a VERIFIED server cache (CacheNode.isVerified): a persisted tree
- * installed ahead of the server's answer is not served. Trust is read off
- * the same view that produces the value (the retained exact-query view when
- * one exists, else a view seeded from the covering complete cache, which
+ * Like syncTreeGetServerValue, but null unless the value the view returns is
+ * VERIFIED (CacheNode.isVerified on its event cache): a persisted tree
+ * installed ahead of the server's answer is not served, nor is a filtered
+ * window a local write refilled from such a tree. Trust is read off the
+ * same view that produces the value (the retained exact-query view when one
+ * exists, else a view seeded from the covering complete cache, which
  * inherits that cache's bit), so it cannot name a different owner than the
  * data.
  */
@@ -850,7 +851,7 @@ export function syncTreeGetVerifiedServerValue(
   query: QueryContext
 ): Node | null {
   const view = syncTreeGetServerView_(syncTree, query);
-  return viewIsServerCacheVerified(view) ? viewGetCompleteNode(view) : null;
+  return viewIsEventCacheVerified(view) ? viewGetCompleteNode(view) : null;
 }
 
 function syncTreeGetServerView_(syncTree: SyncTree, query: QueryContext): View {
@@ -913,12 +914,16 @@ function syncTreeApplyOperationToSyncPoints_(
 }
 
 /**
- * Recursive helper for applyOperationToSyncPoints_
+ * Recursive helper for applyOperationToSyncPoints_. The `serverCache`
+ * threaded down is the first complete server cache found on the way from
+ * the root: the covering cache a view may borrow complete children from
+ * (CompleteChildSource). It travels as a CacheNode so its provenance
+ * reaches the view that borrows from it.
  */
 function syncTreeApplyOperationHelper_(
   operation: Operation,
   syncPointTree: ImmutableTree<SyncPoint>,
-  serverCache: Node | null,
+  serverCache: CacheNode | null,
   writesCache: WriteTreeRef
 ): Event[] {
   if (pathIsEmpty(operation.path)) {
@@ -933,7 +938,10 @@ function syncTreeApplyOperationHelper_(
 
     // If we don't have cached server data, see if we can get it from this SyncPoint.
     if (serverCache == null && syncPoint != null) {
-      serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
+      serverCache = syncPointGetCompleteServerCacheNode(
+        syncPoint,
+        newEmptyPath()
+      );
     }
 
     let events: Event[] = [];
@@ -941,9 +949,7 @@ function syncTreeApplyOperationHelper_(
     const childOperation = operation.operationForChild(childName);
     const childTree = syncPointTree.children.get(childName);
     if (childTree && childOperation) {
-      const childServerCache = serverCache
-        ? serverCache.getImmediateChild(childName)
-        : null;
+      const childServerCache = cacheNodeChild(serverCache, childName);
       const childWritesCache = writeTreeRefChild(writesCache, childName);
       events = events.concat(
         syncTreeApplyOperationHelper_(
@@ -965,27 +971,42 @@ function syncTreeApplyOperationHelper_(
   }
 }
 
+function cacheNodeChild(
+  cache: CacheNode | null,
+  childName: string
+): CacheNode | null {
+  return cache
+    ? new CacheNode(
+        cache.getNode().getImmediateChild(childName),
+        true,
+        false,
+        cache.isVerified()
+      )
+    : null;
+}
+
 /**
  * Recursive helper for applyOperationToSyncPoints_
  */
 function syncTreeApplyOperationDescendantsHelper_(
   operation: Operation,
   syncPointTree: ImmutableTree<SyncPoint>,
-  serverCache: Node | null,
+  serverCache: CacheNode | null,
   writesCache: WriteTreeRef
 ): Event[] {
   const syncPoint = syncPointTree.get(newEmptyPath());
 
   // If we don't have cached server data, see if we can get it from this SyncPoint.
   if (serverCache == null && syncPoint != null) {
-    serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
+    serverCache = syncPointGetCompleteServerCacheNode(
+      syncPoint,
+      newEmptyPath()
+    );
   }
 
   let events: Event[] = [];
   syncPointTree.children.inorderTraversal((childName, childTree) => {
-    const childServerCache = serverCache
-      ? serverCache.getImmediateChild(childName)
-      : null;
+    const childServerCache = cacheNodeChild(serverCache, childName);
     const childWritesCache = writeTreeRefChild(writesCache, childName);
     const childOperation = operation.operationForChild(childName);
     if (childOperation) {

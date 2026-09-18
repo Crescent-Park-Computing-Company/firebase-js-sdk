@@ -88,7 +88,7 @@ export function syncPointApplyOperation(
   syncPoint: SyncPoint,
   operation: Operation,
   writesCache: WriteTreeRef,
-  optCompleteServerCache: Node | null
+  optCompleteServerCache: CacheNode | null
 ): Event[] {
   const queryId = operation.source.queryId;
   if (queryId !== null) {
@@ -152,7 +152,8 @@ export function syncPointGetView(
       eventCacheComplete = false;
     }
     const viewCache = newViewCache(
-      new CacheNode(eventCache, eventCacheComplete, false),
+      // The initial event cache is derived from this server cache alone.
+      new CacheNode(eventCache, eventCacheComplete, false, serverCacheVerified),
       new CacheNode(
         serverCache,
         serverCacheComplete,

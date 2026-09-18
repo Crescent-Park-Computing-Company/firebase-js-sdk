@@ -42,8 +42,34 @@ export function viewCacheUpdateEventSnap(
   complete: boolean,
   filtered: boolean
 ): ViewCache {
+  // Provenance of the event result is settled once per operation
+  // (viewProcessorApplyOperation); carry the current bit through here.
   return newViewCache(
-    new CacheNode(eventSnap, complete, filtered),
+    new CacheNode(
+      eventSnap,
+      complete,
+      filtered,
+      viewCache.eventCache.isVerified()
+    ),
+    viewCache.serverCache
+  );
+}
+
+export function viewCacheSetEventVerified(
+  viewCache: ViewCache,
+  verified: boolean
+): ViewCache {
+  const eventCache = viewCache.eventCache;
+  if (eventCache.isVerified() === verified) {
+    return viewCache;
+  }
+  return newViewCache(
+    new CacheNode(
+      eventCache.getNode(),
+      eventCache.isFullyInitialized(),
+      eventCache.isFiltered(),
+      verified
+    ),
     viewCache.serverCache
   );
 }

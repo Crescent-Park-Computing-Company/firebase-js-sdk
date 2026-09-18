@@ -74,6 +74,7 @@ import {
   ListenHashFn,
   PendingListenHashStore
 } from '../src/core/ServerCacheSeed';
+import { ChildrenNode } from '../src/core/snap/ChildrenNode';
 import { PRIORITY_INDEX } from '../src/core/snap/indexes/PriorityIndex';
 import { Node } from '../src/core/snap/Node';
 import { nodeFromJSON } from '../src/core/snap/nodeFromJSON';
@@ -81,6 +82,7 @@ import {
   SyncTree,
   syncTreeAddEventRegistration,
   syncTreeApplyServerOverwrite,
+  syncTreeApplyUserOverwrite,
   syncTreeGetCompleteServerCache,
   syncTreeRemoveEventRegistration,
   syncTreeGetServerValue,
@@ -2747,6 +2749,18 @@ describe('repoStartServerListen / repoStopServerListen', () => {
   }
 
   /**
+   * The registration a get() installs: matches itself, so repoGetValue's
+   * cleanup removes the temporary view it created (as the real
+   * ValueEventRegistration does) instead of leaking a verified view that a
+   * later get() would be answered from.
+   */
+  function getRegistration(): ValueEventRegistration {
+    const reg = stubRegistration();
+    reg.matches = (other: unknown) => other === reg;
+    return reg as unknown as ValueEventRegistration;
+  }
+
+  /**
    * A value registration that records every raised snapshot value — for
    * asserting the exact event SEQUENCE a listener observes (a fresh→stale
    * flip vs a single consistent value).
@@ -3265,7 +3279,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const getPromise = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     getResponders[0]({ msg: 'fresh' });
     const got = await getPromise;
@@ -3330,11 +3344,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       bobQuery,
       recordingRegistration(bobValues)
     );
-    const getPromise = repoGetValue(
-      repo,
-      bobQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const getPromise = repoGetValue(repo, bobQuery as never, getRegistration());
     getResponders[0]({ profile: 'bob' });
     const got = await getPromise;
     expect(got.val()).to.deep.equal({ profile: 'bob' });
@@ -3830,39 +3840,23 @@ describe('repoStartServerListen / repoStopServerListen', () => {
   });
 
   it('a get() under a restored-but-uncertified root goes to the server, then back to the cache once certified', async () => {
-    const {
-      repo,
-      query,
-      path,
-      hashFn,
-      onComplete,
-      calls,
-      serverCallbacks,
-      getResponders
-    } = makeListenHarness();
-    await persistHarnessRoot(repo, path, { cached: 'stale' });
-    // A live registration at the root, so the SyncTree retains the root's
-    // complete server cache (the restored base) the way a real onValue does.
-    const rootQuery = new QueryImpl(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      null as any,
-      path,
-      new QueryParams(),
-      false
-    );
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, { cached: 'stale', other: 'stale' });
+    wireRealProvider(repo);
+    const rootQuery = mkQuery(path);
     syncTreeAddEventRegistration(
       repo.serverSyncTree_,
       rootQuery,
       stubRegistration()
     );
-    repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
     // Phase 2: the restored base is the SyncTree's complete value for the
     // root and the listen is out but unanswered.
     expect(calls).to.deep.equal(['listen']);
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
-    ).to.deep.equal({ cached: 'stale' });
+    ).to.deep.equal({ cached: 'stale', other: 'stale' });
     expect(repo.listenOutcomes_.get(path.toString())?.outcome).to.deep.equal({
       mode: 'restored',
       certified: false,
@@ -3872,37 +3866,32 @@ describe('repoStartServerListen / repoStopServerListen', () => {
 
     // A get() for a descendant must not be answered from that base: it is a
     // request-response read whose caller treats the answer as server truth.
-    const childPath = new Path('users/alice/cached');
-    const childQuery = new QueryImpl(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      null as any,
-      childPath,
-      new QueryParams(),
-      false
-    );
+    const childQuery = mkQuery(new Path('users/alice/cached'));
     const uncertifiedGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
     getResponders[0]('fresh');
     expect((await uncertifiedGet).val()).to.equal('fresh');
 
-    // Certification: the SyncTree is server truth again and get() is
-    // answered locally, exactly as before.
+    // Certification (the real SyncTree ListenComplete): the restored tree is
+    // hash-confirmed server truth, so a get() of a descendant no earlier
+    // read touched is answered locally, exactly as before.
     serverCallbacks[0]('ok');
     await flushAsync();
     expect(
       repo.listenOutcomes_.get(path.toString())?.outcome?.certified
     ).to.equal(true);
+    const otherQuery = mkQuery(new Path('users/alice/other'));
     const certifiedGet = repoGetValue(
       repo,
-      childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      otherQuery as never,
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
-    expect((await certifiedGet).val()).to.equal('fresh');
+    expect((await certifiedGet).val()).to.equal('stale');
   });
 
   it('a get() keeps reading the server after a fallback push is RECEIVED, until that push is APPLIED', async () => {
@@ -3980,7 +3969,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const midWindowGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
     getResponders[0]('pushed');
@@ -3996,40 +3985,32 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const appliedGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
     expect((await appliedGet).val()).to.equal('pushed');
   });
 
   it('a range merge before certification corrects the restored base but does not make get() trust it', async () => {
-    const {
-      repo,
-      query,
-      path,
-      hashFn,
-      onComplete,
-      calls,
-      serverCallbacks,
-      getResponders
-    } = makeListenHarness();
-    await persistHarnessRoot(repo, path, { cached: 'stale', other: 1 });
-    const rootQuery = new QueryImpl(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      null as any,
-      path,
-      new QueryParams(),
-      false
-    );
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, {
+      cached: 'stale',
+      other: 1,
+      third: 3
+    });
+    wireRealProvider(repo);
+    allowWireData(repo);
+    const rootQuery = mkQuery(path);
     syncTreeAddEventRegistration(
       repo.serverSyncTree_,
       rootQuery,
       stubRegistration()
     );
-    repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
     // An incremental correction over the range (.., 'cached']: the rest of
-    // the tree ('other') is still the unverified restored base.
+    // the tree ('other', 'third') is still the unverified restored base.
     repoOnRangeMergeUpdateForTest(
       repo,
       path.toString(),
@@ -4039,31 +4020,29 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     await flushAsync();
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
-    ).to.deep.equal({ cached: 'merged', other: 1 });
-    const otherQuery = new QueryImpl(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      null as any,
-      new Path('users/alice/other'),
-      new QueryParams(),
-      false
-    );
+    ).to.deep.equal({ cached: 'merged', other: 1, third: 3 });
+    const otherQuery = mkQuery(new Path('users/alice/other'));
     const beforeCert = repoGetValue(
       repo,
       otherQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
     getResponders[0](2);
     expect((await beforeCert).val()).to.equal(2);
+
+    // The listen completes: the merged tree is confirmed. A descendant no
+    // earlier read touched is answered locally.
     serverCallbacks[0]('ok');
     await flushAsync();
+    const thirdQuery = mkQuery(new Path('users/alice/third'));
     const afterCert = repoGetValue(
       repo,
-      otherQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      thirdQuery as never,
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'get']);
-    await afterCert;
+    expect((await afterCert).val()).to.equal(3);
   });
 
   it('a filtered view seeded from a restored root survives root removal: its tagged listen must certify before get() trusts it', async () => {
@@ -4130,11 +4109,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(
       syncTreeGetServerValue(repo.serverSyncTree_, aQuery as never)?.val()
     ).to.equal('stale-a');
-    const survivingGet = repoGetValue(
-      repo,
-      aQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const survivingGet = repoGetValue(repo, aQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     getResponders[0]('fresh-a');
     expect((await survivingGet).val()).to.equal('fresh-a');
@@ -4142,30 +4117,10 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // The tagged listen certifies: local again.
     serverCallbacks[1]('ok');
     await flushAsync();
-    const certifiedGet = repoGetValue(
-      repo,
-      aQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const certifiedGet = repoGetValue(repo, aQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     await certifiedGet;
   });
-
-  function mkQuery(path: Path, params: QueryParams = new QueryParams()) {
-    return new QueryImpl(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      null as any,
-      path,
-      params,
-      false
-    );
-  }
-
-  function allowWireData(repo: Repo) {
-    (
-      repo as unknown as { interceptServerDataCallback_: null }
-    ).interceptServerDataCallback_ = null;
-  }
 
   it('a get() for the same filtered query as a certified tagged listener is served locally', async () => {
     const { repo, calls, serverCallbacks, listenTags } = makeListenHarness();
@@ -4198,11 +4153,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     );
     serverCallbacks[0]('ok');
     await flushAsync();
-    const got = repoGetValue(
-      repo,
-      limited as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const got = repoGetValue(repo, limited as never, getRegistration());
     expect(calls).to.deep.equal(['listen']);
     expect((await got).val()).to.deep.equal({ a: 1, b: 2 });
   });
@@ -4271,11 +4222,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     serverCallbacks[firstIdx]('ok');
     await flushAsync();
 
-    const firstGet = repoGetValue(
-      repo,
-      first as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const firstGet = repoGetValue(repo, first as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'listen', 'listen', 'unlisten']);
     expect((await firstGet).val()).to.deep.equal({
       a: 'fresh-a',
@@ -4286,11 +4233,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(
       syncTreeGetServerValue(repo.serverSyncTree_, last as never)?.val()
     ).to.deep.equal({ c: 'stale-c', d: 'stale-d' });
-    const lastGet = repoGetValue(
-      repo,
-      last as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const lastGet = repoGetValue(repo, last as never, getRegistration());
     expect(calls).to.deep.equal([
       'listen',
       'listen',
@@ -4371,11 +4314,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
 
     // get(items/a) is answered by that stale child view, not by the
     // certified ancestor: it must read the server.
-    const staleGet = repoGetValue(
-      repo,
-      aQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const staleGet = repoGetValue(repo, aQuery as never, getRegistration());
     expect(calls).to.deep.equal([
       'listen',
       'listen',
@@ -4390,11 +4329,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoOnDataUpdateForTest(repo, aPath.toString(), 'fresh-a', false, null);
     serverCallbacks[aIdx]('ok');
     await flushAsync();
-    const liveGet = repoGetValue(
-      repo,
-      aQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const liveGet = repoGetValue(repo, aQuery as never, getRegistration());
     expect(calls).to.deep.equal([
       'listen',
       'listen',
@@ -4459,14 +4394,157 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     // ancestor first. Had the restore grafted alice into that verified
     // view, this would be served stale as server truth.
     const childQuery = mkQuery(new Path('users/alice/cached'));
-    const childGet = repoGetValue(
-      repo,
-      childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const childGet = repoGetValue(repo, childQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'listen', 'get']);
     getResponders[0]('fresh');
     expect((await childGet).val()).to.equal('fresh');
+  });
+
+  it('a filtered window refilled by a local write from an uncertified covering root is not served by get()', async () => {
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, {
+      items: { a: 'stale-a', b: 'stale-b', c: 'stale-c' }
+    });
+    wireRealProvider(repo);
+    allowWireData(repo);
+    const rootQuery = mkQuery(path);
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    await flushAsync();
+    expect(calls).to.deep.equal(['listen']);
+
+    // A limited query under the live restored root, retained by a listener.
+    const itemsPath = new Path('users/alice/items');
+    const limited = mkQuery(
+      itemsPath,
+      queryParamsLimitToFirst(new QueryParams(), 2)
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      limited,
+      stubRegistration()
+    );
+
+    // get(limited) reads the server (its view is seeded from the restored
+    // root) and installs the fresh window through its tagged overwrite: the
+    // retained view's server cache is now verified.
+    const freshGet = repoGetValue(repo, limited as never, getRegistration());
+    expect(calls).to.deep.equal(['listen', 'get']);
+    getResponders[0]({ a: 'fresh-a', b: 'fresh-b' });
+    expect((await freshGet).val()).to.deep.equal({
+      a: 'fresh-a',
+      b: 'fresh-b'
+    });
+    const servedGet = repoGetValue(repo, limited as never, getRegistration());
+    expect(calls).to.deep.equal(['listen', 'get']);
+    expect((await servedGet).val()).to.deep.equal({
+      a: 'fresh-a',
+      b: 'fresh-b'
+    });
+
+    // A local remove inside the window, before the root certifies: the
+    // limit filter refills the window from the covering cache, which is
+    // still the restored tree ('c' is stale). The returned value now
+    // borrows unverified data even though the view's server cache did not.
+    syncTreeApplyUserOverwrite(
+      repo.serverSyncTree_,
+      new Path('users/alice/items/a'),
+      ChildrenNode.EMPTY_NODE,
+      1,
+      true
+    );
+    expect(
+      syncTreeGetServerValue(repo.serverSyncTree_, limited as never)?.val()
+    ).to.deep.equal({ b: 'fresh-b', c: 'stale-c' });
+    const refilledGet = repoGetValue(repo, limited as never, getRegistration());
+    expect(calls).to.deep.equal(['listen', 'get', 'get']);
+    getResponders[1]({ b: 'fresh-b', c: 'fresh-c' });
+    expect((await refilledGet).val()).to.deep.equal({
+      b: 'fresh-b',
+      c: 'fresh-c'
+    });
+
+    // The root certifies (its restored tree hash-confirmed, so 'c' really
+    // was 'stale-c' on the server): the refilled window is server truth.
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    const certifiedGet = repoGetValue(
+      repo,
+      limited as never,
+      getRegistration()
+    );
+    expect(calls).to.deep.equal(['listen', 'get', 'get']);
+    await certifiedGet;
+  });
+
+  it('a range merge at a restored root does not re-verify a descendant filtered window it folds restored bytes into', async () => {
+    const { repo, path, calls, serverCallbacks, getResponders } =
+      makeListenHarness();
+    await persistHarnessRoot(repo, path, {
+      items: { a: 'stale-a', b: 'stale-b', c: 'stale-c' },
+      other: 1
+    });
+    wireRealProvider(repo);
+    allowWireData(repo);
+    const rootQuery = mkQuery(path);
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      rootQuery,
+      stubRegistration()
+    );
+    await flushAsync();
+    const itemsPath = new Path('users/alice/items');
+    const limited = mkQuery(
+      itemsPath,
+      queryParamsLimitToFirst(new QueryParams(), 2)
+    );
+    syncTreeAddEventRegistration(
+      repo.serverSyncTree_,
+      limited,
+      stubRegistration()
+    );
+    const freshGet = repoGetValue(repo, limited as never, getRegistration());
+    expect(calls).to.deep.equal(['listen', 'get']);
+    getResponders[0]({ a: 'fresh-a', b: 'fresh-b' });
+    expect((await freshGet).val()).to.deep.equal({
+      a: 'fresh-a',
+      b: 'fresh-b'
+    });
+
+    // A range merge at the root corrects the range after items/c ('other'
+    // only). It is folded over
+    // the root's restored tree and applied as one overwrite, which reaches
+    // the descendant view as a full replacement of its window with the
+    // restored 'items': that data is as verified as the base it came from.
+    repoOnRangeMergeUpdateForTest(
+      repo,
+      path.toString(),
+      [{ s: 'items/c', m: { other: 2 } }],
+      null
+    );
+    await flushAsync();
+    expect(
+      syncTreeGetServerValue(repo.serverSyncTree_, limited as never)?.val()
+    ).to.deep.equal({ a: 'stale-a', b: 'stale-b' });
+    const foldedGet = repoGetValue(repo, limited as never, getRegistration());
+    expect(calls).to.deep.equal(['listen', 'get', 'get']);
+    getResponders[1]({ a: 'fresh-a', b: 'fresh-b' });
+    await foldedGet;
+
+    // The root certifies: everything under it is server truth.
+    serverCallbacks[0]('ok');
+    await flushAsync();
+    const certifiedGet = repoGetValue(
+      repo,
+      limited as never,
+      getRegistration()
+    );
+    expect(calls).to.deep.equal(['listen', 'get', 'get']);
+    await certifiedGet;
   });
 
   it("a listen completion queued behind an ingest gate does not certify the path's replacement subscription", async () => {
@@ -4512,11 +4590,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     expect(
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, bobPath)
     ).to.equal(null);
-    const emptyGet = repoGetValue(
-      repo,
-      bobQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const emptyGet = repoGetValue(repo, bobQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen', 'get']);
     getResponders[0]({ profile: 'bob' });
     expect((await emptyGet).val()).to.deep.equal({ profile: 'bob' });
@@ -4531,11 +4605,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     );
     serverCallbacks[1]('ok');
     await flushAsync();
-    const liveGet = repoGetValue(
-      repo,
-      bobQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const liveGet = repoGetValue(repo, bobQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen', 'unlisten', 'listen', 'get']);
     expect((await liveGet).val()).to.deep.equal({ profile: 'bob' });
   });
@@ -4546,6 +4616,22 @@ describe('repoStartServerListen / repoStopServerListen', () => {
    * SyncTree's own order. The two regressions below drive registrations
    * through the SyncTree so those seams fire exactly as in production.
    */
+  function mkQuery(path: Path, params: QueryParams = new QueryParams()) {
+    return new QueryImpl(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      null as any,
+      path,
+      params,
+      false
+    );
+  }
+
+  function allowWireData(repo: Repo) {
+    (
+      repo as unknown as { interceptServerDataCallback_: null }
+    ).interceptServerDataCallback_ = null;
+  }
+
   function wireRealProvider(repo: Repo): void {
     repo.serverSyncTree_ = new SyncTree({
       startListening: (query, tag, currentHashFn, onComplete) => {
@@ -4620,7 +4706,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const survivingGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     getResponders[0]('fresh');
@@ -4632,7 +4718,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const certifiedGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     await certifiedGet;
@@ -4691,7 +4777,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     const shadowedGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     getResponders[0]('fresh');
@@ -4712,12 +4798,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     serverCallbacks[1]('ok');
     await flushAsync();
     expect(
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, childPath)?.val()
+      syncTreeGetServerValue(repo.serverSyncTree_, childQuery as never)?.val()
     ).to.equal('live');
     const replacedGet = repoGetValue(
       repo,
       childQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
+      getRegistration()
     );
     expect(calls).to.deep.equal(['listen', 'listen', 'unlisten', 'get']);
     expect((await replacedGet).val()).to.equal('live');
@@ -4753,11 +4839,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       bobPath,
       nodeFromJSON({ profile: 'bob' })
     );
-    const got = await repoGetValue(
-      repo,
-      bobQuery as never,
-      stubRegistration() as unknown as ValueEventRegistration
-    );
+    const got = await repoGetValue(repo, bobQuery as never, getRegistration());
     expect(calls).to.deep.equal(['listen']);
     expect(got.val()).to.deep.equal({ profile: 'bob' });
   });
