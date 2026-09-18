@@ -453,10 +453,10 @@ export class Repo {
    * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
    * the server (repoGetValue). The entry follows the complete cache at the
    * root: nothing else retires it — not a range merge (server ranges folded
-   * over the restored base), not a descendant push, not a stop that leaves
-   * the cache in place — and when the cache goes it passes to the views that
-   * keep the bytes (repoHandDownUnconfirmedRestore). A stale entry can only
-   * send a get() to the server, never serve one.
+   * over the restored base), not a descendant push, not stopping the
+   * listen — and once the cache is gone the next server word under the root
+   * passes the entry to the views that keep the bytes. A stale entry can
+   * only send a get() to the server, never serve one.
    */
   unconfirmedRestores_ = new Map<string, Path>();
 
@@ -726,19 +726,59 @@ function repoOnDataUpdate(
 }
 
 /**
- * The server spoke for the whole subtree at `path`: every restored root at
- * or under it is confirmed. Two doors say so — an untagged overwrite (the
- * server sent the subtree), and the `ok` of the path's current default
- * listen (the server matched the hash of the subtree the listen carried; a
- * restore under it can only have landed before that listen existed, since a
- * default view shadows every descendant listen, so the hash covered it).
+ * The server spoke for the whole subtree at `path`. Two doors say so — an
+ * untagged overwrite (the server sent the subtree), and the `ok` of the
+ * path's current default listen (the server matched the hash of the raw
+ * cache the listen carried; a restore under it can only have landed before
+ * that listen existed, since a default view shadows every descendant
+ * listen, so the hash covered it). Every entry at or under `path` is
+ * confirmed.
+ *
+ * An entry above `path` is not — unless its root's complete cache is gone.
+ * SyncTree drops a view whose registrations are removed, covered or not,
+ * and one whose listen the server cancelled, without stopping anything on
+ * the wire; the restored bytes then live on only in the descendant default
+ * views it kept and restarted listens for (the shallowest complete view per
+ * branch; deeper ones are covered by it). The entry passes to those views,
+ * minus any this word already covers, and each is answered by its own
+ * listen. Until that first word the entry stays where it was, which only
+ * sends a get() on its line to the server.
  */
 function repoConfirmRestoresUnder(repo: Repo, path: Path): void {
-  for (const [rootString, rootPath] of repo.unconfirmedRestores_) {
+  for (const [rootString, rootPath] of [...repo.unconfirmedRestores_]) {
     if (pathContains(path, rootPath)) {
       repo.unconfirmedRestores_.delete(rootString);
+    } else if (
+      pathContains(rootPath, path) &&
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) === null
+    ) {
+      repo.unconfirmedRestores_.delete(rootString);
+      for (const survivor of repoSurvivingDefaultViews(repo, rootPath)) {
+        if (!pathContains(path, survivor)) {
+          repo.unconfirmedRestores_.set(survivor.toString(), survivor);
+        }
+      }
     }
   }
+}
+
+/** The shallowest complete default view on each branch under `rootPath`. */
+function repoSurvivingDefaultViews(repo: Repo, rootPath: Path): Path[] {
+  const frontier: Path[] = [];
+  // Shallowest first; `complete` is non-null only for a default view (see
+  // viewGetCompleteServerCache).
+  for (const state of syncTreeGetDescendantServerCacheStates(
+    repo.serverSyncTree_,
+    rootPath
+  )) {
+    if (
+      state.complete !== null &&
+      !frontier.some(covering => pathContains(covering, state.path))
+    ) {
+      frontier.push(state.path);
+    }
+  }
+  return frontier.map(relative => pathChild(rootPath, relative));
 }
 
 /**
@@ -1851,8 +1891,9 @@ export function repoStopServerListen(
   // lifting the gate drains the queue synchronously, and an `ok` queued
   // behind an ingest this stop cancels must not confirm bytes that ingest
   // was about to replace (processListenComplete checks the entry identity).
+  // The root's restore entry, if any, is untouched: a stop says nothing
+  // about the cache (see repoConfirmRestoresUnder).
   repo.listenOutcomes_.delete(pathString);
-  repoHandDownUnconfirmedRestore(repo, query._path);
   const pending = repo.pendingSeedRestores_.get(pathString);
   if (pending && !repo.ingestQueue_.gates.has(pathString)) {
     // Still waiting on the auth scope or manifest: the listen was never sent.
@@ -1868,48 +1909,6 @@ export function repoStopServerListen(
   repoLiftIngestGate(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
   repo.persistence_?.untrack(pathString);
-}
-
-/**
- * The entry follows the complete cache at the root, which a stopped listen
- * does not necessarily remove. Shadowed by a new ancestor listen, the root's
- * view and cache stay (SyncTree stops the wire listen only): the entry stays
- * with them, and the ancestor's answer — its overwrite or its `ok` — retires
- * it. Removed, the restored bytes outlive the root only in the
- * descendant default views SyncTree just restarted (the shallowest complete
- * view on each branch; deeper ones are covered by it and get no listen), so
- * the entry passes to exactly those: each is confirmed by its own answer. A
- * filtered survivor is not tracked — its answer is tagged, which nothing
- * here observes — so a get() for exactly that query may be served its
- * restored window for the one round trip until its listen answers.
- */
-function repoHandDownUnconfirmedRestore(repo: Repo, rootPath: Path): void {
-  const rootString = rootPath.toString();
-  if (
-    !repo.unconfirmedRestores_.has(rootString) ||
-    syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) !== null
-  ) {
-    return;
-  }
-  repo.unconfirmedRestores_.delete(rootString);
-  const frontier: Path[] = [];
-  // Shallowest first; `complete` is non-null only for a default view (see
-  // viewGetCompleteServerCache).
-  for (const state of syncTreeGetDescendantServerCacheStates(
-    repo.serverSyncTree_,
-    rootPath
-  )) {
-    if (
-      state.complete !== null &&
-      !frontier.some(covering => pathContains(covering, state.path))
-    ) {
-      frontier.push(state.path);
-    }
-  }
-  for (const relative of frontier) {
-    const path = pathChild(rootPath, relative);
-    repo.unconfirmedRestores_.set(path.toString(), path);
-  }
 }
 
 /** Observe the outcome of one exact default listen. @internal */

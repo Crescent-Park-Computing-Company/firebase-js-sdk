@@ -3649,7 +3649,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.not.equal(null);
     });
 
-    it('stopping the listen hands the entry to surviving descendant views; a queued ok for the stopped listen confirms nothing', async () => {
+    it("a stop leaves the entry where it is; a queued ok for the stopped listen confirms nothing; the survivor's own ok then takes the entry with it", async () => {
       const harness = makeListenHarness();
       const { repo, path, hashFn, onComplete, serverCallbacks } = harness;
       const root = await restoredRoot(harness, {
@@ -3688,10 +3688,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         syncTreeGetCompleteServerCache(repo.serverSyncTree_, inboxPath)?.val()
       ).to.deep.equal({ msg: 'stale' });
       expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
-        inboxPath.toString()
+        path.toString()
       ]);
       // The survivor's own listen (SyncTree sends it before stopping the
-      // root) confirms exactly the survivor.
+      // root): its ok is the first server word under the root, whose cache
+      // is gone — the entry passes to the survivors this word does not cover
+      // (none) and is retired.
       repoStartServerListen(
         repo,
         inboxQuery as never,
@@ -4001,7 +4003,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     it('root removal hands the entry to the frontier SyncTree restarts, not to every nested default view', async () => {
       const harness = makeListenHarness();
       wireProvider(harness);
-      const { repo, calls, serverCallbacks } = harness;
+      const { repo, path, calls, serverCallbacks } = harness;
       const root = await restoredRootWired(harness, {
         a: { b: { value: 1 }, other: 2 }
       });
@@ -4026,12 +4028,17 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       );
       expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
       expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
-        '/users/alice/a'
+        path.toString()
       ]);
-      // The server agrees with the cache (its answer is installed either way).
+      // The server agrees with the cache (its answer is installed either
+      // way). This first word under the root passes the entry to the
+      // frontier: /users/alice/a alone, since it covers /users/alice/a/b.
       expect(
         (await getFrom(harness, 'users/alice/a/b/value', 1)).from
       ).to.equal('server');
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        '/users/alice/a'
+      ]);
       // The survivor's hashes match: an `ok` with no data certifies its
       // whole cache, b included.
       serverCallbacks[1]('ok');
@@ -4041,7 +4048,88 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.deep.equal({ from: 'cache', value: 1 });
     });
 
-    it('a stop with no surviving default view leaves nothing tracked', async () => {
+    it("a shadowed root removed while covered (no wire stop), then the ancestor removed: the survivor's ok retires the entry", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        inbox: { msg: 'stale' }
+      });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/inbox'),
+        stubRegistration(undefined, true)
+      );
+      const usersQuery = defaultQuery('users');
+      const usersReg = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(repo.serverSyncTree_, usersQuery, usersReg);
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      // Alice's registration goes while /users covers her: SyncTree drops
+      // her view without a wire stop. Then /users goes: inbox restarts.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        usersQuery,
+        usersReg
+      );
+      expect(calls).to.deep.equal([
+        'listen',
+        'listen',
+        'unlisten',
+        'listen',
+        'unlisten'
+      ]);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // inbox's own listen answers: the first word under the root, whose
+      // cache is gone; inbox is the only survivor and this word covers it.
+      serverCallbacks[2]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it("a root the server cancels (no wire stop) with a surviving descendant: the survivor's ok retires the entry", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'stale' }, other: 1 });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/inbox'),
+        stubRegistration(undefined, true)
+      );
+      // permission_denied: SyncTree removes the root's view and restarts the
+      // survivor's listen with the cancel error, stopping nothing on the wire.
+      serverCallbacks[0]('permission_denied');
+      expect(calls).to.deep.equal(['listen', 'listen']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'stale' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;
       const root = await restoredRoot(harness, { inbox: { a: 1, b: 2 } });
@@ -4059,10 +4147,18 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         stubRegistration()
       );
       root.unsubscribe();
-      expect(repo.unconfirmedRestores_.size).to.equal(0);
       expect(
         syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
       ).to.equal(null);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // No cache under the root answers a get() anyway; the first answer
+      // that lands under it finds no default survivor and retires the entry.
+      expect((await getFrom(harness, 'users/alice/other', 7)).from).to.equal(
+        'server'
+      );
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
     });
 
     it('a restart of the same root confirms with its own ok', async () => {
@@ -4071,7 +4167,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         harness;
       const first = await restoredRoot(harness, { inbox: { msg: 'stale' } });
       first.unsubscribe();
-      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(repo.unconfirmedRestores_.size).to.equal(1);
       // The app resubscribes: the root restores again and the new listen's
       // ok confirms the new install.
       syncTreeAddEventRegistration(
