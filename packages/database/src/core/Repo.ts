@@ -376,6 +376,11 @@ interface ListenOutcomeState {
   subscribers: Set<(outcome: ListenOutcome) => void>;
 }
 
+interface UnconfirmedRestore {
+  path: Path;
+  confirmedUnder: Path[];
+}
+
 function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
   pending.cancelled = true;
   pending.authScopeUnsubscribe?.();
@@ -461,16 +466,14 @@ export class Repo {
    * listen — and once the cache is gone the next server word under the root
    * passes the entry to the views that keep the bytes. A stale entry can
    * only send a get() to the server, never serve one.
+   *
+   * Each entry carries the subtrees strictly under its root the server has
+   * since spoken for: a get() at or under one holds none of that root's
+   * restored bytes and keeps its cached answer while the rest waits. They
+   * are the entry's, not the path's — a new restore at the same root is a
+   * new entry with none, and a survivor an entry passes to starts with none.
    */
-  unconfirmedRestores_ = new Map<string, Path>();
-
-  /**
-   * Subtrees strictly under an unconfirmed root the server has since spoken
-   * for (an untagged overwrite, or a current default listen's `ok`), keyed
-   * by path: a get() at or under one holds no restored bytes and keeps its
-   * cached answer while the rest of the root waits. Pruned with the root.
-   */
-  confirmedUnderRestores_ = new Map<string, Path>();
+  unconfirmedRestores_ = new Map<string, UnconfirmedRestore>();
 
   constructor(
     public repoInfo_: RepoInfo,
@@ -757,38 +760,30 @@ function repoOnDataUpdate(
  * sends a get() on its line to the server.
  */
 function repoConfirmRestoresUnder(repo: Repo, path: Path): void {
-  for (const [rootString, rootPath] of [...repo.unconfirmedRestores_]) {
+  for (const [rootString, entry] of [...repo.unconfirmedRestores_]) {
+    const rootPath = entry.path;
     if (pathContains(path, rootPath)) {
-      repoRetireUnconfirmedRestore(repo, rootString, rootPath);
+      repo.unconfirmedRestores_.delete(rootString);
     } else if (!pathContains(rootPath, path)) {
       continue;
     } else if (
       syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) !== null
     ) {
       // Spoken for under a root that still holds restored bytes elsewhere.
-      repo.confirmedUnderRestores_.set(path.toString(), path);
+      entry.confirmedUnder.push(path);
     } else {
-      repoRetireUnconfirmedRestore(repo, rootString, rootPath);
+      repo.unconfirmedRestores_.delete(rootString);
       for (const survivor of repoSurvivingDefaultViews(repo, rootPath)) {
         if (!pathContains(path, survivor)) {
-          repo.unconfirmedRestores_.set(survivor.toString(), survivor);
+          repoTrackUnconfirmedRestore(repo, survivor);
         }
       }
     }
   }
 }
 
-function repoRetireUnconfirmedRestore(
-  repo: Repo,
-  rootString: string,
-  rootPath: Path
-): void {
-  repo.unconfirmedRestores_.delete(rootString);
-  for (const [confirmedString, confirmed] of repo.confirmedUnderRestores_) {
-    if (pathContains(rootPath, confirmed)) {
-      repo.confirmedUnderRestores_.delete(confirmedString);
-    }
-  }
+function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
+  repo.unconfirmedRestores_.set(path.toString(), { path, confirmedUnder: [] });
 }
 
 /** The shallowest complete default view on each branch under `rootPath`. */
@@ -1856,7 +1851,7 @@ export function repoStartServerListen(
           );
           // Installed even if this listen has since been stopped: the bytes
           // are in the SyncTree now, and only the server can vouch for them.
-          repo.unconfirmedRestores_.set(pathString, query._path);
+          repoTrackUnconfirmedRestore(repo, query._path);
           eventQueueRaiseEventsForChangedPath(
             repo.eventQueue_,
             query._path,
@@ -2277,19 +2272,18 @@ function repoCachedAnswerMayBeRestored(
 ): boolean {
   const path = query._path;
   let onLine = false;
-  for (const rootPath of repo.unconfirmedRestores_.values()) {
-    if (pathContains(rootPath, path) || pathContains(path, rootPath)) {
+  for (const entry of repo.unconfirmedRestores_.values()) {
+    if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
       onLine = true;
-      break;
+    } else {
+      continue;
+    }
+    if (entry.confirmedUnder.some(confirmed => pathContains(confirmed, path))) {
+      return false;
     }
   }
   if (!onLine) {
     return false;
-  }
-  for (const confirmed of repo.confirmedUnderRestores_.values()) {
-    if (pathContains(confirmed, path)) {
-      return false;
-    }
   }
   return (
     writeTreeRefCalcCompleteEventCache(

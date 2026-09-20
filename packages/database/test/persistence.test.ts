@@ -2637,7 +2637,6 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       unconfirmedRestores_: new Map(),
-      confirmedUnderRestores_: new Map(),
       interceptServerDataCallback_: null,
       // The boot-window drain reruns transactions after each replayed push;
       // the real Repo always carries this tree. (The legacy synchronous
@@ -4133,7 +4132,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
 
     it('a subtree the server has since overwritten keeps its cached answer while the rest of the root waits', async () => {
       const harness = makeListenHarness();
-      const { repo, serverCallbacks } = harness;
+      const { repo, path, serverCallbacks } = harness;
       await restoredRoot(harness, {
         inbox: { msg: 'stale' },
         settings: { theme: 'stale' }
@@ -4145,6 +4144,11 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         false,
         null
       );
+      expect(
+        repo.unconfirmedRestores_
+          .get(path.toString())!
+          .confirmedUnder.map(p => p.toString())
+      ).to.deep.equal(['/users/alice/inbox']);
       // At and under the pushed subtree: server bytes only.
       expect(
         await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
@@ -4165,10 +4169,9 @@ describe('repoStartServerListen / repoStopServerListen', () => {
           })
         ).from
       ).to.equal('server');
-      // The root's ok retires the entry and its confirmed subtrees together.
+      // The root's ok retires the entry, confirmed subtrees and all.
       serverCallbacks[0]('ok');
       expect(repo.unconfirmedRestores_.size).to.equal(0);
-      expect(repo.confirmedUnderRestores_.size).to.equal(0);
       expect(
         (await getFrom(harness, 'users/alice/settings', { theme: 'x' })).from
       ).to.equal('cache');
@@ -4215,9 +4218,12 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       // A push under the root, but off the survivor's line, is confirmed
       // under the root...
       repoOnDataUpdateForTest(repo, 'users/alice/a/other', 3, false, null);
-      expect([...repo.confirmedUnderRestores_.keys()]).to.deep.equal([
-        '/users/alice/a/other'
-      ]);
+      const under = (root: string) =>
+        repo.unconfirmedRestores_
+          .get(root)!
+          .confirmedUnder.map(p => p.toString())
+          .sort();
+      expect(under(path.toString())).to.deep.equal(['/users/alice/a/other']);
       // ...and reset when the root goes and the entry moves to /users/alice/a:
       // the survivor's own answer now decides for its whole cache.
       syncTreeRemoveEventRegistration(
@@ -4241,7 +4247,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
         '/users/alice/a'
       ]);
-      expect(repo.confirmedUnderRestores_.size).to.equal(0);
+      expect(under('/users/alice/a')).to.deep.equal([]);
       expect((await getFrom(harness, 'users/alice/a/other', 3)).from).to.equal(
         'server'
       );
@@ -4254,7 +4260,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         false,
         null
       );
-      expect([...repo.confirmedUnderRestores_.keys()].sort()).to.deep.equal([
+      expect(under('/users/alice/a')).to.deep.equal([
         '/users/alice/a/b',
         '/users/alice/a/other'
       ]);
@@ -4263,7 +4269,55 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.deep.equal({ from: 'cache', value: 10 });
       serverCallbacks[1]('ok');
       expect(repo.unconfirmedRestores_.size).to.equal(0);
-      expect(repo.confirmedUnderRestores_.size).to.equal(0);
+    });
+
+    it('a new restore at the same root starts with no confirmed subtrees', async () => {
+      const harness = makeListenHarness();
+      const { repo, query, path, hashFn, onComplete, serverCallbacks } =
+        harness;
+      const first = await restoredRoot(harness, {
+        inbox: { msg: 'stale' },
+        settings: { theme: 'stale' }
+      });
+      // inbox is confirmed under the first install...
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { msg: 'pushed' },
+        false,
+        null
+      );
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+      // ...the app unsubscribes with no surviving view (the persisted tree
+      // now holds the pushed inbox), and resubscribes: a second install.
+      first.unsubscribe();
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        first.rootQuery,
+        first.registration
+      );
+      repoStartServerListen(repo, query, null, hashFn, onComplete);
+      await flushAsync();
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.not.equal(null);
+      expect(
+        repo.unconfirmedRestores_.get(path.toString())!.confirmedUnder
+      ).to.deep.equal([]);
+      // The server may have moved while unsubscribed: nothing under the new
+      // install is confirmed until its own listen answers.
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'newer' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
     });
 
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
@@ -5023,7 +5077,6 @@ describe('stale restore vs live server data', () => {
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       unconfirmedRestores_: new Map(),
-      confirmedUnderRestores_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,

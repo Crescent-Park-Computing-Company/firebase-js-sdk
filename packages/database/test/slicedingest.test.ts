@@ -250,7 +250,6 @@ describe('sliced full-root push ingestion', () => {
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       unconfirmedRestores_: new Map(),
-      confirmedUnderRestores_: new Map(),
       onDisconnect_: newSparseSnapshotTree(),
       infoData_: new SnapshotHolder(),
       infoSyncTree_: new SyncTree({
