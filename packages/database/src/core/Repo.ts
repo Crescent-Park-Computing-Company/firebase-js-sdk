@@ -384,24 +384,25 @@ interface UnconfirmedRestore {
   /** Subtrees strictly under the root the server has since spoken for. */
   confirmedUnder: Path[];
   /**
-   * Filtered windows on the root's line the server has answered exactly,
-   * as the server-cache nodes holding those answers: a view's window after
-   * its tagged listen's `ok` or a tagged overwrite of the whole window (a
-   * get()'s own answer, the listen's first data), and after any tagged word
-   * into a window already certified. Nodes are immutable, so the node is
-   * the answer: SyncTree rebuilds a view's window from its ancestors' bytes
-   * (a range fold over the restored root, a replacement view seeded from a
-   * filtered ancestor, a get()'s temporary view recreated), and the rebuilt
-   * node is not this one. Weak: the entry certifies nodes, it does not keep
-   * them. The shared empty node is never certified.
+   * Filtered windows on the root's line the server has answered exactly:
+   * per registered view, the server-cache node holding its answer (after
+   * its tagged listen's `ok`, a tagged overwrite of the whole window such
+   * as a get()'s own answer, or a tagged word into a window already
+   * certified). Both identities. The node, because SyncTree rebuilds a
+   * view's window from its ancestors' bytes (a range fold over the restored
+   * root, a replacement view seeded from a filtered ancestor) and the
+   * rebuilt node is not the answered one; nodes are immutable. The view,
+   * because views at one path seeded from the same bytes share a node, and
+   * one query's hash match says nothing about another query's window.
+   * Weak: the entry certifies, it does not keep.
    */
-  confirmedNodes: WeakSet<Node>;
+  certifiedWindows: WeakMap<View, Node>;
 }
 
 /** The registered view that would answer `query`, if there is one. */
 function repoRegisteredView(repo: Repo, query: QueryContext): View | null {
   const syncPoint = repo.serverSyncTree_.syncPointTree_.get(query._path);
-  return syncPoint ? syncPointViewForQuery(syncPoint, query) : null;
+  return (syncPoint && syncPointViewForQuery(syncPoint, query)) || null;
 }
 
 /**
@@ -831,38 +832,40 @@ function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
   repo.unconfirmedRestores_.set(path.toString(), {
     path,
     confirmedUnder: [],
-    confirmedNodes: new WeakSet()
+    certifiedWindows: new WeakMap()
   });
 }
 
 /**
- * A tagged word about one filtered window at `path`, now holding `after`:
- * `complete` when the word was the whole window (the listen's `ok`, whose
- * hash the server matched; an overwrite at the query's own path), in which
- * case `after` is server truth outright. A partial word (a merge, an
- * overwrite below the query path) leaves restored bytes where it did not
- * write, so its result is server truth only where the window already was
- * (`before`). Per entry: a window certified against one root's bytes says
+ * A tagged word about `view`'s window at `path`, which held `before` and
+ * now holds `after`: `complete` when the word was the whole window (the
+ * listen's `ok`, whose hash the server matched; an overwrite at the query's
+ * own path), in which case `after` is server truth outright. A partial word
+ * (a merge, an overwrite below the query path) leaves restored bytes where
+ * it did not write, so its result is server truth only if the window
+ * already was. Per entry: a window certified against one root's bytes says
  * nothing about another entry's.
  */
 function repoCertifyWindow(
   repo: Repo,
   path: Path,
+  view: View,
   before: Node | null,
   after: Node | null,
   complete: boolean
 ): void {
-  if (after === null || after.isEmpty()) {
-    // The empty node is one shared instance; certifying it would certify
-    // every empty window. An empty answer is read from the server.
+  if (after === null) {
     return;
   }
   for (const entry of repo.unconfirmedRestores_.values()) {
     if (!pathContains(entry.path, path) && !pathContains(path, entry.path)) {
       continue;
     }
-    if (complete || (before !== null && entry.confirmedNodes.has(before))) {
-      entry.confirmedNodes.add(after);
+    if (
+      complete ||
+      (before !== null && entry.certifiedWindows.get(view) === before)
+    ) {
+      entry.certifiedWindows.set(view, after);
     }
   }
 }
@@ -889,6 +892,7 @@ function repoApplyTaggedWord(
     repoCertifyWindow(
       repo,
       tagged.path,
+      tagged.view,
       before,
       viewGetServerCache(tagged.view),
       !isMerge && pathEquals(path, tagged.path)
@@ -1559,8 +1563,14 @@ export function repoStartServerListen(
       ) {
         // A deferred `ok` for a view since replaced certifies nothing: the
         // replacement never carried this listen's hash.
-        const window = viewGetServerCache(listenView);
-        repoCertifyWindow(repo, query._path, window, window, true);
+        repoCertifyWindow(
+          repo,
+          query._path,
+          listenView,
+          null,
+          viewGetServerCache(listenView),
+          true
+        );
       }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
@@ -2410,7 +2420,7 @@ function repoCachedAnswerMayBeRestored(
   // query's certification is a subtree, in confirmedUnder; only filtered
   // windows are ever certified exactly).
   const view = repoRegisteredView(repo, query);
-  const window = view && viewGetServerCache(view);
+  const window = view === null ? null : viewGetServerCache(view);
   // Each entry on the query's line blocks unless its own confirmations
   // cover the query; one entry's confirmation says nothing about another's
   // restored bytes (a restore at a descendant of a retained ancestor entry).
@@ -2418,7 +2428,7 @@ function repoCachedAnswerMayBeRestored(
     entry =>
       (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
       !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path)) &&
-      !(window !== null && entry.confirmedNodes.has(window))
+      !(view !== null && entry.certifiedWindows.get(view) === window)
   );
   if (!blocked) {
     return false;

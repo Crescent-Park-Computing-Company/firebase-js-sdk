@@ -3432,17 +3432,27 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       return entry[1];
     }
 
-    /** Records the path of every wire listen, in order (serverCallbacks order). */
-    function recordListenPaths(harness: Harness): string[] {
+    /**
+     * Records every wire listen as SyncTree's `<path>$<queryId>` key, in
+     * order (serverCallbacks order).
+     */
+    function recordListens(harness: Harness): string[] {
       const { repo } = harness;
-      const listenPaths: string[] = [];
+      const listens: string[] = [];
       const realListen = repo.server_.listen.bind(repo.server_);
-      repo.server_.listen = ((query: { _path: Path }, ...rest: unknown[]) => {
-        listenPaths.push(query._path.toString());
+      repo.server_.listen = ((
+        query: { _path: Path; _queryIdentifier: string },
+        ...rest: unknown[]
+      ) => {
+        listens.push(query._path.toString() + '$' + query._queryIdentifier);
         return (realListen as (...args: unknown[]) => void)(query, ...rest);
       }) as never;
-      return listenPaths;
+      return listens;
     }
+    const listenAt = (listens: string[], pathString: string): number =>
+      listens.findIndex(key => key.startsWith('/' + pathString + '$'));
+    const listenFor = (listens: string[], query: QueryImpl): number =>
+      listens.indexOf(query._path.toString() + '$' + query._queryIdentifier);
 
     it('reads the server until the listen carrying the restored hashes completes ok', async () => {
       const harness = makeListenHarness();
@@ -4636,7 +4646,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       const harness = makeListenHarness();
       wireProvider(harness);
       const { repo, path, serverCallbacks } = harness;
-      const listenPaths = recordListenPaths(harness);
+      const listens = recordListens(harness);
       const root = await restoredRootWired(harness, {
         inbox: { a: { v: 1 }, b: { v: 2 } }
       });
@@ -4674,11 +4684,9 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         root.rootQuery,
         root.registration
       );
-      expect(listenPaths.slice(1).sort()).to.deep.equal([
-        '/users/alice/inbox',
-        '/users/alice/inbox/a'
-      ]);
-      const childListen = listenPaths.indexOf('/users/alice/inbox/a');
+      expect(listens.length).to.equal(3);
+      const childListen = listenAt(listens, 'users/alice/inbox/a');
+      expect(childListen).to.be.greaterThan(0);
       // Another root's ingest holds the stream: the child's ok is queued.
       repo.ingestQueue_.gates.set('/users/bob', { pathString: '/users/bob' });
       serverCallbacks[childListen]('ok');
@@ -4891,32 +4899,29 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.deep.equal({ from: 'cache', value: { a: { v: 7 } } });
     });
 
-    it('an empty answered window is never certified (the empty node is shared)', async () => {
+    it("two queries at one path share the restored seed node: one query's ok certifies only its own window", async () => {
       const harness = makeListenHarness();
       wireProvider(harness);
       const { repo, serverCallbacks } = harness;
-      const listenPaths = recordListenPaths(harness);
-      const root = await restoredRootWired(harness, {
-        inbox: { a: 1 },
-        drafts: { z: 1 }
-      });
-      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
-      const at = (p: string) =>
+      const listens = recordListens(harness);
+      const root = await restoredRootWired(harness, { inbox: { a: 1 } });
+      const at = (limit: number) =>
         new QueryImpl(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           null as any,
-          new Path(p),
-          firstOnly,
+          new Path('users/alice/inbox'),
+          queryParamsLimitToFirst(new QueryParams(), limit),
           false
         );
+      // Both seeded from the root's `inbox` node, the same object.
       syncTreeAddEventRegistration(
         repo.serverSyncTree_,
-        at('users/alice/inbox'),
+        at(1),
         stubRegistration(undefined, true)
       );
       syncTreeAddEventRegistration(
         repo.serverSyncTree_,
-        at('users/alice/drafts'),
+        at(2),
         stubRegistration(undefined, true)
       );
       syncTreeRemoveEventRegistration(
@@ -4924,24 +4929,39 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         root.rootQuery,
         root.registration
       );
-      // Both survivors listen. Empty the inbox window with its own data,
-      // then certify it with its ok.
+      // The server holds {a:1, b:2}: the narrower window's hash matches
+      // (ok without data), the wider one's does not (its answer is pending).
+      serverCallbacks[listenFor(listens, at(1))]('ok');
+      expect(
+        await getFrom(
+          harness,
+          'users/alice/inbox',
+          { a: 0 },
+          at(1)._queryParams
+        )
+      ).to.deep.equal({ from: 'cache', value: { a: 1 } });
+      // A partial word for the wider query into its (uncertified) window
+      // does not inherit the narrower query's certificate of the shared
+      // node. (The get() would certify; the word comes first.)
+      const tagFor = (query: QueryImpl) =>
+        repo.serverSyncTree_.queryToTagMap.get(
+          query._path.toString() + '$' + query._queryIdentifier
+        );
       repoOnDataUpdateForTest(
         repo,
-        'users/alice/inbox',
-        null,
+        'users/alice/inbox/a',
+        3,
         false,
-        tagAt(repo, 'users/alice/inbox')
+        tagFor(at(2))
       );
-      serverCallbacks[listenPaths.indexOf('/users/alice/inbox')]('ok');
-      // Drafts is still restored; an empty get answer for it would share
-      // the inbox's certified (empty) node if that were certified.
       expect(
-        (await getFrom(harness, 'users/alice/drafts', { z: 5 }, firstOnly)).from
-      ).to.equal('server');
-      expect(
-        (await getFrom(harness, 'users/alice/inbox', null, firstOnly)).from
-      ).to.equal('server');
+        await getFrom(
+          harness,
+          'users/alice/inbox',
+          { a: 3, b: 2 },
+          at(2)._queryParams
+        )
+      ).to.deep.equal({ from: 'server', value: { a: 3, b: 2 } });
     });
 
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
