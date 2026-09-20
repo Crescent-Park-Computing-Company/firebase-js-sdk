@@ -3423,6 +3423,27 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       return { from: fromServer ? 'server' : 'cache', value: node.val() };
     }
 
+    /** The tag of the (own-listen) filtered query registered at `pathString`. */
+    function tagAt(repo: Repo, pathString: string): number {
+      const entry = [...repo.serverSyncTree_.queryToTagMap.entries()].find(
+        ([key]) => key.startsWith('/' + pathString + '$')
+      );
+      expect(entry, 'tag at ' + pathString).to.not.equal(undefined);
+      return entry[1];
+    }
+
+    /** Records the path of every wire listen, in order (serverCallbacks order). */
+    function recordListenPaths(harness: Harness): string[] {
+      const { repo } = harness;
+      const listenPaths: string[] = [];
+      const realListen = repo.server_.listen.bind(repo.server_);
+      repo.server_.listen = ((query: { _path: Path }, ...rest: unknown[]) => {
+        listenPaths.push(query._path.toString());
+        return (realListen as (...args: unknown[]) => void)(query, ...rest);
+      }) as never;
+      return listenPaths;
+    }
+
     it('reads the server until the listen carrying the restored hashes completes ok', async () => {
       const harness = makeListenHarness();
       await restoredRoot(harness, { inbox: { msg: 'stale' } });
@@ -4615,13 +4636,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       const harness = makeListenHarness();
       wireProvider(harness);
       const { repo, path, serverCallbacks } = harness;
-      // Record which path each wire listen is for.
-      const listenPaths: string[] = [];
-      const realListen = repo.server_.listen.bind(repo.server_);
-      repo.server_.listen = ((query: { _path: Path }, ...rest: unknown[]) => {
-        listenPaths.push(query._path.toString());
-        return (realListen as (...args: unknown[]) => void)(query, ...rest);
-      }) as never;
+      const listenPaths = recordListenPaths(harness);
       const root = await restoredRootWired(harness, {
         inbox: { a: { v: 1 }, b: { v: 2 } }
       });
@@ -4690,6 +4705,242 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       expect(
         (await getFrom(harness, 'users/alice/inbox/a', { v: 9 }, firstOnly()))
           .from
+      ).to.equal('server');
+    });
+
+    it('a get() for a covered filtered query installs its answer into the covered view and certifies exactly that window', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, calls } = harness;
+      await restoredRootWired(harness, { inbox: { a: 1, b: 2 } });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      // Registered under the live root: covered (no listen of its own), but
+      // tagged, so the get()'s answer installs into this view.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox'),
+          firstOnly,
+          false
+        ),
+        stubRegistration(undefined, true)
+      );
+      expect(calls).to.deep.equal(['listen']);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 5 }, firstOnly)
+      ).to.deep.equal({ from: 'server', value: { a: 5 } });
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)
+      ).to.deep.equal({ from: 'cache', value: { a: 5 } });
+      // The root's own bytes at inbox are still restored.
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { a: 6, b: 7 })).from
+      ).to.equal('server');
+    });
+
+    it('a tagged range merge folds restored bytes into a certified window: the certificate does not follow', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        inbox: { a: { v: 1 }, b: { v: 2 } }
+      });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox'),
+          firstOnly,
+          false
+        ),
+        stubRegistration(undefined, true)
+      );
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      serverCallbacks[1]('ok');
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)
+      ).to.deep.equal({ from: 'cache', value: { a: { v: 1 } } });
+      // The survivor's own tag; the fold's base is its window.
+      repoOnRangeMergeUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        [{ s: 'a/v', e: 'a/v', m: { a: { v: 9 } } }],
+        tagAt(repo, 'users/alice/inbox')
+      );
+      await flushAsync();
+      expectIngestIdle(repo);
+      // The window now holds the fold (server ranges over restored bytes),
+      // a node the server never answered as a whole.
+      expect(
+        (
+          await getFrom(
+            harness,
+            'users/alice/inbox',
+            { a: { v: 9 } },
+            firstOnly
+          )
+        ).from
+      ).to.equal('server');
+    });
+
+    it("a tagged listen's later data keeps a certified window certified, and does not certify an uncertified one", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        inbox: { a: { v: 1 }, b: { v: 2 } }
+      });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox'),
+          firstOnly,
+          false
+        ),
+        stubRegistration(undefined, true)
+      );
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      const tag = tagAt(repo, 'users/alice/inbox');
+      // Before the ok, partial words into restored bytes certify nothing:
+      // a merge below the query path, a merge at it, an overwrite below it.
+      // (One get() afterwards: a get() that reads the server installs and
+      // certifies its own answer.)
+      repoOnDataUpdateForTest(repo, 'users/alice/inbox/a', { v: 3 }, true, tag);
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { a: { v: 5 } },
+        true,
+        tag
+      );
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox/a',
+        { v: 6 },
+        false,
+        tag
+      );
+      expect(
+        (
+          await getFrom(
+            harness,
+            'users/alice/inbox',
+            { a: { v: 6 } },
+            firstOnly
+          )
+        ).from
+      ).to.equal('server');
+      // The listen's ok certifies its window; the same merge afterwards
+      // keeps the result certified.
+      serverCallbacks[1]('ok');
+      repoOnDataUpdateForTest(repo, 'users/alice/inbox/a', { v: 4 }, true, tag);
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)
+      ).to.deep.equal({ from: 'cache', value: { a: { v: 4 } } });
+    });
+
+    it("a tagged overwrite of the whole window is the server's answer outright", async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo } = harness;
+      const root = await restoredRootWired(harness, {
+        inbox: { a: { v: 1 }, b: { v: 2 } }
+      });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox'),
+          firstOnly,
+          false
+        ),
+        stubRegistration(undefined, true)
+      );
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      // The listen's first data, at the query path, before any ok.
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { a: { v: 7 } },
+        false,
+        tagAt(repo, 'users/alice/inbox')
+      );
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)
+      ).to.deep.equal({ from: 'cache', value: { a: { v: 7 } } });
+    });
+
+    it('an empty answered window is never certified (the empty node is shared)', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, serverCallbacks } = harness;
+      const listenPaths = recordListenPaths(harness);
+      const root = await restoredRootWired(harness, {
+        inbox: { a: 1 },
+        drafts: { z: 1 }
+      });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      const at = (p: string) =>
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path(p),
+          firstOnly,
+          false
+        );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        at('users/alice/inbox'),
+        stubRegistration(undefined, true)
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        at('users/alice/drafts'),
+        stubRegistration(undefined, true)
+      );
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      // Both survivors listen. Empty the inbox window with its own data,
+      // then certify it with its ok.
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        null,
+        false,
+        tagAt(repo, 'users/alice/inbox')
+      );
+      serverCallbacks[listenPaths.indexOf('/users/alice/inbox')]('ok');
+      // Drafts is still restored; an empty get answer for it would share
+      // the inbox's certified (empty) node if that were certified.
+      expect(
+        (await getFrom(harness, 'users/alice/drafts', { z: 5 }, firstOnly)).from
+      ).to.equal('server');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', null, firstOnly)).from
       ).to.equal('server');
     });
 

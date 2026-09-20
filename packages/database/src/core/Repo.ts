@@ -101,6 +101,7 @@ import {
   Path,
   pathChild,
   pathContains,
+  pathEquals,
   pathGetFront,
   pathPopFront,
   pathSlice
@@ -139,7 +140,7 @@ import {
   eventQueueRaiseEventsForChangedPath
 } from './view/EventQueue';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
-import { View } from './view/View';
+import { View, viewGetServerCache } from './view/View';
 import {
   writeTreeChildWrites,
   writeTreeRefCalcCompleteEventCache
@@ -383,21 +384,45 @@ interface UnconfirmedRestore {
   /** Subtrees strictly under the root the server has since spoken for. */
   confirmedUnder: Path[];
   /**
-   * Filtered views on the root's line the server has since answered
-   * exactly (their tagged listen's `ok`, or a get()'s own tagged answer):
-   * that answer is the window's server truth, whatever the root holds. The
-   * view instance, not its query: a view SyncTree drops (a get()'s
-   * temporary one, an unsubscribed listener's) takes its answer with it,
-   * and the next view for the same query is seeded from the root again.
-   * Weak: the entry certifies views, it does not keep them.
+   * Filtered windows on the root's line the server has answered exactly,
+   * as the server-cache nodes holding those answers: a view's window after
+   * its tagged listen's `ok` or a tagged overwrite of the whole window (a
+   * get()'s own answer, the listen's first data), and after any tagged word
+   * into a window already certified. Nodes are immutable, so the node is
+   * the answer: SyncTree rebuilds a view's window from its ancestors' bytes
+   * (a range fold over the restored root, a replacement view seeded from a
+   * filtered ancestor, a get()'s temporary view recreated), and the rebuilt
+   * node is not this one. Weak: the entry certifies nodes, it does not keep
+   * them. The shared empty node is never certified.
    */
-  confirmedViews: WeakSet<View>;
+  confirmedNodes: WeakSet<Node>;
 }
 
 /** The registered view that would answer `query`, if there is one. */
 function repoRegisteredView(repo: Repo, query: QueryContext): View | null {
   const syncPoint = repo.serverSyncTree_.syncPointTree_.get(query._path);
   return syncPoint ? syncPointViewForQuery(syncPoint, query) : null;
+}
+
+/**
+ * The view a tag's listen serves, with its path, while the query is still
+ * registered (SyncTree retires the tag with the view, so a word for a
+ * retired tag finds nothing — as SyncTree itself drops it).
+ */
+function repoViewForTag(
+  repo: Repo,
+  tag: number
+): { view: View; path: Path } | null {
+  // SyncTree's query key is `<path>$<queryId>`.
+  const queryKey = repo.serverSyncTree_.tagToQueryMap.get(tag);
+  if (queryKey === undefined) {
+    return null;
+  }
+  const split = queryKey.indexOf('$');
+  const path = new Path(queryKey.substring(0, split));
+  const syncPoint = repo.serverSyncTree_.syncPointTree_.get(path);
+  const view = syncPoint && syncPoint.views.get(queryKey.substring(split + 1));
+  return view ? { view, path } : null;
 }
 
 function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
@@ -806,22 +831,70 @@ function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
   repo.unconfirmedRestores_.set(path.toString(), {
     path,
     confirmedUnder: [],
-    confirmedViews: new WeakSet()
+    confirmedNodes: new WeakSet()
   });
 }
 
 /**
- * The server answered this filtered query exactly: its tagged listen's `ok`
- * (the server matched the hash of the window the listen carried) or a
- * get()'s own tagged answer. That certifies the view holding that answer,
- * on every entry whose line it lies on, and nothing else.
+ * A tagged word about one filtered window at `path`, now holding `after`:
+ * `complete` when the word was the whole window (the listen's `ok`, whose
+ * hash the server matched; an overwrite at the query's own path), in which
+ * case `after` is server truth outright. A partial word (a merge, an
+ * overwrite below the query path) leaves restored bytes where it did not
+ * write, so its result is server truth only where the window already was
+ * (`before`). Per entry: a window certified against one root's bytes says
+ * nothing about another entry's.
  */
-function repoConfirmViewOnLine(repo: Repo, path: Path, view: View): void {
+function repoCertifyWindow(
+  repo: Repo,
+  path: Path,
+  before: Node | null,
+  after: Node | null,
+  complete: boolean
+): void {
+  if (after === null || after.isEmpty()) {
+    // The empty node is one shared instance; certifying it would certify
+    // every empty window. An empty answer is read from the server.
+    return;
+  }
   for (const entry of repo.unconfirmedRestores_.values()) {
-    if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
-      entry.confirmedViews.add(view);
+    if (!pathContains(entry.path, path) && !pathContains(path, entry.path)) {
+      continue;
+    }
+    if (complete || (before !== null && entry.confirmedNodes.has(before))) {
+      entry.confirmedNodes.add(after);
     }
   }
+}
+
+/**
+ * Applies a tagged server word (a listen's data, a get()'s answer) and
+ * certifies the window it wrote. The tag names the view (every filtered
+ * query has one, listening or covered); for a retired tag SyncTree
+ * installs nothing, and nothing is certified. A tagged range merge folds
+ * restored bytes into the window and does not come through here; its
+ * result is read from the server.
+ */
+function repoApplyTaggedWord(
+  repo: Repo,
+  path: Path,
+  tag: number | null,
+  isMerge: boolean,
+  apply: () => Event[]
+): Event[] {
+  const tagged = tag == null ? null : repoViewForTag(repo, tag);
+  const before = tagged && viewGetServerCache(tagged.view);
+  const events = apply();
+  if (tagged) {
+    repoCertifyWindow(
+      repo,
+      tagged.path,
+      before,
+      viewGetServerCache(tagged.view),
+      !isMerge && pathEquals(path, tagged.path)
+    );
+  }
+  return events;
 }
 
 /** The shallowest complete default view on each branch under `rootPath`. */
@@ -878,26 +951,26 @@ function repoApplyDataUpdate(
     : data;
   let events = [];
   if (tag) {
-    if (isMerge) {
-      const taggedChildren = map(
-        data as { [k: string]: unknown },
-        (raw: unknown) => nodeFromJSON(raw)
-      );
-      events = syncTreeApplyTaggedQueryMerge(
+    events = repoApplyTaggedWord(repo, path, tag, isMerge, () => {
+      if (isMerge) {
+        const taggedChildren = map(
+          data as { [k: string]: unknown },
+          (raw: unknown) => nodeFromJSON(raw)
+        );
+        return syncTreeApplyTaggedQueryMerge(
+          repo.serverSyncTree_,
+          path,
+          taggedChildren,
+          tag
+        );
+      }
+      return syncTreeApplyTaggedQueryOverwrite(
         repo.serverSyncTree_,
         path,
-        taggedChildren,
+        nodeFromJSON(data),
         tag
       );
-    } else {
-      const taggedSnap = nodeFromJSON(data);
-      events = syncTreeApplyTaggedQueryOverwrite(
-        repo.serverSyncTree_,
-        path,
-        taggedSnap,
-        tag
-      );
-    }
+    });
   } else if (isMerge) {
     const changedChildren = map(
       data as { [k: string]: unknown },
@@ -1486,7 +1559,8 @@ export function repoStartServerListen(
       ) {
         // A deferred `ok` for a view since replaced certifies nothing: the
         // replacement never carried this listen's hash.
-        repoConfirmViewOnLine(repo, query._path, listenView);
+        const window = viewGetServerCache(listenView);
+        repoCertifyWindow(repo, query._path, window, window, true);
       }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
@@ -2322,7 +2396,7 @@ function repoGetNextWriteId(repo: Repo): number {
 /**
  * Whether a cached answer for `query` could hold restored bytes: an
  * unconfirmed root lies on its line (at, above, or below it) whose own
- * confirmations (a subtree covering the query, or the registered view that
+ * confirmations (a subtree covering the query, or the very window that
  * would answer it) do not cover it, and no complete local write shadows it
  * (the write tree answers before the server cache is consulted, so such a
  * get() never touched server bytes on base either).
@@ -2332,10 +2406,11 @@ function repoCachedAnswerMayBeRestored(
   query: QueryContext
 ): boolean {
   const path = query._path;
-  // The view that would answer, if one is registered (a default query's
-  // certification is a subtree, in confirmedUnder; only filtered views are
-  // ever certified exactly).
+  // The window that would answer, if a view is registered (a default
+  // query's certification is a subtree, in confirmedUnder; only filtered
+  // windows are ever certified exactly).
   const view = repoRegisteredView(repo, query);
+  const window = view && viewGetServerCache(view);
   // Each entry on the query's line blocks unless its own confirmations
   // cover the query; one entry's confirmation says nothing about another's
   // restored bytes (a restore at a descendant of a retained ancestor entry).
@@ -2343,7 +2418,7 @@ function repoCachedAnswerMayBeRestored(
     entry =>
       (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
       !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path)) &&
-      !(view !== null && entry.confirmedViews.has(view))
+      !(window !== null && entry.confirmedNodes.has(window))
   );
   if (!blocked) {
     return false;
@@ -2430,18 +2505,14 @@ export function repoGetValue(
         events = repoApplyConfirmedServerOverwrite(repo, query._path, node);
       } else {
         const tag = syncTreeTagForQuery(repo.serverSyncTree_, query);
-        events = syncTreeApplyTaggedQueryOverwrite(
-          repo.serverSyncTree_,
-          query._path,
-          node,
-          tag
+        events = repoApplyTaggedWord(repo, query._path, tag, false, () =>
+          syncTreeApplyTaggedQueryOverwrite(
+            repo.serverSyncTree_,
+            query._path,
+            node,
+            tag
+          )
         );
-        // The view the answer was just installed into (the get()'s own
-        // registration is on it).
-        const answered = repoRegisteredView(repo, query);
-        if (answered !== null) {
-          repoConfirmViewOnLine(repo, query._path, answered);
-        }
       }
       /*
        * We need to raise events in the scenario where `get()` is called at a parent path, and
