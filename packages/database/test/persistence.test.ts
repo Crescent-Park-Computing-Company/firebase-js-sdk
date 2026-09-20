@@ -4611,6 +4611,88 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.equal('server');
     });
 
+    it('a deferred tagged ok for a view since replaced does not certify the replacement', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, serverCallbacks } = harness;
+      // Record which path each wire listen is for.
+      const listenPaths: string[] = [];
+      const realListen = repo.server_.listen.bind(repo.server_);
+      repo.server_.listen = ((query: { _path: Path }, ...rest: unknown[]) => {
+        listenPaths.push(query._path.toString());
+        return (realListen as (...args: unknown[]) => void)(query, ...rest);
+      }) as never;
+      const root = await restoredRootWired(harness, {
+        inbox: { a: { v: 1 }, b: { v: 2 } }
+      });
+      const firstOnly = () => queryParamsLimitToFirst(new QueryParams(), 1);
+      // A filtered ancestor whose window holds `a`, and a filtered query
+      // below `a`; both covered by the root.
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox'),
+          firstOnly(),
+          false
+        ),
+        stubRegistration(undefined, true)
+      );
+      const childQuery = () =>
+        new QueryImpl(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          null as any,
+          new Path('users/alice/inbox/a'),
+          firstOnly(),
+          false
+        );
+      const childReg = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        childQuery(),
+        childReg
+      );
+      // The root goes: both filtered listens start.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(listenPaths.slice(1).sort()).to.deep.equal([
+        '/users/alice/inbox',
+        '/users/alice/inbox/a'
+      ]);
+      const childListen = listenPaths.indexOf('/users/alice/inbox/a');
+      // Another root's ingest holds the stream: the child's ok is queued.
+      repo.ingestQueue_.gates.set('/users/bob', { pathString: '/users/bob' });
+      serverCallbacks[childListen]('ok');
+      // Unsubscribe and recreate the child query: the replacement view is
+      // seeded from the still-restored filtered ancestor's window.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        childQuery(),
+        childReg
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        childQuery(),
+        stubRegistration(undefined, true)
+      );
+      repoLiftIngestGateForTest(repo, '/users/bob');
+      await flushAsync();
+      expectIngestIdle(repo);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // The stale ok certified nothing: the replacement's window is restored
+      // bytes until its own listen answers.
+      expect(
+        (await getFrom(harness, 'users/alice/inbox/a', { v: 9 }, firstOnly()))
+          .from
+      ).to.equal('server');
+    });
+
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;

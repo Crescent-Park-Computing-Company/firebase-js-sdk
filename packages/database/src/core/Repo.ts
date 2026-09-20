@@ -389,8 +389,9 @@ interface UnconfirmedRestore {
    * view instance, not its query: a view SyncTree drops (a get()'s
    * temporary one, an unsubscribed listener's) takes its answer with it,
    * and the next view for the same query is seeded from the root again.
+   * Weak: the entry certifies views, it does not keep them.
    */
-  confirmedViews: Set<View>;
+  confirmedViews: WeakSet<View>;
 }
 
 /** The registered view that would answer `query`, if there is one. */
@@ -805,7 +806,7 @@ function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
   repo.unconfirmedRestores_.set(path.toString(), {
     path,
     confirmedUnder: [],
-    confirmedViews: new Set()
+    confirmedViews: new WeakSet()
   });
 }
 
@@ -815,12 +816,7 @@ function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
  * get()'s own tagged answer. That certifies the view holding that answer,
  * on every entry whose line it lies on, and nothing else.
  */
-function repoConfirmViewOnLine(repo: Repo, query: QueryContext): void {
-  const view = repoRegisteredView(repo, query);
-  if (view === null) {
-    return;
-  }
-  const path = query._path;
+function repoConfirmViewOnLine(repo: Repo, path: Path, view: View): void {
   for (const entry of repo.unconfirmedRestores_.values()) {
     if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
       entry.confirmedViews.add(view);
@@ -1453,8 +1449,11 @@ export function repoStartServerListen(
   }
   // This listen is the path's current one exactly while its outcome state
   // is: repoStopServerListen retires the entry on entry, a later start
-  // replaces it.
+  // replaces it. A filtered listen is its view's: SyncTree registers the
+  // view before it starts the listen, and replaces the view (and its tag)
+  // when the query is unsubscribed and re-registered.
   const outcomeState = repo.listenOutcomes_.get(pathString);
+  const listenView = isDefaultComplete ? null : repoRegisteredView(repo, query);
 
   let activeMode: ListenOutcomeMode = 'cold';
   let activeReason: ListenOutcomeReason | undefined;
@@ -1481,8 +1480,13 @@ export function repoStartServerListen(
       // sent before the `ok` has applied (the ingest queue keeps wire order).
       if (isDefaultComplete) {
         repoConfirmRestoresUnder(repo, query._path);
-      } else {
-        repoConfirmViewOnLine(repo, query);
+      } else if (
+        listenView !== null &&
+        repoRegisteredView(repo, query) === listenView
+      ) {
+        // A deferred `ok` for a view since replaced certifies nothing: the
+        // replacement never carried this listen's hash.
+        repoConfirmViewOnLine(repo, query._path, listenView);
       }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
@@ -2432,7 +2436,12 @@ export function repoGetValue(
           node,
           tag
         );
-        repoConfirmViewOnLine(repo, query);
+        // The view the answer was just installed into (the get()'s own
+        // registration is on it).
+        const answered = repoRegisteredView(repo, query);
+        if (answered !== null) {
+          repoConfirmViewOnLine(repo, query._path, answered);
+        }
       }
       /*
        * We need to raise events in the scenario where `get()` is called at a parent path, and
