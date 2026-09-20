@@ -4548,6 +4548,69 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ]);
     });
 
+    it("a get()'s tagged answer certifies its temporary view only: the next identical get() reads the server again", async () => {
+      const harness = makeListenHarness();
+      const { repo, path } = harness;
+      await restoredRoot(harness, { inbox: { a: 1, b: 2 } });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      // No listener for the filtered query: the get()'s view is temporary
+      // and gone once it resolves.
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 5 }, firstOnly)
+      ).to.deep.equal({ from: 'server', value: { a: 5 } });
+      // A new view for the same query is seeded from the restored root.
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 6 }, firstOnly)
+      ).to.deep.equal({ from: 'server', value: { a: 6 } });
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)?.val()
+      ).to.deep.equal({ inbox: { a: 1, b: 2 } });
+    });
+
+    it('an unsubscribed filtered view takes its certification with it', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, { inbox: { a: 1, b: 2 } });
+      const firstOnly = queryParamsLimitToFirst(new QueryParams(), 1);
+      const filtered = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        new Path('users/alice/inbox'),
+        firstOnly,
+        false
+      );
+      const registration = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        filtered,
+        registration
+      );
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      serverCallbacks[1]('ok');
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { a: 0 }, firstOnly)
+      ).to.deep.equal({ from: 'cache', value: { a: 1 } });
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        filtered,
+        registration
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        filtered,
+        stubRegistration(undefined, true)
+      );
+      // The new view holds no answer of its own yet.
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { a: 7 }, firstOnly)).from
+      ).to.equal('server');
+    });
+
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;

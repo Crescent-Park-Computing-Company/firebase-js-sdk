@@ -73,6 +73,7 @@ import {
   statsManagerGetOrCreateReporter
 } from './stats/StatsManager';
 import { StatsReporter, statsReporterIncludeStat } from './stats/StatsReporter';
+import { syncPointViewForQuery } from './SyncPoint';
 import {
   SyncTree,
   syncTreeAckUserWrite,
@@ -138,6 +139,7 @@ import {
   eventQueueRaiseEventsForChangedPath
 } from './view/EventQueue';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
+import { View } from './view/View';
 import {
   writeTreeChildWrites,
   writeTreeRefCalcCompleteEventCache
@@ -381,15 +383,20 @@ interface UnconfirmedRestore {
   /** Subtrees strictly under the root the server has since spoken for. */
   confirmedUnder: Path[];
   /**
-   * Filtered queries on the root's line the server has since answered
+   * Filtered views on the root's line the server has since answered
    * exactly (their tagged listen's `ok`, or a get()'s own tagged answer):
-   * that answer is the window's server truth, whatever the root holds.
+   * that answer is the window's server truth, whatever the root holds. The
+   * view instance, not its query: a view SyncTree drops (a get()'s
+   * temporary one, an unsubscribed listener's) takes its answer with it,
+   * and the next view for the same query is seeded from the root again.
    */
-  confirmedQueries: string[];
+  confirmedViews: Set<View>;
 }
 
-function repoQueryKey(query: QueryContext): string {
-  return query._path.toString() + '|' + query._queryIdentifier;
+/** The registered view that would answer `query`, if there is one. */
+function repoRegisteredView(repo: Repo, query: QueryContext): View | null {
+  const syncPoint = repo.serverSyncTree_.syncPointTree_.get(query._path);
+  return syncPoint ? syncPointViewForQuery(syncPoint, query) : null;
 }
 
 function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
@@ -480,7 +487,7 @@ export class Repo {
    *
    * Each entry carries what the server has since spoken for on its line
    * without retiring it: subtrees strictly under the root, and filtered
-   * queries answered exactly. A get() covered by either holds none of that
+   * views answered exactly. A get() covered by either holds none of that
    * root's restored bytes and keeps its cached answer while the rest waits.
    * They are the entry's, not the path's — a new restore at the same root is
    * a new entry with none, and a survivor an entry passes to starts with none.
@@ -798,22 +805,25 @@ function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
   repo.unconfirmedRestores_.set(path.toString(), {
     path,
     confirmedUnder: [],
-    confirmedQueries: []
+    confirmedViews: new Set()
   });
 }
 
 /**
  * The server answered this filtered query exactly: its tagged listen's `ok`
  * (the server matched the hash of the window the listen carried) or a
- * get()'s own tagged answer. That certifies this one window, on every
- * entry whose line it lies on, and nothing else.
+ * get()'s own tagged answer. That certifies the view holding that answer,
+ * on every entry whose line it lies on, and nothing else.
  */
-function repoConfirmQueryOnLine(repo: Repo, query: QueryContext): void {
+function repoConfirmViewOnLine(repo: Repo, query: QueryContext): void {
+  const view = repoRegisteredView(repo, query);
+  if (view === null) {
+    return;
+  }
   const path = query._path;
-  const key = repoQueryKey(query);
   for (const entry of repo.unconfirmedRestores_.values()) {
     if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
-      entry.confirmedQueries.push(key);
+      entry.confirmedViews.add(view);
     }
   }
 }
@@ -1472,7 +1482,7 @@ export function repoStartServerListen(
       if (isDefaultComplete) {
         repoConfirmRestoresUnder(repo, query._path);
       } else {
-        repoConfirmQueryOnLine(repo, query);
+        repoConfirmViewOnLine(repo, query);
       }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
@@ -2308,19 +2318,20 @@ function repoGetNextWriteId(repo: Repo): number {
 /**
  * Whether a cached answer for `query` could hold restored bytes: an
  * unconfirmed root lies on its line (at, above, or below it) whose own
- * confirmations (a subtree covering the query, or this exact filtered
- * query) do not cover it, and no complete local write shadows it (the
- * write tree answers before the server cache is consulted, so such a get()
- * never touched server bytes on base either).
+ * confirmations (a subtree covering the query, or the registered view that
+ * would answer it) do not cover it, and no complete local write shadows it
+ * (the write tree answers before the server cache is consulted, so such a
+ * get() never touched server bytes on base either).
  */
 function repoCachedAnswerMayBeRestored(
   repo: Repo,
   query: QueryContext
 ): boolean {
   const path = query._path;
-  // Only filtered queries are ever certified exactly (a default query's
-  // certification is a subtree, in confirmedUnder).
-  const key = repoQueryKey(query);
+  // The view that would answer, if one is registered (a default query's
+  // certification is a subtree, in confirmedUnder; only filtered views are
+  // ever certified exactly).
+  const view = repoRegisteredView(repo, query);
   // Each entry on the query's line blocks unless its own confirmations
   // cover the query; one entry's confirmation says nothing about another's
   // restored bytes (a restore at a descendant of a retained ancestor entry).
@@ -2328,7 +2339,7 @@ function repoCachedAnswerMayBeRestored(
     entry =>
       (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
       !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path)) &&
-      !entry.confirmedQueries.includes(key)
+      !(view !== null && entry.confirmedViews.has(view))
   );
   if (!blocked) {
     return false;
@@ -2421,7 +2432,7 @@ export function repoGetValue(
           node,
           tag
         );
-        repoConfirmQueryOnLine(repo, query);
+        repoConfirmViewOnLine(repo, query);
       }
       /*
        * We need to raise events in the scenario where `get()` is called at a parent path, and
