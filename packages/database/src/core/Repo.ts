@@ -2261,8 +2261,8 @@ function repoGetNextWriteId(repo: Repo): number {
 
 /**
  * Whether a cached answer for `query` could hold restored bytes: an
- * unconfirmed root lies on its line (at, above, or below it), no subtree
- * the server has since spoken for covers it, and no complete local write
+ * unconfirmed root lies on its line (at, above, or below it) whose own
+ * confirmed subtrees do not cover the query, and no complete local write
  * shadows it (the write tree answers before the server cache is consulted,
  * so such a get() never touched server bytes on base either).
  */
@@ -2271,18 +2271,15 @@ function repoCachedAnswerMayBeRestored(
   query: QueryContext
 ): boolean {
   const path = query._path;
-  let onLine = false;
-  for (const entry of repo.unconfirmedRestores_.values()) {
-    if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
-      onLine = true;
-    } else {
-      continue;
-    }
-    if (entry.confirmedUnder.some(confirmed => pathContains(confirmed, path))) {
-      return false;
-    }
-  }
-  if (!onLine) {
+  // Each entry on the query's line blocks unless its own confirmed subtrees
+  // cover the query; one entry's confirmation says nothing about another's
+  // restored bytes (a restore at a descendant of a retained ancestor entry).
+  const blocked = [...repo.unconfirmedRestores_.values()].some(
+    entry =>
+      (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
+      !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path))
+  );
+  if (!blocked) {
     return false;
   }
   return (

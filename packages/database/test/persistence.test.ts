@@ -4320,6 +4320,71 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.equal('cache');
     });
 
+    it("a retained ancestor entry's confirmation does not exempt a newer restore at the child", async () => {
+      const harness = makeListenHarness();
+      const { repo, path, calls, serverCallbacks } = harness;
+      const root = await restoredRoot(harness, {
+        inbox: { msg: 'stale' },
+        settings: { theme: 'stale' }
+      });
+      // inbox confirmed under the root's entry...
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { msg: 'pushed' },
+        false,
+        null
+      );
+      // ...every view at the root goes (the entry stays: no server word yet
+      // under a root whose cache is gone)...
+      root.unsubscribe();
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        path.toString()
+      ]);
+      // ...and a persistent listener attaches at the child with its own
+      // stored tree: a second, independent install.
+      const inboxPath = new Path('users/alice/inbox');
+      repo.persistence_!.setPersistentPath(inboxPath.toString(), true);
+      await persistHarnessRoot(repo, inboxPath, { msg: 'older' });
+      const inboxQuery = new QueryImpl(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        null as any,
+        inboxPath,
+        new QueryParams(),
+        false
+      );
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        inboxQuery,
+        stubRegistration(undefined, true)
+      );
+      repoStartServerListen(
+        repo,
+        inboxQuery as never,
+        null,
+        harness.hashFn,
+        harness.onComplete
+      );
+      await flushAsync();
+      expect(calls).to.deep.equal(['listen', 'unlisten', 'listen']);
+      expect([...repo.unconfirmedRestores_.keys()].sort()).to.deep.equal([
+        path.toString(),
+        inboxPath.toString()
+      ]);
+      // The child's restored bytes are its own entry's; the ancestor's old
+      // confirmation of this path says nothing about them.
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'newer' })).from
+      ).to.equal('server');
+      serverCallbacks[1]('ok');
+      expect(
+        (await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })).from
+      ).to.equal('cache');
+    });
+
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;
