@@ -378,7 +378,18 @@ interface ListenOutcomeState {
 
 interface UnconfirmedRestore {
   path: Path;
+  /** Subtrees strictly under the root the server has since spoken for. */
   confirmedUnder: Path[];
+  /**
+   * Filtered queries on the root's line the server has since answered
+   * exactly (their tagged listen's `ok`, or a get()'s own tagged answer):
+   * that answer is the window's server truth, whatever the root holds.
+   */
+  confirmedQueries: string[];
+}
+
+function repoQueryKey(query: QueryContext): string {
+  return query._path.toString() + '|' + query._queryIdentifier;
 }
 
 function repoCancelPendingSeedRestore(pending: PendingSeedRestore): void {
@@ -467,11 +478,12 @@ export class Repo {
    * passes the entry to the views that keep the bytes. A stale entry can
    * only send a get() to the server, never serve one.
    *
-   * Each entry carries the subtrees strictly under its root the server has
-   * since spoken for: a get() at or under one holds none of that root's
-   * restored bytes and keeps its cached answer while the rest waits. They
-   * are the entry's, not the path's — a new restore at the same root is a
-   * new entry with none, and a survivor an entry passes to starts with none.
+   * Each entry carries what the server has since spoken for on its line
+   * without retiring it: subtrees strictly under the root, and filtered
+   * queries answered exactly. A get() covered by either holds none of that
+   * root's restored bytes and keeps its cached answer while the rest waits.
+   * They are the entry's, not the path's — a new restore at the same root is
+   * a new entry with none, and a survivor an entry passes to starts with none.
    */
   unconfirmedRestores_ = new Map<string, UnconfirmedRestore>();
 
@@ -783,7 +795,27 @@ function repoConfirmRestoresUnder(repo: Repo, path: Path): void {
 }
 
 function repoTrackUnconfirmedRestore(repo: Repo, path: Path): void {
-  repo.unconfirmedRestores_.set(path.toString(), { path, confirmedUnder: [] });
+  repo.unconfirmedRestores_.set(path.toString(), {
+    path,
+    confirmedUnder: [],
+    confirmedQueries: []
+  });
+}
+
+/**
+ * The server answered this filtered query exactly: its tagged listen's `ok`
+ * (the server matched the hash of the window the listen carried) or a
+ * get()'s own tagged answer. That certifies this one window, on every
+ * entry whose line it lies on, and nothing else.
+ */
+function repoConfirmQueryOnLine(repo: Repo, query: QueryContext): void {
+  const path = query._path;
+  const key = repoQueryKey(query);
+  for (const entry of repo.unconfirmedRestores_.values()) {
+    if (pathContains(entry.path, path) || pathContains(path, entry.path)) {
+      entry.confirmedQueries.push(key);
+    }
+  }
 }
 
 /** The shallowest complete default view on each branch under `rootPath`. */
@@ -870,6 +902,11 @@ function repoApplyDataUpdate(
       path,
       changedChildren
     );
+    // Each child of an untagged merge is the server's complete word on the
+    // subtree at its (possibly nested) relative path.
+    each(changedChildren, (relativePath: string) => {
+      repoConfirmRestoresUnder(repo, pathChild(path, new Path(relativePath)));
+    });
   } else {
     const snap = nodeFromJSON(data);
     events = repoApplyConfirmedServerOverwrite(repo, path, snap);
@@ -1416,18 +1453,27 @@ export function repoStartServerListen(
     data: unknown,
     wire: ListenWireResult
   ) => {
-    const events = onComplete(status, data);
     if (
-      status === 'ok' &&
       isDefaultComplete &&
-      repo.listenOutcomes_.get(pathString) === outcomeState
+      repo.listenOutcomes_.get(pathString) !== outcomeState
     ) {
+      // A completion for a listen this path no longer has: it was queued
+      // behind an ingest, and the path was stopped (and possibly restarted)
+      // before it drained. The connection rejects such completions for a
+      // live listen; deferral let this one through. Its status is about a
+      // subscription that is gone — an error would cancel the replacement's
+      // registrations, an `ok` would certify a tree it never vouched for.
+      return;
+    }
+    const events = onComplete(status, data);
+    if (status === 'ok') {
       // The server matched the hashes this listen carried, and everything it
       // sent before the `ok` has applied (the ingest queue keeps wire order).
-      // A stopped listen's `ok` may still drain here — behind an ingest its
-      // stop cancelled, or after a restart installed a tree it never vouched
-      // for — so only the path's current listen confirms.
-      repoConfirmRestoresUnder(repo, query._path);
+      if (isDefaultComplete) {
+        repoConfirmRestoresUnder(repo, query._path);
+      } else {
+        repoConfirmQueryOnLine(repo, query);
+      }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
     if (!isDefaultComplete) {
@@ -2262,22 +2308,27 @@ function repoGetNextWriteId(repo: Repo): number {
 /**
  * Whether a cached answer for `query` could hold restored bytes: an
  * unconfirmed root lies on its line (at, above, or below it) whose own
- * confirmed subtrees do not cover the query, and no complete local write
- * shadows it (the write tree answers before the server cache is consulted,
- * so such a get() never touched server bytes on base either).
+ * confirmations (a subtree covering the query, or this exact filtered
+ * query) do not cover it, and no complete local write shadows it (the
+ * write tree answers before the server cache is consulted, so such a get()
+ * never touched server bytes on base either).
  */
 function repoCachedAnswerMayBeRestored(
   repo: Repo,
   query: QueryContext
 ): boolean {
   const path = query._path;
-  // Each entry on the query's line blocks unless its own confirmed subtrees
+  // Only filtered queries are ever certified exactly (a default query's
+  // certification is a subtree, in confirmedUnder).
+  const key = repoQueryKey(query);
+  // Each entry on the query's line blocks unless its own confirmations
   // cover the query; one entry's confirmation says nothing about another's
   // restored bytes (a restore at a descendant of a retained ancestor entry).
   const blocked = [...repo.unconfirmedRestores_.values()].some(
     entry =>
       (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
-      !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path))
+      !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path)) &&
+      !entry.confirmedQueries.includes(key)
   );
   if (!blocked) {
     return false;
@@ -2370,6 +2421,7 @@ export function repoGetValue(
           node,
           tag
         );
+        repoConfirmQueryOnLine(repo, query);
       }
       /*
        * We need to raise events in the scenario where `get()` is called at a parent path, and
