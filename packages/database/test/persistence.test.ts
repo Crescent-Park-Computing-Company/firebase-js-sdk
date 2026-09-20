@@ -83,6 +83,7 @@ import {
   syncTreeAddEventRegistration,
   syncTreeApplyListenComplete,
   syncTreeApplyServerOverwrite,
+  syncTreeApplyUserOverwrite,
   syncTreeGetCompleteServerCache,
   syncTreeRemoveEventRegistration
 } from '../src/core/SyncTree';
@@ -2636,6 +2637,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       unconfirmedRestores_: new Map(),
+      confirmedUnderRestores_: new Map(),
       interceptServerDataCallback_: null,
       // The boot-window drain reruns transactions after each replayed push;
       // the real Repo always carries this tree. (The legacy synchronous
@@ -4129,6 +4131,141 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
     });
 
+    it('a subtree the server has since overwritten keeps its cached answer while the rest of the root waits', async () => {
+      const harness = makeListenHarness();
+      const { repo, serverCallbacks } = harness;
+      await restoredRoot(harness, {
+        inbox: { msg: 'stale' },
+        settings: { theme: 'stale' }
+      });
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/inbox',
+        { msg: 'pushed' },
+        false,
+        null
+      );
+      // At and under the pushed subtree: server bytes only.
+      expect(
+        await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
+      ).to.deep.equal({ from: 'cache', value: { msg: 'pushed' } });
+      expect(
+        await getFrom(harness, 'users/alice/inbox/msg', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 'pushed' });
+      // The root itself and the untouched sibling still hold restored bytes.
+      expect(
+        (await getFrom(harness, 'users/alice/settings', { theme: 'fresh' }))
+          .from
+      ).to.equal('server');
+      expect(
+        (
+          await getFrom(harness, 'users/alice', {
+            inbox: { msg: 'pushed' },
+            settings: { theme: 'fresh' }
+          })
+        ).from
+      ).to.equal('server');
+      // The root's ok retires the entry and its confirmed subtrees together.
+      serverCallbacks[0]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(repo.confirmedUnderRestores_.size).to.equal(0);
+      expect(
+        (await getFrom(harness, 'users/alice/settings', { theme: 'x' })).from
+      ).to.equal('cache');
+    });
+
+    it('a complete local write under an unconfirmed root answers a get() as it did on base', async () => {
+      const harness = makeListenHarness();
+      const { repo } = harness;
+      await restoredRoot(harness, { inbox: { msg: 'stale' }, name: 'old' });
+      syncTreeApplyUserOverwrite(
+        repo.serverSyncTree_,
+        new Path('users/alice/name'),
+        nodeFromJSON('new'),
+        1,
+        true
+      );
+      expect(
+        await getFrom(harness, 'users/alice/name', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 'new' });
+      // A write that only partially covers the query leaves restored bytes
+      // in the answer: still the server.
+      expect(
+        (
+          await getFrom(harness, 'users/alice', {
+            inbox: { msg: 'fresh' },
+            name: 'new'
+          })
+        ).from
+      ).to.equal('server');
+    });
+
+    it('confirmed subtrees are reset when the entry passes to surviving views', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, calls, serverCallbacks } = harness;
+      const root = await restoredRootWired(harness, {
+        a: { b: { value: 1 }, other: 2 }
+      });
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        defaultQuery('users/alice/a'),
+        stubRegistration(undefined, true)
+      );
+      // A push under the root, but off the survivor's line, is confirmed
+      // under the root...
+      repoOnDataUpdateForTest(repo, 'users/alice/a/other', 3, false, null);
+      expect([...repo.confirmedUnderRestores_.keys()]).to.deep.equal([
+        '/users/alice/a/other'
+      ]);
+      // ...and reset when the root goes and the entry moves to /users/alice/a:
+      // the survivor's own answer now decides for its whole cache.
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        root.rootQuery,
+        root.registration
+      );
+      expect(calls).to.deep.equal(['listen', 'listen', 'unlisten']);
+      expect(
+        syncTreeGetCompleteServerCache(repo.serverSyncTree_, path)
+      ).to.equal(null);
+      // The reanchoring word: a push at b moves the entry to the survivor
+      // and drops what was confirmed under the old root.
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/a/b',
+        { value: 9 },
+        false,
+        null
+      );
+      expect([...repo.unconfirmedRestores_.keys()]).to.deep.equal([
+        '/users/alice/a'
+      ]);
+      expect(repo.confirmedUnderRestores_.size).to.equal(0);
+      expect((await getFrom(harness, 'users/alice/a/other', 3)).from).to.equal(
+        'server'
+      );
+      // Words under the new owner are recorded under it (the probe's own
+      // answer above was one).
+      repoOnDataUpdateForTest(
+        repo,
+        'users/alice/a/b',
+        { value: 10 },
+        false,
+        null
+      );
+      expect([...repo.confirmedUnderRestores_.keys()].sort()).to.deep.equal([
+        '/users/alice/a/b',
+        '/users/alice/a/other'
+      ]);
+      expect(
+        await getFrom(harness, 'users/alice/a/b/value', 'unused')
+      ).to.deep.equal({ from: 'cache', value: 10 });
+      serverCallbacks[1]('ok');
+      expect(repo.unconfirmedRestores_.size).to.equal(0);
+      expect(repo.confirmedUnderRestores_.size).to.equal(0);
+    });
+
     it('a stop with no surviving default view: the entry stays until the next server word under the root retires it', async () => {
       const harness = makeListenHarness();
       const { repo, path } = harness;
@@ -4886,6 +5023,7 @@ describe('stale restore vs live server data', () => {
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
       unconfirmedRestores_: new Map(),
+      confirmedUnderRestores_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
       serverSyncTree_: syncTree,

@@ -138,6 +138,10 @@ import {
   eventQueueRaiseEventsForChangedPath
 } from './view/EventQueue';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
+import {
+  writeTreeChildWrites,
+  writeTreeRefCalcCompleteEventCache
+} from './WriteTree';
 
 const INTERRUPT_REASON = 'repo_interrupt';
 
@@ -460,6 +464,14 @@ export class Repo {
    */
   unconfirmedRestores_ = new Map<string, Path>();
 
+  /**
+   * Subtrees strictly under an unconfirmed root the server has since spoken
+   * for (an untagged overwrite, or a current default listen's `ok`), keyed
+   * by path: a get() at or under one holds no restored bytes and keeps its
+   * cached answer while the rest of the root waits. Pruned with the root.
+   */
+  confirmedUnderRestores_ = new Map<string, Path>();
+
   constructor(
     public repoInfo_: RepoInfo,
     public forceRestClient_: boolean,
@@ -747,17 +759,34 @@ function repoOnDataUpdate(
 function repoConfirmRestoresUnder(repo: Repo, path: Path): void {
   for (const [rootString, rootPath] of [...repo.unconfirmedRestores_]) {
     if (pathContains(path, rootPath)) {
-      repo.unconfirmedRestores_.delete(rootString);
+      repoRetireUnconfirmedRestore(repo, rootString, rootPath);
+    } else if (!pathContains(rootPath, path)) {
+      continue;
     } else if (
-      pathContains(rootPath, path) &&
-      syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) === null
+      syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) !== null
     ) {
-      repo.unconfirmedRestores_.delete(rootString);
+      // Spoken for under a root that still holds restored bytes elsewhere.
+      repo.confirmedUnderRestores_.set(path.toString(), path);
+    } else {
+      repoRetireUnconfirmedRestore(repo, rootString, rootPath);
       for (const survivor of repoSurvivingDefaultViews(repo, rootPath)) {
         if (!pathContains(path, survivor)) {
           repo.unconfirmedRestores_.set(survivor.toString(), survivor);
         }
       }
+    }
+  }
+}
+
+function repoRetireUnconfirmedRestore(
+  repo: Repo,
+  rootString: string,
+  rootPath: Path
+): void {
+  repo.unconfirmedRestores_.delete(rootString);
+  for (const [confirmedString, confirmed] of repo.confirmedUnderRestores_) {
+    if (pathContains(rootPath, confirmed)) {
+      repo.confirmedUnderRestores_.delete(confirmedString);
     }
   }
 }
@@ -2235,13 +2264,39 @@ function repoGetNextWriteId(repo: Repo): number {
   return repo.nextWriteId_++;
 }
 
-function repoHasUnconfirmedRestoreOnLine(repo: Repo, path: Path): boolean {
+/**
+ * Whether a cached answer for `query` could hold restored bytes: an
+ * unconfirmed root lies on its line (at, above, or below it), no subtree
+ * the server has since spoken for covers it, and no complete local write
+ * shadows it (the write tree answers before the server cache is consulted,
+ * so such a get() never touched server bytes on base either).
+ */
+function repoCachedAnswerMayBeRestored(
+  repo: Repo,
+  query: QueryContext
+): boolean {
+  const path = query._path;
+  let onLine = false;
   for (const rootPath of repo.unconfirmedRestores_.values()) {
     if (pathContains(rootPath, path) || pathContains(path, rootPath)) {
-      return true;
+      onLine = true;
+      break;
     }
   }
-  return false;
+  if (!onLine) {
+    return false;
+  }
+  for (const confirmed of repo.confirmedUnderRestores_.values()) {
+    if (pathContains(confirmed, path)) {
+      return false;
+    }
+  }
+  return (
+    writeTreeRefCalcCompleteEventCache(
+      writeTreeChildWrites(repo.serverSyncTree_.pendingWriteTree_, path),
+      null
+    ) === null
+  );
 }
 
 /**
@@ -2268,10 +2323,11 @@ export function repoGetValue(
   // server's until the server confirms or replaces it. Restored bytes travel
   // only along the root's own line — down it, as the cache every descendant
   // view is seeded from; up it, as the descendant an ancestor view assembles
-  // its cache from — so that line reads the server while a sibling branch
-  // keeps its cached answer. onValue is untouched: cached-then-live is what a
-  // listener wants, and the listen's answer corrects it in place.
-  const cached = repoHasUnconfirmedRestoreOnLine(repo, query._path)
+  // its cache from — so that line reads the server while a sibling branch,
+  // a subtree the server has since spoken for, or a value a local write
+  // shadows keeps its cached answer. onValue is untouched: cached-then-live
+  // is what a listener wants, and the listen's answer corrects it in place.
+  const cached = repoCachedAnswerMayBeRestored(repo, query)
     ? null
     : syncTreeGetServerValue(repo.serverSyncTree_, query);
   if (cached != null) {
