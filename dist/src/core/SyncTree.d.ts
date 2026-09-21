@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
-import { OperationVerification } from './operation/Operation';
 import { ListenHashFn, PendingListenHashes } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
@@ -98,7 +97,7 @@ export declare function syncTreeAckUserWrite(syncTree: SyncTree, writeId: number
  *
  * @returns Events to raise.
  */
-export declare function syncTreeApplyServerOverwrite(syncTree: SyncTree, path: Path, newData: Node, verification?: OperationVerification): Event[];
+export declare function syncTreeApplyServerOverwrite(syncTree: SyncTree, path: Path, newData: Node): Event[];
 /**
  * Apply new server data to be merged in at the specified path.
  *
@@ -184,7 +183,7 @@ export declare function syncTreeRemoveEventRegistration(syncTree: SyncTree, quer
  *
  * @returns Events to raise.
  */
-export declare function syncTreeApplyTaggedQueryOverwrite(syncTree: SyncTree, path: Path, snap: Node, tag: number, verification?: OperationVerification): Event[];
+export declare function syncTreeApplyTaggedQueryOverwrite(syncTree: SyncTree, path: Path, snap: Node, tag: number): Event[];
 /**
  * Apply server data to be merged in for the specified tagged query.
  *
@@ -212,17 +211,6 @@ export declare function syncTreeAddEventRegistration(syncTree: SyncTree, query: 
  */
 export declare function syncTreeCalcCompleteEventCache(syncTree: SyncTree, path: Path, writeIdsToExclude?: number[]): Node;
 export declare function syncTreeGetServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
-/**
- * Like syncTreeGetServerValue, but null unless the value the view returns is
- * VERIFIED (CacheNode.isVerified on its event cache): a persisted tree
- * installed ahead of the server's answer is not served, nor is a filtered
- * window a local write refilled from such a tree. Trust is read off the
- * same view that produces the value (the retained exact-query view when one
- * exists, else a view seeded from the covering complete cache, which
- * inherits that cache's bit), so it cannot name a different owner than the
- * data.
- */
-export declare function syncTreeGetVerifiedServerValue(syncTree: SyncTree, query: QueryContext): Node | null;
 /**
  * Return the tag associated with the given query.
  */

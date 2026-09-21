@@ -1275,7 +1275,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3";
+const version = "1.1.3-cache-seeding.89";
 
 /**
  * @license
@@ -11787,264 +11787,22 @@ class StatsReporter {
  * limitations under the License.
  */
 /**
- *
- * @enum
- */
-var OperationType;
-(function (OperationType) {
-    OperationType[OperationType["OVERWRITE"] = 0] = "OVERWRITE";
-    OperationType[OperationType["MERGE"] = 1] = "MERGE";
-    OperationType[OperationType["ACK_USER_WRITE"] = 2] = "ACK_USER_WRITE";
-    OperationType[OperationType["LISTEN_COMPLETE"] = 3] = "LISTEN_COMPLETE";
-})(OperationType || (OperationType = {}));
-function newOperationSourceUser() {
-    return {
-        fromUser: true,
-        fromServer: false,
-        queryId: null,
-        tagged: false,
-        verification: 'verify'
-    };
-}
-function newOperationSourceServer(verification = 'verify') {
-    return {
-        fromUser: false,
-        fromServer: true,
-        queryId: null,
-        tagged: false,
-        verification
-    };
-}
-function newOperationSourceServerTaggedQuery(queryId, verification = 'verify') {
-    return {
-        fromUser: false,
-        fromServer: true,
-        queryId,
-        tagged: true,
-        verification
-    };
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class AckUserWrite {
-    /**
-     * @param affectedTree - A tree containing true for each affected path. Affected paths can't overlap.
-     */
-    constructor(
-    /** @inheritDoc */ path, 
-    /** @inheritDoc */ affectedTree, 
-    /** @inheritDoc */ revert) {
-        this.path = path;
-        this.affectedTree = affectedTree;
-        this.revert = revert;
-        /** @inheritDoc */
-        this.type = OperationType.ACK_USER_WRITE;
-        /** @inheritDoc */
-        this.source = newOperationSourceUser();
-    }
-    operationForChild(childName) {
-        if (!pathIsEmpty(this.path)) {
-            util.assert(pathGetFront(this.path) === childName, 'operationForChild called for unrelated child.');
-            return new AckUserWrite(pathPopFront(this.path), this.affectedTree, this.revert);
-        }
-        else if (this.affectedTree.value != null) {
-            util.assert(this.affectedTree.children.isEmpty(), 'affectedTree should not have overlapping affected paths.');
-            // All child locations are affected as well; just return same operation.
-            return this;
-        }
-        else {
-            const childTree = this.affectedTree.subtree(new Path(childName));
-            return new AckUserWrite(newEmptyPath(), childTree, this.revert);
-        }
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class ListenComplete {
-    constructor(source, path) {
-        this.source = source;
-        this.path = path;
-        /** @inheritDoc */
-        this.type = OperationType.LISTEN_COMPLETE;
-    }
-    operationForChild(childName) {
-        if (pathIsEmpty(this.path)) {
-            return new ListenComplete(this.source, newEmptyPath());
-        }
-        else {
-            return new ListenComplete(this.source, pathPopFront(this.path));
-        }
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class Overwrite {
-    constructor(source, path, snap) {
-        this.source = source;
-        this.path = path;
-        this.snap = snap;
-        /** @inheritDoc */
-        this.type = OperationType.OVERWRITE;
-    }
-    operationForChild(childName) {
-        if (pathIsEmpty(this.path)) {
-            return new Overwrite(this.source, newEmptyPath(), this.snap.getImmediateChild(childName));
-        }
-        else {
-            return new Overwrite(this.source, pathPopFront(this.path), this.snap);
-        }
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-class Merge {
-    constructor(
-    /** @inheritDoc */ source, 
-    /** @inheritDoc */ path, 
-    /** @inheritDoc */ children) {
-        this.source = source;
-        this.path = path;
-        this.children = children;
-        /** @inheritDoc */
-        this.type = OperationType.MERGE;
-    }
-    operationForChild(childName) {
-        if (pathIsEmpty(this.path)) {
-            const childTree = this.children.subtree(new Path(childName));
-            if (childTree.isEmpty()) {
-                // This child is unaffected
-                return null;
-            }
-            else if (childTree.value) {
-                // We have a snapshot for the child in question.  This becomes an overwrite of the child.
-                return new Overwrite(this.source, newEmptyPath(), childTree.value);
-            }
-            else {
-                // This is a merge at a deeper level
-                return new Merge(this.source, newEmptyPath(), childTree);
-            }
-        }
-        else {
-            util.assert(pathGetFront(this.path) === childName, "Can't get a merge for a child not on the path of the operation");
-            return new Merge(this.source, pathPopFront(this.path), this.children);
-        }
-    }
-    toString() {
-        return ('Operation(' +
-            this.path +
-            ': ' +
-            this.source.toString() +
-            ' merge: ' +
-            this.children.toString() +
-            ')');
-    }
-}
-
-/**
- * @license
- * Copyright 2017 Google LLC
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-/**
  * A cache node only stores complete children. Additionally it holds a flag whether the node can be considered fully
  * initialized in the sense that we know at one point in time this represented a valid state of the world, e.g.
  * initialized with data from the server, or a complete overwrite by the client. The filtered flag also tracks
  * whether a node potentially had children removed due to a filter.
  */
 class CacheNode {
-    constructor(node_, fullyInitialized_, filtered_, verified_ = true) {
+    constructor(node_, fullyInitialized_, filtered_) {
         this.node_ = node_;
         this.fullyInitialized_ = fullyInitialized_;
         this.filtered_ = filtered_;
-        this.verified_ = verified_;
     }
     /**
      * Returns whether this node was fully initialized with either server data or a complete overwrite by the client
      */
     isFullyInitialized() {
         return this.fullyInitialized_;
-    }
-    /**
-     * Whether the data came from (or was confirmed by) the server. False only
-     * while a view holds a persisted tree installed ahead of the server's
-     * answer (OperationVerification 'restore'); a full server overwrite or the
-     * listen's completion flips it back. Travels with the cache: a view seeded
-     * from another view's complete cache inherits the bit. get() serves a
-     * cached value only from a verified server cache.
-     */
-    isVerified() {
-        return this.verified_;
     }
     /**
      * Returns whether this node is potentially missing children due to a filter applied to the node
@@ -12065,6 +11823,58 @@ class CacheNode {
     getNode() {
         return this.node_;
     }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ *
+ * @enum
+ */
+var OperationType;
+(function (OperationType) {
+    OperationType[OperationType["OVERWRITE"] = 0] = "OVERWRITE";
+    OperationType[OperationType["MERGE"] = 1] = "MERGE";
+    OperationType[OperationType["ACK_USER_WRITE"] = 2] = "ACK_USER_WRITE";
+    OperationType[OperationType["LISTEN_COMPLETE"] = 3] = "LISTEN_COMPLETE";
+})(OperationType || (OperationType = {}));
+function newOperationSourceUser() {
+    return {
+        fromUser: true,
+        fromServer: false,
+        queryId: null,
+        tagged: false
+    };
+}
+function newOperationSourceServer() {
+    return {
+        fromUser: false,
+        fromServer: true,
+        queryId: null,
+        tagged: false
+    };
+}
+function newOperationSourceServerTaggedQuery(queryId) {
+    return {
+        fromUser: false,
+        fromServer: true,
+        queryId,
+        tagged: true
+    };
 }
 
 /**
@@ -12173,19 +11983,10 @@ function newViewCache(eventCache, serverCache) {
     return { eventCache, serverCache };
 }
 function viewCacheUpdateEventSnap(viewCache, eventSnap, complete, filtered) {
-    // Provenance of the event result is settled once per operation
-    // (viewProcessorApplyOperation); carry the current bit through here.
-    return newViewCache(new CacheNode(eventSnap, complete, filtered, viewCache.eventCache.isVerified()), viewCache.serverCache);
+    return newViewCache(new CacheNode(eventSnap, complete, filtered), viewCache.serverCache);
 }
-function viewCacheSetEventVerified(viewCache, verified) {
-    const eventCache = viewCache.eventCache;
-    if (eventCache.isVerified() === verified) {
-        return viewCache;
-    }
-    return newViewCache(new CacheNode(eventCache.getNode(), eventCache.isFullyInitialized(), eventCache.isFiltered(), verified), viewCache.serverCache);
-}
-function viewCacheUpdateServerSnap(viewCache, serverSnap, complete, filtered, verified) {
-    return newViewCache(viewCache.eventCache, new CacheNode(serverSnap, complete, filtered, verified));
+function viewCacheUpdateServerSnap(viewCache, serverSnap, complete, filtered) {
+    return newViewCache(viewCache.eventCache, new CacheNode(serverSnap, complete, filtered));
 }
 function viewCacheGetCompleteEventSnap(viewCache) {
     return viewCache.eventCache.isFullyInitialized()
@@ -13341,12 +13142,8 @@ function viewProcessorAssertIndexed(viewProcessor, viewCache) {
     util.assert(viewCache.eventCache.getNode().isIndexed(viewProcessor.filter.getIndex()), 'Event snap not indexed');
     util.assert(viewCache.serverCache.getNode().isIndexed(viewProcessor.filter.getIndex()), 'Server snap not indexed');
 }
-function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, writesCache, completeServerCache) {
+function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, writesCache, completeCache) {
     const accumulator = new ChildChangeAccumulator();
-    const completeCache = completeServerCache === null ? null : completeServerCache.getNode();
-    // Whether data borrowed from the covering cache is server truth. No cover
-    // (tagged operations, or nothing complete above) borrows nothing.
-    const coverVerified = completeServerCache === null || completeServerCache.isVerified();
     let newViewCache, filterServerNode;
     if (operation.type === OperationType.OVERWRITE) {
         const overwrite = operation;
@@ -13361,7 +13158,7 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
             filterServerNode =
                 overwrite.source.tagged ||
                     (oldViewCache.serverCache.isFiltered() && !pathIsEmpty(overwrite.path));
-            newViewCache = viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, overwrite.path, overwrite.snap, writesCache, completeCache, filterServerNode, accumulator, overwrite.source.verification, coverVerified);
+            newViewCache = viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, overwrite.path, overwrite.snap, writesCache, completeCache, filterServerNode, accumulator);
         }
     }
     else if (operation.type === OperationType.MERGE) {
@@ -13374,7 +13171,7 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
             // We filter the node if it's a tagged update or the node has been previously filtered
             filterServerNode =
                 merge.source.tagged || oldViewCache.serverCache.isFiltered();
-            newViewCache = viewProcessorApplyServerMerge(viewProcessor, oldViewCache, merge.path, merge.children, writesCache, completeCache, filterServerNode, accumulator, merge.source.verification, coverVerified);
+            newViewCache = viewProcessorApplyServerMerge(viewProcessor, oldViewCache, merge.path, merge.children, writesCache, completeCache, filterServerNode, accumulator);
         }
     }
     else if (operation.type === OperationType.ACK_USER_WRITE) {
@@ -13392,20 +13189,6 @@ function viewProcessorApplyOperation(viewProcessor, oldViewCache, operation, wri
     else {
         throw util.assertionError('Unknown operation type: ' + operation.type);
     }
-    // Provenance of the returned value. At the view's own path the event cache
-    // is rebuilt from this view's server cache (plus local writes), so it is
-    // as verified as that cache. Below it, an incremental update may have
-    // borrowed complete children from the covering cache (CompleteChildSource)
-    // to refill a filtered window, so it stays verified only if it was, the
-    // server cache is, and the cover is. Conservative: an update under an
-    // unverified cover marks the result unverified whether or not it borrowed;
-    // the next full replacement or completion at this view resets it.
-    const eventVerified = pathIsEmpty(operation.path)
-        ? newViewCache.serverCache.isVerified()
-        : oldViewCache.eventCache.isVerified() &&
-            newViewCache.serverCache.isVerified() &&
-            coverVerified;
-    newViewCache = viewCacheSetEventVerified(newViewCache, eventVerified);
     const changes = accumulator.getChanges();
     viewProcessorMaybeAddValueEvent(oldViewCache, newViewCache, changes);
     return { viewCache: newViewCache, changes };
@@ -13499,14 +13282,8 @@ function viewProcessorGenerateEventCacheAfterServerEvent(viewProcessor, viewCach
         return viewCacheUpdateEventSnap(viewCache, newEventCache, oldEventSnap.isFullyInitialized() || pathIsEmpty(changePath), viewProcessor.filter.filtersNodes());
     }
 }
-function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePath, changedSnap, writesCache, completeCache, filterServerNode, accumulator, verification, coverVerified) {
+function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePath, changedSnap, writesCache, completeCache, filterServerNode, accumulator) {
     const oldServerSnap = oldViewCache.serverCache;
-    if (verification === 'restore' && !pathIsEmpty(changePath)) {
-        // A restored tree only ever covers the views at and below its listen;
-        // an ancestor view keeps its own (server) data rather than absorbing
-        // unverified bytes it could later serve as verified.
-        return oldViewCache;
-    }
     let newServerCache;
     const serverFilter = filterServerNode
         ? viewProcessor.filter
@@ -13538,18 +13315,7 @@ function viewProcessorApplyServerOverwrite(viewProcessor, oldViewCache, changePa
             newServerCache = serverFilter.updateChild(oldServerSnap.getNode(), childKey, newChildNode, childChangePath, NO_COMPLETE_CHILD_SOURCE, null);
         }
     }
-    // A full overwrite carries the operation's provenance; a partial one
-    // cannot verify (or unverify) the parts it does not touch. A 'keep' fold
-    // is as verified as the base it was folded over: this view's own cache
-    // when the fold is at this view, the covering cache when it was folded
-    // above and propagated down (a range merge at a restored root replacing a
-    // descendant view's server-delivered window with restored bytes).
-    const verified = !pathIsEmpty(changePath)
-        ? oldServerSnap.isVerified()
-        : verification === 'keep'
-            ? oldServerSnap.isVerified() && coverVerified
-            : verification === 'verify';
-    const newViewCache = viewCacheUpdateServerSnap(oldViewCache, newServerCache, oldServerSnap.isFullyInitialized() || pathIsEmpty(changePath), serverFilter.filtersNodes(), verified);
+    const newViewCache = viewCacheUpdateServerSnap(oldViewCache, newServerCache, oldServerSnap.isFullyInitialized() || pathIsEmpty(changePath), serverFilter.filtersNodes());
     const source = new WriteTreeCompleteChildSource(writesCache, newViewCache, completeCache);
     return viewProcessorGenerateEventCacheAfterServerEvent(viewProcessor, newViewCache, changePath, writesCache, source, accumulator);
 }
@@ -13635,7 +13401,7 @@ function viewProcessorApplyMerge(viewProcessor, node, merge) {
     });
     return node;
 }
-function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedChildren, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified) {
+function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedChildren, writesCache, serverCache, filterServerNode, accumulator) {
     // If we don't have a cache yet, this merge was intended for a previously listen in the same location. Ignore it and
     // wait for the complete data update coming soon.
     if (viewCache.serverCache.getNode().isEmpty() &&
@@ -13663,7 +13429,7 @@ function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedCh
                 .getNode()
                 .getImmediateChild(childKey);
             const newChild = viewProcessorApplyMerge(viewProcessor, serverChild, childTree);
-            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified);
+            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator);
         }
     });
     viewMergeTree.children.inorderTraversal((childKey, childMergeTree) => {
@@ -13674,7 +13440,7 @@ function viewProcessorApplyServerMerge(viewProcessor, viewCache, path, changedCh
                 .getNode()
                 .getImmediateChild(childKey);
             const newChild = viewProcessorApplyMerge(viewProcessor, serverChild, childMergeTree);
-            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator, verification, coverVerified);
+            curViewCache = viewProcessorApplyServerOverwrite(viewProcessor, curViewCache, new Path(childKey), newChild, writesCache, serverCache, filterServerNode, accumulator);
         }
     });
     return curViewCache;
@@ -13692,9 +13458,7 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
         // This is an overwrite.
         if ((pathIsEmpty(ackPath) && serverCache.isFullyInitialized()) ||
             serverCache.isCompleteForPath(ackPath)) {
-            return viewProcessorApplyServerOverwrite(viewProcessor, viewCache, ackPath, serverCache.getNode().getChild(ackPath), writesCache, completeCache, filterServerNode, accumulator, 
-            // Re-applying the view's own cache: its provenance is unchanged.
-            'keep', true);
+            return viewProcessorApplyServerOverwrite(viewProcessor, viewCache, ackPath, serverCache.getNode().getChild(ackPath), writesCache, completeCache, filterServerNode, accumulator);
         }
         else if (pathIsEmpty(ackPath)) {
             // This is a goofy edge case where we are acking data at this location but don't have full data.  We
@@ -13703,7 +13467,7 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
             serverCache.getNode().forEachChild(KEY_INDEX, (name, node) => {
                 changedChildren = changedChildren.set(new Path(name), node);
             });
-            return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep', true);
+            return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator);
         }
         else {
             return viewCache;
@@ -13718,14 +13482,12 @@ function viewProcessorAckUserWrite(viewProcessor, viewCache, ackPath, affectedTr
                 changedChildren = changedChildren.set(mergePath, serverCache.getNode().getChild(serverCachePath));
             }
         });
-        return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator, 'keep', true);
+        return viewProcessorApplyServerMerge(viewProcessor, viewCache, ackPath, changedChildren, writesCache, completeCache, filterServerNode, accumulator);
     }
 }
 function viewProcessorListenComplete(viewProcessor, viewCache, path, writesCache, accumulator) {
     const oldServerNode = viewCache.serverCache;
-    // The server answered the listen covering this view: whatever the view
-    // holds now is hash-confirmed or was replaced by that listen's pushes.
-    const newViewCache = viewCacheUpdateServerSnap(viewCache, oldServerNode.getNode(), oldServerNode.isFullyInitialized() || pathIsEmpty(path), oldServerNode.isFiltered(), oldServerNode.isVerified() || pathIsEmpty(path));
+    const newViewCache = viewCacheUpdateServerSnap(viewCache, oldServerNode.getNode(), oldServerNode.isFullyInitialized() || pathIsEmpty(path), oldServerNode.isFiltered());
     return viewProcessorGenerateEventCacheAfterServerEvent(viewProcessor, newViewCache, path, writesCache, NO_COMPLETE_CHILD_SOURCE, accumulator);
 }
 function viewProcessorRevertUserWrite(viewProcessor, viewCache, path, writesCache, completeServerCache, accumulator) {
@@ -13821,8 +13583,8 @@ class View {
         // Don't filter server node with other filter than index, wait for tagged listen
         const serverSnap = indexFilter.updateFullNode(ChildrenNode.EMPTY_NODE, initialServerCache.getNode(), null);
         const eventSnap = filter.updateFullNode(ChildrenNode.EMPTY_NODE, initialEventCache.getNode(), null);
-        const newServerCache = new CacheNode(serverSnap, initialServerCache.isFullyInitialized(), indexFilter.filtersNodes(), initialServerCache.isVerified());
-        const newEventCache = new CacheNode(eventSnap, initialEventCache.isFullyInitialized(), filter.filtersNodes(), initialEventCache.isVerified());
+        const newServerCache = new CacheNode(serverSnap, initialServerCache.isFullyInitialized(), indexFilter.filtersNodes());
+        const newEventCache = new CacheNode(eventSnap, initialEventCache.isFullyInitialized(), filter.filtersNodes());
         this.viewCache_ = newViewCache(newEventCache, newServerCache);
         this.eventGenerator_ = new EventGenerator(this.query_);
     }
@@ -13848,27 +13610,6 @@ function viewGetCompleteServerCache(view, path) {
         }
     }
     return null;
-}
-/**
- * The complete server cache this view holds for `path`, as a CacheNode that
- * carries the view's `verified` bit, so a view seeded from it inherits the
- * provenance along with the data.
- */
-function viewGetCompleteServerCacheNode(view, path) {
-    const node = viewGetCompleteServerCache(view, path);
-    return node === null
-        ? null
-        : new CacheNode(node, true, false, view.viewCache_.serverCache.isVerified());
-}
-/**
- * Whether the value this view returns (its event cache: server data plus
- * local writes) is built only from verified data. False while the view's
- * server cache is a restored tree, or while a local write's refill of a
- * filtered window borrowed from an unverified covering cache
- * (see viewProcessorApplyOperation).
- */
-function viewIsEventCacheVerified(view) {
-    return view.viewCache_.eventCache.isVerified();
 }
 function viewIsEmpty(view) {
     return view.eventRegistrations_.length === 0;
@@ -14030,7 +13771,7 @@ function syncPointApplyOperation(syncPoint, operation, writesCache, optCompleteS
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-function syncPointGetView(syncPoint, query, writesCache, serverCache, serverCacheComplete, serverCacheVerified = true) {
+function syncPointGetView(syncPoint, query, writesCache, serverCache, serverCacheComplete) {
     const queryId = query._queryIdentifier;
     const view = syncPoint.views.get(queryId);
     if (!view) {
@@ -14048,9 +13789,7 @@ function syncPointGetView(syncPoint, query, writesCache, serverCache, serverCach
             eventCache = ChildrenNode.EMPTY_NODE;
             eventCacheComplete = false;
         }
-        const viewCache = newViewCache(
-        // The initial event cache is derived from this server cache alone.
-        new CacheNode(eventCache, eventCacheComplete, false, serverCacheVerified), new CacheNode(serverCache, serverCacheComplete, false, serverCacheVerified));
+        const viewCache = newViewCache(new CacheNode(eventCache, eventCacheComplete, false), new CacheNode(serverCache, serverCacheComplete, false));
         return new View(query, viewCache);
     }
     return view;
@@ -14065,8 +13804,8 @@ function syncPointGetView(syncPoint, query, writesCache, serverCache, serverCach
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-function syncPointAddEventRegistration(syncPoint, query, eventRegistration, writesCache, serverCache, serverCacheComplete, serverCacheVerified = true) {
-    const view = syncPointGetView(syncPoint, query, writesCache, serverCache, serverCacheComplete, serverCacheVerified);
+function syncPointAddEventRegistration(syncPoint, query, eventRegistration, writesCache, serverCache, serverCacheComplete) {
+    const view = syncPointGetView(syncPoint, query, writesCache, serverCache, serverCacheComplete);
     if (!syncPoint.views.has(query._queryIdentifier)) {
         syncPoint.views.set(query._queryIdentifier, view);
     }
@@ -14142,17 +13881,6 @@ function syncPointGetCompleteServerCache(syncPoint, path) {
     }
     return serverCache;
 }
-/**
- * Same as syncPointGetCompleteServerCache, as a CacheNode carrying the
- * owning view's `verified` bit (see viewGetCompleteServerCacheNode).
- */
-function syncPointGetCompleteServerCacheNode(syncPoint, path) {
-    let serverCache = null;
-    for (const view of syncPoint.views.values()) {
-        serverCache = serverCache || viewGetCompleteServerCacheNode(view, path);
-    }
-    return serverCache;
-}
 function syncPointViewForQuery(syncPoint, query) {
     const params = query._queryParams;
     if (params.loadsAllData()) {
@@ -14176,6 +13904,181 @@ function syncPointGetCompleteView(syncPoint) {
         }
     }
     return null;
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class AckUserWrite {
+    /**
+     * @param affectedTree - A tree containing true for each affected path. Affected paths can't overlap.
+     */
+    constructor(
+    /** @inheritDoc */ path, 
+    /** @inheritDoc */ affectedTree, 
+    /** @inheritDoc */ revert) {
+        this.path = path;
+        this.affectedTree = affectedTree;
+        this.revert = revert;
+        /** @inheritDoc */
+        this.type = OperationType.ACK_USER_WRITE;
+        /** @inheritDoc */
+        this.source = newOperationSourceUser();
+    }
+    operationForChild(childName) {
+        if (!pathIsEmpty(this.path)) {
+            util.assert(pathGetFront(this.path) === childName, 'operationForChild called for unrelated child.');
+            return new AckUserWrite(pathPopFront(this.path), this.affectedTree, this.revert);
+        }
+        else if (this.affectedTree.value != null) {
+            util.assert(this.affectedTree.children.isEmpty(), 'affectedTree should not have overlapping affected paths.');
+            // All child locations are affected as well; just return same operation.
+            return this;
+        }
+        else {
+            const childTree = this.affectedTree.subtree(new Path(childName));
+            return new AckUserWrite(newEmptyPath(), childTree, this.revert);
+        }
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class ListenComplete {
+    constructor(source, path) {
+        this.source = source;
+        this.path = path;
+        /** @inheritDoc */
+        this.type = OperationType.LISTEN_COMPLETE;
+    }
+    operationForChild(childName) {
+        if (pathIsEmpty(this.path)) {
+            return new ListenComplete(this.source, newEmptyPath());
+        }
+        else {
+            return new ListenComplete(this.source, pathPopFront(this.path));
+        }
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class Overwrite {
+    constructor(source, path, snap) {
+        this.source = source;
+        this.path = path;
+        this.snap = snap;
+        /** @inheritDoc */
+        this.type = OperationType.OVERWRITE;
+    }
+    operationForChild(childName) {
+        if (pathIsEmpty(this.path)) {
+            return new Overwrite(this.source, newEmptyPath(), this.snap.getImmediateChild(childName));
+        }
+        else {
+            return new Overwrite(this.source, pathPopFront(this.path), this.snap);
+        }
+    }
+}
+
+/**
+ * @license
+ * Copyright 2017 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+class Merge {
+    constructor(
+    /** @inheritDoc */ source, 
+    /** @inheritDoc */ path, 
+    /** @inheritDoc */ children) {
+        this.source = source;
+        this.path = path;
+        this.children = children;
+        /** @inheritDoc */
+        this.type = OperationType.MERGE;
+    }
+    operationForChild(childName) {
+        if (pathIsEmpty(this.path)) {
+            const childTree = this.children.subtree(new Path(childName));
+            if (childTree.isEmpty()) {
+                // This child is unaffected
+                return null;
+            }
+            else if (childTree.value) {
+                // We have a snapshot for the child in question.  This becomes an overwrite of the child.
+                return new Overwrite(this.source, newEmptyPath(), childTree.value);
+            }
+            else {
+                // This is a merge at a deeper level
+                return new Merge(this.source, newEmptyPath(), childTree);
+            }
+        }
+        else {
+            util.assert(pathGetFront(this.path) === childName, "Can't get a merge for a child not on the path of the operation");
+            return new Merge(this.source, pathPopFront(this.path), this.children);
+        }
+    }
+    toString() {
+        return ('Operation(' +
+            this.path +
+            ': ' +
+            this.source.toString() +
+            ' merge: ' +
+            this.children.toString() +
+            ')');
+    }
 }
 
 /**
@@ -14304,8 +14207,8 @@ function syncTreeAckUserWrite(syncTree, writeId, revert = false) {
  *
  * @returns Events to raise.
  */
-function syncTreeApplyServerOverwrite(syncTree, path, newData, verification = 'verify') {
-    return syncTreeApplyOperationToSyncPoints_(syncTree, new Overwrite(newOperationSourceServer(verification), path, newData));
+function syncTreeApplyServerOverwrite(syncTree, path, newData) {
+    return syncTreeApplyOperationToSyncPoints_(syncTree, new Overwrite(newOperationSourceServer(), path, newData));
 }
 /**
  * Apply new server data to be merged in at the specified path.
@@ -14423,9 +14326,7 @@ function syncTreeApplyServerRangeMerges(syncTree, path, merges) {
         // No complete view for this update: it was removed, ignore
         return [];
     }
-    // A fold over the current cache: corrects part of it, verifies none of it
-    // (the listen completion that follows does).
-    return syncTreeApplyServerOverwrite(syncTree, path, applyRangeMergesToView(view, merges), 'keep');
+    return syncTreeApplyServerOverwrite(syncTree, path, applyRangeMergesToView(view, merges));
 }
 /**
  * The base an untagged range merge at `path` folds over — the complete
@@ -14466,7 +14367,7 @@ function syncTreeApplyTaggedRangeMerges(syncTree, path, merges, tag) {
     if (!view) {
         return [];
     }
-    return syncTreeApplyTaggedQueryOverwrite(syncTree, r.path, applyRangeMergesToView(view, merges), tag, 'keep');
+    return syncTreeApplyTaggedQueryOverwrite(syncTree, r.path, applyRangeMergesToView(view, merges), tag);
 }
 /**
  * Folds server range merges over a view's raw server cache — the tree the
@@ -14567,13 +14468,13 @@ function syncTreeRemoveEventRegistration(syncTree, query, eventRegistration, can
  *
  * @returns Events to raise.
  */
-function syncTreeApplyTaggedQueryOverwrite(syncTree, path, snap, tag, verification = 'verify') {
+function syncTreeApplyTaggedQueryOverwrite(syncTree, path, snap, tag) {
     const queryKey = syncTreeQueryKeyForTag_(syncTree, tag);
     if (queryKey != null) {
         const r = syncTreeParseQueryKey_(queryKey);
         const queryPath = r.path, queryId = r.queryId;
         const relativePath = newRelativePath(queryPath, path);
-        const op = new Overwrite(newOperationSourceServerTaggedQuery(queryId, verification), relativePath, snap);
+        const op = new Overwrite(newOperationSourceServerTaggedQuery(queryId), relativePath, snap);
         return syncTreeApplyTaggedOperation_(syncTree, queryPath, op);
     }
     else {
@@ -14608,14 +14509,14 @@ function syncTreeApplyTaggedQueryMerge(syncTree, path, changedChildren, tag) {
  */
 function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSetupListener = false) {
     const path = query._path;
-    let coveringCache = null;
+    let serverCache = null;
     let foundAncestorDefaultView = false;
     // Any covering writes will necessarily be at the root, so really all we need to find is the server cache.
     // Consider optimizing this once there's a better understanding of what actual behavior will be.
     syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
         const relativePath = newRelativePath(pathToSyncPoint, path);
-        coveringCache =
-            coveringCache || syncPointGetCompleteServerCacheNode(sp, relativePath);
+        serverCache =
+            serverCache || syncPointGetCompleteServerCache(sp, relativePath);
         foundAncestorDefaultView =
             foundAncestorDefaultView || syncPointHasCompleteView(sp);
     });
@@ -14627,18 +14528,12 @@ function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSe
     else {
         foundAncestorDefaultView =
             foundAncestorDefaultView || syncPointHasCompleteView(syncPoint);
-        coveringCache =
-            coveringCache ||
-                syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
+        serverCache =
+            serverCache || syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
     }
-    // A view seeded from a covering cache inherits its provenance.
-    let serverCache = null;
     let serverCacheComplete;
-    let serverCacheVerified = true;
-    if (coveringCache != null) {
-        serverCache = coveringCache.getNode();
+    if (serverCache != null) {
         serverCacheComplete = true;
-        serverCacheVerified = coveringCache.isVerified();
     }
     else {
         serverCacheComplete = false;
@@ -14665,7 +14560,7 @@ function syncTreeAddEventRegistration(syncTree, query, eventRegistration, skipSe
         syncTree.tagToQueryMap.set(tag, queryKey);
     }
     const writesCache = writeTreeChildWrites(syncTree.pendingWriteTree_, path);
-    let events = syncPointAddEventRegistration(syncPoint, query, eventRegistration, writesCache, serverCache, serverCacheComplete, serverCacheVerified);
+    let events = syncPointAddEventRegistration(syncPoint, query, eventRegistration, writesCache, serverCache, serverCacheComplete);
     if (!viewAlreadyExists && !foundAncestorDefaultView && !skipSetupListener) {
         const view = syncPointViewForQuery(syncPoint, query);
         events = events.concat(syncTreeSetupListener_(syncTree, query, view));
@@ -14695,21 +14590,7 @@ function syncTreeCalcCompleteEventCache(syncTree, path, writeIdsToExclude) {
     });
     return writeTreeCalcCompleteEventCache(writeTree, path, serverCache, writeIdsToExclude, includeHiddenSets);
 }
-/**
- * Like syncTreeGetServerValue, but null unless the value the view returns is
- * VERIFIED (CacheNode.isVerified on its event cache): a persisted tree
- * installed ahead of the server's answer is not served, nor is a filtered
- * window a local write refilled from such a tree. Trust is read off the
- * same view that produces the value (the retained exact-query view when one
- * exists, else a view seeded from the covering complete cache, which
- * inherits that cache's bit), so it cannot name a different owner than the
- * data.
- */
-function syncTreeGetVerifiedServerValue(syncTree, query) {
-    const view = syncTreeGetServerView_(syncTree, query);
-    return viewIsEventCacheVerified(view) ? viewGetCompleteNode(view) : null;
-}
-function syncTreeGetServerView_(syncTree, query) {
+function syncTreeGetServerValue(syncTree, query) {
     const path = query._path;
     let serverCache = null;
     // Any covering writes will necessarily be at the root, so really all we need to find is the server cache.
@@ -14717,7 +14598,7 @@ function syncTreeGetServerView_(syncTree, query) {
     syncTree.syncPointTree_.foreachOnPath(path, (pathToSyncPoint, sp) => {
         const relativePath = newRelativePath(pathToSyncPoint, path);
         serverCache =
-            serverCache || syncPointGetCompleteServerCacheNode(sp, relativePath);
+            serverCache || syncPointGetCompleteServerCache(sp, relativePath);
     });
     let syncPoint = syncTree.syncPointTree_.get(path);
     if (!syncPoint) {
@@ -14726,12 +14607,15 @@ function syncTreeGetServerView_(syncTree, query) {
     }
     else {
         serverCache =
-            serverCache ||
-                syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
+            serverCache || syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
     }
     const serverCacheComplete = serverCache != null;
+    const serverCacheNode = serverCacheComplete
+        ? new CacheNode(serverCache, true, false)
+        : null;
     const writesCache = writeTreeChildWrites(syncTree.pendingWriteTree_, query._path);
-    return syncPointGetView(syncPoint, query, writesCache, serverCacheComplete ? serverCache.getNode() : ChildrenNode.EMPTY_NODE, serverCacheComplete, serverCacheComplete ? serverCache.isVerified() : true);
+    const view = syncPointGetView(syncPoint, query, writesCache, serverCacheComplete ? serverCacheNode.getNode() : ChildrenNode.EMPTY_NODE, serverCacheComplete);
+    return viewGetCompleteNode(view);
 }
 /**
  * A helper method that visits all descendant and ancestor SyncPoints, applying the operation.
@@ -14751,11 +14635,7 @@ function syncTreeApplyOperationToSyncPoints_(syncTree, operation) {
     /*serverCache=*/ null, writeTreeChildWrites(syncTree.pendingWriteTree_, newEmptyPath()));
 }
 /**
- * Recursive helper for applyOperationToSyncPoints_. The `serverCache`
- * threaded down is the first complete server cache found on the way from
- * the root: the covering cache a view may borrow complete children from
- * (CompleteChildSource). It travels as a CacheNode so its provenance
- * reaches the view that borrows from it.
+ * Recursive helper for applyOperationToSyncPoints_
  */
 function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, writesCache) {
     if (pathIsEmpty(operation.path)) {
@@ -14765,14 +14645,16 @@ function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, wr
         const syncPoint = syncPointTree.get(newEmptyPath());
         // If we don't have cached server data, see if we can get it from this SyncPoint.
         if (serverCache == null && syncPoint != null) {
-            serverCache = syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
+            serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
         }
         let events = [];
         const childName = pathGetFront(operation.path);
         const childOperation = operation.operationForChild(childName);
         const childTree = syncPointTree.children.get(childName);
         if (childTree && childOperation) {
-            const childServerCache = cacheNodeChild(serverCache, childName);
+            const childServerCache = serverCache
+                ? serverCache.getImmediateChild(childName)
+                : null;
             const childWritesCache = writeTreeRefChild(writesCache, childName);
             events = events.concat(syncTreeApplyOperationHelper_(childOperation, childTree, childServerCache, childWritesCache));
         }
@@ -14782,11 +14664,6 @@ function syncTreeApplyOperationHelper_(operation, syncPointTree, serverCache, wr
         return events;
     }
 }
-function cacheNodeChild(cache, childName) {
-    return cache
-        ? new CacheNode(cache.getNode().getImmediateChild(childName), true, false, cache.isVerified())
-        : null;
-}
 /**
  * Recursive helper for applyOperationToSyncPoints_
  */
@@ -14794,11 +14671,13 @@ function syncTreeApplyOperationDescendantsHelper_(operation, syncPointTree, serv
     const syncPoint = syncPointTree.get(newEmptyPath());
     // If we don't have cached server data, see if we can get it from this SyncPoint.
     if (serverCache == null && syncPoint != null) {
-        serverCache = syncPointGetCompleteServerCacheNode(syncPoint, newEmptyPath());
+        serverCache = syncPointGetCompleteServerCache(syncPoint, newEmptyPath());
     }
     let events = [];
     syncPointTree.children.inorderTraversal((childName, childTree) => {
-        const childServerCache = cacheNodeChild(serverCache, childName);
+        const childServerCache = serverCache
+            ? serverCache.getImmediateChild(childName)
+            : null;
         const childWritesCache = writeTreeRefChild(writesCache, childName);
         const childOperation = operation.operationForChild(childName);
         if (childOperation) {
@@ -15794,6 +15673,28 @@ function repoIngestGateFor(repo, pathString) {
     }
     return null;
 }
+/** The registered view that would answer `query`, if there is one. */
+function repoRegisteredView(repo, query) {
+    const syncPoint = repo.serverSyncTree_.syncPointTree_.get(query._path);
+    return (syncPoint && syncPointViewForQuery(syncPoint, query)) || null;
+}
+/**
+ * The view a tag's listen serves, with its path, while the query is still
+ * registered (SyncTree retires the tag with the view, so a word for a
+ * retired tag finds nothing — as SyncTree itself drops it).
+ */
+function repoViewForTag(repo, tag) {
+    // SyncTree's query key is `<path>$<queryId>`.
+    const queryKey = repo.serverSyncTree_.tagToQueryMap.get(tag);
+    if (queryKey === undefined) {
+        return null;
+    }
+    const split = queryKey.indexOf('$');
+    const path = new Path(queryKey.substring(0, split));
+    const syncPoint = repo.serverSyncTree_.syncPointTree_.get(path);
+    const view = syncPoint && syncPoint.views.get(queryKey.substring(split + 1));
+    return view ? { view, path } : null;
+}
 function repoCancelPendingSeedRestore(pending) {
     pending.cancelled = true;
     pending.authScopeUnsubscribe?.();
@@ -15851,14 +15752,27 @@ class Repo {
          */
         this.listenOutcomes_ = new Map();
         /**
-         * Identity of each live wire listen, by repoListenKey. A listen completion
-         * that was queued behind an ingest gate can drain after its subscription
-         * was stopped and the same path re-subscribed (PersistentConnection's
-         * listenSpec check runs before the callback is queued, so it does not
-         * cover that); the completion is applied only while the token it captured
-         * is still this map's entry for its key.
+         * Restored roots the server has not spoken for yet, keyed by path: the
+         * persisted tree is installed as the root's server cache the moment it is
+         * read (repoStartServerListen), and stays there as the SyncTree's complete
+         * value until the server speaks for a subtree containing it — an untagged
+         * overwrite, or the `ok` of a current default listen, at or above the root
+         * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
+         * the server (repoGetValue). The entry follows the complete cache at the
+         * root: nothing else retires it — not a range merge (server ranges folded
+         * over the restored base), not a descendant push, not stopping the
+         * listen — and once the cache is gone the next server word under the root
+         * passes the entry to the views that keep the bytes. A stale entry can
+         * only send a get() to the server, never serve one.
+         *
+         * Each entry carries what the server has since spoken for on its line
+         * without retiring it: subtrees strictly under the root, and filtered
+         * views answered exactly. A get() covered by either holds none of that
+         * root's restored bytes and keeps its cached answer while the rest waits.
+         * They are the entry's, not the path's — a new restore at the same root is
+         * a new entry with none, and a survivor an entry passes to starts with none.
          */
-        this.liveListens_ = new Map();
+        this.unconfirmedRestores_ = new Map();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
         this.key = this.repoInfo_.toURLString();
     }
@@ -16009,6 +15923,120 @@ function repoOnDataUpdate(repo, pathString, data, isMerge, tag, wireBytes = 0) {
     repoApplyDataUpdate(repo, pathString, data, isMerge, tag);
 }
 /**
+ * The server spoke for the whole subtree at `path`. Two doors say so — an
+ * untagged overwrite (the server sent the subtree), and the `ok` of the
+ * path's current default listen (the server matched the hash of the raw
+ * cache the listen carried; a restore under it can only have landed before
+ * that listen existed, since a default view shadows every descendant
+ * listen, so the hash covered it). Every entry at or under `path` is
+ * confirmed.
+ *
+ * An entry above `path` is not — unless its root's complete cache is gone.
+ * SyncTree drops a view whose registrations are removed, covered or not,
+ * and one whose listen the server cancelled, without stopping anything on
+ * the wire; the restored bytes then live on only in the descendant default
+ * views it kept and restarted listens for (the shallowest complete view per
+ * branch; deeper ones are covered by it). The entry passes to those views,
+ * minus any this word already covers, and each is answered by its own
+ * listen. Until that first word the entry stays where it was, which only
+ * sends a get() on its line to the server.
+ */
+function repoConfirmRestoresUnder(repo, path) {
+    for (const [rootString, entry] of [...repo.unconfirmedRestores_]) {
+        const rootPath = entry.path;
+        if (pathContains(path, rootPath)) {
+            repo.unconfirmedRestores_.delete(rootString);
+        }
+        else if (!pathContains(rootPath, path)) {
+            continue;
+        }
+        else if (syncTreeGetCompleteServerCache(repo.serverSyncTree_, rootPath) !== null) {
+            // Spoken for under a root that still holds restored bytes elsewhere.
+            entry.confirmedUnder.push(path);
+        }
+        else {
+            repo.unconfirmedRestores_.delete(rootString);
+            for (const survivor of repoSurvivingDefaultViews(repo, rootPath)) {
+                if (!pathContains(path, survivor)) {
+                    repoTrackUnconfirmedRestore(repo, survivor);
+                }
+            }
+        }
+    }
+}
+function repoTrackUnconfirmedRestore(repo, path) {
+    repo.unconfirmedRestores_.set(path.toString(), {
+        path,
+        confirmedUnder: [],
+        certifiedWindows: new WeakMap()
+    });
+}
+/**
+ * A tagged word about `view`'s window at `path`, which held `before` and
+ * now holds `after`: `complete` when the word was the whole window (the
+ * listen's `ok`, whose hash the server matched; an overwrite at the query's
+ * own path), in which case `after` is server truth outright. A partial word
+ * (a merge, an overwrite below the query path) leaves restored bytes where
+ * it did not write, so its result is server truth only if the window
+ * already was. Per entry: a window certified against one root's bytes says
+ * nothing about another entry's.
+ */
+function repoCertifyWindow(repo, path, view, before, after, complete) {
+    if (after === null) {
+        return;
+    }
+    for (const entry of repo.unconfirmedRestores_.values()) {
+        if (!pathContains(entry.path, path) && !pathContains(path, entry.path)) {
+            continue;
+        }
+        if (complete ||
+            (before !== null && entry.certifiedWindows.get(view) === before)) {
+            entry.certifiedWindows.set(view, after);
+        }
+    }
+}
+/**
+ * Applies a tagged server word (a listen's data, a get()'s answer) and
+ * certifies the window it wrote. The tag names the view (every filtered
+ * query has one, listening or covered); for a retired tag SyncTree
+ * installs nothing, and nothing is certified. A tagged range merge folds
+ * restored bytes into the window and does not come through here; its
+ * result is read from the server.
+ */
+function repoApplyTaggedWord(repo, path, tag, isMerge, apply) {
+    const tagged = tag == null ? null : repoViewForTag(repo, tag);
+    const before = tagged && viewGetServerCache(tagged.view);
+    const events = apply();
+    if (tagged) {
+        repoCertifyWindow(repo, tagged.path, tagged.view, before, viewGetServerCache(tagged.view), !isMerge && pathEquals(path, tagged.path));
+    }
+    return events;
+}
+/** The shallowest complete default view on each branch under `rootPath`. */
+function repoSurvivingDefaultViews(repo, rootPath) {
+    const frontier = [];
+    // Shallowest first; `complete` is non-null only for a default view (see
+    // viewGetCompleteServerCache).
+    for (const state of syncTreeGetDescendantServerCacheStates(repo.serverSyncTree_, rootPath)) {
+        if (state.complete !== null &&
+            !frontier.some(covering => pathContains(covering, state.path))) {
+            frontier.push(state.path);
+        }
+    }
+    return frontier.map(relative => pathChild(rootPath, relative));
+}
+/**
+ * Applies an untagged server overwrite and confirms what it covers. The
+ * restore door (repoStartServerListen) and the range-merge fold
+ * (repoIngestRangeMerge) also overwrite, but with bytes the server has not
+ * confirmed; they call syncTreeApplyServerOverwrite directly.
+ */
+function repoApplyConfirmedServerOverwrite(repo, path, node) {
+    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, node);
+    repoConfirmRestoresUnder(repo, path);
+    return events;
+}
+/**
  * The synchronous data-push application (the pre-ingest-pump body of
  * repoOnDataUpdate): decode, apply to SyncTree, rerun transactions, raise
  * events, write through to persistence. Bounded payloads only — full-root
@@ -16021,22 +16049,26 @@ function repoApplyDataUpdate(repo, pathString, data, isMerge, tag) {
         : data;
     let events = [];
     if (tag) {
-        if (isMerge) {
-            const taggedChildren = util.map(data, (raw) => nodeFromJSON(raw));
-            events = syncTreeApplyTaggedQueryMerge(repo.serverSyncTree_, path, taggedChildren, tag);
-        }
-        else {
-            const taggedSnap = nodeFromJSON(data);
-            events = syncTreeApplyTaggedQueryOverwrite(repo.serverSyncTree_, path, taggedSnap, tag);
-        }
+        events = repoApplyTaggedWord(repo, path, tag, isMerge, () => {
+            if (isMerge) {
+                const taggedChildren = util.map(data, (raw) => nodeFromJSON(raw));
+                return syncTreeApplyTaggedQueryMerge(repo.serverSyncTree_, path, taggedChildren, tag);
+            }
+            return syncTreeApplyTaggedQueryOverwrite(repo.serverSyncTree_, path, nodeFromJSON(data), tag);
+        });
     }
     else if (isMerge) {
         const changedChildren = util.map(data, (raw) => nodeFromJSON(raw));
         events = syncTreeApplyServerMerge(repo.serverSyncTree_, path, changedChildren);
+        // Each child of an untagged merge is the server's complete word on the
+        // subtree at its (possibly nested) relative path.
+        each(changedChildren, (relativePath) => {
+            repoConfirmRestoresUnder(repo, pathChild(path, new Path(relativePath)));
+        });
     }
     else {
         const snap = nodeFromJSON(data);
-        events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, snap);
+        events = repoApplyConfirmedServerOverwrite(repo, path, snap);
     }
     let affectedPath = path;
     if (events.length > 0) {
@@ -16285,7 +16317,7 @@ async function repoIngestFullRootPush(repo, pathString, data, isCurrent) {
     if (!isCurrent()) {
         throw new IngestCancelledError();
     }
-    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, rootPath, assembled);
+    const events = repoApplyConfirmedServerOverwrite(repo, rootPath, assembled);
     let affectedPath = rootPath;
     if (events.length > 0) {
         affectedPath = repoRerunTransactions(repo, rootPath);
@@ -16423,7 +16455,7 @@ async function repoIngestRangeMerge(repo, pathString, ranges, isCurrent) {
     if (!isCurrent()) {
         throw new IngestCancelledError();
     }
-    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, folded, 'keep');
+    const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, path, folded);
     let affectedPath = path;
     if (events.length > 0) {
         affectedPath = repoRerunTransactions(repo, path);
@@ -16457,9 +16489,6 @@ function repoPublishListenOutcome(repo, pathString, outcome) {
 function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skipPersistence = false, authScopeTimeoutMs = PERSISTENCE_RESTORE_TIMEOUT_MS, coldReason) {
     const pathString = query._path.toString();
     const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
-    const listenKey = repoListenKey(pathString, tag);
-    const listenToken = {};
-    repo.liveListens_.set(listenKey, listenToken);
     if (isDefaultComplete) {
         const prior = repo.listenOutcomes_.get(pathString);
         repo.listenOutcomes_.set(pathString, {
@@ -16467,15 +16496,40 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
             subscribers: prior?.subscribers ?? new Set()
         });
     }
+    // This listen is the path's current one exactly while its outcome state
+    // is: repoStopServerListen retires the entry on entry, a later start
+    // replaces it. A filtered listen is its view's: SyncTree registers the
+    // view before it starts the listen, and replaces the view (and its tag)
+    // when the query is unsubscribed and re-registered.
+    const outcomeState = repo.listenOutcomes_.get(pathString);
+    const listenView = isDefaultComplete ? null : repoRegisteredView(repo, query);
     let activeMode = 'cold';
     let activeReason;
     const processListenComplete = (status, data, wire) => {
-        if (repo.liveListens_.get(listenKey) !== listenToken) {
-            // Stopped (and possibly re-subscribed) while this answer was queued:
-            // it belongs to a subscription that no longer exists.
+        if (isDefaultComplete &&
+            repo.listenOutcomes_.get(pathString) !== outcomeState) {
+            // A completion for a listen this path no longer has: it was queued
+            // behind an ingest, and the path was stopped (and possibly restarted)
+            // before it drained. The connection rejects such completions for a
+            // live listen; deferral let this one through. Its status is about a
+            // subscription that is gone — an error would cancel the replacement's
+            // registrations, an `ok` would certify a tree it never vouched for.
             return;
         }
         const events = onComplete(status, data);
+        if (status === 'ok') {
+            // The server matched the hashes this listen carried, and everything it
+            // sent before the `ok` has applied (the ingest queue keeps wire order).
+            if (isDefaultComplete) {
+                repoConfirmRestoresUnder(repo, query._path);
+            }
+            else if (listenView !== null &&
+                repoRegisteredView(repo, query) === listenView) {
+                // A deferred `ok` for a view since replaced certifies nothing: the
+                // replacement never carried this listen's hash.
+                repoCertifyWindow(repo, query._path, listenView, null, viewGetServerCache(listenView), true);
+            }
+        }
         eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
         if (!isDefaultComplete) {
             return;
@@ -16802,7 +16856,10 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
                 '', record.compoundHash !== undefined
                     ? blankGraftedRangeHashes(record.compoundHash, graftList.map(graft => pathSlice(graft.path)))
                     : undefined);
-            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored, 'restore');
+            const events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, restored);
+            // Installed even if this listen has since been stopped: the bytes
+            // are in the SyncTree now, and only the server can vouch for them.
+            repoTrackUnconfirmedRestore(repo, query._path);
             eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
             if (!isCurrent()) {
                 repo.pendingListenHashes_.clear(pathString);
@@ -16851,11 +16908,17 @@ function repoStartServerListen(repo, query, tag, currentHashFn, onComplete, skip
  */
 function repoStopServerListen(repo, query, tag) {
     const pathString = query._path.toString();
-    repo.liveListens_.delete(repoListenKey(pathString, tag));
     if (tag != null || !query._queryParams.loadsAllData()) {
         repo.server_.unlisten(query, tag);
         return;
     }
+    // This listen ends here, before anything below can run its queued `ok`:
+    // lifting the gate drains the queue synchronously, and an `ok` queued
+    // behind an ingest this stop cancels must not confirm bytes that ingest
+    // was about to replace (processListenComplete checks the entry identity).
+    // The root's restore entry, if any, is untouched: a stop says nothing
+    // about the cache (see repoConfirmRestoresUnder).
+    repo.listenOutcomes_.delete(pathString);
     const pending = repo.pendingSeedRestores_.get(pathString);
     if (pending && !repo.ingestQueue_.gates.has(pathString)) {
         // Still waiting on the auth scope or manifest: the listen was never sent.
@@ -16871,7 +16934,6 @@ function repoStopServerListen(repo, query, tag) {
     }
     repoLiftIngestGate(repo, pathString);
     repo.pendingListenHashes_.clear(pathString);
-    repo.listenOutcomes_.delete(pathString);
     repo.persistence_?.untrack(pathString);
 }
 /** Observe the outcome of one exact default listen. @internal */
@@ -16970,7 +17032,6 @@ function repoDispose(repo) {
         }
     }
     repoClearListenOutcomes(repo);
-    repo.liveListens_.clear();
     repo.persistenceAuthScopeListeners_.clear();
     repo.persistence_?.dispose();
 }
@@ -17131,11 +17192,30 @@ function repoGetNextWriteId(repo) {
     return repo.nextWriteId_++;
 }
 /**
- * Key of one wire listen as handed to the ListenProvider: default listens by
- * path, filtered queries by path plus their SyncTree tag.
+ * Whether a cached answer for `query` could hold restored bytes: an
+ * unconfirmed root lies on its line (at, above, or below it) whose own
+ * confirmations (a subtree covering the query, or the very window that
+ * would answer it) do not cover it, and no complete local write shadows it
+ * (the write tree answers before the server cache is consulted, so such a
+ * get() never touched server bytes on base either).
  */
-function repoListenKey(pathString, tag) {
-    return tag == null ? pathString : pathString + '|' + tag;
+function repoCachedAnswerMayBeRestored(repo, query) {
+    const path = query._path;
+    // The window that would answer, if a view is registered (a default
+    // query's certification is a subtree, in confirmedUnder; only filtered
+    // windows are ever certified exactly).
+    const view = repoRegisteredView(repo, query);
+    const window = view === null ? null : viewGetServerCache(view);
+    // Each entry on the query's line blocks unless its own confirmations
+    // cover the query; one entry's confirmation says nothing about another's
+    // restored bytes (a restore at a descendant of a retained ancestor entry).
+    const blocked = [...repo.unconfirmedRestores_.values()].some(entry => (pathContains(entry.path, path) || pathContains(path, entry.path)) &&
+        !entry.confirmedUnder.some(confirmed => pathContains(confirmed, path)) &&
+        !(view !== null && entry.certifiedWindows.get(view) === window));
+    if (!blocked) {
+        return false;
+    }
+    return (writeTreeRefCalcCompleteEventCache(writeTreeChildWrites(repo.serverSyncTree_.pendingWriteTree_, path), null) === null);
 }
 /**
  * The purpose of `getValue` is to return the latest known value
@@ -17153,11 +17233,17 @@ function repoListenKey(pathString, tag) {
  * @param query - The query to surface a value for.
  */
 function repoGetValue(repo, query, eventRegistration) {
-    // Only active queries are cached, and only a VERIFIED cache is served: a
-    // persistent listen's restored tree sits in its views (and any view seeded
-    // from them) unverified until the server replaces or confirms it
-    // (CacheNode.isVerified). The bit lives on the view the value comes from.
-    const cached = syncTreeGetVerifiedServerValue(repo.serverSyncTree_, query);
+    // Only active queries are cached, and a restored root's cache is not the
+    // server's until the server confirms or replaces it. Restored bytes travel
+    // only along the root's own line — down it, as the cache every descendant
+    // view is seeded from; up it, as the descendant an ancestor view assembles
+    // its cache from — so that line reads the server while a sibling branch,
+    // a subtree the server has since spoken for, or a value a local write
+    // shadows keeps its cached answer. onValue is untouched: cached-then-live
+    // is what a listener wants, and the listen's answer corrects it in place.
+    const cached = repoCachedAnswerMayBeRestored(repo, query)
+        ? null
+        : syncTreeGetServerValue(repo.serverSyncTree_, query);
     if (cached != null) {
         return Promise.resolve(cached);
     }
@@ -17190,11 +17276,11 @@ function repoGetValue(repo, query, eventRegistration) {
         syncTreeAddEventRegistration(repo.serverSyncTree_, query, eventRegistration, true);
         let events;
         if (query._queryParams.loadsAllData()) {
-            events = syncTreeApplyServerOverwrite(repo.serverSyncTree_, query._path, node);
+            events = repoApplyConfirmedServerOverwrite(repo, query._path, node);
         }
         else {
             const tag = syncTreeTagForQuery(repo.serverSyncTree_, query);
-            events = syncTreeApplyTaggedQueryOverwrite(repo.serverSyncTree_, query._path, node, tag);
+            events = repoApplyTaggedWord(repo, query._path, tag, false, () => syncTreeApplyTaggedQueryOverwrite(repo.serverSyncTree_, query._path, node, tag));
         }
         /*
          * We need to raise events in the scenario where `get()` is called at a parent path, and

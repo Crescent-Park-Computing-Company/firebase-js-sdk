@@ -27,7 +27,6 @@ export interface ViewCache {
 }
 export declare function newViewCache(eventCache: CacheNode, serverCache: CacheNode): ViewCache;
 export declare function viewCacheUpdateEventSnap(viewCache: ViewCache, eventSnap: Node, complete: boolean, filtered: boolean): ViewCache;
-export declare function viewCacheSetEventVerified(viewCache: ViewCache, verified: boolean): ViewCache;
-export declare function viewCacheUpdateServerSnap(viewCache: ViewCache, serverSnap: Node, complete: boolean, filtered: boolean, verified: boolean): ViewCache;
+export declare function viewCacheUpdateServerSnap(viewCache: ViewCache, serverSnap: Node, complete: boolean, filtered: boolean): ViewCache;
 export declare function viewCacheGetCompleteEventSnap(viewCache: ViewCache): Node | null;
 export declare function viewCacheGetCompleteServerSnap(viewCache: ViewCache): Node | null;

@@ -34,29 +34,12 @@ export interface Operation {
     path: Path;
     operationForChild(childName: string): Operation | null;
 }
-/**
- * What a server-sourced operation says about the data it carries, for the
- * `verified` bit of the server cache it lands in (see CacheNode.isVerified):
- *
- * - 'verify': ordinary server data. A full overwrite of a view, or a listen
- *   completing at it, marks the view's server cache verified.
- * - 'keep': a correction folded over the current cache (range merges). The
- *   view keeps whatever bit it had; the listen completion that follows the
- *   merges is what verifies it.
- * - 'restore': a persisted tree being installed as a listen's initial cache
- *   before the server has answered. A full overwrite of a view marks it
- *   UNverified; a view the operation only partially covers (an ancestor
- *   view) is left untouched, so unverified data never grafts into a view
- *   the server did verify.
- */
-export type OperationVerification = 'verify' | 'keep' | 'restore';
 export interface OperationSource {
     fromUser: boolean;
     fromServer: boolean;
     queryId: string | null;
     tagged: boolean;
-    verification: OperationVerification;
 }
 export declare function newOperationSourceUser(): OperationSource;
-export declare function newOperationSourceServer(verification?: OperationVerification): OperationSource;
-export declare function newOperationSourceServerTaggedQuery(queryId: string, verification?: OperationVerification): OperationSource;
+export declare function newOperationSourceServer(): OperationSource;
+export declare function newOperationSourceServerTaggedQuery(queryId: string): OperationSource;

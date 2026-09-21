@@ -18,7 +18,6 @@ import { ReferenceConstructor } from '../api/Reference';
 import { Operation } from './operation/Operation';
 import { Node } from './snap/Node';
 import { Path } from './util/Path';
-import { CacheNode } from './view/CacheNode';
 import { Event } from './view/Event';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
 import { View } from './view/View';
@@ -44,7 +43,7 @@ export declare class SyncPoint {
 }
 export declare function syncPointSetReferenceConstructor(val: ReferenceConstructor): void;
 export declare function syncPointIsEmpty(syncPoint: SyncPoint): boolean;
-export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation: Operation, writesCache: WriteTreeRef, optCompleteServerCache: CacheNode | null): Event[];
+export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation: Operation, writesCache: WriteTreeRef, optCompleteServerCache: Node | null): Event[];
 /**
  * Get a view for the specified query.
  *
@@ -54,7 +53,7 @@ export declare function syncPointApplyOperation(syncPoint: SyncPoint, operation:
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryContext, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean, serverCacheVerified?: boolean): View;
+export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryContext, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean): View;
 /**
  * Add an event callback for the specified query.
  *
@@ -65,7 +64,7 @@ export declare function syncPointGetView(syncPoint: SyncPoint, query: QueryConte
  * @param serverCacheComplete
  * @returns Events to raise.
  */
-export declare function syncPointAddEventRegistration(syncPoint: SyncPoint, query: QueryContext, eventRegistration: EventRegistration, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean, serverCacheVerified?: boolean): Event[];
+export declare function syncPointAddEventRegistration(syncPoint: SyncPoint, query: QueryContext, eventRegistration: EventRegistration, writesCache: WriteTreeRef, serverCache: Node | null, serverCacheComplete: boolean): Event[];
 /**
  * Remove event callback(s).  Return cancelEvents if a cancelError is specified.
  *
@@ -86,11 +85,6 @@ export declare function syncPointGetQueryViews(syncPoint: SyncPoint): View[];
  * @returns A complete cache, if it exists
  */
 export declare function syncPointGetCompleteServerCache(syncPoint: SyncPoint, path: Path): Node | null;
-/**
- * Same as syncPointGetCompleteServerCache, as a CacheNode carrying the
- * owning view's `verified` bit (see viewGetCompleteServerCacheNode).
- */
-export declare function syncPointGetCompleteServerCacheNode(syncPoint: SyncPoint, path: Path): CacheNode | null;
 export declare function syncPointViewForQuery(syncPoint: SyncPoint, query: QueryContext): View | null;
 export declare function syncPointViewExistsForQuery(syncPoint: SyncPoint, query: QueryContext): boolean;
 export declare function syncPointHasCompleteView(syncPoint: SyncPoint): boolean;

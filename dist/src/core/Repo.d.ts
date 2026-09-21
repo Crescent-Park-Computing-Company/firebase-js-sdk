@@ -35,6 +35,7 @@ import { Tree } from './util/Tree';
 import { Event } from './view/Event';
 import { EventQueue } from './view/EventQueue';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
+import { View } from './view/View';
 declare const enum TransactionStatus {
     RUN = 0,
     SENT = 1,
@@ -181,6 +182,25 @@ interface ListenOutcomeState {
     outcome: ListenOutcome | null;
     subscribers: Set<(outcome: ListenOutcome) => void>;
 }
+interface UnconfirmedRestore {
+    path: Path;
+    /** Subtrees strictly under the root the server has since spoken for. */
+    confirmedUnder: Path[];
+    /**
+     * Filtered windows on the root's line the server has answered exactly:
+     * per registered view, the server-cache node holding its answer (after
+     * its tagged listen's `ok`, a tagged overwrite of the whole window such
+     * as a get()'s own answer, or a tagged word into a window already
+     * certified). Both identities. The node, because SyncTree rebuilds a
+     * view's window from its ancestors' bytes (a range fold over the restored
+     * root, a replacement view seeded from a filtered ancestor) and the
+     * rebuilt node is not the answered one; nodes are immutable. The view,
+     * because views at one path seeded from the same bytes share a node, and
+     * one query's hash match says nothing about another query's window.
+     * Weak: the entry certifies, it does not keep.
+     */
+    certifiedWindows: WeakMap<View, Node>;
+}
 export declare class Repo {
     repoInfo_: RepoInfo;
     forceRestClient_: boolean;
@@ -237,14 +257,27 @@ export declare class Repo {
      */
     listenOutcomes_: Map<string, ListenOutcomeState>;
     /**
-     * Identity of each live wire listen, by repoListenKey. A listen completion
-     * that was queued behind an ingest gate can drain after its subscription
-     * was stopped and the same path re-subscribed (PersistentConnection's
-     * listenSpec check runs before the callback is queued, so it does not
-     * cover that); the completion is applied only while the token it captured
-     * is still this map's entry for its key.
+     * Restored roots the server has not spoken for yet, keyed by path: the
+     * persisted tree is installed as the root's server cache the moment it is
+     * read (repoStartServerListen), and stays there as the SyncTree's complete
+     * value until the server speaks for a subtree containing it — an untagged
+     * overwrite, or the `ok` of a current default listen, at or above the root
+     * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
+     * the server (repoGetValue). The entry follows the complete cache at the
+     * root: nothing else retires it — not a range merge (server ranges folded
+     * over the restored base), not a descendant push, not stopping the
+     * listen — and once the cache is gone the next server word under the root
+     * passes the entry to the views that keep the bytes. A stale entry can
+     * only send a get() to the server, never serve one.
+     *
+     * Each entry carries what the server has since spoken for on its line
+     * without retiring it: subtrees strictly under the root, and filtered
+     * views answered exactly. A get() covered by either holds none of that
+     * root's restored bytes and keeps its cached answer while the rest waits.
+     * They are the entry's, not the path's — a new restore at the same root is
+     * a new entry with none, and a survivor an entry passes to starts with none.
      */
-    liveListens_: Map<string, object>;
+    unconfirmedRestores_: Map<string, UnconfirmedRestore>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.

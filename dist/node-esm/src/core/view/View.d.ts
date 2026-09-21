@@ -18,7 +18,6 @@ import { Operation } from '../operation/Operation';
 import { Node } from '../snap/Node';
 import { Path } from '../util/Path';
 import { WriteTreeRef } from '../WriteTree';
-import { CacheNode } from './CacheNode';
 import { Event } from './Event';
 import { EventGenerator } from './EventGenerator';
 import { EventRegistration, QueryContext } from './EventRegistration';
@@ -45,20 +44,6 @@ export declare class View {
 export declare function viewGetServerCache(view: View): Node | null;
 export declare function viewGetCompleteNode(view: View): Node | null;
 export declare function viewGetCompleteServerCache(view: View, path: Path): Node | null;
-/**
- * The complete server cache this view holds for `path`, as a CacheNode that
- * carries the view's `verified` bit, so a view seeded from it inherits the
- * provenance along with the data.
- */
-export declare function viewGetCompleteServerCacheNode(view: View, path: Path): CacheNode | null;
-/**
- * Whether the value this view returns (its event cache: server data plus
- * local writes) is built only from verified data. False while the view's
- * server cache is a restored tree, or while a local write's refill of a
- * filtered window borrowed from an unverified covering cache
- * (see viewProcessorApplyOperation).
- */
-export declare function viewIsEventCacheVerified(view: View): boolean;
 export declare function viewIsEmpty(view: View): boolean;
 export declare function viewAddEventRegistration(view: View, eventRegistration: EventRegistration): void;
 /**
@@ -70,5 +55,5 @@ export declare function viewRemoveEventRegistration(view: View, eventRegistratio
 /**
  * Applies the given Operation, updates our cache, and returns the appropriate events.
  */
-export declare function viewApplyOperation(view: View, operation: Operation, writesCache: WriteTreeRef, completeServerCache: CacheNode | null): Event[];
+export declare function viewApplyOperation(view: View, operation: Operation, writesCache: WriteTreeRef, completeServerCache: Node | null): Event[];
 export declare function viewGetInitialEvents(view: View, registration: EventRegistration): Event[];
