@@ -59,6 +59,7 @@ interface ListenSpec {
 
   hashFn: ListenHashFn;
   bytes: number;
+  completed: boolean;
   // Captured once when the listen request is serialized. The wire result
   // must never call back into hashFn(): recomputing the canonical hash of a
   // large post-merge cache is a full-tree serialize+SHA-1 walk, and the
@@ -272,6 +273,7 @@ export class PersistentConnection extends ServerActions {
       query,
       tag,
       bytes: 0,
+      completed: false,
       hadHash: false,
       hadCompoundHash: false,
       dataReceived: false,
@@ -326,6 +328,7 @@ export class PersistentConnection extends ServerActions {
     listenSpec.hadHash = req['h'] !== '';
     listenSpec.hadCompoundHash = compoundHash !== undefined;
     listenSpec.bytes = 0;
+    listenSpec.completed = false;
     listenSpec.dataReceived = false;
     listenSpec.rangeMerged = false;
 
@@ -345,6 +348,7 @@ export class PersistentConnection extends ServerActions {
         // only trigger actions if the listen hasn't been removed and readded
         if (currentListenSpec === listenSpec) {
           this.log_('listen response', message);
+          listenSpec.completed = true;
 
           if (status !== 'ok') {
             this.removeListen_(pathString, queryId);
@@ -730,6 +734,10 @@ export class PersistentConnection extends ServerActions {
       const listensAtPath = this.listens.get(pushPath);
       if (listensAtPath) {
         for (const listen of listensAtPath.values()) {
+          // Progress belongs to the pending listen, not its live updates.
+          if (listen.completed) {
+            continue;
+          }
           listen.bytes += bytes;
           listen.dataReceived = true;
           if (action === 'rm') {

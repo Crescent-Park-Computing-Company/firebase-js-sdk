@@ -2636,6 +2636,7 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       pendingListenHashes_: pendingHashes,
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      listenOutcomeSubscribers_: new Map(),
       unconfirmedRestores_: new Map(),
       interceptServerDataCallback_: null,
       // The boot-window drain reruns transactions after each replayed push;
@@ -3919,6 +3920,53 @@ describe('repoStartServerListen / repoStopServerListen', () => {
       expect(
         await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })
       ).to.deep.equal({ from: 'cache', value: { msg: 'stale' } });
+    });
+
+    it('keeps outcome observers through covering-listen shadowing and restart', async () => {
+      const harness = makeListenHarness();
+      wireProvider(harness);
+      const { repo, path, serverCallbacks } = harness;
+      await restoredRootWired(harness, { inbox: { msg: 'cached' } });
+      const outcomes: ListenOutcome[] = [];
+      const unsubscribe = repoOnListenOutcome(repo, path.toString(), outcome =>
+        outcomes.push(outcome)
+      );
+      serverCallbacks[0]('ok');
+      expect(outcomes.at(-1)?.certified).to.equal(true);
+      const ancestor = defaultQuery('users');
+      const registration = stubRegistration(undefined, true);
+      syncTreeAddEventRegistration(
+        repo.serverSyncTree_,
+        ancestor,
+        registration
+      );
+      expect(outcomes.at(-1)?.certified).to.equal(false);
+      serverCallbacks[1]('ok');
+      expect(outcomes.at(-1)?.certified).to.equal(true);
+      const late: ListenOutcome[] = [];
+      const unsubscribeLate = repoOnListenOutcome(
+        repo,
+        path.toString(),
+        outcome => late.push(outcome)
+      );
+      expect(late.at(-1)?.certified).to.equal(true);
+      syncTreeRemoveEventRegistration(
+        repo.serverSyncTree_,
+        ancestor,
+        registration
+      );
+      await flushAsync();
+      expect(outcomes.at(-1)?.certified).to.equal(false);
+      serverCallbacks[0]('ok'); // retired child cannot certify the replacement
+      expect(outcomes.at(-1)?.certified).to.equal(false);
+      serverCallbacks.at(-1)!('ok');
+      expect(outcomes.at(-1)?.certified).to.equal(true);
+      expect(late.at(-1)?.certified).to.equal(true);
+      unsubscribe();
+      unsubscribeLate();
+      const count = outcomes.length;
+      serverCallbacks.at(-1)!('ok');
+      expect(outcomes).to.have.length(count);
     });
 
     it('an ancestor listen shadowing the root: the ancestor overwrite confirms too', async () => {
@@ -5668,8 +5716,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
     repoStartServerListen(repo, query, null, hashFn, onComplete);
     await flushAsync();
     expect(repo.listenOutcomes_.size).to.equal(1);
+    const unsubscribe = repoOnListenOutcome(repo, path.toString(), () => {});
+    expect(repo.listenOutcomeSubscribers_.size).to.equal(1);
+    unsubscribe();
+    expect(repo.listenOutcomeSubscribers_.size).to.equal(0);
+    repoOnListenOutcome(repo, path.toString(), () => {});
     repoClearListenOutcomes(repo);
     expect(repo.listenOutcomes_.size).to.equal(0);
+    expect(repo.listenOutcomeSubscribers_.size).to.equal(0);
   });
 
   it('emits generic persistence traces without an app-side wrapper', async () => {
@@ -5720,6 +5774,7 @@ describe('stale restore vs live server data', () => {
       pendingSeedRestores_: new Map<string, { cancelled: boolean }>(),
       ingestQueue_: newIngestQueue(),
       listenOutcomes_: new Map(),
+      listenOutcomeSubscribers_: new Map(),
       unconfirmedRestores_: new Map(),
       persistence_: manager,
       eventQueue_: new EventQueue(),
