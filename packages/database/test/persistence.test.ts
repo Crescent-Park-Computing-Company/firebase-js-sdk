@@ -4199,6 +4199,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         defaultQuery('users/alice/inbox'),
         stubRegistration(undefined, true)
       );
+      const childOutcomes: ListenOutcome[] = [];
+      repoOnListenOutcome(repo, '/users/alice/inbox', outcome =>
+        childOutcomes.push(outcome)
+      );
+      const parentOutcomes: ListenOutcome[] = [];
+      repoOnListenOutcome(repo, path.toString(), outcome =>
+        parentOutcomes.push(outcome)
+      );
       // permission_denied: SyncTree removes the root's view and restarts the
       // survivor's listen with the cancel error, stopping nothing on the wire.
       serverCallbacks[0]('permission_denied');
@@ -4213,6 +4221,14 @@ describe('repoStartServerListen / repoStopServerListen', () => {
         (await getFrom(harness, 'users/alice/inbox', { msg: 'stale' })).from
       ).to.equal('server');
       serverCallbacks[1]('ok');
+      expect(childOutcomes.at(-1)?.certified).to.equal(true);
+      expect(parentOutcomes.at(-1)?.reason).to.equal('auth');
+      const late: ListenOutcome[] = [];
+      repoOnListenOutcome(repo, '/users/alice/inbox', outcome =>
+        late.push(outcome)
+      );
+      expect(late.at(-1)?.certified).to.equal(true);
+      expect(repo.listenOutcomes_.has(path.toString())).to.equal(false);
       expect(repo.unconfirmedRestores_.size).to.equal(0);
       expect(
         await getFrom(harness, 'users/alice/inbox', { msg: 'unused' })

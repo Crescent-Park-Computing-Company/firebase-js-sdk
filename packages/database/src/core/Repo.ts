@@ -1580,6 +1580,12 @@ export function repoStartServerListen(
       // registrations, an `ok` would certify a tree it never vouched for.
       return;
     }
+    if (isDefaultComplete && status !== 'ok') {
+      // Server cancellation bypasses stopListening. Retire this covering
+      // listen before onComplete starts the surviving descendant frontier.
+      repo.listenOutcomes_.delete(pathString);
+      repo.persistence_?.evict(query._path);
+    }
     const events = onComplete(status, data);
     if (status === 'ok') {
       // The server matched the hashes this listen carried, and everything it
@@ -1603,27 +1609,43 @@ export function repoStartServerListen(
       }
     }
     eventQueueRaiseEventsForChangedPath(repo.eventQueue_, query._path, events);
-    if (
-      !isDefaultComplete ||
-      repo.listenOutcomes_.get(pathString) !== outcomeState
-    ) {
+    if (!isDefaultComplete) {
+      return;
+    }
+    if (status !== 'ok') {
+      const outcome: ListenOutcome = {
+        mode: activeMode,
+        certified: false,
+        bytes: wire.bytes,
+        reason: 'auth'
+      };
+      emitPersistenceTrace({
+        type: 'listen-outcome',
+        path: pathString,
+        outcome
+      });
+      // Only this cancelled path gets its terminal outcome; descendants now
+      // belong to their own live listens. Never overwrite a reentrant restart.
+      for (const subscriber of repo.listenOutcomeSubscribers_.get(pathString) ??
+        []) {
+        if (repo.listenOutcomes_.has(pathString)) {
+          break;
+        }
+        exceptionGuard(() => subscriber(outcome));
+      }
+      return;
+    }
+    if (repo.listenOutcomes_.get(pathString) !== outcomeState) {
       return;
     }
     repoPublishListenOutcome(repo, pathString, {
       mode: activeMode,
-      certified: status === 'ok',
+      certified: true,
       bytes: wire.bytes,
-      reason: status === 'ok' ? activeReason : 'auth'
+      reason: activeReason
     });
-    if (repo.persistence_ !== null) {
-      if (status === 'ok') {
-        // The certification confirms state whose changes (pushes / range
-        // merges before it) were already reported individually.
-        repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
-      } else {
-        repo.persistence_.evict(query._path);
-      }
-    }
+    // Pushes before this certification already reported their own changes.
+    repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
   };
 
   const sendListen = (
