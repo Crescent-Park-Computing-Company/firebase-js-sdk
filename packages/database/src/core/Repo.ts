@@ -376,7 +376,6 @@ export interface ListenOutcome {
 
 interface ListenOutcomeState {
   outcome: ListenOutcome | null;
-  subscribers: Set<(outcome: ListenOutcome) => void>;
 }
 
 interface UnconfirmedRestore {
@@ -491,12 +490,13 @@ export class Repo {
    */
   ingestQueue_ = newIngestQueue();
 
-  /**
-   * Listen-complete state per default complete listen, keyed by path: whether
-   * the current listen has received its initial server response, and waiters
-   * to publish its certification outcome (see onListenOutcome in api/Database.ts).
-   */
+  /** Current wire-listen identities; a stop retires stale completions. */
   listenOutcomes_ = new Map<string, ListenOutcomeState>();
+  /** Application observers outlive wire-listen shadowing and replacement. */
+  listenOutcomeSubscribers_ = new Map<
+    string,
+    Set<(outcome: ListenOutcome) => void>
+  >();
 
   /**
    * Restored roots the server has not spoken for yet, keyed by path: the
@@ -1479,15 +1479,42 @@ async function repoIngestRangeMerge(
   repoPersistAfterServerUpdate(repo, path, 'unknown');
 }
 
-/**
- * Sends a listen for the server sync tree, restoring the persisted server
- * cache first where applicable: a complete default listen on a persisted
- * root is held until the stored tree restores (bounded inside restore()),
- * the restored tree is applied as server data — raising cached events
- * immediately, mobile-persistence semantics — and the listen then goes out
- * carrying the restored tree's hashes. Roots that were never persisted
- * resolve null instantly and attach exactly as before.
- */
+/** The shallowest live default listen owns certification of the whole subtree. */
+function repoCoveringListenOutcome(
+  repo: Repo,
+  pathString: string
+): ListenOutcome | null {
+  const path = new Path(pathString);
+  let covering: string | undefined;
+  let outcome: ListenOutcome | null = null;
+  for (const [listenPath, state] of repo.listenOutcomes_) {
+    if (
+      (covering === undefined || listenPath.length < covering.length) &&
+      pathContains(new Path(listenPath), path)
+    ) {
+      covering = listenPath;
+      outcome = state.outcome;
+    }
+  }
+  return outcome;
+}
+
+function repoRaiseListenOutcomes(repo: Repo, pathString: string): void {
+  const path = new Path(pathString);
+  for (const [observedPath, subscribers] of repo.listenOutcomeSubscribers_) {
+    if (!pathContains(path, new Path(observedPath))) {
+      continue;
+    }
+    for (const subscriber of subscribers) {
+      // Earlier callbacks may stop or replace the covering listen.
+      const outcome = repoCoveringListenOutcome(repo, observedPath);
+      if (outcome) {
+        exceptionGuard(() => subscriber(outcome));
+      }
+    }
+  }
+}
+
 function repoPublishListenOutcome(
   repo: Repo,
   pathString: string,
@@ -1499,12 +1526,18 @@ function repoPublishListenOutcome(
   }
   state.outcome = outcome;
   emitPersistenceTrace({ type: 'listen-outcome', path: pathString, outcome });
-  for (const subscriber of state.subscribers) {
-    // Observability callbacks must never abort authoritative wire processing.
-    exceptionGuard(() => subscriber(outcome));
-  }
+  repoRaiseListenOutcomes(repo, pathString);
 }
 
+/**
+ * Sends a listen for the server sync tree, restoring the persisted server
+ * cache first where applicable: a complete default listen on a persisted
+ * root is held until the stored tree restores (bounded inside restore()),
+ * the restored tree is applied as server data — raising cached events
+ * immediately, mobile-persistence semantics — and the listen then goes out
+ * carrying the restored tree's hashes. Roots that were never persisted
+ * resolve null instantly and attach exactly as before.
+ */
 export function repoStartServerListen(
   repo: Repo,
   query: QueryContext,
@@ -1518,11 +1551,7 @@ export function repoStartServerListen(
   const pathString = query._path.toString();
   const isDefaultComplete = tag == null && query._queryParams.loadsAllData();
   if (isDefaultComplete) {
-    const prior = repo.listenOutcomes_.get(pathString);
-    repo.listenOutcomes_.set(pathString, {
-      outcome: null,
-      subscribers: prior?.subscribers ?? new Set()
-    });
+    repo.listenOutcomes_.set(pathString, { outcome: null });
   }
   // This listen is the path's current one exactly while its outcome state
   // is: repoStopServerListen retires the entry on entry, a later start
@@ -1551,6 +1580,12 @@ export function repoStartServerListen(
       // registrations, an `ok` would certify a tree it never vouched for.
       return;
     }
+    if (isDefaultComplete && status !== 'ok') {
+      // Server cancellation bypasses stopListening. Retire this covering
+      // listen before onComplete starts the surviving descendant frontier.
+      repo.listenOutcomes_.delete(pathString);
+      repo.persistence_?.evict(query._path);
+    }
     const events = onComplete(status, data);
     if (status === 'ok') {
       // The server matched the hashes this listen carried, and everything it
@@ -1577,21 +1612,40 @@ export function repoStartServerListen(
     if (!isDefaultComplete) {
       return;
     }
+    if (status !== 'ok') {
+      const outcome: ListenOutcome = {
+        mode: activeMode,
+        certified: false,
+        bytes: wire.bytes,
+        reason: 'auth'
+      };
+      emitPersistenceTrace({
+        type: 'listen-outcome',
+        path: pathString,
+        outcome
+      });
+      // Only this cancelled path gets its terminal outcome; descendants now
+      // belong to their own live listens. Never overwrite a reentrant restart.
+      for (const subscriber of repo.listenOutcomeSubscribers_.get(pathString) ??
+        []) {
+        if (repo.listenOutcomes_.has(pathString)) {
+          break;
+        }
+        exceptionGuard(() => subscriber(outcome));
+      }
+      return;
+    }
+    if (repo.listenOutcomes_.get(pathString) !== outcomeState) {
+      return;
+    }
     repoPublishListenOutcome(repo, pathString, {
       mode: activeMode,
-      certified: status === 'ok',
+      certified: true,
       bytes: wire.bytes,
-      reason: status === 'ok' ? activeReason : 'auth'
+      reason: activeReason
     });
-    if (repo.persistence_ !== null) {
-      if (status === 'ok') {
-        // The certification confirms state whose changes (pushes / range
-        // merges before it) were already reported individually.
-        repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
-      } else {
-        repo.persistence_.evict(query._path);
-      }
-    }
+    // Pushes before this certification already reported their own changes.
+    repoPersistAfterServerUpdate(repo, query._path, 'confirmed');
   };
 
   const sendListen = (
@@ -2077,28 +2131,34 @@ export function repoStopServerListen(
   repoLiftIngestGate(repo, pathString);
   repo.pendingListenHashes_.clear(pathString);
   repo.persistence_?.untrack(pathString);
+  repoRaiseListenOutcomes(repo, pathString);
 }
 
-/** Observe the outcome of one exact default listen. @internal */
+/** Observe the default listen currently covering a path. @internal */
 export function repoOnListenOutcome(
   repo: Repo,
   pathString: string,
   subscriber: (outcome: ListenOutcome) => void
 ): () => void {
-  let state = repo.listenOutcomes_.get(pathString);
-  if (!state) {
-    // Subscribing before the listen starts is the natural ordering for a
-    // caller that wires observability alongside its onValue().
-    // repoStartServerListen preserves the subscriber set from a prior state,
-    // so an empty pre-created state is carried into the real listen.
-    state = { outcome: null, subscribers: new Set() };
-    repo.listenOutcomes_.set(pathString, state);
+  let subscribers = repo.listenOutcomeSubscribers_.get(pathString);
+  if (!subscribers) {
+    subscribers = new Set();
+    repo.listenOutcomeSubscribers_.set(pathString, subscribers);
   }
-  state.subscribers.add(subscriber);
-  if (state.outcome) {
-    subscriber(state.outcome);
+  subscribers.add(subscriber);
+  const outcome = repoCoveringListenOutcome(repo, pathString);
+  if (outcome) {
+    exceptionGuard(() => subscriber(outcome));
   }
-  return () => state.subscribers.delete(subscriber);
+  return () => {
+    subscribers.delete(subscriber);
+    if (
+      subscribers.size === 0 &&
+      repo.listenOutcomeSubscribers_.get(pathString) === subscribers
+    ) {
+      repo.listenOutcomeSubscribers_.delete(pathString);
+    }
+  };
 }
 
 /**
@@ -2168,6 +2228,7 @@ export function repoCancelPendingSeedRestores(
 
 export function repoClearListenOutcomes(repo: Repo): void {
   repo.listenOutcomes_.clear();
+  repo.listenOutcomeSubscribers_.clear();
 }
 
 export function repoNotifyPersistenceAuthScope(repo: Repo): void {

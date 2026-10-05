@@ -247,6 +247,42 @@ describe('PersistentConnection compound-hash wire protocol', () => {
     });
   });
 
+  it('ends progress at ok and reopens it when the listen is resent', () => {
+    const connection = makeConnection([]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const wire = connection as any;
+    wire.connected_ = true;
+    let respond: (message: unknown) => void;
+    wire.sendRequest = (
+      _action: string,
+      _body: unknown,
+      callback: typeof respond
+    ) => {
+      respond = callback;
+    };
+    const progress: unknown[] = [];
+    connection.listen(
+      defaultQueryAt('some/path'),
+      () => '',
+      null,
+      () => {},
+      result => progress.push(result)
+    );
+    wire.onDataPush_('m', { p: 'some/path', d: { a: 1 } }, 10);
+    expect(progress).to.have.length(1);
+    respond!({ s: 'ok', d: null });
+    for (const action of ['d', 'm', 'rm']) {
+      wire.onDataPush_(action, { p: 'some/path', d: {} }, 10);
+    }
+    expect(progress).to.have.length(1);
+    wire.restoreState_();
+    wire.onDataPush_('m', { p: 'some/path', d: { a: 2 } }, 10);
+    expect(progress).to.have.length(2);
+    respond!({ s: 'ok', d: null });
+    wire.onDataPush_('m', { p: 'some/path', d: { a: 3 } }, 10);
+    expect(progress).to.have.length(2);
+  });
+
   it('onDataPush_ ignores rm when no callback is registered', () => {
     const connection = new PersistentConnection(
       new RepoInfo(

@@ -704,9 +704,11 @@ export function setPersistenceAuthScope(
 }
 
 /**
- * Observes the restore/cold/fallback state and final server certification for
- * one exact default listen. The callback is invoked first when the local path
- * choice is known (`certified: false`), then once the server responds.
+ * Observes the restore/cold/fallback state and server certification of the
+ * default listen covering this path. Observers survive internal wire-listen
+ * replacement until unsubscribed. Progress ends when that listen responds;
+ * subsequent live updates do not reopen it. A covering ancestor's outcome
+ * describes the whole ancestor listen, including its mode and byte count.
  *
  * @public
  */
