@@ -38,24 +38,6 @@ declare interface AuthTokenProvider {
     notifyForInvalidToken(): void;
 }
 
-/** One server operation held during a manifest-first boot window. */
-declare type BootBufferedOp = {
-    kind: 'data';
-    pathString: string;
-    data: unknown;
-    isMerge: boolean;
-    tag: number | null;
-} | {
-    kind: 'rm';
-    pathString: string;
-    ranges: Array<{
-        s?: string;
-        e?: string;
-        m: unknown;
-    }>;
-    tag: number | null;
-};
-
 /**
  * A cache node only stores complete children. Additionally it holds a flag whether the node can be considered fully
  * initialized in the sense that we know at one point in time this represented a valid state of the world, e.g.
@@ -206,6 +188,30 @@ declare class CompoundWrite {
 export declare function connectDatabaseEmulator(db: Database, host: string, port: number, options?: {
     mockUserToken?: EmulatorMockTokenOptions | string;
 }): void;
+
+/**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+export declare function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
 
 /**
  * Class representing a Firebase Realtime Database.
@@ -399,6 +405,38 @@ export declare class DataSnapshot {
      */
     val(): any;
 }
+
+declare type DeferredWireOp = {
+    kind: 'data';
+    pathString: string;
+    data: unknown;
+    isMerge: boolean;
+    tag: number | null;
+    /** Wire bytes of the message that carried this push (0 if unknown). */
+    wireBytes: number;
+    /** The queue generation this account-bound op was received under. */
+    generation: number;
+} | {
+    kind: 'rm';
+    pathString: string;
+    ranges: Array<{
+        s?: string;
+        e?: string;
+        m: unknown;
+    }>;
+    tag: number | null;
+    /** Wire bytes of the message that carried this merge (0 if unknown). */
+    wireBytes: number;
+    generation: number;
+} | {
+    kind: 'complete';
+    apply: () => void;
+    generation: number;
+} | {
+    /** Repo-global (no generation): fires regardless of account changes. */
+    kind: 'disconnect';
+    tree: SparseSnapshotTree;
+};
 export { EmulatorMockTokenOptions }
 
 /**
@@ -566,6 +604,8 @@ declare interface EventRegistration {
      *
      */
     hasAnyCallback(): boolean;
+    /** Called exactly once when this concrete registration leaves its View. */
+    onRemove?(): void;
 }
 
 /**
@@ -614,9 +654,9 @@ export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
-export declare function _getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 
 /**
  * Disconnects from the server (all Database operations will be completed
@@ -653,6 +693,14 @@ export declare function goOffline(db: Database): void;
  * @param db - The instance to reconnect.
  */
 export declare function goOnline(db: Database): void;
+
+/** The subset of Storage the heartbeat needs (injectable for tests). */
+declare interface HeartbeatStore {
+    getItem(key: string): string | null;
+    setItem(key: string, value: string): void;
+    /** Optional: stores without it simply skip release-time stamp cleanup. */
+    removeItem?(key: string): void;
+}
 
 /**
  * A tree with immutable elements.
@@ -797,6 +845,43 @@ declare abstract class Index {
 }
 
 /**
+ * THE ordering primitive for asynchronous ingestion: one repo-level FIFO of
+ * wire-ordered operations, drained by a single driver, one operation at a
+ * time, yielding between them. The wire is one totally ordered stream;
+ * keeping the deferred portion in ONE queue makes global order STRUCTURAL —
+ * an operation runs after everything enqueued before it and nothing after
+ * it, across roots and across kinds (data, range merges, completions,
+ * disconnect runs), with no cross-queue coordination to get wrong. (The
+ * per-root form of this queue needed refcounted markers and barriers to
+ * approximate exactly this property, and grew a bug per review round —
+ * a queue per root reconstructs badly what one queue gives for free.)
+ *
+ * `gates` records which subtrees are ingest-gated (a manifest-first boot
+ * window or a sliced full-root ingest in flight) and is ROUTING METADATA
+ * ONLY — it decides whether a fresh wire callback defers or applies
+ * directly, never ordering. `generation` invalidates the in-flight sliced
+ * ingest continuation (NOT the queue) on account switch / persistence
+ * toggle / dispose: the superseded payload's decode stands down, while the
+ * queued stream — including disconnect runs, which are repo-global, not
+ * account data — still drains in order.
+ */
+declare interface IngestQueue {
+    ops: DeferredWireOp[];
+    /**
+     * Paths whose subtrees defer fresh wire ops into `ops`, each mapped to an
+     * identity token owned by the installer. The token makes lift/supersede
+     * observable to the in-flight ingest (its isCurrent compares identity):
+     * a stop-listen lifts the gate and the decode stands down; a successor
+     * ingest REPLACES the token and the predecessor stands down likewise.
+     */
+    gates: Map<string, object>;
+    /** True while the single drain driver is running. */
+    draining: boolean;
+    /** Bumped to cancel the in-flight sliced decode + its queued payloads. */
+    generation: number;
+}
+
+/**
  * Used by console to create a database based on the app,
  * passed database URL and a custom auth implementation.
  * @internal
@@ -877,27 +962,42 @@ declare interface ListenHashFn {
 export declare interface ListenOptions {
     /** Whether to remove the listener after its first invocation. */
     readonly onlyOnce?: boolean;
+    /**
+     * Whether the complete, unfiltered path listened to by this registration
+     * should be retained in IndexedDB for cache-first startup. Selection is
+     * reference-counted across registrations and released automatically when
+     * this registration is removed, including `off()`, `onlyOnce`, and server
+     * cancellation paths.
+     */
+    readonly persistent?: boolean;
 }
 
-declare interface ListenOutcome {
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export declare interface ListenOutcome {
     mode: ListenOutcomeMode;
     certified: boolean;
     bytes: number;
     reason?: ListenOutcomeReason;
 }
 
-declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** How a persistent default listen started. @public */
+export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
 
-declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+/** Why a restore fell back cold. @public */
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 
 declare interface ListenOutcomeState {
     outcome: ListenOutcome | null;
-    subscribers: Set<(outcome: ListenOutcome) => void>;
 }
 
 declare interface ListenProvider {
     startListening(query: QueryContext, tag: number | null, hashFn: ListenHashFn, onComplete: (a: string, b?: unknown) => Event_2[]): Event_2[];
     stopListening(a: QueryContext, b: number | null): void;
+    /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
+    getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
 }
 
 declare interface ListenWireResult {
@@ -1358,7 +1458,7 @@ export declare function onChildAdded(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1447,7 +1547,7 @@ export declare function onChildChanged(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1530,7 +1630,7 @@ export declare function onChildMoved(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Listens for data changes at a particular location.
@@ -1625,7 +1725,7 @@ export declare function onChildRemoved(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * The `onDisconnect` class allows you to write or clear data when your client
@@ -1730,13 +1830,15 @@ export declare class OnDisconnect {
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
 
 /**
- * Observes the restore/cold/fallback state and final server certification for
- * one exact default listen. The callback is invoked first when the local path
- * choice is known (`certified: false`), then once the server responds.
+ * Observes the restore/cold/fallback state and server certification of the
+ * default listen covering this path. Observers survive internal wire-listen
+ * replacement until unsubscribed. Progress ends when that listen responds;
+ * subsequent live updates do not reopen it. A covering ancestor's outcome
+ * describes the whole ancestor listen, including its mode and byte count.
  *
- * @internal
+ * @public
  */
-export declare function _onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 
 /**
  * Listens for data changes at a particular location.
@@ -1819,7 +1921,7 @@ export declare function onValue(query: Query, callback: (snapshot: DataSnapshot)
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 
 /**
  * Creates a new `QueryConstraint` that orders by the specified child key.
@@ -1903,11 +2005,42 @@ declare class Path {
     toString(): string;
 }
 
+/** The hash pair a manifest-first listen can consume before its Node exists. */
+declare interface PendingListenHashes {
+    hash: string;
+    compoundHash: SeedCompoundHash;
+}
+
+/**
+ * Repo-scoped manifest-first hash registry. Different Database instances can
+ * listen to the same relative path while holding different caches; keeping
+ * this store on Repo prevents one restore from overwriting or clearing
+ * another Repo's pending hashes.
+ */
+declare class PendingListenHashStore {
+    private readonly pending_;
+    set(pathString: string, hash: string, compoundHash: SeedCompoundHash): void;
+    clear(pathString: string): void;
+    get(pathString: string): PendingListenHashes | undefined;
+    clearAll(): void;
+}
+
 /**
  * A connection to a single data repository.
  */
 declare interface PendingSeedRestore {
     cancelled: boolean;
+    authScopeUnsubscribe?: () => void;
+    authScopeTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Tears down whatever this pending restore has already put on the wire /
+     * buffered, then re-enters repoStartServerListen for the SAME subscription
+     * without persistence. Installed by repoStartServerListen; called by the
+     * bulk cancel (an account switch) so no live registration is left silent
+     * behind a cancelled token — the restore is moot under the new identity,
+     * but the listen itself must still reach the server.
+     */
+    reattachCold?: () => void;
 }
 
 /**
@@ -1940,7 +2073,7 @@ declare interface PersistedSeedHashes {
  * window, and never more often than one in-flight flush allows.
  * @internal
  */
-export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 1000;
+export declare const _PERSISTENCE_WRITE_DEBOUNCE_MS = 15000;
 
 declare class PersistenceManager {
     private prefix_;
@@ -1949,6 +2082,11 @@ declare class PersistenceManager {
     private operationTimeoutMs_;
     private cacheMaxBytes_;
     private writeDelayMs_;
+    private rangeTargetBytes_;
+    private peekHandoffMs_;
+    private peekPreAuthHandoffMs_;
+    private leaseHeartbeatMs_;
+    private leaseStaleMs_;
     private db_;
     /** Roots explicitly selected by the application (keepSynced semantics). */
     private persistentRoots_;
@@ -1960,6 +2098,20 @@ declare class PersistenceManager {
      * collide with a tree that arrived after its root was evicted and
      * re-tracked.
      */
+    /**
+     * Changed subtree paths accumulated since the flush baseline
+     * (lastFlush_.rootNode), keyed by root. The server names the exact path of
+     * every ordinary data push, so steady-state flushes can mark dirty ranges
+     * from this list directly instead of re-discovering the same information
+     * with a full-width identity diff of two ~60MB trees (the diff's sorted
+     * child merges were the single largest CPU slice of a flush).
+     *
+     * `null` = imprecise: an update arrived whose changed path is unknown or
+     * at/above the root (range merges, listen completions, foreign rebases) —
+     * the flush falls back to the identity diff, which is exactly today's
+     * behavior. Entries reset to [] whenever lastFlush_ gains a fresh baseline.
+     */
+    private changedSinceFlush_;
     private latest_;
     /**
      * What IndexedDB currently holds per root (see FlushedState) — the basis
@@ -1991,15 +2143,106 @@ declare class PersistenceManager {
      */
     private activeReads_;
     private restoreReasons_;
+    /** One writer lease per TRACKED root (see the WriterLease notes). */
+    private writerLeases_;
+    /**
+     * True while the repo's network is deliberately interrupted (goOffline /
+     * repoInterrupt). LIVENESS is not ELIGIBILITY: an offline tab's JS keeps
+     * running and heartbeating, but its server cache is frozen — if it kept
+     * its leases (or the fail-open gate), an online tab receiving newer
+     * server state could never persist it, and storage would hold the
+     * disconnected tab's stale tree. While suspended this manager holds no
+     * leases, queues none, steals none, and the write gate is CLOSED even
+     * where Web Locks don't exist — a stale flush from an offline tab must
+     * not overwrite an online writer's fresh generation in the CAS-only
+     * environment either. Roots stay tracked; trees stay in memory; resume
+     * re-acquires and the armed write windows flush whatever was pending.
+     * (Deliberate-offline only: an involuntary network drop hits every tab
+     * on the machine alike — no online follower exists to starve — and the
+     * connection self-reconnects, so leases follow repoInterrupt/repoResume,
+     * not transient socket state.)
+     */
+    private networkSuspended_;
+    /** One timer for all leases: held → heartbeat, requested → steal check. */
+    private leaseTimer_;
+    private heartbeatStore_;
+    /**
+     * Identifies THIS manager's heartbeat stamps (`<ms>|<token>`), so a
+     * clean release can remove its own stamp without ever deleting a
+     * successor's. Without cleanup, a departed holder's stamp lingers: a
+     * later holder whose storage cannot WRITE never overwrites it, and a
+     * follower that can READ sees a PRESENT-but-stale heartbeat — and
+     * steals from a perfectly healthy writer, contradicting the documented
+     * page-death fallback for storage-denied holders.
+     */
+    private heartbeatToken_;
     private activeRestoreCount_;
     private restoreQueue_;
     private writesDeferredUntilRestores_;
     private sweepTimer_;
+    private sweepInFlight_;
     private disposed_;
     private authScope_;
+    private authScopeConfigured_;
+    /**
+     * True once the APP's auth integration (setPersistenceAuthScope) has
+     * confirmed the scope — as opposed to a pre-auth peek merely priming it
+     * with a trusted expected identity. Selects the peek-retention budget:
+     * a primed-only scope holds the long pre-auth backstop, a confirmed one
+     * the short handoff grace (see PERSISTENCE_PEEK_PREAUTH_HANDOFF_MS).
+     */
+    private authScopeConfirmed_;
     private authGeneration_;
-    setAuthScope(scope: string | null): boolean;
-    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number);
+    isAuthScopeConfigured(): boolean;
+    /**
+     * The current identity-scope generation — bumped by every setAuthScope
+     * that changes the scope. Callers whose continuation spans an await after
+     * peek() resolves capture this before the wait and compare after, so a
+     * scope switch mid-continuation invalidates the result exactly like
+     * peek()'s own resolution-time check. @internal
+     */
+    authGeneration(): number;
+    /**
+     * True while THE read that decoded `node` is still RETAINED at this root
+     * for a future listener join (see readRecord_'s retainAfterResolve) — the
+     * only window in which materialization stamps have a consumer. Identity-
+     * bound on purpose: a path-only check would also pass for a REPLACEMENT
+     * read (the original consumed by a listener mid-walk, a second peek
+     * retained since), and stamps would then ride the consumed read's live
+     * nodes with no replay ever taking them — a session-long pinned copy of
+     * each subtree. False once the read was consumed, expired, superseded,
+     * or the manager disposed. @internal
+     */
+    hasRetainedPeek(pathString: string, node: Node_2): boolean;
+    setAuthScope(scope: string | null, confirmedByApp?: boolean): boolean;
+    /**
+     * Lifecycle flush (F11): fire every root's pending write NOW when the page
+     * hides. The write window is a debounce for foreground UX; a hiding page
+     * has no UX to protect and may never come back — iOS Safari kills
+     * background tabs under memory pressure with no beforeunload. An
+     * unflushed generation makes the NEXT boot restore a staler tree, whose
+     * listen then resends a bigger server delta, which is the giant-message
+     * crash amplifier. Best-effort by design: an IndexedDB commit that loses
+     * the race against teardown simply doesn't commit (the manifest CAS keeps
+     * storage consistent), which is exactly today's behavior without the
+     * attempt.
+     *
+     * `force` decides what happens while restores are still in flight.
+     * pagehide is terminal — the page is going away, so flushing NOW is
+     * strictly better than losing the generation, even at the cost of
+     * contending with a restore that will die with the page anyway.
+     * visibilitychange:hidden is RECOVERABLE (mobile backgrounding, tab
+     * switch): a forced readwrite there could starve an active restore into
+     * its idle timeout on return, so those roots keep the ordinary
+     * restore-deferral (writesDeferredUntilRestores_ re-arms them when the
+     * restores drain) and only restore-free roots flush.
+     */
+    private lifecycleFlush_;
+    private onPageHide_;
+    private onVisibilityChange_;
+    private installLifecycleFlush_;
+    private removeLifecycleFlush_;
+    constructor(prefix_: string, idbFactory_?: IDBFactory | null, schemaKnownCurrent_?: boolean, operationTimeoutMs_?: number, cacheMaxBytes_?: number, writeDelayMs_?: number, rangeTargetBytes_?: number, peekHandoffMs_?: number, peekPreAuthHandoffMs_?: number, leaseHeartbeatMs_?: number, leaseStaleMs_?: number, heartbeatStore?: HeartbeatStore | null);
     rebindTo(prefix: string): PersistenceManager;
     setPersistentPath(pathString: string, enabled: boolean): void;
     isPersistentPath(pathString: string): boolean;
@@ -2008,6 +2251,77 @@ declare class PersistenceManager {
      * tracked roots (and their descendants' updates).
      */
     track(pathString: string): void;
+    /**
+     * Follows the repo's DELIBERATE network state (repoInterrupt/repoResume,
+     * i.e. goOffline/goOnline — see networkSuspended_). Suspending returns
+     * every lease so an online tab becomes each root's writer; roots stay
+     * tracked and trees stay in memory. Resuming re-queues politely (never
+     * steals) and re-arms the write windows, so data seen before or during
+     * the offline stretch persists once this tab is eligible again — in the
+     * lock-less environment the re-armed window is the whole story, since
+     * eligibility there is only the gate.
+     */
+    setNetworkSuspended(suspended: boolean): void;
+    /**
+     * True when this manager may write the root: it holds the root's writer
+     * lease, or leases are unenforceable here (no Web Locks, or the root has
+     * no lease entry — the manifest CAS remains the correctness backstop).
+     */
+    private holdsWriterLease_;
+    /** The root's shared heartbeat key. */
+    private heartbeatKey_;
+    private writeHeartbeat_;
+    private readHeartbeat_;
+    /**
+     * One tick, role by lease state: a holder proves liveness (heartbeat); a
+     * queued follower checks the holder's liveness and STEALS the lock when
+     * the heartbeat is PRESENT but stale — the holder stamped once (every
+     * holder stamps at grant) and then went silent: frozen, cached,
+     * suspended, or wedged, and would otherwise starve every live tab's
+     * writes for as long as it existed. An ABSENT heartbeat never justifies a
+     * steal: it means the liveness protocol is not operating for this lock —
+     * the holder's storage throws, the stamp was cleared, or nothing was
+     * ever granted — and stealing on silence alone would take the lock from
+     * a perfectly healthy writer over and over (each stolen holder re-queues
+     * and, reading the same absence, steals right back). Without a readable
+     * heartbeat, takeover degrades to page death — the documented
+     * no-shared-storage mode. The request-time anchor additionally prevents
+     * stealing within the staleness budget of first joining the queue.
+     */
+    private onLeaseTick_;
+    /** Requests the root's writer lease once (idempotent per root). */
+    private ensureWriterLease_;
+    /**
+     * Puts a lease request for the root in the browser's queue, superseding
+     * any current one (`steal` preempts a stale holder; see onLeaseTick_).
+     */
+    private requestWriterLease_;
+    private writerLeaseName_;
+    /**
+     * Removes THIS manager's own heartbeat stamp (token-checked, so a
+     * successor's stamp is never deleted). The get→remove pair is not
+     * atomic; the benign worst case is deleting a successor stamp written
+     * in between — absence never justifies a steal, and the successor
+     * re-stamps on its next tick. A crashed holder never runs this, so its
+     * stamp can linger: a follower may then steal once from a write-denied
+     * successor — accepted residual; the stealer stamps and it stabilizes.
+     */
+    private clearOwnHeartbeat_;
+    /** Returns the root's writer lease to the browser (idempotent). */
+    private releaseWriterLease_;
+    /**
+     * Cleanup-completion rule shared by untrack paths: return the root's
+     * lease unless the root was re-tracked meanwhile — the new listen owns
+     * it now.
+     */
+    private releaseWriterLeaseIfUntracked_;
+    /** Returns every lease (dispose). */
+    private releaseAllWriterLeases_;
+    /**
+     * A tab tracking nothing must neither heartbeat nor evaluate steals: the
+     * tick stops with the last lease and restarts with the next track().
+     */
+    private stopLeaseTimerIfIdle_;
     /**
      * The root's last listen stopped. When a live tracked ancestor covers the
      * root, its record — which contains this subtree and keeps flushing — is
@@ -2051,30 +2365,71 @@ declare class PersistenceManager {
      */
     private withStore_;
     /**
-     * Reads a root's stored state: the manifest in a first short transaction —
-     * validated and surfaced to `onManifest` IMMEDIATELY, so a listen carrying
-     * the stored hashes can be on the wire while the tree record is still
-     * loading — then the tree record, decoded into a Node and joined with the
-     * manifest's hashes. A revision mismatch between the two (an interrupted
-     * or foreign write; single-transaction commits make this near-impossible,
-     * but the check is cheap) resolves null. Expired or format-mismatched
-     * records resolve null and are deleted best-effort.
+     * Reads a root's committed manifest and every immutable range it references
+     * in one readonly transaction. `onManifest` fires as soon as the requests
+     * are queued, overlapping network reconciliation with structured-clone
+     * range reads and private Node assembly. Missing/mismatched ranges fail the
+     * whole restore; Repo then performs the structural-failure cold relisten.
      */
     private readRecord_;
+    /**
+     * Auth just confirmed the scope a pre-auth peek primed: every retained
+     * completed read waiting under the long pre-auth backstop switches to the
+     * short post-auth grace, counted from now. Entries still resolving (no
+     * cleanupTimer yet) pick the right budget in their own release().
+     */
+    private rearmRetainedReads_;
     private readRecordOnce_;
-    private deleteRecord_;
+    /**
+     * Decodes and merges raw persisted range clones into one Node in yielded
+     * slices. Each slice decodes a few records, then yields a macrotask so the
+     * main thread can paint/GC between slices; consumed entries are nulled so
+     * the structured clones are collectable while later slices run. Returns
+     * null when any fragment fails to decode.
+     */
+    private decodeFragmentsSliced_;
+    /**
+     * Cleanup for a manifest judged structurally invalid: the verdict is
+     * re-reached INSIDE the readwrite transaction, so a valid generation a
+     * concurrent writer committed after the (readonly) judgement is never
+     * touched. Still-invalid garbage — whatever garbage it is by now — goes.
+     */
+    private deleteRecordIfInvalid_;
+    /**
+     * Housekeeping variant of deleteRecord_: deletes the root's record only
+     * while the committed manifest still carries `expectedRevision` — the one
+     * generation this manager itself verified or wrote. An unconditional
+     * housekeeping delete could erase a FRESH generation another tab
+     * committed for this root after this manager last looked (that tab keeps
+     * flushing under its own lease and would skip identical rewrites against
+     * a lastFlush_ that no longer describes storage). Check and delete run in
+     * ONE readwrite transaction, so a concurrent commit cannot interleave
+     * between them. Skipping is always safe: a record left behind is at
+     * worst a slightly stale shadow, and every restored record is
+     * revalidated against the server by the hash protocol anyway.
+     */
+    private deleteRecordIfRevision_;
+    /** Deletes a root's manifest and every '#'-suffixed sidecar in `store`. */
+    private deleteRecordInStore_;
     private withRestoreSlot_;
     /**
-     * Exact-root optimistic peek. The completed decode is retained briefly so
-     * the authenticated listener can consume the same immutable Node instead of
-     * decoding a large IndexedDB record twice during boot.
+     * Projects an exact-path peek from a covering root that is already restored
+     * or actively restoring in this manager. This never starts a large ancestor
+     * read just to answer a tiny token lookup; it only reuses work the app is
+     * already paying for, preserving the exact-root fast path on direct boots.
+     */
+    private peekFromCoveringRead_;
+    /**
+     * Exact-root optimistic peek. The completed range assembly is retained briefly
+     * so the authenticated listener consumes the same immutable Node instead of
+     * reconstructing the root twice during boot.
      */
     peek(pathString: string, expectedAuthScope?: string | null): Promise<PersistedRecord | null>;
     /**
      * Listener restore with an idle (no-progress) bound. `onManifest` fires as
      * soon as the stored generation's hashes are known — typically
-     * milliseconds — letting the caller send the range listen while the tree
-     * record is still being read and decoded. The callback is suppressed after
+     * milliseconds — letting the caller send the range listen while immutable
+     * range records are still being read and assembled. The callback is suppressed after
      * a timeout/miss resolution, and never fires once the returned promise has
      * settled null.
      */
@@ -2096,7 +2451,33 @@ declare class PersistenceManager {
      * timestamp needs a refresh (see PERSISTENCE_REFRESH_AGE_MS).
      */
     private flushWritesDeferredUntilRestores_;
-    serverCacheUpdated(path: Path, node: Node_2): void;
+    /**
+     * Re-enters the ordinary write window when the root still has work: it is
+     * tracked and holds a pending tree in latest_ (flush_ reads latest_ when
+     * it runs, so whatever landed meanwhile is covered). The one definition
+     * used by every deferred-retry path — a lease grant after skipped writes,
+     * a failed-open lock acquisition, and the stale-baseline adoption.
+     */
+    private armWriteWindowIfPending_;
+    /**
+     * Arms the non-restarting single-flight write window for a root. Two
+     * regimes: a root with a flush baseline coalesces under the ordinary
+     * window; a root with none (first generation — see
+     * PERSISTENCE_FIRST_GENERATION_WRITE_DELAY_MS) flushes on the shorter of
+     * the two delays so the cache exists before short mobile sessions end.
+     */
+    private armWriteWindow_;
+    private accumulateChangedPaths_;
+    /**
+     * `changedPaths` — the root-relative paths of the subtrees this update
+     * changed, when the caller knows them precisely: an ordinary server data
+     * push names its own path (`[relative]`), a listen certification confirms
+     * already-accounted state (`[]`, nothing new). Omitted/undefined marks the
+     * accumulated change-set imprecise — a range merge, or any update whose
+     * shape the caller cannot name — falling the next flush back to the
+     * identity diff.
+     */
+    serverCacheUpdated(path: Path, node: Node_2, changedPaths?: string[][]): void;
     /**
      * Enqueues a flush unless the root's queue is still working — then one
      * flush is marked pending and enqueued when the queue drains. Without the
@@ -2115,6 +2496,23 @@ declare class PersistenceManager {
      * listens, so nothing else would ever untrack it.
      */
     evict(path: Path): void;
+    /**
+     * Eviction's delete: manifest + sidecars in one transaction, gated on the
+     * stored manifest belonging to the REVOKED scope (captured at evict();
+     * see the comment there). `null` is a REAL scope — the anonymous
+     * identity — not malformation: an anonymous user's valid record must
+     * survive a signed-in tab's eviction exactly like any other identity's.
+     * The unconditional purge is reserved for values no live writer produced
+     * — a structurally invalid manifest, a malformed scope field (neither
+     * string nor null), or a stored value that is not an object at all
+     * (null, primitives): eviction is exactly the moment to drop those WITH
+     * their sidecars, which may still carry revoked bytes. Only a truly
+     * ABSENT record (undefined) is a no-op. Field reads happen only after
+     * structural validation — a stored literal `null` passes an
+     * undefined-check and then throws on property access, aborting the
+     * transaction and silently RETAINING the revoked record.
+     */
+    private purgeEvictedRecord_;
     dispose(): void;
     /**
      * Test seam: forces a pending flush window to fire now.
@@ -2129,16 +2527,49 @@ declare class PersistenceManager {
      */
     private enqueue_;
     /**
+     * Adopts the currently COMMITTED generation as the next flush baseline
+     * WITHOUT reading or decoding its range payloads — a manifest-only read.
+     *
+     * Used when this manager discovers its baseline is stale (the flush CAS
+     * lost to another writer, or the stored generation vanished): the
+     * winner's revision + ranges are all the next CAS needs, while its tree
+     * stays undecoded (rootNode: null). The follow-up flush cannot diff
+     * against an absent tree, so it stages a fresh self-contained generation
+     * — the same write the old adopt-and-diff produced anyway (a freshly
+     * decoded tree shares no identity with the live one, so its identity
+     * diff marked every range dirty) minus the full IndexedDB read and Node
+     * decode of the entire root that made every cross-tab conflict as
+     * expensive as a cold restore.
+     *
+     * The retry enters the ordinary NON-RESTARTING write window instead of
+     * re-flushing immediately: under sustained cross-tab churn an immediate
+     * retry conflicts again back-to-back — full-tree work with no pause
+     * between attempts (the multi-tab thrash the write leases exist to
+     * prevent, kept bounded here for lease-less environments too).
+     */
+    private adoptCommittedBaseline_;
+    /**
      * One generation: identity-diff against the last known stored tree marks
      * the dirty ranges; only those are re-serialized (between preserved
-     * boundary posts) and re-hashed; clean ranges carry over verbatim, their
-     * bytes never read. The manifest (ranges + hashes) and the tree record
-     * (structured-clone export tree) commit in ONE transaction, so every
+     * boundary posts), re-hashed, and written under new immutable ids. Clean
+     * range records carry over verbatim and are never cloned. New records plus
+     * the manifest commit in ONE transaction, so every
      * committed generation's hashes exactly describe its stored tree — which
      * is what lets the next boot listen straight off the manifest with zero
      * hashing.
      */
     private flush_;
+    /**
+     * Second half of a flush: stages the planned dirty ranges and commits the
+     * generation. Split from flush_ so the sliced planner can yield between
+     * slices without holding the whole body in one closure. `entry` is the
+     * latest_ record the flush entered with (its node/revision/authScope are
+     * the generation being written); `rebuilt` is the planned range list —
+     * clean ranges carried with their recordIds, dirty ranges with empty
+     * hashes to be serialized, digested, and staged here.
+     */
+    private finishFlush_;
+    private gcRangeRecords_;
 }
 
 declare type PersistenceRestoreReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
@@ -2201,11 +2632,11 @@ declare class PersistentConnection extends ServerActions {
      * @param applicationId_ - The Firebase App ID for this project
      * @param onDataUpdate_ - A callback for new data from the server
      */
-    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
+    constructor(repoInfo_: RepoInfo, applicationId_: string, onDataUpdate_: (a: string, b: unknown, c: boolean, d: number | null, wireBytes?: number) => void, onConnectStatus_: (a: boolean) => void, onServerInfoUpdate_: (a: unknown) => void, authTokenProvider_: AuthTokenProvider, appCheckTokenProvider_: AppCheckTokenProvider, authOverride_?: object | null, onRangeMergeUpdate_?: (path: string, ranges: Array<{
         s?: string;
         e?: string;
         m: unknown;
-    }>, tag: number | null) => void);
+    }>, tag: number | null, wireBytes?: number) => void);
     protected sendRequest(action: string, body: unknown, onResponse?: (a: unknown, bytes?: number) => void): void;
     get(query: QueryContext): Promise<string>;
     listen(query: QueryContext, currentHashFn: ListenHashFn, tag: number | null, onComplete: (a: string, b: unknown, result: ListenWireResult) => void, onProgress?: (result: ListenWireResult) => void): void;
@@ -2596,25 +3027,52 @@ declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
+     * The application-provided identity scope currently bound to persistence.
+     * `undefined` means Auth has not resolved yet; null means signed out.
+     */
+    persistenceAuthScope_: string | null | undefined;
+    persistenceAuthScopeListeners_: Set<() => void>;
+    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
+    /** Manifest-first hashes scoped to this Repo, never process-global. */
+    pendingListenHashes_: PendingListenHashStore;
     /**
-     * Server operations buffered during a manifest-first boot window: the
-     * range listen is on the wire before the cached base has been applied to
-     * SyncTree, so anything the server sends for that root (range merges —
-     * deltas against the base — or full pushes) is held, in arrival order,
-     * until the base applies, then replayed. Keyed by the listened root path.
+     * The repo-level ordered ingest queue (see IngestQueue): wire operations
+     * deferred behind a manifest-first boot window or an in-flight sliced
+     * ingest, in exact arrival order across roots and kinds, plus the gate
+     * set and the continuation generation.
      */
-    bootBuffers_: Map<string, BootBufferedOp[]>;
-    /**
-     * Listen-complete state per default complete listen, keyed by path: whether
-     * the current listen has received its initial server response, and waiters
-     * to publish its certification outcome (see onListenOutcome in api/Database.ts).
-     */
+    ingestQueue_: IngestQueue;
+    /** Current wire-listen identities; a stop retires stale completions. */
     listenOutcomes_: Map<string, ListenOutcomeState>;
+    /** Application observers outlive wire-listen shadowing and replacement. */
+    listenOutcomeSubscribers_: Map<string, Set<(outcome: ListenOutcome) => void>>;
+    /**
+     * Restored roots the server has not spoken for yet, keyed by path: the
+     * persisted tree is installed as the root's server cache the moment it is
+     * read (repoStartServerListen), and stays there as the SyncTree's complete
+     * value until the server speaks for a subtree containing it — an untagged
+     * overwrite, or the `ok` of a current default listen, at or above the root
+     * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
+     * the server (repoGetValue). The entry follows the complete cache at the
+     * root: nothing else retires it — not a range merge (server ranges folded
+     * over the restored base), not a descendant push, not stopping the
+     * listen — and once the cache is gone the next server word under the root
+     * passes the entry to the views that keep the bytes. A stale entry can
+     * only send a get() to the server, never serve one.
+     *
+     * Each entry carries what the server has since spoken for on its line
+     * without retiring it: subtrees strictly under the root, and filtered
+     * views answered exactly. A get() covered by either holds none of that
+     * root's restored bytes and keeps its cached answer while the rest waits.
+     * They are the entry's, not the path's — a new restore at the same root is
+     * a new entry with none, and a survivor an entry passes to starts with none.
+     */
+    unconfirmedRestores_: Map<string, UnconfirmedRestore>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -2807,8 +3265,11 @@ export declare function serverTimestamp(): object;
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
 
-/** Sets the identity scope used to read and write persisted cache records. @internal */
-export declare function _setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
 
 /**
  * Enables client-side persistence of the server cache for this Database
@@ -2821,12 +3282,9 @@ export declare function _setPersistenceAuthScope(db: Database, scope: string | n
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
-export declare function _setPersistenceEnabled(db: Database, enabled: boolean): void;
-
-/** Selects an exact default-listen root for persistence. @internal */
-export declare function _setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 
 /**
  * Sets a priority for the data at this Database location.
@@ -3243,6 +3701,26 @@ declare interface TreeNode<T> {
     children: Record<string, TreeNode<T>>;
     childCount: number;
     value?: T;
+}
+
+declare interface UnconfirmedRestore {
+    path: Path;
+    /** Subtrees strictly under the root the server has since spoken for. */
+    confirmedUnder: Path[];
+    /**
+     * Filtered windows on the root's line the server has answered exactly:
+     * per registered view, the server-cache node holding its answer (after
+     * its tagged listen's `ok`, a tagged overwrite of the whole window such
+     * as a get()'s own answer, or a tagged word into a window already
+     * certified). Both identities. The node, because SyncTree rebuilds a
+     * view's window from its ancestors' bytes (a range fold over the restored
+     * root, a replacement view seeded from a filtered ancestor) and the
+     * rebuilt node is not the answered one; nodes are immutable. The view,
+     * because views at one path seeded from the same bytes share a node, and
+     * one query's hash match says nothing about another query's window.
+     * Weak: the entry certifies, it does not keep.
+     */
+    certifiedWindows: WeakMap<View, Node_2>;
 }
 
 /** A callback that can invoked to remove a listener. */

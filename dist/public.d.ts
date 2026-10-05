@@ -33,6 +33,29 @@ export declare function connectDatabaseEmulator(db: Database, host: string, port
     mockUserToken?: EmulatorMockTokenOptions | string;
 }): void;
 /**
+ * Consumes the optimistic peek's one-boot materialization for exactly this
+ * snapshot's immutable node, or returns `undefined` when none exists (no
+ * peek, a different node, or already consumed — each stamp is returned at
+ * most once).
+ *
+ * This is the deliberate opt-in half of the peek→listener handoff (see
+ * ServerCacheSeed): `getPersistedValue()` materializes the restored tree
+ * once, and the listener that replays the SAME immutable nodes can adopt
+ * that materialization instead of walking the tree a second time.
+ * Correctness is by construction — a Node is immutable, so a stamp can only
+ * be returned for exactly the data it was computed from; any server delta
+ * between peek and replay creates a new node, which misses.
+ *
+ * The returned object is the SAME object `getPersistedValue()` returned to
+ * the application — shared by design, so an optimistic paint and the live
+ * tree keep child identity (memoized consumers see unchanged branches as
+ * unchanged). Treat it as immutable. `snapshot.val()` itself never consumes
+ * a stamp and always returns fresh objects.
+ *
+ * @public
+ */
+export declare function consumePersistedMaterialization(snapshot: DataSnapshot): unknown | undefined;
+/**
  * Class representing a Firebase Realtime Database.
  */
 export declare class Database {
@@ -316,7 +339,16 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  * @returns The `Database` instance of the provided app.
  */
 export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
-/* Excluded from this release type: _getPersistedValue */
+/**
+ * Reads the exact persisted server cache root at `path` WITHOUT attaching a
+ * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
+ * completes can render the persisted tree, then let the real (authenticated)
+ * listener attach and reconcile. Resolves null when persistence is disabled,
+ * nothing is stored, or the record expired.
+ *
+ * @public
+ */
+export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
  * Disconnects from the server (all Database operations will be completed
  * offline).
@@ -408,7 +440,29 @@ export declare function limitToLast(limit: number): QueryConstraint;
 export declare interface ListenOptions {
     /** Whether to remove the listener after its first invocation. */
     readonly onlyOnce?: boolean;
+    /**
+     * Whether the complete, unfiltered path listened to by this registration
+     * should be retained in IndexedDB for cache-first startup. Selection is
+     * reference-counted across registrations and released automatically when
+     * this registration is removed, including `off()`, `onlyOnce`, and server
+     * cancellation paths.
+     */
+    readonly persistent?: boolean;
 }
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
+export declare interface ListenOutcome {
+    mode: ListenOutcomeMode;
+    certified: boolean;
+    bytes: number;
+    reason?: ListenOutcomeReason;
+}
+/** How a persistent default listen started. @public */
+export declare type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
+/** Why a restore fell back cold. @public */
+export declare type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
 /**
  * Detaches a callback previously attached with the corresponding `on*()` (`onValue`, `onChildAdded`) listener.
  * Note: This is not the recommended way to remove a listener. Instead, please use the returned callback function from
@@ -515,7 +569,7 @@ export declare function onChildAdded(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildAdded(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 /**
  * Listens for data changes at a particular location.
  *
@@ -601,7 +655,7 @@ export declare function onChildChanged(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildChanged(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 /**
  * Listens for data changes at a particular location.
  *
@@ -681,7 +735,7 @@ export declare function onChildMoved(query: Query, callback: (snapshot: DataSnap
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildMoved(query: Query, callback: (snapshot: DataSnapshot, previousChildName: string | null) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 /**
  * Listens for data changes at a particular location.
  *
@@ -773,7 +827,7 @@ export declare function onChildRemoved(query: Query, callback: (snapshot: DataSn
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onChildRemoved(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 /**
  * The `onDisconnect` class allows you to write or clear data when your client
  * disconnects from the Database server. These updates occur whether your
@@ -871,7 +925,16 @@ export declare class OnDisconnect {
  * @param ref - The reference to add OnDisconnect triggers for.
  */
 export declare function onDisconnect(ref: DatabaseReference): OnDisconnect;
-/* Excluded from this release type: _onListenOutcome */
+/**
+ * Observes the restore/cold/fallback state and server certification of the
+ * default listen covering this path. Observers survive internal wire-listen
+ * replacement until unsubscribed. Progress ends when that listen responds;
+ * subsequent live updates do not reopen it. A covering ancestor's outcome
+ * describes the whole ancestor listen, including its mode and byte count.
+ *
+ * @public
+ */
+export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
  * Listens for data changes at a particular location.
  *
@@ -951,7 +1014,7 @@ export declare function onValue(query: Query, callback: (snapshot: DataSnapshot)
  * then removes the listener after its first invocation.
  * @returns A function that can be invoked to remove the listener.
  */
-export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: (error: Error) => unknown, options: ListenOptions): Unsubscribe;
+export declare function onValue(query: Query, callback: (snapshot: DataSnapshot) => unknown, cancelCallback: ((error: Error) => unknown) | undefined, options: ListenOptions): Unsubscribe;
 /**
  * Creates a new `QueryConstraint` that orders by the specified child key.
  *
@@ -1261,9 +1324,25 @@ export declare function serverTimestamp(): object;
  * @returns Resolves when write to server is complete.
  */
 export declare function set(ref: DatabaseReference, value: unknown): Promise<void>;
-/* Excluded from this release type: _setPersistenceAuthScope */
-/* Excluded from this release type: _setPersistenceEnabled */
-/* Excluded from this release type: _setPersistencePath */
+/**
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Enables client-side persistence of the server cache for this Database
+ * instance (see core/Persistence.ts): listened roots are stored in IndexedDB
+ * and restored on the next startup, where they paint immediately and
+ * revalidate with the server via the hash protocol — an unchanged tree costs
+ * a handshake, a changed one costs range-merge deltas.
+ *
+ * Must be called before the first listener attaches (matching the mobile
+ * SDKs' setPersistenceEnabled contract); listens attached earlier simply
+ * bypass persistence. No-ops where IndexedDB is unavailable.
+ *
+ * @public
+ */
+export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
 /**
  * Sets a priority for the data at this Database location.
  *

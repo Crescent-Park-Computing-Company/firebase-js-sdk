@@ -21,7 +21,7 @@ import { PersistenceManager } from './Persistence';
 import { PersistentConnection } from './PersistentConnection';
 import { RepoInfo } from './RepoInfo';
 import { ServerActions } from './ServerActions';
-import { ListenHashFn } from './ServerCacheSeed';
+import { ListenHashFn, PendingListenHashStore } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { SnapshotHolder } from './SnapshotHolder';
 import { SparseSnapshotTree } from './SparseSnapshotTree';
@@ -35,6 +35,7 @@ import { Tree } from './util/Tree';
 import { Event } from './view/Event';
 import { EventQueue } from './view/EventQueue';
 import { EventRegistration, QueryContext } from './view/EventRegistration';
+import { View } from './view/View';
 declare const enum TransactionStatus {
     RUN = 0,
     SENT = 1,
@@ -62,14 +63,48 @@ interface Transaction {
  */
 interface PendingSeedRestore {
     cancelled: boolean;
+    authScopeUnsubscribe?: () => void;
+    authScopeTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Tears down whatever this pending restore has already put on the wire /
+     * buffered, then re-enters repoStartServerListen for the SAME subscription
+     * without persistence. Installed by repoStartServerListen; called by the
+     * bulk cancel (an account switch) so no live registration is left silent
+     * behind a cancelled token — the restore is moot under the new identity,
+     * but the listen itself must still reach the server.
+     */
+    reattachCold?: () => void;
 }
-/** One server operation held during a manifest-first boot window. */
-type BootBufferedOp = {
+/**
+ * One wire-ordered operation deferred behind an ingest/boot gate. Data,
+ * range merges, and listen completions are the server stream itself; a
+ * disconnect carries its own registration tree, FROZEN at the moment the
+ * connection dropped (repoOnConnectStatus snapshots and resets the live
+ * repo.onDisconnect_ in one motion, so acks and registrations landing on
+ * the next connection can never rewrite an earlier disconnect's run).
+ */
+/**
+ * Wire size (bytes of websocket frames for the message) above which an
+ * untagged, non-merge, children-shaped data push is ingested through the
+ * sliced pump even when its path is NOT a registered persistent root. Path
+ * registration tracks the app's DECLARED long-lived roots, but the freeze
+ * class is a property of PAYLOAD SIZE: giant pushes also arrive for
+ * unregistered listens (a component's own listener on a large node, a
+ * re-listen racing a remount's deregistration, repos without persistence).
+ * Below the threshold the synchronous path is faster than a pump cycle.
+ * @internal
+ */
+export declare const _INGEST_WIRE_BYTES_THRESHOLD: number;
+type DeferredWireOp = {
     kind: 'data';
     pathString: string;
     data: unknown;
     isMerge: boolean;
     tag: number | null;
+    /** Wire bytes of the message that carried this push (0 if unknown). */
+    wireBytes: number;
+    /** The queue generation this account-bound op was received under. */
+    generation: number;
 } | {
     kind: 'rm';
     pathString: string;
@@ -79,9 +114,64 @@ type BootBufferedOp = {
         m: unknown;
     }>;
     tag: number | null;
+    /** Wire bytes of the message that carried this merge (0 if unknown). */
+    wireBytes: number;
+    generation: number;
+} | {
+    kind: 'complete';
+    apply: () => void;
+    generation: number;
+} | {
+    /** Repo-global (no generation): fires regardless of account changes. */
+    kind: 'disconnect';
+    tree: SparseSnapshotTree;
 };
+/**
+ * THE ordering primitive for asynchronous ingestion: one repo-level FIFO of
+ * wire-ordered operations, drained by a single driver, one operation at a
+ * time, yielding between them. The wire is one totally ordered stream;
+ * keeping the deferred portion in ONE queue makes global order STRUCTURAL —
+ * an operation runs after everything enqueued before it and nothing after
+ * it, across roots and across kinds (data, range merges, completions,
+ * disconnect runs), with no cross-queue coordination to get wrong. (The
+ * per-root form of this queue needed refcounted markers and barriers to
+ * approximate exactly this property, and grew a bug per review round —
+ * a queue per root reconstructs badly what one queue gives for free.)
+ *
+ * `gates` records which subtrees are ingest-gated (a manifest-first boot
+ * window or a sliced full-root ingest in flight) and is ROUTING METADATA
+ * ONLY — it decides whether a fresh wire callback defers or applies
+ * directly, never ordering. `generation` invalidates the in-flight sliced
+ * ingest continuation (NOT the queue) on account switch / persistence
+ * toggle / dispose: the superseded payload's decode stands down, while the
+ * queued stream — including disconnect runs, which are repo-global, not
+ * account data — still drains in order.
+ */
+interface IngestQueue {
+    ops: DeferredWireOp[];
+    /**
+     * Paths whose subtrees defer fresh wire ops into `ops`, each mapped to an
+     * identity token owned by the installer. The token makes lift/supersede
+     * observable to the in-flight ingest (its isCurrent compares identity):
+     * a stop-listen lifts the gate and the decode stands down; a successor
+     * ingest REPLACES the token and the predecessor stands down likewise.
+     */
+    gates: Map<string, object>;
+    /** True while the single drain driver is running. */
+    draining: boolean;
+    /** Bumped to cancel the in-flight sliced decode + its queued payloads. */
+    generation: number;
+}
+/** @internal */
+export declare function newIngestQueue(): IngestQueue;
+/** How a persistent default listen started. @public */
 export type ListenOutcomeMode = 'restored' | 'cold' | 'fallback';
-export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'corrupt' | 'timeout';
+/** Why a restore fell back cold. @public */
+export type ListenOutcomeReason = 'missing' | 'expired' | 'auth' | 'auth-timeout' | 'partial-descendants' | 'corrupt' | 'timeout';
+/**
+ * Restore/certification state of one persistent default listen.
+ * @public
+ */
 export interface ListenOutcome {
     mode: ListenOutcomeMode;
     certified: boolean;
@@ -90,7 +180,25 @@ export interface ListenOutcome {
 }
 interface ListenOutcomeState {
     outcome: ListenOutcome | null;
-    subscribers: Set<(outcome: ListenOutcome) => void>;
+}
+interface UnconfirmedRestore {
+    path: Path;
+    /** Subtrees strictly under the root the server has since spoken for. */
+    confirmedUnder: Path[];
+    /**
+     * Filtered windows on the root's line the server has answered exactly:
+     * per registered view, the server-cache node holding its answer (after
+     * its tagged listen's `ok`, a tagged overwrite of the whole window such
+     * as a get()'s own answer, or a tagged word into a window already
+     * certified). Both identities. The node, because SyncTree rebuilds a
+     * view's window from its ancestors' bytes (a range fold over the restored
+     * root, a replacement view seeded from a filtered ancestor) and the
+     * rebuilt node is not the answered one; nodes are immutable. The view,
+     * because views at one path seeded from the same bytes share a node, and
+     * one query's hash match says nothing about another query's window.
+     * Weak: the entry certifies, it does not keep.
+     */
+    certifiedWindows: WeakMap<View, Node>;
 }
 export declare class Repo {
     repoInfo_: RepoInfo;
@@ -121,25 +229,52 @@ export declare class Repo {
      */
     persistence_: PersistenceManager | null;
     /**
+     * The application-provided identity scope currently bound to persistence.
+     * `undefined` means Auth has not resolved yet; null means signed out.
+     */
+    persistenceAuthScope_: string | null | undefined;
+    persistenceAuthScopeListeners_: Set<() => void>;
+    /**
      * Listens held back while their persisted root restores, keyed by path.
      * stopListening flips the token so a listen whose last registration was
      * removed mid-restore is never sent (see repoStartServerListen).
      */
     pendingSeedRestores_: Map<string, PendingSeedRestore>;
+    /** Manifest-first hashes scoped to this Repo, never process-global. */
+    pendingListenHashes_: PendingListenHashStore;
     /**
-     * Server operations buffered during a manifest-first boot window: the
-     * range listen is on the wire before the cached base has been applied to
-     * SyncTree, so anything the server sends for that root (range merges —
-     * deltas against the base — or full pushes) is held, in arrival order,
-     * until the base applies, then replayed. Keyed by the listened root path.
+     * The repo-level ordered ingest queue (see IngestQueue): wire operations
+     * deferred behind a manifest-first boot window or an in-flight sliced
+     * ingest, in exact arrival order across roots and kinds, plus the gate
+     * set and the continuation generation.
      */
-    bootBuffers_: Map<string, BootBufferedOp[]>;
-    /**
-     * Listen-complete state per default complete listen, keyed by path: whether
-     * the current listen has received its initial server response, and waiters
-     * to publish its certification outcome (see onListenOutcome in api/Database.ts).
-     */
+    ingestQueue_: IngestQueue;
+    /** Current wire-listen identities; a stop retires stale completions. */
     listenOutcomes_: Map<string, ListenOutcomeState>;
+    /** Application observers outlive wire-listen shadowing and replacement. */
+    listenOutcomeSubscribers_: Map<string, Set<(outcome: ListenOutcome) => void>>;
+    /**
+     * Restored roots the server has not spoken for yet, keyed by path: the
+     * persisted tree is installed as the root's server cache the moment it is
+     * read (repoStartServerListen), and stays there as the SyncTree's complete
+     * value until the server speaks for a subtree containing it — an untagged
+     * overwrite, or the `ok` of a current default listen, at or above the root
+     * (repoConfirmRestoresUnder). Until then a get() on the root's line reads
+     * the server (repoGetValue). The entry follows the complete cache at the
+     * root: nothing else retires it — not a range merge (server ranges folded
+     * over the restored base), not a descendant push, not stopping the
+     * listen — and once the cache is gone the next server word under the root
+     * passes the entry to the views that keep the bytes. A stale entry can
+     * only send a get() to the server, never serve one.
+     *
+     * Each entry carries what the server has since spoken for on its line
+     * without retiring it: subtrees strictly under the root, and filtered
+     * views answered exactly. A get() covered by either holds none of that
+     * root's restored bytes and keeps its cached answer while the rest waits.
+     * They are the entry's, not the path's — a new restore at the same root is
+     * a new entry with none, and a survivor an entry passes to starts with none.
+     */
+    unconfirmedRestores_: Map<string, UnconfirmedRestore>;
     constructor(repoInfo_: RepoInfo, forceRestClient_: boolean, authTokenProvider_: AuthTokenProvider, appCheckProvider_: AppCheckTokenProvider);
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -158,9 +293,28 @@ export declare function repoGenerateServerValues(repo: Repo): Indexable;
 /**
  * Called by realtime when we get new messages from the server.
  */
+/** Test seam: lifts one ingest gate exactly as stop-listen does. @internal */
+export declare function repoLiftIngestGateForTest(repo: Repo, pathString: string): void;
+/** Test seam: drives a connection-status flip exactly as the connection would. @internal */
+export declare function repoOnConnectStatusForTest(repo: Repo, connectStatus: boolean): void;
 /** Test seam: drives a server data push exactly as the connection would. @internal */
-export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null): void;
-export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[]): void;
+export declare function repoOnDataUpdateForTest(repo: Repo, pathString: string, data: unknown, isMerge: boolean, tag: number | null, wireBytes?: number): void;
+/** Test seam: drives a server range merge exactly as the connection would. @internal */
+export declare function repoOnRangeMergeUpdateForTest(repo: Repo, pathString: string, ranges: Array<{
+    s?: string;
+    e?: string;
+    m: unknown;
+}>, tag: number | null, wireBytes?: number): void;
+/**
+ * Sends a listen for the server sync tree, restoring the persisted server
+ * cache first where applicable: a complete default listen on a persisted
+ * root is held until the stored tree restores (bounded inside restore()),
+ * the restored tree is applied as server data — raising cached events
+ * immediately, mobile-persistence semantics — and the listen then goes out
+ * carrying the restored tree's hashes. Roots that were never persisted
+ * resolve null instantly and attach exactly as before.
+ */
+export declare function repoStartServerListen(repo: Repo, query: QueryContext, tag: number | null, currentHashFn: ListenHashFn, onComplete: (status: string, data?: unknown) => Event[], skipPersistence?: boolean, authScopeTimeoutMs?: number, coldReason?: ListenOutcomeReason): void;
 /**
  * Stops a server listen. With persistence, a complete default listen may
  * still be waiting on its restore — cancel it so it never attaches — and its
@@ -168,10 +322,22 @@ export declare function repoStartServerListen(repo: Repo, query: QueryContext, t
  * releasing the in-memory copy that only live listens need.
  */
 export declare function repoStopServerListen(repo: Repo, query: QueryContext, tag: number | null): void;
-/** Observe the outcome of one exact default listen. @internal */
+/** Observe the default listen currently covering a path. @internal */
 export declare function repoOnListenOutcome(repo: Repo, pathString: string, subscriber: (outcome: ListenOutcome) => void): () => void;
-export declare function repoCancelPendingSeedRestores(repo: Repo): void;
+/**
+ * Activates persistence for a `{ persistent: true }` registration that JOINED
+ * an already-listening default query (repoStartServerListen does not re-run
+ * for it, so nothing else would ever track the root). Tracking is idempotent;
+ * when the live listen has already certified a complete server cache, that
+ * exact tree is seeded through the normal write-through path so the root is
+ * warm on the next boot. A still-loading listen needs nothing here — its own
+ * listen-complete certification write-through covers the root once tracked.
+ * @internal
+ */
+export declare function repoActivatePersistenceForJoinedListen(repo: Repo, path: Path): void;
+export declare function repoCancelPendingSeedRestores(repo: Repo, reattach?: boolean): void;
 export declare function repoClearListenOutcomes(repo: Repo): void;
+export declare function repoNotifyPersistenceAuthScope(repo: Repo): void;
 export declare function repoDispose(repo: Repo): void;
 export declare function repoInterceptServerData(repo: Repo, callback: ((a: string, b: unknown) => unknown) | null): void;
 /**

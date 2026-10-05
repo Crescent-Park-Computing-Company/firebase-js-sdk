@@ -84,4 +84,6 @@ export interface EventRegistration {
      *
      */
     hasAnyCallback(): boolean;
+    /** Called exactly once when this concrete registration leaves its View. */
+    onRemove?(): void;
 }

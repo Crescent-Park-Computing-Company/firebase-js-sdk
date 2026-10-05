@@ -110,13 +110,22 @@ export declare function connectDatabaseEmulator(db: Database, host: string, port
  */
 export declare function goOffline(db: Database): void;
 /**
+ * Per-child work units charged per main-thread slice of the peek walk (one
+ * charge per child pulled from a node's iterator and per array-coercion
+ * copy). Sized so one slice stays well inside a frame budget on mobile
+ * hardware while keeping the total slice count (and its scheduling overhead)
+ * low on large workspaces.
+ * @internal
+ */
+export declare const _PEEK_MATERIALIZE_SLICE_VISITS = 4000;
+/**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
  * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in
  * completes can render the persisted tree, then let the real (authenticated)
  * listener attach and reconcile. Resolves null when persistence is disabled,
  * nothing is stored, or the record expired.
  *
- * @internal
+ * @public
  */
 export declare function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;
 /**
@@ -130,19 +139,22 @@ export declare function getPersistedValue(db: Database, pathString: string, expe
  * SDKs' setPersistenceEnabled contract); listens attached earlier simply
  * bypass persistence. No-ops where IndexedDB is unavailable.
  *
- * @internal
+ * @public
  */
 export declare function setPersistenceEnabled(db: Database, enabled: boolean): void;
-/** Sets the identity scope used to read and write persisted cache records. @internal */
-export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
-/** Selects an exact default-listen root for persistence. @internal */
-export declare function setPersistencePath(db: Database, pathString: string, enabled: boolean): void;
 /**
- * Observes the restore/cold/fallback state and final server certification for
- * one exact default listen. The callback is invoked first when the local path
- * choice is known (`certified: false`), then once the server responds.
+ * Sets the identity scope used to read and write persisted cache records.
+ * @public
+ */
+export declare function setPersistenceAuthScope(db: Database, scope: string | null): void;
+/**
+ * Observes the restore/cold/fallback state and server certification of the
+ * default listen covering this path. Observers survive internal wire-listen
+ * replacement until unsubscribed. Progress ends when that listen responds;
+ * subsequent live updates do not reopen it. A covering ancestor's outcome
+ * describes the whole ancestor listen, including its mode and byte count.
  *
- * @internal
+ * @public
  */
 export declare function onListenOutcome(db: Database, pathString: string, callback: (outcome: ListenOutcome) => void): () => void;
 /**
