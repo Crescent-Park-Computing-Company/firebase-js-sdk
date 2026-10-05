@@ -1,7 +1,5 @@
-# Firebase Database certification preview
+# Firebase Database certification release
 
-Built from Crescent-Park-Computing-Company/firebase-js-sdk PR #18, source commit `815dc9acda6db94b80bab73557c4ffdd42fa5ad4`.
+`@firebase/database@1.1.3-cache-seeding.90`, built from merged source commit `6e3a3cb174c07879eeb4d7adf76817d82db70981` (Firebase SDK PR #18). The source tree matches reviewed and user-tested PR head `815dc9acda6db94b80bab73557c4ffdd42fa5ad4`.
 
-Package version: `1.1.3-cache-seeding.90-pr18.1`. Only the package version differs from the reviewed source. Built with the database package’s standard `npm run build` (Rollup and API extraction), then packed with `npm pack`.
-
-This is a preview artifact, not a merged source release. The persistence data format is unchanged.
+Build: set the database package version above, run `npm run build`, then `npm pack` at this built-package commit. No cache format change.

@@ -4,7 +4,7 @@ import { stringify, jsonEval, contains, assert, isNodeSdk, stringToByteArray, Sh
 import { Logger, LogLevel } from '@firebase/logger';
 
 const name = "@firebase/database";
-const version = "1.1.3-cache-seeding.90-pr18.1";
+const version = "1.1.3-cache-seeding.90";
 
 /**
  * @license
