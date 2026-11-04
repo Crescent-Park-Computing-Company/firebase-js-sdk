@@ -6846,7 +6846,8 @@ describe('re-listen range hashes', () => {
     );
     const v2 = syncTreeGetCompleteServerCache(syncTree, path)!;
     expect(v2).to.not.equal(v1);
-    manager.serverCacheUpdated(path, v2, [['k05']]);
+    // Persistence is deliberately not told: the ranges must describe the
+    // view's cache however it changed.
 
     const hashFn = hashFns[hashFns.length - 1];
     expect(hashFn()).to.equal('');
