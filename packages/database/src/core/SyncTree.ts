@@ -32,6 +32,7 @@ import { Overwrite } from './operation/Overwrite';
 import {
   ListenHashFn,
   PendingListenHashes,
+  SeedCompoundHash,
   getNodeCanonicalHash,
   getNodeCompoundHash
 } from './ServerCacheSeed';
@@ -115,6 +116,15 @@ export interface ListenProvider {
   getPendingListenHashes?: (
     pathString: string
   ) => PendingListenHashes | undefined;
+
+  /**
+   * Current range hashes for a persisted root whose server cache carries no
+   * stamped compound hash (see PersistenceManager.relistenCompoundHash).
+   */
+  getRelistenCompoundHash?: (
+    pathString: string,
+    serverCache: Node
+  ) => SeedCompoundHash | undefined;
 }
 
 /**
@@ -981,6 +991,14 @@ function syncTreeCreateListenerForView_(
   const query = view.query;
   const tag = syncTreeTagForQuery(syncTree, query);
   const pathString = query._path.toString();
+  // A seeded or flushed node carries its own compound hash. Once a server
+  // update replaces the cache, a persisted root's re-listen gets current range
+  // hashes from persistence; any other listen sends only the simple hash.
+  const relistenCompoundHash = (cache: Node): SeedCompoundHash | undefined =>
+    getNodeCompoundHash(cache) === undefined &&
+    view.query._queryParams.isDefault()
+      ? syncTree.listenProvider_.getRelistenCompoundHash?.(pathString, cache)
+      : undefined;
   const hashFn: ListenHashFn = () => {
     // Manifest-first boot: the persisted hashes are stamped for this path
     // before the restored tree exists in SyncTree (see stampNextListenHashes).
@@ -990,12 +1008,16 @@ function syncTreeCreateListenerForView_(
       return pending.hash;
     }
     const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+    if (relistenCompoundHash(cache) !== undefined) {
+      // The ranges certify the cache; the simple hash would only cost a
+      // full-tree SHA-1. An empty one never matches, so the server always
+      // compares the ranges.
+      return '';
+    }
     return getNodeCanonicalHash(cache) ?? cache.hash();
   };
   // The compound hash rides as a property on hashFn so it threads through
-  // the existing listen-provider chain untouched. Only a seeded node carries
-  // one; once a server update replaces the cache it is gone, and re-listens
-  // send only the simple hash.
+  // the existing listen-provider chain untouched.
   hashFn.compoundHash = () => {
     const pending =
       syncTree.listenProvider_.getPendingListenHashes?.(pathString);
@@ -1003,7 +1025,7 @@ function syncTreeCreateListenerForView_(
       return pending.compoundHash;
     }
     const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-    return getNodeCompoundHash(cache);
+    return getNodeCompoundHash(cache) ?? relistenCompoundHash(cache);
   };
 
   return {

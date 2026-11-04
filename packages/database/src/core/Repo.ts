@@ -663,7 +663,9 @@ export function repoStart(
       repoStopServerListen(repo, query, tag);
     },
     getPendingListenHashes: pathString =>
-      repo.pendingListenHashes_.get(pathString)
+      repo.pendingListenHashes_.get(pathString),
+    getRelistenCompoundHash: (pathString, serverCache) =>
+      repo.persistence_?.relistenCompoundHash(pathString, serverCache)
   });
 }
 
