@@ -1267,7 +1267,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3-cache-seeding.90";
+const version = "1.1.3-cache-seeding.91";
 
 /**
  * @license
@@ -6801,6 +6801,53 @@ class PersistenceManager {
         this.changedSinceFlush_.set(pathString, list);
     }
     /**
+     * The compound hash a re-sent listen carries for a tracked root whose live
+     * server cache is no longer the node a restore or flush stamped (any server
+     * update replaces the root Node). It is the baseline generation's ranges
+     * with every range the live tree may have changed since blanked, so the
+     * server answers with range merges for exactly those. Without it the
+     * re-listen falls back to the simple hash: a full-tree SHA-1 on the main
+     * thread which, after any write during a disconnect, also misses and makes
+     * the server re-send the whole root.
+     *
+     * Changes are found with the identity diff against the baseline tree, not
+     * changedSinceFlush_ (an in-flight flush has already consumed it), so the
+     * result may over-approximate but never misses a change. Undefined when
+     * there is no ranged baseline tree, when `node` is not this root's latest
+     * certified cache, or when everything would be dirty anyway (a divorced
+     * tree): the listen then keeps its simple hash.
+     */
+    relistenCompoundHash(pathString, node) {
+        if (this.disposed_) {
+            return undefined;
+        }
+        const prev = this.lastFlush_.get(pathString);
+        if (!prev || prev.rootNode === null || prev.ranges.length === 0) {
+            return undefined;
+        }
+        const compoundHash = wireCompoundHashFromRanges(prev.ranges);
+        if (prev.rootNode === node) {
+            return compoundHash;
+        }
+        const latest = this.latest_.get(pathString);
+        if (latest === undefined ||
+            latest.node !== node ||
+            latest.authScope !== this.authScope_) {
+            return undefined;
+        }
+        const changed = collectChangedSubtreePaths(prev.rootNode, node);
+        if (changed.some(path => path.length === 0)) {
+            return undefined;
+        }
+        const { dirty } = markDirtyRanges(prev.ranges, changed);
+        for (let i = 0; i < dirty.length; i++) {
+            if (dirty[i]) {
+                compoundHash.hashes[i] = '';
+            }
+        }
+        return compoundHash;
+    }
+    /**
      * `changedPaths` — the root-relative paths of the subtrees this update
      * changed, when the caller knows them precisely: an ordinary server data
      * push names its own path (`[relative]`), a listen certification confirms
@@ -7464,7 +7511,8 @@ class PersistenceManager {
             let batch = [];
             let batchBytes = 0;
             for (const plan of dirtyPlans) {
-                if (batch.length > 0 && batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
+                if (batch.length > 0 &&
+                    batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
                     await stageBatch(batch);
                     batch = [];
                     batchBytes = 0;
@@ -7709,7 +7757,11 @@ class PersistenceManager {
                     if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
                         const recordId = cursor.key.slice(prefix.length);
                         if (!liveIds.has(recordId)) {
-                            cursor.delete();
+                            // A key cursor cannot delete (InvalidStateError: its key-only
+                            // flag is set), and the throw aborted the whole GC transaction.
+                            // Delete through the store by the cursor's primary key, which
+                            // works for the value-cursor fallback too.
+                            store.delete(cursor.primaryKey);
                         }
                     }
                     cursor.continue();
@@ -14692,6 +14744,13 @@ function syncTreeCreateListenerForView_(syncTree, view) {
     const query = view.query;
     const tag = syncTreeTagForQuery(syncTree, query);
     const pathString = query._path.toString();
+    // A seeded or flushed node carries its own compound hash. Once a server
+    // update replaces the cache, a persisted root's re-listen gets current range
+    // hashes from persistence; any other listen sends only the simple hash.
+    const relistenCompoundHash = (cache) => getNodeCompoundHash(cache) === undefined &&
+        view.query._queryParams.isDefault()
+        ? syncTree.listenProvider_.getRelistenCompoundHash?.(pathString, cache)
+        : undefined;
     const hashFn = () => {
         // Manifest-first boot: the persisted hashes are stamped for this path
         // before the restored tree exists in SyncTree (see stampNextListenHashes).
@@ -14700,19 +14759,23 @@ function syncTreeCreateListenerForView_(syncTree, view) {
             return pending.hash;
         }
         const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
+        if (relistenCompoundHash(cache) !== undefined) {
+            // The ranges certify the cache; the simple hash would only cost a
+            // full-tree SHA-1. An empty one never matches, so the server always
+            // compares the ranges.
+            return '';
+        }
         return getNodeCanonicalHash(cache) ?? cache.hash();
     };
     // The compound hash rides as a property on hashFn so it threads through
-    // the existing listen-provider chain untouched. Only a seeded node carries
-    // one; once a server update replaces the cache it is gone, and re-listens
-    // send only the simple hash.
+    // the existing listen-provider chain untouched.
     hashFn.compoundHash = () => {
         const pending = syncTree.listenProvider_.getPendingListenHashes?.(pathString);
         if (pending !== undefined) {
             return pending.compoundHash;
         }
         const cache = viewGetServerCache(view) || ChildrenNode.EMPTY_NODE;
-        return getNodeCompoundHash(cache);
+        return getNodeCompoundHash(cache) ?? relistenCompoundHash(cache);
     };
     return {
         hashFn,
@@ -15850,7 +15913,8 @@ function repoStart(repo, appId, authOverride) {
         stopListening: (query, tag) => {
             repoStopServerListen(repo, query, tag);
         },
-        getPendingListenHashes: pathString => repo.pendingListenHashes_.get(pathString)
+        getPendingListenHashes: pathString => repo.pendingListenHashes_.get(pathString),
+        getRelistenCompoundHash: (pathString, serverCache) => repo.persistence_?.relistenCompoundHash(pathString, serverCache)
     });
 }
 /**

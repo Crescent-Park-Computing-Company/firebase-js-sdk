@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 import { ReferenceConstructor } from '../api/Reference';
-import { ListenHashFn, PendingListenHashes } from './ServerCacheSeed';
+import { ListenHashFn, PendingListenHashes, SeedCompoundHash } from './ServerCacheSeed';
 import { Node } from './snap/Node';
 import { RangeMerge } from './snap/RangeMerge';
 import { SyncPoint } from './SyncPoint';
@@ -30,6 +30,11 @@ export interface ListenProvider {
     stopListening(a: QueryContext, b: number | null): void;
     /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
     getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
+    /**
+     * Current range hashes for a persisted root whose server cache carries no
+     * stamped compound hash (see PersistenceManager.relistenCompoundHash).
+     */
+    getRelistenCompoundHash?: (pathString: string, serverCache: Node) => SeedCompoundHash | undefined;
 }
 export declare function resetSyncTreeTag(): void;
 /**

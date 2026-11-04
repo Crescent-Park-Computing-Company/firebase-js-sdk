@@ -551,6 +551,24 @@ export declare class PersistenceManager {
     private armWriteWindow_;
     private accumulateChangedPaths_;
     /**
+     * The compound hash a re-sent listen carries for a tracked root whose live
+     * server cache is no longer the node a restore or flush stamped (any server
+     * update replaces the root Node). It is the baseline generation's ranges
+     * with every range the live tree may have changed since blanked, so the
+     * server answers with range merges for exactly those. Without it the
+     * re-listen falls back to the simple hash: a full-tree SHA-1 on the main
+     * thread which, after any write during a disconnect, also misses and makes
+     * the server re-send the whole root.
+     *
+     * Changes are found with the identity diff against the baseline tree, not
+     * changedSinceFlush_ (an in-flight flush has already consumed it), so the
+     * result may over-approximate but never misses a change. Undefined when
+     * there is no ranged baseline tree, when `node` is not this root's latest
+     * certified cache, or when everything would be dirty anyway (a divorced
+     * tree): the listen then keeps its simple hash.
+     */
+    relistenCompoundHash(pathString: string, node: Node): SeedCompoundHash | undefined;
+    /**
      * `changedPaths` — the root-relative paths of the subtrees this update
      * changed, when the caller knows them precisely: an ordinary server data
      * push names its own path (`[relative]`), a listen certification confirms
