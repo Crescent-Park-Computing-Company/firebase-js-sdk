@@ -2715,14 +2715,13 @@ function walkLeafInterval(node, fromPost, toPost, builder) {
     walker.finish();
 }
 /**
- * Node-pair visits the identity-diff may spend before concluding the trees
- * are too divorced to diff (collapse to the root path: everything dirty).
- * The diff's output was
+ * Node-pair visits the identity-diff may spend descending before it stops
+ * and reports each remaining differing subtree whole. The diff's output was
  * always budgeted (maxPaths); its WORK was not — two trees that share no
  * structure (a fallback boot's baseline vs a fully re-downloaded root) made
- * it walk both trees end to end only to conclude "all dirty". Visits accrue
- * only where identity differs, so a genuine incremental change stays far
- * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * it walk both trees end to end. Visits accrue only where identity differs,
+ * so a genuine incremental change stays far under this bound while a
+ * divorced pair exhausts it in a few milliseconds.
  * @internal
  */
 const DIFF_VISIT_BUDGET = 20000;
@@ -2733,16 +2732,18 @@ const DIFF_VISIT_BUDGET = 20000;
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
  * dirty mapping only needs interval bounds, not precise leaves. Exhausting
- * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
- * collapses the affected branches toward the root — in the limit to the
- * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
- * diff's cost is bounded even against a baseline sharing no structure with
- * the live tree. The result is always a (possibly collapsed) path list; it
+ * the path budget collapses the affected branches toward the root — in the
+ * limit to the root path `[[]]`, which markDirtyRanges maps to
+ * every-range-dirty. Exhausting the visit budget (`maxVisits` — see
+ * DIFF_VISIT_BUDGET) stops the descent: each remaining differing subtree is
+ * reported at the depth reached, so the diff's cost is bounded even against
+ * a baseline sharing no structure with the live tree. The result is always a (possibly collapsed) path list; it
  * over-approximates but never misses a change.
  */
 function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512, maxVisits = DIFF_VISIT_BUDGET) {
     const changed = [];
     let visits = 0;
+    let exhausted = false;
     /**
      * Returns true when the caller must collapse this branch to stay within the
      * global path budget. A large atomic subtree update should dirty that
@@ -2752,12 +2753,16 @@ function collectChangedSubtreePaths(before, after, maxDepth = 8, maxPaths = 512,
         if (a === b) {
             return false;
         }
-        if (++visits > maxVisits) {
-            // Work budget exhausted: the trees are too divorced for the diff to
-            // pay off. Collapse to the root path — everything dirty.
-            changed.length = 0;
-            changed.push([]);
-            return true;
+        if (exhausted || ++visits > maxVisits) {
+            // Work budget exhausted: stop descending. This differing subtree and
+            // every later one are reported whole; siblings are still compared by
+            // identity (no further walk), so unchanged subtrees stay clean. A
+            // range merge or a graft makes whole intervals of new nodes, and
+            // collapsing to the root there turned a few changed ranges into
+            // "everything dirty".
+            exhausted = true;
+            changed.push(path.slice());
+            return changed.length > maxPaths;
         }
         const branchStart = changed.length;
         const collapseBranch = () => {

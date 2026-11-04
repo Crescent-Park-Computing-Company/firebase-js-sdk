@@ -237,14 +237,13 @@ export declare class LeafIntervalWalker {
  */
 export declare function walkLeafInterval(node: Node, fromPost: string[] | null, toPost: string[] | null, builder: CompoundHashBuilder): void;
 /**
- * Node-pair visits the identity-diff may spend before concluding the trees
- * are too divorced to diff (collapse to the root path: everything dirty).
- * The diff's output was
+ * Node-pair visits the identity-diff may spend descending before it stops
+ * and reports each remaining differing subtree whole. The diff's output was
  * always budgeted (maxPaths); its WORK was not — two trees that share no
  * structure (a fallback boot's baseline vs a fully re-downloaded root) made
- * it walk both trees end to end only to conclude "all dirty". Visits accrue
- * only where identity differs, so a genuine incremental change stays far
- * under this bound while a divorced pair exhausts it in a few milliseconds.
+ * it walk both trees end to end. Visits accrue only where identity differs,
+ * so a genuine incremental change stays far under this bound while a
+ * divorced pair exhausts it in a few milliseconds.
  * @internal
  */
 export declare const DIFF_VISIT_BUDGET = 20000;
@@ -255,11 +254,12 @@ export declare const DIFF_VISIT_BUDGET = 20000;
  * present in only one version reports that child's path. Descends at most
  * `maxDepth` levels before treating a differing subtree as wholly changed —
  * dirty mapping only needs interval bounds, not precise leaves. Exhausting
- * the path budget or the visit budget (`maxVisits` — see DIFF_VISIT_BUDGET)
- * collapses the affected branches toward the root — in the limit to the
- * root path `[[]]`, which markDirtyRanges maps to every-range-dirty — so the
- * diff's cost is bounded even against a baseline sharing no structure with
- * the live tree. The result is always a (possibly collapsed) path list; it
+ * the path budget collapses the affected branches toward the root — in the
+ * limit to the root path `[[]]`, which markDirtyRanges maps to
+ * every-range-dirty. Exhausting the visit budget (`maxVisits` — see
+ * DIFF_VISIT_BUDGET) stops the descent: each remaining differing subtree is
+ * reported at the depth reached, so the diff's cost is bounded even against
+ * a baseline sharing no structure with the live tree. The result is always a (possibly collapsed) path list; it
  * over-approximates but never misses a change.
  */
 export declare function collectChangedSubtreePaths(before: Node, after: Node, maxDepth?: number, maxPaths?: number, maxVisits?: number): string[][];
