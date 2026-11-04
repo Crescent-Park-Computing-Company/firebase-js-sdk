@@ -6228,10 +6228,11 @@ class PersistenceManager {
      *
      * Changes are found with the identity diff against the baseline tree, not
      * changedSinceFlush_ (an in-flight flush has already consumed it), so the
-     * result may over-approximate but never misses a change. Undefined when
-     * there is no ranged baseline tree, when `node` is not this root's latest
-     * certified cache, or when everything would be dirty anyway (a divorced
-     * tree): the listen then keeps its simple hash.
+     * result may over-approximate but never misses a change: a subtree the
+     * baseline shares by identity has the baseline's content, so every hash
+     * still sent describes `node`, whatever path its updates took. Undefined
+     * when there is no ranged baseline tree or when everything would be dirty
+     * anyway (a divorced tree): the listen then keeps its simple hash.
      */
     relistenCompoundHash(pathString, node) {
         if (this.disposed_) {
@@ -6244,12 +6245,6 @@ class PersistenceManager {
         const compoundHash = wireCompoundHashFromRanges(prev.ranges);
         if (prev.rootNode === node) {
             return compoundHash;
-        }
-        const latest = this.latest_.get(pathString);
-        if (latest === undefined ||
-            latest.node !== node ||
-            latest.authScope !== this.authScope_) {
-            return undefined;
         }
         const changed = collectChangedSubtreePaths(prev.rootNode, node);
         if (changed.some(path => path.length === 0)) {
