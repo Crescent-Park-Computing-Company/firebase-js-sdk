@@ -6612,10 +6612,15 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     const shape = wideRoot(30, 30);
     const a = nodeFromJSON(shape);
     const b = nodeFromJSON(shape); // equal content, ZERO shared identity
-    // A tiny visit budget must collapse to the root (everything dirty)
-    // instead of walking both trees end to end.
+    // A tiny visit budget stops the descent instead of walking both trees
+    // end to end: every root child differs by identity, so each is reported
+    // whole.
     const collapsed = collectChangedSubtreePaths(a, b, 8, 512, 10);
-    expect(collapsed).to.deep.equal([[]]);
+    // Bounded, and still covering every root child (nothing is missed).
+    // At most the children already gathered on the open frames.
+    expect(collapsed.length).to.be.at.most(30 + 30);
+    expect(collapsed.every(path => path.length >= 1)).to.equal(true);
+    expect(new Set(collapsed.map(path => path[0])).size).to.equal(30);
     // An incremental change against a shared baseline stays precise well
     // under the same budget: the diff only visits where identity differs.
     const evolved = a.updateChild(
@@ -6624,6 +6629,23 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     );
     const precise = collectChangedSubtreePaths(a, evolved, 8, 512, 10);
     expect(precise).to.deep.equal([['p0', 'c0']]);
+  });
+
+  it('an exhausted visit budget keeps unchanged siblings clean', () => {
+    const shape = wideRoot(30, 30) as Record<string, unknown>;
+    const a = nodeFromJSON(shape);
+    // p3 is replaced by an equal-content copy (no shared identity below it,
+    // as after a range merge); p7 gets one real change; the rest are shared.
+    const b = a
+      .updateImmediateChild('p3', nodeFromJSON(shape.p3))
+      .updateChild(new Path('p7/c1'), nodeFromJSON('changed-leaf'));
+    const changed = collectChangedSubtreePaths(a, b, 8, 512, 10);
+    const keys = changed.map(path => path.join('/'));
+    expect(
+      keys.every(key => key.startsWith('p3') || key.startsWith('p7'))
+    ).to.equal(true);
+    expect(keys.some(key => key.startsWith('p7'))).to.equal(true);
+    expect(keys).to.not.include('');
   });
 
   it('manifest estimatedBytes equals the sum of range sizes', async () => {
