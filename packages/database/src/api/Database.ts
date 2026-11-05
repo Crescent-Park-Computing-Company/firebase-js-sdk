@@ -136,7 +136,8 @@ export function repoManagerDatabaseFromApp(
   authProvider: Provider<FirebaseAuthInternalName>,
   appCheckProvider?: Provider<AppCheckInternalComponentName>,
   url?: string,
-  nodeAdmin?: boolean
+  nodeAdmin?: boolean,
+  instance?: string
 ): Database {
   let dbUrl: string | undefined = url || app.options.databaseURL;
   if (dbUrl === undefined) {
@@ -168,6 +169,23 @@ export function repoManagerDatabaseFromApp(
     repoInfo = parsedUrl.repoInfo;
   } else {
     isEmulator = !parsedUrl.repoInfo.secure;
+  }
+
+  if (instance !== undefined) {
+    // The persistence key separates the repo, its cache and its persisted
+    // records from every other instance of the same URL; the wire target is
+    // unchanged.
+    repoInfo = new RepoInfo(
+      repoInfo.host,
+      repoInfo.secure,
+      repoInfo.namespace,
+      repoInfo.webSocketOnly,
+      repoInfo.nodeAdmin,
+      instance,
+      repoInfo.includeNamespaceInQueryParams,
+      repoInfo.isUsingEmulator,
+      repoInfo.emulatorOptions
+    );
   }
 
   const authTokenProvider =
@@ -226,14 +244,14 @@ function repoManagerCreateRepo(
     repos[app.name] = appRepos;
   }
 
-  let repo = appRepos[repoInfo.toURLString()];
+  let repo = appRepos[repoInfo.toString()];
   if (repo) {
     fatal(
       'Database initialized multiple times. Please make sure the format of the database URL matches with each database() call.'
     );
   }
   repo = new Repo(repoInfo, useRestClient, authTokenProvider, appCheckProvider);
-  appRepos[repoInfo.toURLString()] = repo;
+  appRepos[repoInfo.toString()] = repo;
 
   return repo;
 }
@@ -334,15 +352,37 @@ export function forceLongPolling() {
  * Database instance is associated with.
  * @param url - The URL of the Realtime Database instance to connect to. If not
  * provided, the SDK connects to the default instance of the Firebase App.
+ * @param instance - Names an additional, independent connection to the same
+ * database (letters, digits, `_` and `-`). Each named instance has its own
+ * connection, local cache and persistence namespace, and shares the app's
+ * Auth and App Check. The same app, URL and name return the same instance.
  * @returns The `Database` instance of the provided app.
  */
 export function getDatabase(
   app: FirebaseApp = getApp(),
-  url?: string
+  url?: string,
+  instance?: string
 ): Database {
-  const db = _getProvider(app, 'database').getImmediate({
-    identifier: url
-  }) as Database;
+  const provider = _getProvider(app, 'database');
+  let db: Database;
+  if (instance === undefined) {
+    db = provider.getImmediate({ identifier: url }) as Database;
+  } else {
+    if (!/^[A-Za-z0-9_-]+$/.test(instance)) {
+      fatal(
+        'Database instance names may contain only letters, digits, "_" and "-".'
+      );
+    }
+    const identifier = `${url ?? ''}<${instance}>`;
+    db = (
+      provider.isInitialized(identifier)
+        ? provider.getImmediate({ identifier })
+        : provider.initialize({
+            instanceIdentifier: identifier,
+            options: { url, instance }
+          })
+    ) as Database;
+  }
   if (!db._instanceStarted) {
     const emulator = getDefaultEmulatorHostnameAndPort('database');
     if (emulator) {
@@ -420,9 +460,7 @@ export function connectDatabaseEmulator(
   // namespace. (Emulator config only happens pre-start, so no listens or
   // tracked roots exist yet.)
   if (repo.persistence_ !== null) {
-    repo.persistence_ = repo.persistence_.rebindTo(
-      repo.repoInfo_.toURLString()
-    );
+    repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toString());
   }
 }
 
@@ -669,7 +707,7 @@ export function setPersistenceEnabled(db: Database, enabled: boolean): void {
   const repo = db._repoInternal;
   if (enabled) {
     if (repo.persistence_ === null) {
-      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+      repo.persistence_ = new PersistenceManager(repo.repoInfo_.toString());
     }
   } else {
     if (repo.persistence_ !== null) {
