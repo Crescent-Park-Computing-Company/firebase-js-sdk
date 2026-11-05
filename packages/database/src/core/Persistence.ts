@@ -2655,6 +2655,52 @@ export class PersistenceManager {
   }
 
   /**
+   * The compound hash a re-sent listen carries for a tracked root whose live
+   * server cache is no longer the node a restore or flush stamped (any server
+   * update replaces the root Node). It is the baseline generation's ranges
+   * with every range the live tree may have changed since blanked, so the
+   * server answers with range merges for exactly those. Without it the
+   * re-listen falls back to the simple hash: a full-tree SHA-1 on the main
+   * thread which, after any write during a disconnect, also misses and makes
+   * the server re-send the whole root.
+   *
+   * Changes are found with the identity diff against the baseline tree, not
+   * changedSinceFlush_ (an in-flight flush has already consumed it), so the
+   * result may over-approximate but never misses a change: a subtree the
+   * baseline shares by identity has the baseline's content, so every hash
+   * still sent describes `node`, whatever path its updates took. Undefined
+   * when there is no ranged baseline tree or when everything would be dirty
+   * anyway (a divorced tree): the listen then keeps its simple hash.
+   */
+  relistenCompoundHash(
+    pathString: string,
+    node: Node
+  ): SeedCompoundHash | undefined {
+    if (this.disposed_) {
+      return undefined;
+    }
+    const prev = this.lastFlush_.get(pathString);
+    if (!prev || prev.rootNode === null || prev.ranges.length === 0) {
+      return undefined;
+    }
+    const compoundHash = wireCompoundHashFromRanges(prev.ranges);
+    if (prev.rootNode === node) {
+      return compoundHash;
+    }
+    const changed = collectChangedSubtreePaths(prev.rootNode, node);
+    if (changed.some(path => path.length === 0)) {
+      return undefined;
+    }
+    const { dirty } = markDirtyRanges(prev.ranges, changed);
+    for (let i = 0; i < dirty.length; i++) {
+      if (dirty[i]) {
+        compoundHash.hashes[i] = '';
+      }
+    }
+    return compoundHash;
+  }
+
+  /**
    * `changedPaths` — the root-relative paths of the subtrees this update
    * changed, when the caller knows them precisely: an ordinary server data
    * push names its own path (`[relative]`), a listen certification confirms
@@ -3238,7 +3284,8 @@ export class PersistenceManager {
       return rebuilder.result();
     };
     return planSliced().then(
-      rebuilt => this.finishFlush_(pathString, entry, prev, accumulated, rebuilt),
+      rebuilt =>
+        this.finishFlush_(pathString, entry, prev, accumulated, rebuilt),
       e => {
         if (e instanceof FlushObsoleteError) {
           return;
@@ -3402,7 +3449,10 @@ export class PersistenceManager {
       let batch: DirtyRangePlan[] = [];
       let batchBytes = 0;
       for (const plan of dirtyPlans) {
-        if (batch.length > 0 && batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES) {
+        if (
+          batch.length > 0 &&
+          batchBytes + plan.range.size > FLUSH_STAGE_BATCH_BYTES
+        ) {
           await stageBatch(batch);
           batch = [];
           batchBytes = 0;
@@ -3676,7 +3726,11 @@ export class PersistenceManager {
           if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
             const recordId = cursor.key.slice(prefix.length);
             if (!liveIds.has(recordId)) {
-              cursor.delete();
+              // A key cursor cannot delete (InvalidStateError: its key-only
+              // flag is set), and the throw aborted the whole GC transaction.
+              // Delete through the store by the cursor's primary key, which
+              // works for the value-cursor fallback too.
+              store.delete(cursor.primaryKey);
             }
           }
           cursor.continue();

@@ -308,10 +308,46 @@ function makeFakeIndexedDB(
           const [key, value] = entries[index++];
           req.result = {
             key,
+            primaryKey: key,
             value,
             delete: () => {
               data.delete(key);
               return makeRequest(undefined);
+            },
+            continue: () => async(step)
+          };
+        } else {
+          req.result = null;
+        }
+        if (req.onsuccess) {
+          req.onsuccess();
+        }
+      };
+      async(step);
+      return req;
+    },
+    openKeyCursor: (range?: { includes(key: string): boolean }) => {
+      // Keys only, as real IndexedDB: a key cursor's delete() throws
+      // InvalidStateError because its key-only flag is set.
+      const keys = [...data.keys()].filter(
+        key => range === undefined || range.includes(key)
+      );
+      const req: {
+        result: unknown;
+        onsuccess: null | (() => void);
+        onerror: null | (() => void);
+      } = { result: null, onsuccess: null, onerror: null };
+      let index = 0;
+      const step = () => {
+        if (index < keys.length) {
+          const key = keys[index++];
+          req.result = {
+            key,
+            primaryKey: key,
+            delete: () => {
+              throw new Error(
+                "InvalidStateError: Failed to execute 'delete' on 'IDBCursor': The cursor is a key cursor."
+              );
             },
             continue: () => async(step)
           };
@@ -6576,10 +6612,15 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     const shape = wideRoot(30, 30);
     const a = nodeFromJSON(shape);
     const b = nodeFromJSON(shape); // equal content, ZERO shared identity
-    // A tiny visit budget must collapse to the root (everything dirty)
-    // instead of walking both trees end to end.
+    // A tiny visit budget stops the descent instead of walking both trees
+    // end to end: every root child differs by identity, so each is reported
+    // whole.
     const collapsed = collectChangedSubtreePaths(a, b, 8, 512, 10);
-    expect(collapsed).to.deep.equal([[]]);
+    // Bounded, and still covering every root child (nothing is missed).
+    // At most the children already gathered on the open frames.
+    expect(collapsed.length).to.be.at.most(30 + 30);
+    expect(collapsed.every(path => path.length >= 1)).to.equal(true);
+    expect(new Set(collapsed.map(path => path[0])).size).to.equal(30);
     // An incremental change against a shared baseline stays precise well
     // under the same budget: the diff only visits where identity differs.
     const evolved = a.updateChild(
@@ -6588,6 +6629,23 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     );
     const precise = collectChangedSubtreePaths(a, evolved, 8, 512, 10);
     expect(precise).to.deep.equal([['p0', 'c0']]);
+  });
+
+  it('an exhausted visit budget keeps unchanged siblings clean', () => {
+    const shape = wideRoot(30, 30) as Record<string, unknown>;
+    const a = nodeFromJSON(shape);
+    // p3 is replaced by an equal-content copy (no shared identity below it,
+    // as after a range merge); p7 gets one real change; the rest are shared.
+    const b = a
+      .updateImmediateChild('p3', nodeFromJSON(shape.p3))
+      .updateChild(new Path('p7/c1'), nodeFromJSON('changed-leaf'));
+    const changed = collectChangedSubtreePaths(a, b, 8, 512, 10);
+    const keys = changed.map(path => path.join('/'));
+    expect(
+      keys.every(key => key.startsWith('p3') || key.startsWith('p7'))
+    ).to.equal(true);
+    expect(keys.some(key => key.startsWith('p7'))).to.equal(true);
+    expect(keys).to.not.include('');
   });
 
   it('manifest estimatedBytes equals the sum of range sizes', async () => {
@@ -6709,5 +6767,189 @@ describe('gentle flush (sliced planning + budgeted staging)', () => {
     await flushing;
     await flushAsync();
     expect(data.get('test-repo|/dispose/root')).to.equal(undefined);
+  });
+});
+
+describe('re-listen range hashes', () => {
+  /** Range hashes of `node` at fixed `posts`, as the server computes them. */
+  function rangeHashesAt(node: Node, posts: string[]): string[] {
+    const hashes: string[] = [];
+    let previous: string[] | null = null;
+    for (const post of posts) {
+      const end = post === '/' ? [] : post.split('/');
+      const builder = new CompoundHashBuilder(() => false);
+      if (previous !== null) {
+        builder.seedBoundary(previous);
+      }
+      walkLeafInterval(node, previous, end, builder);
+      hashes.push(builder.hashes[0]);
+      previous = end;
+    }
+    return hashes;
+  }
+
+  function makeRelistenHarness() {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = scopedManager(
+      'test-repo',
+      factory,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      128
+    );
+    const hashFns: ListenHashFn[] = [];
+    const syncTree = new SyncTree({
+      startListening: (_query, _tag, hashFn) => {
+        hashFns.push(hashFn);
+        return [];
+      },
+      stopListening: () => {},
+      getRelistenCompoundHash: (pathString, serverCache) =>
+        manager.relistenCompoundHash(pathString, serverCache)
+    });
+    const repo = {
+      persistence_: manager,
+      serverSyncTree_: syncTree,
+      infoSyncTree_: syncTree,
+      eventQueue_: new EventQueue()
+    } as unknown as Repo;
+    const path = new Path('relisten/root');
+    const query = new QueryImpl(repo, path, new QueryParams(), false);
+    const json: Record<string, string> = {};
+    for (let i = 0; i < 24; i++) {
+      json['k' + String(i).padStart(2, '0')] = 'x'.repeat(80);
+    }
+    onValue(query, () => {});
+    syncTreeApplyServerOverwrite(syncTree, path, nodeFromJSON(json));
+    return { manager, data, syncTree, path, hashFns };
+  }
+
+  it('sends the flushed ranges with only the changed ones blanked, without a full-tree hash', async () => {
+    const { manager, data, syncTree, path, hashFns } = makeRelistenHarness();
+    const v1 = syncTreeGetCompleteServerCache(syncTree, path)!;
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, v1);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = data.get('test-repo|/relisten/root') as {
+      ranges: Array<{ post: string; hash: string }>;
+    };
+    expect(manifest.ranges.length).to.be.greaterThan(2);
+
+    // A server push replaces the root Node: the flush's stamp is gone.
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path('relisten/root/k05'),
+      nodeFromJSON('y'.repeat(80))
+    );
+    const v2 = syncTreeGetCompleteServerCache(syncTree, path)!;
+    expect(v2).to.not.equal(v1);
+    // Persistence is deliberately not told: the ranges must describe the
+    // view's cache however it changed.
+
+    const hashFn = hashFns[hashFns.length - 1];
+    expect(hashFn()).to.equal('');
+    // No full-tree SHA-1 ran on the live root.
+    expect((v2 as unknown as { lazyHash_: string | null }).lazyHash_).to.equal(
+      null
+    );
+    const ch = hashFn.compoundHash!()!;
+    const posts = manifest.ranges.map(range => range.post);
+    expect(ch.posts).to.deep.equal(posts);
+    expect(ch.hashes.length).to.equal(posts.length + 1);
+    expect(ch.hashes[posts.length]).to.equal('');
+    const actual = rangeHashesAt(v2, posts);
+    const blanked = ch.hashes
+      .slice(0, posts.length)
+      .map((hash, i) => (hash === '' ? i : -1))
+      .filter(i => i >= 0);
+    // Only the range(s) around the changed key are blanked (a key that ends
+    // a range also dirties the next one), and every truly changed range is.
+    expect(blanked.length).to.be.within(1, 2);
+    expect(blanked.length).to.be.lessThan(posts.length);
+    for (let i = 0; i < posts.length; i++) {
+      if (actual[i] !== manifest.ranges[i].hash) {
+        expect(blanked).to.include(i);
+      }
+      if (!blanked.includes(i)) {
+        // Every hash still sent describes the live tree.
+        expect(ch.hashes[i]).to.equal(actual[i]);
+      }
+    }
+  });
+
+  it('finds changes by identity even when an in-flight flush has consumed the changed paths', async () => {
+    const { manager, data, syncTree, path, hashFns } = makeRelistenHarness();
+    const v1 = syncTreeGetCompleteServerCache(syncTree, path)!;
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, v1);
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    const manifest = data.get('test-repo|/relisten/root') as {
+      ranges: Array<{ post: string; hash: string }>;
+    };
+
+    syncTreeApplyServerOverwrite(
+      syncTree,
+      new Path('relisten/root/k09'),
+      nodeFromJSON('z'.repeat(80))
+    );
+    const v2 = syncTreeGetCompleteServerCache(syncTree, path)!;
+    manager.serverCacheUpdated(path, v2, [['k09']]);
+    // The flush starts (consuming the accumulated paths) but has not
+    // committed: the baseline is still v1's generation.
+    const flushing = manager.flushNow(path.toString());
+    const ch = hashFns[hashFns.length - 1].compoundHash!()!;
+    const posts = manifest.ranges.map(range => range.post);
+    const actual = rangeHashesAt(v2, posts);
+    const blanked = ch.hashes
+      .slice(0, posts.length)
+      .filter(hash => hash === '').length;
+    expect(blanked).to.be.within(1, 2);
+    for (let i = 0; i < posts.length; i++) {
+      if (actual[i] !== manifest.ranges[i].hash) {
+        expect(ch.hashes[i]).to.equal('');
+      }
+      if (ch.hashes[i] !== '') {
+        expect(ch.hashes[i]).to.equal(actual[i]);
+      }
+    }
+    await flushing;
+  });
+
+  it('keeps the simple hash for a root persistence does not track', () => {
+    const { syncTree, path, hashFns } = makeRelistenHarness();
+    const v1 = syncTreeGetCompleteServerCache(syncTree, path)!;
+    const hashFn = hashFns[hashFns.length - 1];
+    expect(hashFn.compoundHash!()).to.equal(undefined);
+    expect(hashFn()).to.equal(v1.hash());
+  });
+});
+
+describe('range record GC', () => {
+  it('reclaims an orphan range record through the key cursor', async () => {
+    const { factory, data } = makeFakeIndexedDB();
+    const manager = scopedManager('test-repo', factory);
+    const path = new Path('gc/root');
+    // Left by an earlier generation that no manifest references any more.
+    data.set('test-repo|/gc/root#range:zzz', { tree: 'orphan' });
+    manager.track(path.toString());
+    manager.serverCacheUpdated(path, nodeFromJSON({ a: 1, b: 2 }));
+    await manager.flushNow(path.toString());
+    await flushAsync();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await flushAsync();
+    const manifest = data.get('test-repo|/gc/root') as {
+      ranges: Array<{ recordId: string }>;
+    };
+    expect(manifest.ranges.length).to.be.greaterThan(0);
+    expect(data.has('test-repo|/gc/root#range:zzz')).to.equal(false);
+    for (const range of manifest.ranges) {
+      expect(data.has('test-repo|/gc/root#range:' + range.recordId)).to.equal(
+        true
+      );
+    }
   });
 });
