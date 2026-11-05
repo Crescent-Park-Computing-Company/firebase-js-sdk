@@ -528,7 +528,7 @@ export class Repo {
     public appCheckProvider_: AppCheckTokenProvider
   ) {
     // This key is intentionally not updated if RepoInfo is later changed or replaced
-    this.key = this.repoInfo_.toURLString();
+    this.key = this.repoInfo_.toString();
   }
 
   /**

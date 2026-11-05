@@ -77,7 +77,7 @@ export function forceWebSockets(): void;
 export function get(query: Query): Promise<DataSnapshot>;
 
 // @public
-export function getDatabase(app?: FirebaseApp, url?: string): Database;
+export function getDatabase(app?: FirebaseApp, url?: string, instance?: string): Database;
 
 // @public
 export function getPersistedValue(db: Database, pathString: string, expectedAuthScope?: string | null): Promise<unknown | null>;

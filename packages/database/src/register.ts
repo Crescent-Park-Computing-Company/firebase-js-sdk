@@ -32,15 +32,23 @@ export function registerDatabase(variant?: string): void {
   _registerComponent(
     new Component(
       'database',
-      (container, { instanceIdentifier: url }) => {
+      (container, { instanceIdentifier, options }) => {
         const app = container.getProvider('app').getImmediate()!;
         const authProvider = container.getProvider('auth-internal');
         const appCheckProvider = container.getProvider('app-check-internal');
+        // A named instance is initialized by getDatabase() with its URL and
+        // name as options; its identifier only keys the provider cache.
+        const { url, instance } = options as {
+          url?: string;
+          instance?: string;
+        };
         return repoManagerDatabaseFromApp(
           app,
           authProvider,
           appCheckProvider,
-          url
+          instance === undefined ? instanceIdentifier : url,
+          undefined,
+          instance
         );
       },
       ComponentType.PUBLIC
