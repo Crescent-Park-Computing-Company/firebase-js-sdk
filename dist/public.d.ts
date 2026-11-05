@@ -4,6 +4,7 @@
  * @packageDocumentation
  */
 import { FirebaseApp } from '@firebase/app';
+import { _FirebaseService } from '@firebase/app';
 import { EmulatorMockTokenOptions } from '@firebase/util';
 
 /**
@@ -58,7 +59,7 @@ export declare function consumePersistedMaterialization(snapshot: DataSnapshot):
 /**
  * Class representing a Firebase Realtime Database.
  */
-export declare class Database {
+export declare class Database implements _FirebaseService {
     /** The {@link @firebase/app#FirebaseApp} associated with this Realtime Database instance. */
     readonly app: FirebaseApp;
     /** Represents a `Database` instance. */
@@ -309,7 +310,6 @@ export declare function equalTo(value: number | string | boolean | null, key?: s
  * "child_removed", or "child_moved."
  */
 export declare type EventType = 'value' | 'child_added' | 'child_changed' | 'child_moved' | 'child_removed';
-/* Excluded from this release type: _FirebaseService */
 /**
  * Force the use of longPolling instead of websockets. This will be ignored if websocket protocol is used in databaseURL.
  */
@@ -336,9 +336,13 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  * Database instance is associated with.
  * @param url - The URL of the Realtime Database instance to connect to. If not
  * provided, the SDK connects to the default instance of the Firebase App.
+ * @param instance - Names an additional, independent connection to the same
+ * database (letters, digits, `_` and `-`). Each named instance has its own
+ * connection, local cache and persistence namespace, and shares the app's
+ * Auth and App Check. The same app, URL and name return the same instance.
  * @returns The `Database` instance of the provided app.
  */
-export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
+export declare function getDatabase(app?: FirebaseApp, url?: string, instance?: string): Database;
 /**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
  * listener — the pre-auth boot peek: apps that paint an optimistic shell before sign-in

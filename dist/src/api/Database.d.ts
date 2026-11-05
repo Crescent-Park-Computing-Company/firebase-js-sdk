@@ -26,7 +26,7 @@ export { EmulatorMockTokenOptions } from '@firebase/util';
  * This function should only ever be called to CREATE a new database instance.
  * @internal
  */
-export declare function repoManagerDatabaseFromApp(app: FirebaseApp, authProvider: Provider<FirebaseAuthInternalName>, appCheckProvider?: Provider<AppCheckInternalComponentName>, url?: string, nodeAdmin?: boolean): Database;
+export declare function repoManagerDatabaseFromApp(app: FirebaseApp, authProvider: Provider<FirebaseAuthInternalName>, appCheckProvider?: Provider<AppCheckInternalComponentName>, url?: string, nodeAdmin?: boolean, instance?: string): Database;
 /**
  * Forces us to use ReadonlyRestClient instead of PersistentConnection for new Repos.
  */
@@ -70,9 +70,13 @@ export declare function forceLongPolling(): void;
  * Database instance is associated with.
  * @param url - The URL of the Realtime Database instance to connect to. If not
  * provided, the SDK connects to the default instance of the Firebase App.
+ * @param instance - Names an additional, independent connection to the same
+ * database (letters, digits, `_` and `-`). Each named instance has its own
+ * connection, local cache and persistence namespace, and shares the app's
+ * Auth and App Check. The same app, URL and name return the same instance.
  * @returns The `Database` instance of the provided app.
  */
-export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
+export declare function getDatabase(app?: FirebaseApp, url?: string, instance?: string): Database;
 /**
  * Modify the provided instance to communicate with the Realtime Database
  * emulator.

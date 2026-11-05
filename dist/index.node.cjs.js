@@ -1275,7 +1275,7 @@ WebSocketConnection.responsesRequiredToBeHealthy = 2;
 WebSocketConnection.healthyTimeout = 30000;
 
 const name = "@firebase/database";
-const version = "1.1.3-cache-seeding.91";
+const version = "1.1.3-cache-seeding.92";
 
 /**
  * @license
@@ -15842,7 +15842,7 @@ class Repo {
          */
         this.unconfirmedRestores_ = new Map();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
-        this.key = this.repoInfo_.toURLString();
+        this.key = this.repoInfo_.toString();
     }
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -19925,7 +19925,7 @@ function repoManagerApplyEmulatorSettings(repo, hostAndPort, emulatorOptions, to
  * This function should only ever be called to CREATE a new database instance.
  * @internal
  */
-function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, nodeAdmin) {
+function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, nodeAdmin, instance) {
     let dbUrl = url || app.options.databaseURL;
     if (dbUrl === undefined) {
         if (!app.options.projectId) {
@@ -19950,6 +19950,12 @@ function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, no
     }
     else {
         isEmulator = !parsedUrl.repoInfo.secure;
+    }
+    if (instance !== undefined) {
+        // The persistence key separates the repo, its cache and its persisted
+        // records from every other instance of the same URL; the wire target is
+        // unchanged.
+        repoInfo = new RepoInfo(repoInfo.host, repoInfo.secure, repoInfo.namespace, repoInfo.webSocketOnly, repoInfo.nodeAdmin, instance, repoInfo.includeNamespaceInQueryParams, repoInfo.isUsingEmulator, repoInfo.emulatorOptions);
     }
     const authTokenProvider = nodeAdmin && isEmulator
         ? new EmulatorTokenProvider(EmulatorTokenProvider.OWNER)
@@ -19988,12 +19994,12 @@ function repoManagerCreateRepo(repoInfo, app, authTokenProvider, appCheckProvide
         appRepos = {};
         repos[app.name] = appRepos;
     }
-    let repo = appRepos[repoInfo.toURLString()];
+    let repo = appRepos[repoInfo.toString()];
     if (repo) {
         fatal('Database initialized multiple times. Please make sure the format of the database URL matches with each database() call.');
     }
     repo = new Repo(repoInfo, useRestClient, authTokenProvider, appCheckProvider);
-    appRepos[repoInfo.toURLString()] = repo;
+    appRepos[repoInfo.toString()] = repo;
     return repo;
 }
 /**
@@ -20073,12 +20079,30 @@ function forceLongPolling() {
  * Database instance is associated with.
  * @param url - The URL of the Realtime Database instance to connect to. If not
  * provided, the SDK connects to the default instance of the Firebase App.
+ * @param instance - Names an additional, independent connection to the same
+ * database (letters, digits, `_` and `-`). Each named instance has its own
+ * connection, local cache and persistence namespace, and shares the app's
+ * Auth and App Check. The same app, URL and name return the same instance.
  * @returns The `Database` instance of the provided app.
  */
-function getDatabase(app$1 = app.getApp(), url) {
-    const db = app._getProvider(app$1, 'database').getImmediate({
-        identifier: url
-    });
+function getDatabase(app$1 = app.getApp(), url, instance) {
+    const provider = app._getProvider(app$1, 'database');
+    let db;
+    if (instance === undefined) {
+        db = provider.getImmediate({ identifier: url });
+    }
+    else {
+        if (!/^[A-Za-z0-9_-]+$/.test(instance)) {
+            fatal('Database instance names may contain only letters, digits, "_" and "-".');
+        }
+        const identifier = `${url ?? ''}<${instance}>`;
+        db = (provider.isInitialized(identifier)
+            ? provider.getImmediate({ identifier })
+            : provider.initialize({
+                instanceIdentifier: identifier,
+                options: { url, instance }
+            }));
+    }
     if (!db._instanceStarted) {
         const emulator = util.getDefaultEmulatorHostnameAndPort('database');
         if (emulator) {
@@ -20137,7 +20161,7 @@ function connectDatabaseEmulator(db, host, port, options = {}) {
     // namespace. (Emulator config only happens pre-start, so no listens or
     // tracked roots exist yet.)
     if (repo.persistence_ !== null) {
-        repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toURLString());
+        repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toString());
     }
 }
 /**
@@ -20369,7 +20393,7 @@ function setPersistenceEnabled(db, enabled) {
     const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
-            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toString());
         }
     }
     else {
@@ -20451,11 +20475,14 @@ function enableLogging(logger, persistent) {
  */
 function registerDatabase(variant) {
     setSDKVersion(app.SDK_VERSION);
-    app._registerComponent(new component.Component('database', (container, { instanceIdentifier: url }) => {
+    app._registerComponent(new component.Component('database', (container, { instanceIdentifier, options }) => {
         const app = container.getProvider('app').getImmediate();
         const authProvider = container.getProvider('auth-internal');
         const appCheckProvider = container.getProvider('app-check-internal');
-        return repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url);
+        // A named instance is initialized by getDatabase() with its URL and
+        // name as options; its identifier only keys the provider cache.
+        const { url, instance } = options;
+        return repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, instance === undefined ? instanceIdentifier : url, undefined, instance);
     }, "PUBLIC" /* ComponentType.PUBLIC */).setMultipleInstances(true));
     app.registerVersion(name, version, variant);
     // BUILD_TARGET will be replaced by values like esm, cjs, etc during the compilation

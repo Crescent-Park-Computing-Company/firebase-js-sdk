@@ -14,6 +14,7 @@ import { FirebaseAppCheckInternal } from '@firebase/app-check-interop-types';
 import { FirebaseAuthInternal } from '@firebase/auth-interop-types';
 import { FirebaseAuthInternalName } from '@firebase/auth-interop-types';
 import { FirebaseAuthTokenData } from '@firebase/app-types/private';
+import { _FirebaseService } from '@firebase/app';
 import { Provider } from '@firebase/component';
 
 /**
@@ -613,8 +614,6 @@ declare interface EventRegistration {
  */
 export declare type EventType = 'value' | 'child_added' | 'child_changed' | 'child_moved' | 'child_removed';
 
-/* Excluded from this release type: _FirebaseService */
-
 /**
  * Force the use of longPolling instead of websockets. This will be ignored if websocket protocol is used in databaseURL.
  */
@@ -644,9 +643,13 @@ export declare function get(query: Query): Promise<DataSnapshot>;
  * Database instance is associated with.
  * @param url - The URL of the Realtime Database instance to connect to. If not
  * provided, the SDK connects to the default instance of the Firebase App.
+ * @param instance - Names an additional, independent connection to the same
+ * database (letters, digits, `_` and `-`). Each named instance has its own
+ * connection, local cache and persistence namespace, and shares the app's
+ * Auth and App Check. The same app, URL and name return the same instance.
  * @returns The `Database` instance of the provided app.
  */
-export declare function getDatabase(app?: FirebaseApp, url?: string): Database;
+export declare function getDatabase(app?: FirebaseApp, url?: string, instance?: string): Database;
 
 /**
  * Reads the exact persisted server cache root at `path` WITHOUT attaching a
@@ -982,6 +985,11 @@ declare interface ListenProvider {
     stopListening(a: QueryContext, b: number | null): void;
     /** Repo-scoped hashes for a manifest-first listen whose Node is not ready. */
     getPendingListenHashes?: (pathString: string) => PendingListenHashes | undefined;
+    /**
+     * Current range hashes for a persisted root whose server cache carries no
+     * stamped compound hash (see PersistenceManager.relistenCompoundHash).
+     */
+    getRelistenCompoundHash?: (pathString: string, serverCache: Node_2) => SeedCompoundHash | undefined;
 }
 
 declare interface ListenWireResult {
@@ -2423,6 +2431,25 @@ declare class PersistenceManager {
      */
     private armWriteWindow_;
     private accumulateChangedPaths_;
+    /**
+     * The compound hash a re-sent listen carries for a tracked root whose live
+     * server cache is no longer the node a restore or flush stamped (any server
+     * update replaces the root Node). It is the baseline generation's ranges
+     * with every range the live tree may have changed since blanked, so the
+     * server answers with range merges for exactly those. Without it the
+     * re-listen falls back to the simple hash: a full-tree SHA-1 on the main
+     * thread which, after any write during a disconnect, also misses and makes
+     * the server re-send the whole root.
+     *
+     * Changes are found with the identity diff against the baseline tree, not
+     * changedSinceFlush_ (an in-flight flush has already consumed it), so the
+     * result may over-approximate but never misses a change: a subtree the
+     * baseline shares by identity has the baseline's content, so every hash
+     * still sent describes `node`, whatever path its updates took. Undefined
+     * when there is no ranged baseline tree or when everything would be dirty
+     * anyway (a divorced tree): the listen then keeps its simple hash.
+     */
+    relistenCompoundHash(pathString: string, node: Node_2): SeedCompoundHash | undefined;
     /**
      * `changedPaths` — the root-relative paths of the subtrees this update
      * changed, when the caller knows them precisely: an ordinary server data

@@ -15839,7 +15839,7 @@ class Repo {
          */
         this.unconfirmedRestores_ = new Map();
         // This key is intentionally not updated if RepoInfo is later changed or replaced
-        this.key = this.repoInfo_.toURLString();
+        this.key = this.repoInfo_.toString();
     }
     /**
      * @returns The URL corresponding to the root of this Firebase.
@@ -19922,7 +19922,7 @@ function repoManagerApplyEmulatorSettings(repo, hostAndPort, emulatorOptions, to
  * This function should only ever be called to CREATE a new database instance.
  * @internal
  */
-function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, nodeAdmin) {
+function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, nodeAdmin, instance) {
     let dbUrl = url || app.options.databaseURL;
     if (dbUrl === undefined) {
         if (!app.options.projectId) {
@@ -19947,6 +19947,12 @@ function repoManagerDatabaseFromApp(app, authProvider, appCheckProvider, url, no
     }
     else {
         isEmulator = !parsedUrl.repoInfo.secure;
+    }
+    if (instance !== undefined) {
+        // The persistence key separates the repo, its cache and its persisted
+        // records from every other instance of the same URL; the wire target is
+        // unchanged.
+        repoInfo = new RepoInfo(repoInfo.host, repoInfo.secure, repoInfo.namespace, repoInfo.webSocketOnly, repoInfo.nodeAdmin, instance, repoInfo.includeNamespaceInQueryParams, repoInfo.isUsingEmulator, repoInfo.emulatorOptions);
     }
     const authTokenProvider = nodeAdmin && isEmulator
         ? new EmulatorTokenProvider(EmulatorTokenProvider.OWNER)
@@ -19985,12 +19991,12 @@ function repoManagerCreateRepo(repoInfo, app, authTokenProvider, appCheckProvide
         appRepos = {};
         repos[app.name] = appRepos;
     }
-    let repo = appRepos[repoInfo.toURLString()];
+    let repo = appRepos[repoInfo.toString()];
     if (repo) {
         fatal('Database initialized multiple times. Please make sure the format of the database URL matches with each database() call.');
     }
     repo = new Repo(repoInfo, useRestClient, authTokenProvider, appCheckProvider);
-    appRepos[repoInfo.toURLString()] = repo;
+    appRepos[repoInfo.toString()] = repo;
     return repo;
 }
 /**
@@ -20111,7 +20117,7 @@ function connectDatabaseEmulator(db, host, port, options = {}) {
     // namespace. (Emulator config only happens pre-start, so no listens or
     // tracked roots exist yet.)
     if (repo.persistence_ !== null) {
-        repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toURLString());
+        repo.persistence_ = repo.persistence_.rebindTo(repo.repoInfo_.toString());
     }
 }
 /**
@@ -20343,7 +20349,7 @@ function setPersistenceEnabled(db, enabled) {
     const repo = db._repoInternal;
     if (enabled) {
         if (repo.persistence_ === null) {
-            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toURLString());
+            repo.persistence_ = new PersistenceManager(repo.repoInfo_.toString());
         }
     }
     else {
